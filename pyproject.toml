@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "certorag"
+version = "0.1.0"
+description = "CertorAIl"
+requires-python = ">=3.12"
+license = "GPL-3.0-only"
+authors = [
+    {name = "Certora Ltd."}
+]
+
+[tool.setuptools.packages.find]
+include = ["certorail*"]
+
