@@ -216,6 +216,7 @@ DANGEROUS_MEMBERS: dict[tuple[str, ...], frozenset[str]] = {
         "SetValueEx", "DeleteKey", "DeleteValue", "QueryValue",
         "QueryValueEx", "ConnectRegistry", "SaveKey", "LoadKey",
     }),
+    ("typing",): frozenset({"cast"})
 }
 
 

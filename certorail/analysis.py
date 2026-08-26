@@ -1,9 +1,15 @@
 import ast
 from contextlib import contextmanager
 import inspect
-from typing import Any, cast, Callable, Literal, Sequence
+import pathlib
+import stat
+from turtle import isvisible
+from types import UnionType
+from typing import Any, cast, Callable, Literal, Sequence, final, override, reveal_type
 from dataclasses import dataclass, is_dataclass
-from .dangerous import DANGEROUS_MEMBERS, FORBIDDEN_ATTRIBUTES, FORBIDDEN_MODULES
+from typing_extensions import TypeForm
+from .dangerous import DANGEROUS_MEMBERS, FORBIDDEN_MODULES
+from .typed_ast_tsp import typed_ast
 
 sensitive_builtins = (
     "getattr",
@@ -35,7 +41,15 @@ class RegexMatch:
 class PathConfinement:
     confined_path: str
 
-type ValidationRule = PathConfinement | RegexMatch
+type ContainerSort = Literal["set", "list", "dict_key", "dict_val", "tuple"]
+
+@dataclass
+class ContainerOf:
+    of: "ValidationRule"
+    sort: ContainerSort
+
+
+type ValidationRule = PathConfinement | RegexMatch | ContainerOf
 
 @dataclass
 class ValidatedUsage:
@@ -55,6 +69,43 @@ class Validated:
     ident: str
     validations: list[ValidationRule]
 
+
+@dataclass
+class NameAccess:
+    _wrappedBase: ast.Name | Literal["super"]
+    fields: Sequence[tuple[str, ast.Attribute]]
+
+    @property
+    def base_var(self) -> str:
+        assert isinstance(self._wrappedBase, ast.Name)
+        return self._wrappedBase.id
+
+    @property
+    def is_var_base(self) -> bool:
+        return isinstance(self._wrappedBase, ast.Name)
+
+    @property
+    def field_names(self) -> tuple[str, ...]:
+        return tuple(fld for (fld, _) in self.fields)
+
+    def matches(self, *names: str) -> bool:
+        return len(names) > 0 and self.is_var_base and self.base_var == names[0] and tuple(names[1:]) == self.field_names
+
+def unfold_attr(e: ast.Attribute) -> NameAccess | ast.AST:
+    attr_path : list[tuple[str, ast.Attribute]] = []
+    it = e
+    while True:
+        if isinstance(it, ast.Attribute):
+            attr_path.append((it.attr, it))
+            it = it.value
+        elif isinstance(it, ast.Name):
+            return NameAccess(it, list(reversed(attr_path)))
+        elif isinstance(it, ast.Call) and len(it.args) == 0 and len(it.keywords) == 0 and \
+            isinstance(it.func, ast.Name) and it.func.id == "super":
+            return NameAccess("super", list(reversed(attr_path)))
+        else:
+            return it
+
 def is_call_to(
     i: ast.AST
 ) -> str | None:
@@ -63,6 +114,18 @@ def is_call_to(
     if not isinstance(i.func, ast.Name):
         return None
     return i.func.id
+
+def resolve_callee(
+    i: ast.AST
+) -> NameAccess | None:
+    if isinstance(i, ast.Name):
+        return NameAccess(i, ())
+    elif isinstance(i, ast.Attribute):
+        r = unfold_attr(i)
+        return r if isinstance(r, NameAccess) else None
+    else:
+        return None
+    
 
 class InvalidConstantForm(Exception):
     ...
@@ -92,6 +155,13 @@ def as_const[T](t: type[T], elem: ast.expr) -> T:
         raise InvalidConstantForm(f"Expression is not a constant, got: {type(elem)}")
     if not isinstance(elem.value, t):
         raise InvalidConstantForm(f"Constant value is not a {t}, got {type(elem.value)}")
+    return elem.value
+
+def as_const_or_null[T](t: type[T], elem: ast.expr) -> T | None:
+    if not isinstance(elem, ast.Constant):
+        return None
+    if not isinstance(elem.value, t):
+        return None
     return elem.value
 
 @dataclass(frozen=True)
@@ -186,22 +256,6 @@ def bind_call_args[T](call: ast.Call, spec: type[T]) -> T | None:
         return None
     return spec(*bound.args, **bound.kwargs)
 
-
-def unfold_attr(e: ast.Attribute) -> tuple[ast.Name | Literal["super"], Sequence[tuple[str, ast.Attribute]]] | ast.AST:
-    attr_path : list[tuple[str, ast.Attribute]] = []
-    it = e
-    while True:
-        if isinstance(it, ast.Attribute):
-            attr_path.append((it.attr, it))
-            it = e.value
-        elif isinstance(it, ast.Name):
-            return (it, list(reversed(attr_path)))
-        elif isinstance(it, ast.Call) and len(it.args) == 0 and len(it.keywords) == 0 and \
-            isinstance(it.func, ast.Name) and it.func.id == "super":
-            return ("super", list(reversed(attr_path)))
-        else:
-            return it
-
 def is_prefix[T](s: Sequence[T], r: Sequence[T]) -> bool:
     if len(s) > len(r):
         return False
@@ -209,6 +263,365 @@ def is_prefix[T](s: Sequence[T], r: Sequence[T]) -> bool:
         if s[i] != r[i]:
             return False
     return True
+
+@dataclass(frozen=True)
+class RegexLit:
+    reg: str
+
+@dataclass(frozen=True)
+class Exact:
+    exact_str: str
+
+@dataclass(frozen=True)
+class Concat:
+    seq: list["PseudoRegex"]
+
+@dataclass(frozen=True)
+class Alternation:
+    any_of: list["PseudoRegex"]
+
+type PseudoRegex = Alternation | Concat | RegexLit | Exact
+
+@dataclass(frozen=True)
+class StaticPath:
+    path_components: tuple[PseudoRegex, ...]
+
+    @property
+    def final_component(self) -> PseudoRegex:
+        return self.path_components[-1]
+
+    def merge_other(self, other: "LocationFact") -> "LocationFact":
+        if isinstance(other, StaticPath):
+            return StaticPath(self.path_components + other.path_components)
+        else:
+            return DirSplat(self.path_components + other.static_prefix, other.final_component)
+
+    def extend_static(self, other: tuple[str, ...]) -> "StaticPath":
+        return StaticPath(self.path_components + tuple(Exact(i) for i in other))
+
+    def extend_single(self, other: PseudoRegex) -> "StaticPath":
+        return StaticPath(self.path_components + (other,))
+
+    def to_splat(self, final_component: PseudoRegex) -> "DirSplat":
+        return DirSplat(self.path_components, final_component)
+
+@dataclass(frozen=True)
+class DirSplat:
+    static_prefix: tuple[PseudoRegex, ...]
+    final_component: PseudoRegex
+
+    def merge_other(self, other: "LocationFact") -> "DirSplat":
+        return DirSplat(static_prefix=self.static_prefix, final_component=other.final_component)
+
+    def extend_static(self, ext: tuple[str, ...]) -> "DirSplat":
+        return DirSplat(
+            static_prefix=self.static_prefix,
+            final_component=Exact(ext[-1])
+        )
+
+    def extend_single(self, other: PseudoRegex) -> "DirSplat":
+        return DirSplat(
+            self.static_prefix,
+            other
+        )
+
+    def to_splat(self, final_component: PseudoRegex) -> "DirSplat":
+        return DirSplat(self.static_prefix, final_component)
+
+
+type LocationFact = StaticPath | DirSplat
+
+type AtomicFact = Literal["no-slash", "no-parent-traversal", "not-absolute"]
+
+def _explicit_check_no_parent(regex: PseudoRegex) -> bool:
+    match regex:
+        case Alternation():
+            return all(_explicit_check_no_parent(p) for p in regex.any_of)
+        case Exact():
+            return _safe_path_extension(regex.exact_str) is not None
+        case RegexLit():
+            return False
+        case Concat():
+            return False
+
+def _explicit_check_no_slash(regex: PseudoRegex) -> bool:
+    match regex:
+        case Alternation():
+            return all(_explicit_check_no_slash(p) for p in regex.any_of)
+        case Exact():
+            return "/" not in regex.exact_str
+        case RegexLit():
+            return False
+        case Concat():
+            return all(_explicit_check_no_slash(p) for p in regex.seq)
+
+def _explicit_check_not_absolute(regex: PseudoRegex):
+    match regex:
+        case Alternation():
+            return all(_explicit_check_not_absolute(p) for p in regex.any_of)
+        case Exact():
+            return not regex.exact_str.startswith("/")
+        case RegexLit():
+            return False
+        case Concat():
+            return _explicit_check_not_absolute(regex.seq[0])
+
+def _explicit_check(other: AtomicFact, regex: PseudoRegex) -> bool:
+    match other:
+        case "no-parent-traversal":
+            return _explicit_check_no_parent(regex)
+        case "no-slash":
+            return _explicit_check_no_slash(regex)
+        case "not-absolute":
+            return _explicit_check_not_absolute(regex)
+
+@dataclass(frozen=True)
+class ValidationFact:
+    regex: PseudoRegex | None
+    containment: LocationFact | None
+    atoms: frozenset[AtomicFact]
+
+    def __contains__(self, other: AtomicFact):
+        return other in self.atoms or (
+            self.regex is not None and _explicit_check(other, self.regex)
+        )
+        
+
+    type_info: Literal["str", "path"]
+
+
+class InvalidProgram(Exception):
+    def __init__(self, node: ast.AST, msg: str):
+        super().__init__(msg)
+        self.node = node
+
+def reroot(
+    s: StaticPath,
+    new_root: StaticPath
+):
+    return StaticPath(
+        s.path_components + new_root.path_components
+    )
+
+def _safe_path_extension(s: str) -> tuple[str, ...] | None:
+    as_path = pathlib.PurePath(s)
+    if as_path.is_absolute():
+        return None
+    if any(p == ".." for p in as_path.parts):
+        return None
+    last = as_path.name
+    if last:
+        return as_path.parts
+    else:
+        return None
+
+
+def combine_containment(
+    cont: LocationFact,
+    child: str | ValidationFact | None
+):
+    if child is None:
+        return None
+    
+    if isinstance(child, str):
+        as_path = _safe_path_extension(child)
+        if as_path is None:
+            return None
+        return cont.extend_static(as_path)
+
+    elif child.containment is not None:
+        return cont.merge_other(child.containment)
+    elif "no-parent-traversal" in child and "no-slash" in child:
+        return cont.extend_single(other=child.regex or RegexLit(".*"))
+    elif "no-parent-traversal" in child and "not-absolute" in child:
+        return cont.to_splat(RegexLit(".*"))
+    else:
+        return None
+
+class OperandInterpreter():
+    def __init__(self, st: dict[str, ValidationFact]):
+        self.st = st
+
+    def interp[R](
+        self,
+        e: ast.expr,
+        on_str: Callable[[OptionMonad[str]], OptionMonad[R]],
+        on_fact: Callable[[OptionMonad[ValidationFact]], OptionMonad[R]],
+        on_expr: Callable[[OptionMonad[ast.expr]], OptionMonad[R]] | None = None
+    ) -> R | None:
+        if (as_str := as_const_or_null(str, e)):
+            return on_str(OptionMonad(as_str)).unwrap()
+        if not isinstance(e, ast.Name):
+            if on_expr is None:
+                return None
+            return on_expr(OptionMonad(e)).unwrap()
+        res = self.st.get(e.id)
+        if res is None:
+            return None
+        return on_fact(OptionMonad(res)).unwrap()
+
+    def interp_bind[R](
+        self,
+        e: ast.expr,
+        on_str: Callable[[OptionMonad[str]], OptionMonad[R]],
+        on_fact: Callable[[OptionMonad[ValidationFact]], OptionMonad[R]],
+        on_expr : Callable[[OptionMonad[ast.expr]], OptionMonad[R]] | None = None
+    ) -> OptionMonad[R]:
+        return OptionMonad.lift(self.interp(e, on_str, on_fact, on_expr))
+
+
+class ExprInterpreter:
+    def __init__(self, st: dict[str, ValidationFact]):
+        self.st = st
+
+def type_cast[T](t: TypeForm[T]) -> Callable[[T], T]:
+    return lambda x: x
+
+def take_if[T](pred: Callable[[T], bool]) -> Callable[[T], T | None]:
+    def to_ret(it: T) -> T | None:
+        if not pred(it):
+            return None
+        else:
+            return it
+    return to_ret
+
+class _default:
+    @classmethod
+    def BindNone[T, R](cls) -> Callable[[OptionMonad[T]], OptionMonad[R]]:
+        return lambda _ign: OptionMonad.lift(None)
+
+    @classmethod
+    def Cast[R](cls, ty: TypeForm[R]) -> Callable[[OptionMonad[R]], OptionMonad[R]]:
+        return lambda x: x.bind(type_cast(ty))
+
+@dataclass(frozen=True, eq=False)
+class CurriedMonad[M, R]:
+    staged: Callable[[OptionMonad[M]], OptionMonad[R]]
+
+    def bind_curried[S](self, c: Callable[[R], OptionMonad[S] | S | None]) -> "CurriedMonad[M, S]":
+        return CurriedMonad(lambda to_exec: self.staged(to_exec).bind(c))
+
+    def __call__(self, arg: OptionMonad[M]) -> OptionMonad[R]:
+        return self.staged(arg)
+
+def interpret_expr(e: ast.expr, st: dict[str, ValidationFact]) -> ValidationFact | None:
+    interp = OperandInterpreter(st)
+    if isinstance(e, ast.Name):
+        return st.get(e.id, None)
+
+    wrapper : CurriedMonad[ast.expr, ValidationFact] = CurriedMonad(lambda exp_m: exp_m.bind(lambda exp: interpret_expr(exp, st)))
+
+    if isinstance(e, ast.Call):
+        node = e
+        call = resolve_callee(node.func)
+        if call is None:
+            raise InvalidProgram(node.func, "invalid call")
+        if call.matches("pathlib", "Path") and len(e.args) > 0:
+            accum = interp.interp(e.args[0],
+                on_fact=(lambda f: f.bind(lambda proj: proj.containment)),
+                on_str=lambda nm: (
+                    nm.bind(_safe_path_extension).map(lambda feats: tuple(Exact(i) for i in feats)).map(StaticPath)
+                ),
+                on_expr=wrapper.bind_curried(lambda fact: fact.containment)
+            )
+            if accum is None:
+                return None
+            for i in e.args[:1]:
+                d = interp.interp(
+                    i,
+                    on_str=lambda id: id.map(type_cast(str | ValidationFact)),
+                    on_fact=lambda id: id.map(type_cast(str | ValidationFact)),
+                    on_expr=wrapper.bind_curried(type_cast(str | ValidationFact))
+                )
+                if d is None:
+                    return None
+                accum = combine_containment(accum, d)
+                if accum is None:
+                    return None
+            return ValidationFact(
+                regex=None,
+                containment=accum,
+                atoms=frozenset(),
+                type_info="path"
+            )
+    elif isinstance(e, ast.BinOp) and isinstance(e.op, ast.Div):
+        return interp.interp_bind(
+            e.left,
+            on_str=_default.BindNone(),
+            on_fact=lambda nm: nm,
+            on_expr=wrapper
+        ).bind(take_if(
+            lambda d: d.type_info == "path" and d.containment is not None
+        )).bind(lambda fact: \
+            combine_containment(
+                cast(LocationFact, fact.containment),
+                interp.interp(
+                    e.right,
+                    on_str=lambda nm: nm.map(type_cast(str | ValidationFact)),
+                    on_fact=lambda nm: nm.map(type_cast(str | ValidationFact)),
+                    on_expr=wrapper.bind_curried(type_cast(str | ValidationFact))
+                )
+            )
+        ).map(lambda fact: \
+            ValidationFact(
+                None, fact, frozenset(), "path"
+            )
+        ).unwrap()
+        
+class ValidationWalker(ast.NodeVisitor):
+    def __init__(self):
+        self.state : dict[str, ValidationFact] = {}
+
+    def visit_Await(self, node: ast.Await) -> Any:
+        raise InvalidProgram(node, "async")
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> Any:
+        raise InvalidProgram(node, "async")
+
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> Any:
+        raise InvalidProgram(node, "async")
+
+    def visit_AsyncWith(self, node: ast.AsyncWith) -> Any:
+        raise InvalidProgram(node, "async")
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> Any:
+        raise InvalidProgram(node, "walrus")
+
+    def visit_Nonlocal(self, node: ast.Nonlocal) -> Any:
+        raise InvalidProgram(node, "nonlocal")
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> Any:
+        return super().visit_AnnAssign(node)
+
+    def visit_Assign(self, node: ast.Assign) -> Any:
+        
+        return super().visit_Assign(node)
+
+    def visit_Call(self, node: ast.Call) -> Any:
+        call = resolve_callee(node.func)
+        if call is None:
+            raise InvalidProgram(node.func, "invalid call")
+        return super().visit_Call(node)
+
+    def visit_Assert(self, node: ast.Assert) -> Any:
+        return super().visit_Assert(node)
+
+    @contextmanager
+    def state_snapshot(self):
+        saved = self.state.copy()
+        try:
+            yield
+        finally:
+            self.state = saved
+
+    def _parse_args(self, node: ast.FunctionDef) -> dict[str, ValidationFact]:
+        ...
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> Any:
+        with self.state_snapshot():
+            self.state = self._parse_args(node)
+            for s in node.body:
+                self.generic_visit(s)
 
 class ValidationAnalysis(ast.NodeVisitor):
     def __init__(self):
@@ -369,7 +782,7 @@ class ValidationAnalysis(ast.NodeVisitor):
 
     def visit_Name(self, node: ast.Name) -> Any:
         self._name_visit(node)
-        
+
         for k in DANGEROUS_MEMBERS.keys():
             if is_prefix((node.id,), k):
                 self._violation(node, "module escape")
