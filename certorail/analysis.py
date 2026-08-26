@@ -385,7 +385,6 @@ class ValidationFact:
         return other in self.atoms or (
             self.regex is not None and _explicit_check(other, self.regex)
         )
-        
 
     type_info: Literal["str", "path"]
 
@@ -468,11 +467,6 @@ class OperandInterpreter():
         on_expr : Callable[[OptionMonad[ast.expr]], OptionMonad[R]] | None = None
     ) -> OptionMonad[R]:
         return OptionMonad.lift(self.interp(e, on_str, on_fact, on_expr))
-
-
-class ExprInterpreter:
-    def __init__(self, st: dict[str, ValidationFact]):
-        self.st = st
 
 def type_cast[T](t: TypeForm[T]) -> Callable[[T], T]:
     return lambda x: x
@@ -567,7 +561,37 @@ def interpret_expr(e: ast.expr, st: dict[str, ValidationFact]) -> ValidationFact
                 None, fact, frozenset(), "path"
             )
         ).unwrap()
-        
+
+    elif isinstance(e, ast.Constant) and (as_str := as_const_or_null(str, e)) is not None:
+        return ValidationFact(
+            regex=Exact(as_str),
+            containment=None,
+            atoms=frozenset(),
+            type_info="str"
+        )
+    elif isinstance(e, ast.JoinedStr):
+        to_acc = []
+        known_facts : set[AtomicFact] = {"no-slash"}
+        for i in e.values:
+            as_str = as_const_or_null(str, i)
+            if as_str is not None:
+                if "/" in as_str:
+                    known_facts.remove("no-slash")
+                to_acc.append(Exact(as_str))
+                continue
+            rec = interpret_expr(i, st)
+            if rec is None:
+                known_facts.remove("no-slash")
+                to_acc.append(RegexLit(".*"))
+                continue
+            if "no-slash" not in rec:
+                known_facts.remove("no-slash")
+            if rec.type_info == "str":
+                to_acc.append(rec.regex or RegexLit(".*"))
+                continue
+            
+            
+
 class ValidationWalker(ast.NodeVisitor):
     def __init__(self):
         self.state : dict[str, ValidationFact] = {}

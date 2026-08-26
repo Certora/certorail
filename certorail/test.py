@@ -9,3 +9,5 @@ with (
 
 if (x := 3 > 5):
     print(x)
+
+print(f"welp{x!r}")
