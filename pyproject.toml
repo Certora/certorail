@@ -18,3 +18,5 @@ include = ["certorail*"]
 
 [tool.pyright]
 enableExperimentalFeatures=true
+reportUnnecessaryComparison = "error"
+reportMatchNotExhaustive = "error"

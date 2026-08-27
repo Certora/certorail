@@ -1,0 +1,344 @@
+"""``typing.Annotated`` hints -> dataflow facts.
+
+A parameter annotation is the *rely* of a function: :func:`parse_function` turns it into the fact
+the body analysis may assume about that parameter, and which every caller has to discharge. The
+return annotation is the *guarantee*: the fact every ``return`` has to establish, and which callers
+may assume about the call. Neither direction is checked here; this module only reads annotations.
+
+Only the source of the annotation is consulted (never the runtime marker objects), so every marker
+argument has to be a constant or a nested marker. Malformed markers raise
+:class:`InvalidAnnotation`: an annotation is a specification, and silently dropping a misspelt
+one would weaken a rely without anyone noticing.
+
+The marker vocabulary lives in ``markers.py`` and is reached as ``certora.<name>``; the base type
+is ``str``, one of the ``pathlib`` path classes, or a ``list``/``set``/``frozenset``/``tuple[T, ...]``/
+``dict`` of those. Anything else carries no fact (and may not carry markers).
+"""
+import ast
+from dataclasses import dataclass
+from typing import Literal, Sequence
+
+from .analysis import (
+    ANY_NAME,
+    ANY_STR,
+    AtomicFact,
+    Component,
+    DirSplat,
+    Exact,
+    InvalidProgram,
+    LocationFact,
+    Matching,
+    Named,
+    OneOf,
+    PathFact,
+    PseudoRegex,
+    RegexLit,
+    StaticPath,
+    StrFact,
+    ValidationFact,
+    _safe_path_extension,
+    alternation,
+    concat,
+    is_safe_name,
+)
+from .markers import NAMESPACE
+from .terms import Call, Const, Dotted, Items, Subscript, Term, Var, lower
+
+
+class InvalidAnnotation(InvalidProgram):
+    """An annotation that uses the marker vocabulary incorrectly."""
+
+
+def _err(t: Term, msg: str) -> InvalidAnnotation:
+    return InvalidAnnotation(t.node, msg)
+
+
+# ---------------------------------------------------------------------------
+# facts for parameters and returns
+# ---------------------------------------------------------------------------
+
+type ElementSort = Literal["list", "set", "frozenset", "tuple"]
+
+
+@dataclass(frozen=True)
+class ElementsFact:
+    """``list[T]``, ``set[T]``, ``frozenset[T]``, ``tuple[T, ...]``: every element satisfies ``element``."""
+
+    sort: ElementSort
+    element: "Fact"
+
+
+@dataclass(frozen=True)
+class MappingFact:
+    """``dict[K, V]``: every key satisfies ``key``, every value ``value`` (``None`` = nothing known)."""
+
+    key: "Fact | None"
+    value: "Fact | None"
+
+
+type Fact = ValidationFact | ElementsFact | MappingFact
+
+
+@dataclass(frozen=True)
+class Contract:
+    """What a function relies on (per parameter) and guarantees (return)."""
+
+    params: dict[str, Fact]
+    returns: Fact | None
+
+
+# ---------------------------------------------------------------------------
+# markers
+# ---------------------------------------------------------------------------
+
+# ``certora.<attr>`` atoms; must agree with the constants in ``markers.py``.
+_ATOMS: dict[str, AtomicFact] = {
+    "no_slash": "no-slash",
+    "no_parent_traversal": "no-parent-traversal",
+    "not_absolute": "not-absolute",
+    "not_dot_dot": "not-dot-dot",
+}
+_REGEX_MARKERS = ("matches", "one_of", "seq")
+_LOCATION_MARKERS = ("within", "exactly")
+
+type Args = tuple[Term, ...]
+type Kwargs = tuple[tuple[str, Term], ...]
+
+
+def _marker_call(t: Term) -> tuple[str, Args, Kwargs] | None:
+    """``certora.<name>(...)`` -> ``(name, args, kwargs)``."""
+    match t:
+        case Call((ns, name), args, kwargs) if ns == NAMESPACE:
+            return name, args, kwargs
+        case _:
+            return None
+
+
+def _bind(
+    t: Term, args: Args, kwargs: Kwargs, params: Sequence[str], required: int, what: str
+) -> list[Term | None]:
+    """Bind a marker's arguments to *params* (the first *required* being mandatory)."""
+    if len(args) > len(params):
+        raise _err(t, f"{what}: too many arguments")
+    bound: list[Term | None] = list(args) + [None] * (len(params) - len(args))
+    for name, value in kwargs:
+        if name not in params:
+            raise _err(value, f"{what}: unknown argument {name!r}")
+        i = params.index(name)
+        if bound[i] is not None:
+            raise _err(value, f"{what}: {name!r} given twice")
+        bound[i] = value
+    if any(b is None for b in bound[:required]):
+        raise _err(t, f"{what}: missing argument")
+    return bound
+
+
+def _str_args(t: Term, args: Args, kwargs: Kwargs, what: str) -> list[str]:
+    """The positional string-literal arguments of a variadic marker."""
+    if kwargs:
+        raise _err(t, f"{what} takes no keyword arguments")
+    if not args:
+        raise _err(t, f"{what} needs at least one argument")
+    out: list[str] = []
+    for a in args:
+        s = a.as_str()
+        if s is None:
+            raise _err(a, f"{what} arguments must be string literals")
+        out.append(s)
+    return out
+
+
+# --- regex markers: what a string looks like ---------------------------------
+
+
+def _regex_of(t: Term, name: str, args: Args, kwargs: Kwargs) -> PseudoRegex:
+    match name:
+        case "matches":
+            (regex,) = _bind(t, args, kwargs, ("regex",), 1, "matches")
+            assert regex is not None
+            r = regex.as_str()
+            if r is None:
+                raise _err(regex, "matches() takes a string literal")
+            return RegexLit(r)
+        case "one_of":
+            return alternation(*(Exact(s) for s in _str_args(t, args, kwargs, "one_of")))
+        case "seq":
+            if kwargs:
+                raise _err(t, "seq takes no keyword arguments")
+            if not args:
+                raise _err(t, "seq needs at least one piece")
+            return concat(*(_fragment_regex(a) for a in args))
+        case _:
+            raise _err(t, f"unknown marker certora.{name}")
+
+
+def _fragment_regex(t: Term) -> PseudoRegex:
+    """A literal or a regex marker, as a description of a string."""
+    if (s := t.as_str()) is not None:
+        return Exact(s)
+    m = _marker_call(t)
+    if m is None or m[0] not in _REGEX_MARKERS:
+        raise _err(t, "expected a string literal or one of certora.matches/one_of/seq")
+    return _regex_of(t, *m)
+
+
+# --- location markers: where a path is ---------------------------------------
+
+
+def _components_of(t: Term) -> tuple[Component, ...]:
+    """A fragment in component position. A literal may name several components
+    (``"data/uploads"``); a marker names exactly one."""
+    if (s := t.as_str()) is not None:
+        parts = _safe_path_extension(s)
+        if parts is None:
+            raise _err(t, "path fragments must be relative, non-empty and free of '..'")
+        return tuple(Named(p) for p in parts)
+    m = _marker_call(t)
+    if m is None or m[0] not in _REGEX_MARKERS:
+        raise _err(t, "expected a path literal or one of certora.matches/one_of/seq")
+    name, args, kwargs = m
+    if name == "one_of":
+        names = _str_args(t, args, kwargs, "one_of")
+        if not all(is_safe_name(n) for n in names):
+            raise _err(t, "one_of() in a path names single components")
+        return (OneOf(frozenset(names)),)
+    return (Matching(_regex_of(t, name, args, kwargs)),)
+
+
+def _single_component(t: Term, what: str) -> Component:
+    comps = _components_of(t)
+    if len(comps) != 1:
+        raise _err(t, f"{what} must be a single component")
+    return comps[0]
+
+
+def _location_of(t: Term, name: str, args: Args, kwargs: Kwargs) -> LocationFact:
+    match name:
+        case "exactly":
+            if kwargs:
+                raise _err(t, "exactly takes no keyword arguments")
+            if not args:
+                raise _err(t, "exactly needs at least one component")
+            return StaticPath(tuple(c for a in args for c in _components_of(a)))
+        case "within":
+            prefix_t, leaf_t = _bind(t, args, kwargs, ("prefix", "leaf"), 1, "within")
+            assert prefix_t is not None
+            # "." is the sandbox root: an empty prefix
+            if prefix_t.as_str() in (".", ""):
+                prefix: tuple[Component, ...] = ()
+            else:
+                prefix = _components_of(prefix_t)
+            leaf = ANY_NAME if leaf_t is None else _single_component(leaf_t, "within(leaf=)")
+            return DirSplat(prefix, leaf)
+        case _:
+            raise _err(t, f"unknown marker certora.{name}")
+
+
+# ---------------------------------------------------------------------------
+# annotations
+# ---------------------------------------------------------------------------
+
+
+def _scalar_fact(t: Term) -> ValidationFact | None:
+    match t:
+        case Var("str"):
+            return StrFact()
+        case Dotted(("pathlib", "Path" | "PurePath" | "PosixPath" | "PurePosixPath")):
+            return PathFact()
+        case _:
+            return None
+
+
+def _annotated(base: Term, metadata: Sequence[Term]) -> ValidationFact:
+    fact = _parse(base)
+    if not isinstance(fact, (StrFact, PathFact)):
+        raise _err(base, "markers apply to str and pathlib paths only")
+
+    atoms: set[AtomicFact] = set()
+    regex: PseudoRegex | None = None
+    containment: LocationFact | None = None
+    for m in metadata:
+        match m:
+            case Dotted((ns, atom_name)) if ns == NAMESPACE:
+                if atom_name not in _ATOMS:
+                    raise _err(m, f"unknown marker certora.{atom_name}")
+                atoms.add(_ATOMS[atom_name])
+                continue
+            case _:
+                ...
+        call = _marker_call(m)
+        if call is None:
+            raise _err(m, f"expected a certora marker, got {type(m).__name__}")
+        name, args, kwargs = call
+        if name in _LOCATION_MARKERS:
+            if containment is not None:
+                raise _err(m, "at most one of within()/exactly()")
+            containment = _location_of(m, name, args, kwargs)
+        elif name in _REGEX_MARKERS:
+            if isinstance(fact, PathFact):
+                raise _err(
+                    m, "a path has no regex; constrain its leaf with within(..., leaf=) or exactly()"
+                )
+            if regex is not None:
+                raise _err(m, "at most one of matches()/one_of()/seq()")
+            regex = _regex_of(m, name, args, kwargs)
+        else:
+            raise _err(m, f"unknown marker certora.{name}")
+
+    if isinstance(fact, StrFact):
+        return StrFact(
+            regex=ANY_STR if regex is None else regex,
+            containment=containment,
+            atoms=frozenset(atoms),
+        )
+    return PathFact(containment=containment, atoms=frozenset(atoms))
+
+
+def _parse(t: Term) -> Fact | None:
+    match t:
+        case Subscript(Dotted(("typing", "Annotated")), Items((base, *metadata))) if metadata:
+            return _annotated(base, metadata)
+        case Subscript(Dotted(("typing", "Annotated")), _):
+            raise _err(t, "Annotated[type, marker, ...] needs at least one marker")
+        case Subscript(Var("list" | "set" | "frozenset" as sort), elem):
+            element = _parse(elem)
+            return None if element is None else ElementsFact(sort, element)
+        case Subscript(Var("tuple"), Items((elem, Const(ell)))) if ell is Ellipsis:
+            element = _parse(elem)
+            return None if element is None else ElementsFact("tuple", element)
+        case Subscript(Var("dict"), Items((key, value))):
+            kf, vf = _parse(key), _parse(value)
+            return None if kf is None and vf is None else MappingFact(kf, vf)
+        case _:
+            return _scalar_fact(t)
+
+
+def parse_annotation(e: ast.expr) -> Fact | None:
+    """The fact an annotation expresses, or ``None`` if it says nothing the analysis tracks."""
+    return _parse(lower(e))
+
+
+def parse_function(node: ast.FunctionDef) -> Contract:
+    """The rely (per annotated parameter) and guarantee (return) of a function.
+
+    ``*args`` becomes a ``tuple`` of its annotation, ``**kwargs`` a ``dict[str, ...]`` of it.
+    Parameters whose annotation says nothing (or have none) are absent from ``params``.
+    """
+    params: dict[str, Fact] = {}
+    a = node.args
+    for arg in [*a.posonlyargs, *a.args, *a.kwonlyargs]:
+        if arg.annotation is None:
+            continue
+        fact = parse_annotation(arg.annotation)
+        if fact is not None:
+            params[arg.arg] = fact
+    if a.vararg is not None and a.vararg.annotation is not None:
+        fact = parse_annotation(a.vararg.annotation)
+        if fact is not None:
+            params[a.vararg.arg] = ElementsFact("tuple", fact)
+    if a.kwarg is not None and a.kwarg.annotation is not None:
+        fact = parse_annotation(a.kwarg.annotation)
+        if fact is not None:
+            params[a.kwarg.arg] = MappingFact(StrFact(), fact)
+    returns = parse_annotation(node.returns) if node.returns is not None else None
+    return Contract(params, returns)

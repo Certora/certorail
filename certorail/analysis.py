@@ -1,7 +1,9 @@
 import ast
 from contextlib import contextmanager
+import functools
 import inspect
 import pathlib
+import re
 import stat
 from turtle import isvisible
 from types import UnionType
@@ -76,9 +78,14 @@ class NameAccess:
     fields: Sequence[tuple[str, ast.Attribute]]
 
     @property
-    def base_var(self) -> str:
+    def base_name(self) -> str:
         assert isinstance(self._wrappedBase, ast.Name)
         return self._wrappedBase.id
+
+    @property
+    def base_var(self) -> ast.Name:
+        assert isinstance(self._wrappedBase, ast.Name)
+        return self._wrappedBase
 
     @property
     def is_var_base(self) -> bool:
@@ -89,7 +96,7 @@ class NameAccess:
         return tuple(fld for (fld, _) in self.fields)
 
     def matches(self, *names: str) -> bool:
-        return len(names) > 0 and self.is_var_base and self.base_var == names[0] and tuple(names[1:]) == self.field_names
+        return len(names) > 0 and self.is_var_base and self.base_name == names[0] and tuple(names[1:]) == self.field_names
 
 def unfold_attr(e: ast.Attribute) -> NameAccess | ast.AST:
     attr_path : list[tuple[str, ast.Attribute]] = []
@@ -280,14 +287,70 @@ class Concat:
 class Alternation:
     any_of: list["PseudoRegex"]
 
-type PseudoRegex = Alternation | Concat | RegexLit | Exact
+@dataclass(frozen=True)
+class AnyStr:
+    """Any string at all: the top of the string domain.
+
+    Distinct from ``RegexLit(".*")``, which is opaque to every structural check and, since ``.``
+    does not match a newline, is not actually top.
+    """
+
+type PseudoRegex = Alternation | Concat | RegexLit | Exact | AnyStr
+
+ANY_STR = AnyStr()
+
+# ---------------------------------------------------------------------------
+# Path components
+#
+# The elements of a LocationFact. Every Component denotes a *safe* name: no "/", and none of "",
+# "." or "..". That invariant is what lets the location operations stay structural; the string
+# domain (PseudoRegex) enters only through Matching, as a further restriction on the name.
+# ---------------------------------------------------------------------------
+
+def is_safe_name(s: str) -> bool:
+    return s not in ("", ".", "..") and "/" not in s
+
+@dataclass(frozen=True)
+class Named:
+    """One specific component."""
+    name: str
+
+    def __post_init__(self) -> None:
+        if not is_safe_name(self.name):
+            raise ValueError(f"not a path component: {self.name!r}")
+
+@dataclass(frozen=True)
+class AnyName:
+    """Any single safe component."""
+
+@dataclass(frozen=True)
+class Matching:
+    """A safe component whose name fullmatches ``regex``.
+
+    The conjunction is the meaning: the regex itself may admit strings that are not components.
+    """
+    regex: PseudoRegex
+
+@dataclass(frozen=True)
+class OneOf:
+    """One of finitely many specific components (``x in ("a", "b")``)."""
+    names: frozenset[str]
+
+    def __post_init__(self) -> None:
+        bad = [n for n in self.names if not is_safe_name(n)]
+        if bad:
+            raise ValueError(f"not path components: {bad!r}")
+
+type Component = Named | AnyName | Matching | OneOf
+
+ANY_NAME = AnyName()
 
 @dataclass(frozen=True)
 class StaticPath:
-    path_components: tuple[PseudoRegex, ...]
+    path_components: tuple[Component, ...]
 
     @property
-    def final_component(self) -> PseudoRegex:
+    def final_component(self) -> Component:
         return self.path_components[-1]
 
     def merge_other(self, other: "LocationFact") -> "LocationFact":
@@ -297,18 +360,18 @@ class StaticPath:
             return DirSplat(self.path_components + other.static_prefix, other.final_component)
 
     def extend_static(self, other: tuple[str, ...]) -> "StaticPath":
-        return StaticPath(self.path_components + tuple(Exact(i) for i in other))
+        return StaticPath(self.path_components + tuple(Named(i) for i in other))
 
-    def extend_single(self, other: PseudoRegex) -> "StaticPath":
+    def extend_single(self, other: Component) -> "StaticPath":
         return StaticPath(self.path_components + (other,))
 
-    def to_splat(self, final_component: PseudoRegex) -> "DirSplat":
+    def to_splat(self, final_component: Component) -> "DirSplat":
         return DirSplat(self.path_components, final_component)
 
 @dataclass(frozen=True)
 class DirSplat:
-    static_prefix: tuple[PseudoRegex, ...]
-    final_component: PseudoRegex
+    static_prefix: tuple[Component, ...]
+    final_component: Component
 
     def merge_other(self, other: "LocationFact") -> "DirSplat":
         return DirSplat(static_prefix=self.static_prefix, final_component=other.final_component)
@@ -316,22 +379,243 @@ class DirSplat:
     def extend_static(self, ext: tuple[str, ...]) -> "DirSplat":
         return DirSplat(
             static_prefix=self.static_prefix,
-            final_component=Exact(ext[-1])
+            final_component=Named(ext[-1])
         )
 
-    def extend_single(self, other: PseudoRegex) -> "DirSplat":
+    def extend_single(self, other: Component) -> "DirSplat":
         return DirSplat(
             self.static_prefix,
             other
         )
 
-    def to_splat(self, final_component: PseudoRegex) -> "DirSplat":
+    def to_splat(self, final_component: Component) -> "DirSplat":
         return DirSplat(self.static_prefix, final_component)
 
 
 type LocationFact = StaticPath | DirSplat
 
-type AtomicFact = Literal["no-slash", "no-parent-traversal", "not-absolute"]
+# ---------------------------------------------------------------------------
+# LocationFact -> PseudoRegex
+#
+# PseudoRegex is read as a language: L(Exact s) = {s}, L(RegexLit r) = the fullmatch language of
+# r, Concat = concatenation, Alternation = union. The translation below produces a PseudoRegex
+# whose language contains the canonical (PurePath) string of every path a LocationFact denotes.
+# ---------------------------------------------------------------------------
+
+SLASH = Exact("/")
+ROOT = Exact(".")                    # canonical spelling of the empty relative path
+
+# One safe component (see ``is_safe_name``) as a regex, written without anchors so it can sit
+# anywhere inside a Concat:   [^.]...  |  .[^.]...  |  ..[at least one more char]
+_COMPONENT_RE = r"(?:[^/.][^/]*|\.[^/.][^/]*|\.\.[^/]+)"
+COMPONENT = RegexLit(_COMPONENT_RE)
+# Zero or more such components, each followed by "/". PseudoRegex has no repetition node, so this
+# is the one place the translation is a literal rather than structural.
+DESCENDANTS = RegexLit(f"(?:{_COMPONENT_RE}/)*")
+
+
+def concat(*ps: PseudoRegex) -> PseudoRegex:
+    """Concatenation that flattens nested Concats and fuses adjacent literals.
+
+    Fusing matters for precision: ``_explicit_check_no_parent`` answers False for any Concat but
+    consults ``_safe_path_extension`` for an Exact, so ``data`` + ``/`` + ``uploads`` has to come
+    out as ``Exact("data/uploads")`` for the atoms to stay derivable from the result.
+    """
+    flat: list[PseudoRegex] = []
+    for p in ps:
+        for q in (p.seq if isinstance(p, Concat) else [p]):
+            if flat and isinstance(flat[-1], Exact) and isinstance(q, Exact):
+                flat[-1] = Exact(flat[-1].exact_str + q.exact_str)
+            elif flat and flat[-1] == ANY_STR and q == ANY_STR:
+                continue  # adjacent wildcards are one wildcard
+            else:
+                flat.append(q)
+    if len(flat) == 1:
+        return flat[0]
+    return Concat(flat)
+
+
+def alternation(*ps: PseudoRegex) -> PseudoRegex:
+    """Union that flattens nested Alternations and drops duplicate branches; any wildcard branch
+    absorbs the rest."""
+    flat: list[PseudoRegex] = []
+    for p in ps:
+        for q in (p.any_of if isinstance(p, Alternation) else [p]):
+            if q == ANY_STR:
+                return ANY_STR
+            if q not in flat:
+                flat.append(q)
+    if len(flat) == 1:
+        return flat[0]
+    return Alternation(flat)
+
+
+def component_to_regex(c: Component) -> PseudoRegex:
+    """The string language of one component.
+
+    Exact except for ``Matching``, whose "is a safe component" conjunct has to be dropped because
+    PseudoRegex has no intersection: the result is looser there, never tighter.
+    """
+    match c:
+        case Named(name=name):
+            return Exact(name)
+        case AnyName():
+            return COMPONENT
+        case Matching(regex=regex):
+            return regex
+        case OneOf(names=names):
+            return alternation(*(Exact(n) for n in sorted(names)))
+
+
+def _joined(components: Sequence[Component]) -> PseudoRegex:
+    pieces: list[PseudoRegex] = []
+    for i, c in enumerate(components):
+        if i:
+            pieces.append(SLASH)
+        pieces.append(component_to_regex(c))
+    return concat(*pieces)
+
+
+def location_to_regex(loc: LocationFact) -> PseudoRegex:
+    """A PseudoRegex whose language contains the canonical string of every path denoted by *loc*.
+
+    Exact except where a ``Matching`` component is rendered (see ``component_to_regex``).
+    """
+    match loc:
+        case StaticPath(path_components=()):
+            return ROOT
+        case StaticPath(path_components=components):
+            return _joined(components)
+        case DirSplat(static_prefix=prefix, final_component=final):
+            head: list[PseudoRegex] = [_joined(prefix), SLASH] if prefix else []
+            below = concat(*head, DESCENDANTS, component_to_regex(final))
+            if final != ANY_NAME:
+                return below
+            # an unconstrained leaf means "at or below": the prefix itself is denoted too
+            return alternation(_joined(prefix) if prefix else ROOT, below)
+
+
+def splat_under(loc: LocationFact) -> DirSplat:
+    """The location "somewhere at or below *loc*"."""
+    match loc:
+        case StaticPath(path_components=components):
+            return DirSplat(components, ANY_NAME)
+        case DirSplat(static_prefix=prefix):
+            return DirSplat(prefix, ANY_NAME)
+
+
+# ---------------------------------------------------------------------------
+# Subsumption of components
+#
+# ``subsumes(general, specific)`` holds when every name *specific* can denote also satisfies
+# *general*, i.e. L(specific) ⊆ L(general). It is conservative: False means "cannot show it",
+# not "disjoint". Regex leaves are only ever asked about concrete strings (``re.fullmatch``), so
+# no regex-inclusion reasoning is attempted beyond syntactic equality and Alternation splitting.
+# ---------------------------------------------------------------------------
+
+
+def _regex_accepts(p: PseudoRegex, s: str) -> bool:
+    """Is the concrete string *s* in the language of *p*?"""
+    match p:
+        case AnyStr():
+            return True
+        case Exact(exact_str=e):
+            return e == s
+        case RegexLit(reg=r):
+            try:
+                return re.fullmatch(r, s) is not None
+            except re.error:
+                return False
+        case Alternation(any_of=branches):
+            return any(_regex_accepts(b, s) for b in branches)
+        case Concat(seq=pieces):
+            return _concat_accepts(pieces, s)
+
+
+def _concat_accepts(pieces: Sequence[PseudoRegex], s: str) -> bool:
+    # try every split point for the head piece; strings here are single path components
+    if not pieces:
+        return s == ""
+    head, rest = pieces[0], pieces[1:]
+    return any(
+        _regex_accepts(head, s[:i]) and _concat_accepts(rest, s[i:]) for i in range(len(s) + 1)
+    )
+
+
+def _regex_subsumes(general: PseudoRegex, specific: PseudoRegex) -> bool:
+    """L(specific) ⊆ L(general), by the obvious rules."""
+    if general == specific or general == ANY_STR:
+        return True
+    match specific:
+        case Exact(exact_str=s):
+            return _regex_accepts(general, s)
+        case Alternation(any_of=branches):
+            return all(_regex_subsumes(general, b) for b in branches)
+        case _:
+            ...
+    match general:
+        case Alternation(any_of=branches):
+            return any(_regex_subsumes(b, specific) for b in branches)
+        case _:
+            ...
+    return False
+
+
+def _normalize_component(c: Component) -> Component:
+    """Fold a Matching with a finite language into the equivalent Named/OneOf, and a singleton
+    OneOf into a Named, so the structural cases below see one spelling per meaning."""
+    match c:
+        case Matching(regex=AnyStr()):
+            return ANY_NAME
+        case Matching(regex=Exact(exact_str=s)) if is_safe_name(s):
+            return Named(s)
+        case Matching(regex=Alternation(any_of=branches)) if all(
+            isinstance(b, Exact) for b in branches
+        ):
+            names = frozenset(b.exact_str for b in branches if isinstance(b, Exact))
+            if not all(is_safe_name(n) for n in names):
+                return c
+            return Named(next(iter(names))) if len(names) == 1 else OneOf(names)
+        case OneOf(names=names) if len(names) == 1:
+            return Named(next(iter(names)))
+        case _:
+            return c
+
+
+def subsumes(general: Component, specific: Component) -> bool:
+    """Does every name *specific* can denote also satisfy *general*?
+
+    Conservative: False means "cannot show it". A ``Matching`` on the general side is checked
+    against concrete names by ``re.fullmatch`` (the "safe component" conjunct is already true of
+    any ``Named``); a ``Named``/``OneOf`` on the general side can never be shown to cover a regex.
+    """
+    general, specific = _normalize_component(general), _normalize_component(specific)
+    if general == specific or general == ANY_NAME:
+        return True
+    match general, specific:
+        case _, AnyName():
+            return False  # only AnyName covers every name
+        case OneOf(names=gs), Named(name=s):
+            return s in gs
+        case OneOf(names=gs), OneOf(names=ss):
+            return ss <= gs
+        case Matching(regex=r), Named(name=s):
+            return _regex_accepts(r, s)
+        case Matching(regex=r), OneOf(names=ss):
+            return all(_regex_accepts(r, s) for s in ss)
+        case Matching(regex=g), Matching(regex=s):
+            return _regex_subsumes(g, s)
+        case _:
+            return False
+
+
+# "not-dot-dot": the string is not exactly "..". Together with "no-slash" it implies
+# "no-parent-traversal" (a single component traverses upward only if it is exactly "..").
+type AtomicFact = Literal["no-slash", "no-parent-traversal", "not-absolute", "not-dot-dot"]
+
+ALL_ATOMS: frozenset[AtomicFact] = frozenset(
+    {"no-slash", "no-parent-traversal", "not-absolute", "not-dot-dot"}
+)
 
 def _explicit_check_no_parent(regex: PseudoRegex) -> bool:
     match regex:
@@ -339,7 +623,7 @@ def _explicit_check_no_parent(regex: PseudoRegex) -> bool:
             return all(_explicit_check_no_parent(p) for p in regex.any_of)
         case Exact():
             return _safe_path_extension(regex.exact_str) is not None
-        case RegexLit():
+        case RegexLit() | AnyStr():
             return False
         case Concat():
             return False
@@ -350,21 +634,33 @@ def _explicit_check_no_slash(regex: PseudoRegex) -> bool:
             return all(_explicit_check_no_slash(p) for p in regex.any_of)
         case Exact():
             return "/" not in regex.exact_str
-        case RegexLit():
+        case RegexLit() | AnyStr():
             return False
         case Concat():
             return all(_explicit_check_no_slash(p) for p in regex.seq)
 
-def _explicit_check_not_absolute(regex: PseudoRegex):
+def _explicit_check_not_absolute(regex: PseudoRegex) -> bool:
     match regex:
         case Alternation():
             return all(_explicit_check_not_absolute(p) for p in regex.any_of)
         case Exact():
             return not regex.exact_str.startswith("/")
-        case RegexLit():
+        case RegexLit() | AnyStr():
             return False
         case Concat():
             return _explicit_check_not_absolute(regex.seq[0])
+
+def _explicit_check_not_dot_dot(regex: PseudoRegex) -> bool:
+    match regex:
+        case Alternation():
+            return all(_explicit_check_not_dot_dot(p) for p in regex.any_of)
+        case Exact():
+            return regex.exact_str != ".."
+        case RegexLit() | AnyStr():
+            return False
+        case Concat():
+            # some literal piece contributes a character other than "."
+            return any(isinstance(p, Exact) and p.exact_str.strip(".") != "" for p in regex.seq)
 
 def _explicit_check(other: AtomicFact, regex: PseudoRegex) -> bool:
     match other:
@@ -374,19 +670,51 @@ def _explicit_check(other: AtomicFact, regex: PseudoRegex) -> bool:
             return _explicit_check_no_slash(regex)
         case "not-absolute":
             return _explicit_check_not_absolute(regex)
+        case "not-dot-dot":
+            return _explicit_check_not_dot_dot(regex)
+
+def _holds(atom: AtomicFact, atoms: frozenset[AtomicFact], regex: PseudoRegex) -> bool:
+    """Does *atom* hold, either as stated, as derivable from the regex, or as implied by other atoms?"""
+    if atom in atoms or _explicit_check(atom, regex):
+        return True
+    match atom:
+        case "not-absolute":
+            # a string without "/" cannot start with one
+            return _holds("no-slash", atoms, regex)
+        case "no-parent-traversal":
+            # a single component traverses upward only if it is exactly ".."
+            return _holds("no-slash", atoms, regex) and _holds("not-dot-dot", atoms, regex)
+        case _:
+            return False
 
 @dataclass(frozen=True)
-class ValidationFact:
-    regex: PseudoRegex | None
-    containment: LocationFact | None
-    atoms: frozenset[AtomicFact]
+class StrFact:
+    """What is known about a value of type ``str``.
 
-    def __contains__(self, other: AtomicFact):
-        return other in self.atoms or (
-            self.regex is not None and _explicit_check(other, self.regex)
-        )
+    ``containment`` is set when the string is known to *denote* a path at some location (e.g. a
+    ``certora_within`` guard); it does not make the value a path.
+    """
+    regex: PseudoRegex = ANY_STR
+    containment: LocationFact | None = None
+    atoms: frozenset[AtomicFact] = frozenset()
 
-    type_info: Literal["str", "path"]
+    def __contains__(self, atom: AtomicFact) -> bool:
+        return _holds(atom, self.atoms, self.regex)
+
+@dataclass(frozen=True)
+class PathFact:
+    """What is known about a value of type ``pathlib.Path``.
+
+    Atoms are read through ``str(p)``: ``no-slash`` means a single relative component,
+    ``not-absolute`` means ``not p.is_absolute()``, ``no-parent-traversal`` means no ``..`` part.
+    """
+    containment: LocationFact | None = None
+    atoms: frozenset[AtomicFact] = frozenset()
+
+    def __contains__(self, atom: AtomicFact) -> bool:
+        return _holds(atom, self.atoms, ANY_STR)
+
+type ValidationFact = StrFact | PathFact
 
 
 class InvalidProgram(Exception):
@@ -415,10 +743,31 @@ def _safe_path_extension(s: str) -> tuple[str, ...] | None:
         return None
 
 
+def as_component(fact: ValidationFact) -> Component | None:
+    """Lift a validated value to a single path component, if its atoms allow it.
+
+    This is the only place the string domain's atoms are consumed on behalf of the location
+    domain: a value is a component iff it has no "/" and no ".." (``_holds`` supplies the
+    derived forms of both). The regex, if any, then decides how precise the component is.
+    """
+    if not ("no-slash" in fact and "no-parent-traversal" in fact):
+        return None
+    regex = fact.regex if isinstance(fact, StrFact) else ANY_STR
+    match regex:
+        case AnyStr():
+            return ANY_NAME
+        case Exact(exact_str=s):
+            return Named(s) if is_safe_name(s) else None
+        case Alternation(any_of=branches) if all(isinstance(b, Exact) for b in branches):
+            names = [b.exact_str for b in branches if isinstance(b, Exact)]
+            return OneOf(frozenset(names)) if all(is_safe_name(n) for n in names) else None
+        case _:
+            return Matching(regex)
+
 def combine_containment(
     cont: LocationFact,
     child: str | ValidationFact | None
-):
+) -> LocationFact | None:
     if child is None:
         return None
     
@@ -430,12 +779,65 @@ def combine_containment(
 
     elif child.containment is not None:
         return cont.merge_other(child.containment)
-    elif "no-parent-traversal" in child and "no-slash" in child:
-        return cont.extend_single(other=child.regex or RegexLit(".*"))
+    elif (component := as_component(child)) is not None:
+        return cont.extend_single(component)
     elif "no-parent-traversal" in child and "not-absolute" in child:
-        return cont.to_splat(RegexLit(".*"))
+        return cont.to_splat(ANY_NAME)
     else:
         return None
+
+def interp_to_str(fact: ValidationFact | str | None) -> StrFact:
+    if fact is None:
+        return StrFact()
+    elif isinstance(fact, str):
+        return StrFact(Exact(fact))
+    cont = fact
+    if not isinstance(cont, StrFact):
+        return StrFact(
+            regex=location_to_regex(cont.containment) if cont.containment is not None else ANY_STR,
+            containment=cont.containment,
+            atoms=cont.atoms
+        )
+    else:
+        return cont
+
+def combine_str(
+    cont: str | ValidationFact | None,
+    other: str | ValidationFact | None
+) -> StrFact:
+    cont = interp_to_str(cont)
+    
+    if other is None:
+        return StrFact(regex = concat(cont.regex, ANY_STR), containment=None, atoms=frozenset())
+    if isinstance(other, str):
+        return combine_str(
+            cont,
+            StrFact(regex=Exact(other), containment=None, atoms=frozenset())
+        )
+    to_add : set[AtomicFact] = set({})
+    for f in ("no-slash",):
+        if f in cont and f in other:
+            to_add.add(f)
+    contain = OptionMonad.lift(cont.containment).bind(
+        lambda c: combine_containment(c, other)
+    ).unwrap()
+    
+    if isinstance(other, StrFact):
+        other_reg = other.regex
+    else:
+        other_reg = location_to_regex(other.containment) if other.containment is not None else ANY_STR
+    return StrFact(
+        regex=concat(cont.regex, other_reg),
+        containment=contain,
+        atoms=frozenset(to_add)
+    )
+
+def bind[T, R](f: Callable[[T], OptionMonad[R] | R | None]) -> Callable[[OptionMonad[T]], OptionMonad[R]]:
+    return lambda m: m.bind(f)
+
+def map_[T, R](f: Callable[[T], R]) -> Callable[[OptionMonad[T]], OptionMonad[R]]:
+    return lambda m: m.map(f)
+
 
 class OperandInterpreter():
     def __init__(self, st: dict[str, ValidationFact]):
@@ -470,6 +872,7 @@ class OperandInterpreter():
 
 def type_cast[T](t: TypeForm[T]) -> Callable[[T], T]:
     return lambda x: x
+
 
 def take_if[T](pred: Callable[[T], bool]) -> Callable[[T], T | None]:
     def to_ret(it: T) -> T | None:
@@ -512,19 +915,19 @@ def interpret_expr(e: ast.expr, st: dict[str, ValidationFact]) -> ValidationFact
             raise InvalidProgram(node.func, "invalid call")
         if call.matches("pathlib", "Path") and len(e.args) > 0:
             accum = interp.interp(e.args[0],
-                on_fact=(lambda f: f.bind(lambda proj: proj.containment)),
+                on_fact=bind(lambda proj: proj.containment),
                 on_str=lambda nm: (
-                    nm.bind(_safe_path_extension).map(lambda feats: tuple(Exact(i) for i in feats)).map(StaticPath)
+                    nm.bind(_safe_path_extension).map(lambda feats: tuple(Named(i) for i in feats)).map(StaticPath)
                 ),
                 on_expr=wrapper.bind_curried(lambda fact: fact.containment)
             )
             if accum is None:
                 return None
-            for i in e.args[:1]:
+            for i in e.args[1:]:
                 d = interp.interp(
                     i,
-                    on_str=lambda id: id.map(type_cast(str | ValidationFact)),
-                    on_fact=lambda id: id.map(type_cast(str | ValidationFact)),
+                    on_str=map_(type_cast(str | ValidationFact)),
+                    on_fact=map_(type_cast(str | ValidationFact)),
                     on_expr=wrapper.bind_curried(type_cast(str | ValidationFact))
                 )
                 if d is None:
@@ -532,12 +935,7 @@ def interpret_expr(e: ast.expr, st: dict[str, ValidationFact]) -> ValidationFact
                 accum = combine_containment(accum, d)
                 if accum is None:
                     return None
-            return ValidationFact(
-                regex=None,
-                containment=accum,
-                atoms=frozenset(),
-                type_info="path"
-            )
+            return PathFact(containment=accum)
     elif isinstance(e, ast.BinOp) and isinstance(e.op, ast.Div):
         return interp.interp_bind(
             e.left,
@@ -545,270 +943,111 @@ def interpret_expr(e: ast.expr, st: dict[str, ValidationFact]) -> ValidationFact
             on_fact=lambda nm: nm,
             on_expr=wrapper
         ).bind(take_if(
-            lambda d: d.type_info == "path" and d.containment is not None
-        )).bind(lambda fact: \
+            lambda d: isinstance(d, PathFact)
+        )).bind(lambda fact: fact.containment).bind(lambda fact: \
             combine_containment(
-                cast(LocationFact, fact.containment),
+                cast(LocationFact, fact),
                 interp.interp(
                     e.right,
-                    on_str=lambda nm: nm.map(type_cast(str | ValidationFact)),
-                    on_fact=lambda nm: nm.map(type_cast(str | ValidationFact)),
+                    on_str=map_(type_cast(str | ValidationFact)),
+                    on_fact=map_(type_cast(str | ValidationFact)),
                     on_expr=wrapper.bind_curried(type_cast(str | ValidationFact))
                 )
             )
-        ).map(lambda fact: \
-            ValidationFact(
-                None, fact, frozenset(), "path"
+        ).map(lambda loc: PathFact(containment=loc)).unwrap()
+    elif isinstance(e, ast.BinOp) and isinstance(e.op, ast.Add):
+        return interp.interp_bind(
+            e.left,
+            on_fact=lambda nm: nm,
+            on_str=map_(lambda s: StrFact(Exact(s))),
+            on_expr=wrapper
+        ).downcast(StrFact).bind(lambda l_as_str: \
+            interp.interp_bind(
+                e.right,
+                on_str=map_(type_cast(str | ValidationFact)),
+                on_fact=map_(type_cast(str | ValidationFact)),
+                on_expr=wrapper.bind_curried(type_cast(str | ValidationFact))
+            ).map(lambda r_as_str: \
+                combine_str(l_as_str, r_as_str)
             )
         ).unwrap()
 
     elif isinstance(e, ast.Constant) and (as_str := as_const_or_null(str, e)) is not None:
-        return ValidationFact(
-            regex=Exact(as_str),
-            containment=None,
-            atoms=frozenset(),
-            type_info="str"
-        )
+        return StrFact(regex=Exact(as_str))
     elif isinstance(e, ast.JoinedStr):
-        to_acc = []
-        known_facts : set[AtomicFact] = {"no-slash"}
-        for i in e.values:
-            as_str = as_const_or_null(str, i)
-            if as_str is not None:
-                if "/" in as_str:
-                    known_facts.remove("no-slash")
-                to_acc.append(Exact(as_str))
-                continue
-            rec = interpret_expr(i, st)
-            if rec is None:
-                known_facts.remove("no-slash")
-                to_acc.append(RegexLit(".*"))
-                continue
-            if "no-slash" not in rec:
-                known_facts.remove("no-slash")
-            if rec.type_info == "str":
-                to_acc.append(rec.regex or RegexLit(".*"))
-                continue
-            
-            
+        if len(e.values) == 0:
+            return StrFact(regex=Exact(""))
 
-class ValidationWalker(ast.NodeVisitor):
-    def __init__(self):
-        self.state : dict[str, ValidationFact] = {}
+        atoms = list(interp.interp(
+            v,
+            on_str=lambda nm: nm.map(type_cast(str | ValidationFact)),
+            on_fact=lambda nm: nm.map(type_cast(str | ValidationFact)),
+            on_expr=wrapper.bind_curried(type_cast(str | ValidationFact))
+        ) for v in e.values)
 
-    def visit_Await(self, node: ast.Await) -> Any:
-        raise InvalidProgram(node, "async")
+        combined = functools.reduce(combine_str, atoms[1:], interp_to_str(atoms[0]))
+        return combined
 
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> Any:
-        raise InvalidProgram(node, "async")
+def widen_loc(
+    prev: LocationFact,
+    next: LocationFact
+) -> LocationFact | None:
+    ...
 
-    def visit_AsyncFor(self, node: ast.AsyncFor) -> Any:
-        raise InvalidProgram(node, "async")
+def join_component(
+    c1: Component,
+    c2: Component
+) -> Component:
+    if isinstance(c1, AnyName) or isinstance(c2, AnyName):
+        return AnyName()
+    if subsumes(c1, c2):
+        return c1
+    elif subsumes(c2, c1):
+        return c2
+    match c1, c2:
+        case Named(name=n1), Named(name=n2):
+            return OneOf(frozenset({n1, n2}))
+        case (Named(name=n1), OneOf(names=existing)) | (OneOf(names=existing), Named(name=n1)):
+            return OneOf(frozenset({*existing, n1}))
+        case Matching(regex=r1), Matching(regex=r2):
+            return Matching(alternation(r1, r2))
+        case OneOf(names=n1), OneOf(names=n2):
+            return OneOf(frozenset({*n1, *n2}))
+        case (Matching(regex=r1), other) | (other, Matching(regex=r1)):
+            match other:
+                case Named(name=n):
+                    return Matching(alternation(r1, Exact(n)))
+                case OneOf(names=n):
+                    return Matching(alternation(r1, *(Exact(i) for i in n)))
 
-    def visit_AsyncWith(self, node: ast.AsyncWith) -> Any:
-        raise InvalidProgram(node, "async")
-
-    def visit_NamedExpr(self, node: ast.NamedExpr) -> Any:
-        raise InvalidProgram(node, "walrus")
-
-    def visit_Nonlocal(self, node: ast.Nonlocal) -> Any:
-        raise InvalidProgram(node, "nonlocal")
-
-    def visit_AnnAssign(self, node: ast.AnnAssign) -> Any:
-        return super().visit_AnnAssign(node)
-
-    def visit_Assign(self, node: ast.Assign) -> Any:
-        
-        return super().visit_Assign(node)
-
-    def visit_Call(self, node: ast.Call) -> Any:
-        call = resolve_callee(node.func)
-        if call is None:
-            raise InvalidProgram(node.func, "invalid call")
-        return super().visit_Call(node)
-
-    def visit_Assert(self, node: ast.Assert) -> Any:
-        return super().visit_Assert(node)
-
-    @contextmanager
-    def state_snapshot(self):
-        saved = self.state.copy()
-        try:
-            yield
-        finally:
-            self.state = saved
-
-    def _parse_args(self, node: ast.FunctionDef) -> dict[str, ValidationFact]:
-        ...
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> Any:
-        with self.state_snapshot():
-            self.state = self._parse_args(node)
-            for s in node.body:
-                self.generic_visit(s)
-
-class ValidationAnalysis(ast.NodeVisitor):
-    def __init__(self):
-        self.violations : list[tuple[ast.AST, str]] = []
-        self.validation_stack : list[Validated] = []
-
-        self.report : list[AuditEvents] = []
-
-    def _get_validations(self, s: str) -> list[ValidationRule] | None:
-        return next((i.validations for i in self.validation_stack if i.ident == s), None)
-
-    def _violation(self, n: ast.AST, what: str):
-        self.violations.append((n, what))
-
-    def visit_Call(self, node: ast.Call):
-        if not isinstance(node.func, ast.Name) and not isinstance(node.func, ast.Attribute):
-            self._violation(node.func, "computed callee")
-        call_name = is_call_to(node)
-        if call_name == "open":
-            call_match = bind_call_args(node, PyOpenCall)
-            if call_match is None:
-                self._violation(node, "Illegal open call shape")
-                self.generic_visit(node)
-                return
-            try:
-                mode = as_const_or_default(str, call_match.mode)
-            except InvalidConstantForm:
-                self._violation(node, "mode type")
-                self.generic_visit(node)
-                return
-            
-            file_arg = call_match.file
-            if not isinstance(file_arg, ast.Name) and not (isinstance(file_arg, ast.Constant) and isinstance(file_arg.value, str)):
-                self._violation(file_arg, f"not a recognizable open type {type(file_arg)}")
-                return
-            if isinstance(file_arg, ast.Name):
-                self.report.append(OpenCall(
-                    node, mode=mode, target=self._get_validations(file_arg.id) or []
-                ))
-            else:
-                assert isinstance(file_arg, ast.Constant) and isinstance(file_arg.value, str)
-                self.report.append(OpenCall(
-                    node, mode=mode, target=file_arg.value
-                ))
-            return
-        return self.generic_visit(node)
-
-    def to_call(self, n: ast.AST) -> ast.Call:
-        return cast(ast.Call, n)
-
-    def _bind_target(self, it: ast.withitem) -> str | None:
-        if it.optional_vars is None:
-            return None
-        if not isinstance(it.optional_vars, ast.Name):
-            return None
-        if self._get_validations(it.optional_vars.id) is not None:
-            self._violation(it.optional_vars, "Overwriting bound validation")
-        return it.optional_vars.id
-
-    def visit_With(self, node: ast.With) -> Any:
-        old = self.validation_stack.copy()
-        try:
-            for i in node.items:
-                named_function = is_call_to(i.context_expr)
-                if named_function is None:
-                    self.generic_visit(i)
-                    continue
-                try:
-                    match named_function:
-                        case "certora_matches" | "certora_within":
-                            args = bind_call_args(self.to_call(i.context_expr), CertoraMatch)
-                            if args is None:
-                                self._violation(i.context_expr, "Illegal certora match call")
-                                continue
-                            self.visit(args.target)
-                            carried_validations = (
-                                OptionMonad.lift(args.target)
-                                .downcast(ast.Name)
-                                .bind(lambda nm: self._get_validations(nm.id))
-                                .unwrap_or([])
-                            )
-                            matches = as_const(str, args.matches)
-                            if (tgt := self._bind_target(i)) is None:
-                                self._violation(i.context_expr, "Illegal binding for certora guard")
-                                continue
-                            validation = RegexMatch(matches) if named_function == "certora_matches" else PathConfinement(matches)
-                            self.validation_stack.append(Validated(tgt, carried_validations + [validation]))
-                        case _:
-                            self.generic_visit(i)
-                except InvalidConstantForm:
-                    self._violation(i, "Illegal certora guard binding")
-            for s in node.body:
-                self.visit(s)
-        finally:
-            self.validation_stack = old
-
-    def visit_Attribute(self, node: ast.Attribute) -> Any:
-        attr = unfold_attr(node)
-        if isinstance(attr, ast.AST):
-            self._violation(attr, "invalid attr format")
-            return
-        (base, fields) = attr
-        dunder_attr = next(
-            (node for (fld, node) in fields if is_dunder(fld) and fld != "__init__"), None
-        )
-        if dunder_attr is not None:
-            self._violation(dunder_attr, "dunder attribute")
-            return
-        if base != "super":
-            path = [base.id]
-            for (fld, _) in fields[:-1]:
-                path.append(fld)
-            pref = tuple(path)
-            last = fields[-1][0]
-            if fields[-1][0] in DANGEROUS_MEMBERS.get(pref, {}):
-                self._violation(node, "access to forbidden attr")
-                return
-            dangerous_prefix = pref + (last,)
-            for k in DANGEROUS_MEMBERS.keys():
-                if is_prefix(dangerous_prefix, k):
-                    self._violation(node, "dangerous module escape")
-            self._name_visit(base)
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> Any:
-        if is_dunder(node.name) and node.name != "__init__":
-            self.violations.append((node, "define dunder"))
-        if node.name in validator_funcs:
-            self._violation(node, "validation alias")
-        return self.generic_visit(node)
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> Any:
-        self._violation(node, "async def")
-
-    def visit_ImportFrom(self, node: ast.ImportFrom) -> Any:
-        self.violations.append((node, "import from"))
-        return self.generic_visit(node)
-
-    def visit_Import(self, node: ast.Import) -> Any:
-        for a in node.names:
-            if a.asname is not None:
-                self.violations.append((a, "as-alias"))
-            if a.name in FORBIDDEN_MODULES:
-                self._violation(node, "forbidden module import")
-        return self.generic_visit(node)
-
-    def _name_visit(self, node: ast.Name):
-        if isinstance(node.ctx, ast.Load):
-            if node.id in sensitive_builtins:
-                self.violations.append(
-                    (node, "built in escape")
-                )
-
-        if is_dunder(node.id):
-            self._violation(node, "read dunder")
-
-        if isinstance(node.ctx, ast.Store) and self._get_validations(node.id) is not None:
-            self._violation(node, "write to validated id")
-
-    def visit_Name(self, node: ast.Name) -> Any:
-        self._name_visit(node)
-
-        for k in DANGEROUS_MEMBERS.keys():
-            if is_prefix((node.id,), k):
-                self._violation(node, "module escape")
-
-        return self.generic_visit(node)
+def join_loc(
+    left: LocationFact,
+    right: LocationFact
+) -> LocationFact | None:
+    match left, right:
+        case (DirSplat(static_prefix=dir_prefix) as splat, StaticPath(path_components=known_path) as _static) | \
+             (StaticPath(path_components=known_path) as _static, DirSplat(static_prefix=dir_prefix) as splat):
+            if len(dir_prefix) > len(known_path):
+                return None
+            for (splat_comp, static_comp) in zip(dir_prefix, known_path[:-1]):
+                if not subsumes(splat_comp, static_comp):
+                    return None
+            if not subsumes(splat.final_component, known_path[-1]):
+                return None
+            return splat
+        case (StaticPath(path_components=p1), StaticPath(path_components=p2)):
+            if len(p1) == len(p2):
+                paths = tuple(join_component(
+                    c1, c2
+                ) for (c1, c2) in zip(p1, p2))
+                return StaticPath(paths)
+            last_comps = join_component(p1[-1], p2[-1])
+            static_prefix = tuple(join_component(
+                c1, c2
+            ) for (c1, c2) in zip(p1[:-1], p2[:-1]))
+            return DirSplat(static_prefix=static_prefix, final_component=last_comps)
+        case DirSplat(static_prefix=p1, final_component=c1), DirSplat(static_prefix=p2, final_component=c2):
+            return DirSplat(
+                final_component=join_component(c1, c2),
+                static_prefix=tuple(join_component(c1, c2) for (c1, c2) in zip(p1, p2))
+            )
