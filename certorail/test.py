@@ -1,13 +1,15 @@
+import pathlib
+import re
 import sys
 
-with (
-    certora_within(sys.argv[1], ".") as t1,
-    certora_matches(t1, r"\.txt$") as t2,
-    open(t2, "w") as f
-):
-    f.write("HAHAHAHA")
+hello = "hi"
+p = pathlib.Path(hello, "foo")
 
-if (x := 3 > 5):
-    print(x)
-
-print(f"welp{x!r}")
+r = sys.argv[1]
+as_path = pathlib.Path(r)
+assert not as_path.is_absolute()
+assert ".." not in as_path.parts
+# assert ".." not in r
+# assert r[0] != "/"
+final_path = p / as_path
+open(final_path, "r")

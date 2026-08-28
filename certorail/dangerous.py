@@ -21,15 +21,25 @@ Categories:
                                 you might otherwise allow. (Also documents the
                                 escape surface of FORBIDDEN_MODULES, in case one
                                 is later allowed or reached via ``sys.modules``.)
+  * ALLOWED_MEMBERS          -- the dual: module -> the only members that may be
+                                accessed, for modules that are mostly escape
+                                surface (default deny).
   * FORBIDDEN_ATTRIBUTES     -- non-dunder attribute names banned regardless of
                                 receiver (the frame/code/generator structural
                                 surface + a few rare-but-lethal method names).
                                 Complements the existing dunder ban.
   * EXTRA_FORBIDDEN_BUILTINS -- add to `sensitive_builtins`.
+  * CLASS_FACTORIES          -- callables whose *application* manufactures a class
+                                from data; a violation in call position only.
+  * ALLOWED_BASES /          -- the static-inheritance rule: what a ``class``
+    SENSITIVE_CLASSES /         statement may name as a base, what it may never
+    FORBIDDEN_CLASS_KEYWORDS    subclass, and the ``metaclass=`` hole.
   * REVIEW_*                 -- plausibly-legitimate names; ban if your policy
                                 can afford the false positives (recommended for
                                 a locked-down sandbox).
 """
+
+import builtins
 
 # ---------------------------------------------------------------------------
 # Whole-module bans: no legitimate sandbox use; import is itself a violation.
@@ -39,7 +49,8 @@ Categories:
 
 FORBIDDEN_MODULES: frozenset[str] = frozenset({
     # process / shell / native code execution
-    "os", "posix", "nt", "subprocess", "_posixsubprocess", "pty",
+    # (`os` itself is allowlisted member-by-member: see ALLOWED_MEMBERS)
+    "posix", "nt", "subprocess", "_posixsubprocess", "pty",
     "multiprocessing", "_multiprocessing", "concurrent",
     "ctypes", "_ctypes", "cffi",
     "signal",            # os.kill / setitimer -> control & DoS
@@ -173,8 +184,8 @@ DANGEROUS_MEMBERS: dict[tuple[str, ...], frozenset[str]] = {
 
     # ---- filesystem beyond the open() guard ----
     ("io",): frozenset({"open", "FileIO", "open_code"}),
-    ("pathlib",): frozenset({"Path", "PosixPath", "WindowsPath",
-                          "PurePath", "PurePosixPath", "PureWindowsPath"}),
+    # ("pathlib",): frozenset({"Path", "PosixPath", "WindowsPath",
+    #                       "PurePath", "PurePosixPath", "PureWindowsPath"}),
     ("shutil",): frozenset({
         "rmtree", "copy", "copy2", "copyfile", "copytree", "move",
         "which", "make_archive", "unpack_archive", "chown", "disk_usage",
@@ -221,6 +232,139 @@ DANGEROUS_MEMBERS: dict[tuple[str, ...], frozenset[str]] = {
 
 
 # ---------------------------------------------------------------------------
+# Member allowlists: `module -> {members}`, default DENY. For modules that are
+# overwhelmingly escape surface (`os`: system, popen, remove, fork, exec*,
+# environ, kill, ...) but carry a small sub-surface the analysis has semantics
+# for. The invariant this buys: everything reachable under such a module is
+# something the analysis *models*, so nothing is "allowed but unmodelled".
+#
+# Enforce in visit_Attribute on the access path: if any prefix of the path is a
+# key here, the next component must be in its set (``os.path.join`` checks
+# ``path`` against ("os",) and ``join`` against ("os", "path")). The root name
+# itself is governed by the escape rules like any other module.
+#
+# NB: `os.listdir`/`os.walk`/`os.path.exists` & co. are read sinks -- listing or
+# probing a directory outside the sandbox leaks -- and belong to the same
+# containment audit as `open`.
+# ---------------------------------------------------------------------------
+
+ALLOWED_MEMBERS: dict[tuple[str, ...], frozenset[str]] = {
+    ("os",): frozenset({
+        "path", "sep", "pathsep", "linesep", "fspath", "PathLike",
+        "listdir", "walk",
+    }),
+    ("os", "path"): frozenset({
+        "join", "basename", "dirname", "split", "splitext",
+        "isabs", "normpath", "abspath", "realpath", "commonpath",
+        "exists", "isfile", "isdir",
+    }),
+}
+
+
+# ---------------------------------------------------------------------------
+# Path sinks: operations that touch the filesystem at a path the program
+# supplies. None of these is banned outright; each is legal iff the dataflow
+# walker can prove the path's location (a `Located` fact). Reading, listing and
+# even probing existence outside the sandbox leaks; writing outside it is worse.
+# `resolve()`/`realpath()` are deliberately absent: they are the guard idiom
+# that *establishes* a location and are applied to unconfined paths by design.
+# Enforce in walker.ValidationWalker.visit_Call.
+# ---------------------------------------------------------------------------
+
+# builtins and module-level functions: dotted callee -> index of the path argument.
+# A missing argument (``os.listdir()``) means the current directory, i.e. the sandbox root.
+PATH_SINK_FUNCTIONS: dict[tuple[str, ...], int] = {
+    ("open",): 0,
+    ("os", "listdir"): 0, ("os", "walk"): 0,
+    ("os", "path", "exists"): 0, ("os", "path", "isfile"): 0, ("os", "path", "isdir"): 0,
+}
+
+# pathlib.Path methods: the receiver is the path. An unknown receiver counts as unproven, not
+# as "probably not a Path": a user class may define these names, but a Path from an unknown
+# source must not slip through on that account.
+PATH_SINK_METHODS: frozenset[str] = frozenset({
+    "open", "read_text", "read_bytes", "write_text", "write_bytes",
+    "iterdir", "glob", "rglob", "exists", "is_file", "is_dir",
+})
+
+
+# ---------------------------------------------------------------------------
+# Dynamic class creation.
+#
+# The analysis assumes that no subclass of a sensitive class exists (so that
+# `str`/`pathlib` method resolution is fixed) and that no class carries a
+# dunder the program wrote (so that operator semantics are fixed). A `class`
+# statement is checked for both; everything below manufactures a class from
+# *data* at runtime and so bypasses the statement: arbitrary bases
+# (``abc.ABCMeta("X", (pathlib.Path,), {})``, ``enum.StrEnum("Codec", "gz xz")``
+# is a `str` subclass) and/or an arbitrary namespace (``type("X", (), {"__reduce__":
+# f})`` injects a dunder through a string key).
+#
+# Enforce in visit_Call, on the *callee* path: calling one of these is a
+# violation. Naming one as a base or in isinstance() is governed by
+# ALLOWED_BASES / the escape rules instead -- ``class Color(enum.Enum)`` is fine,
+# ``enum.Enum("Color", "RED GREEN")`` is not.
+# ---------------------------------------------------------------------------
+
+CLASS_FACTORIES: frozenset[tuple[str, ...]] = frozenset({
+    ("abc", "ABCMeta"),                      # ABCMeta(name, bases, ns): type() with a hat on
+    ("enum", "EnumType"), ("enum", "EnumMeta"),
+    # the functional API: Enum("X", "a b"), also with type=str / a member mapping
+    ("enum", "Enum"), ("enum", "IntEnum"), ("enum", "StrEnum"), ("enum", "ReprEnum"),
+    ("enum", "Flag"), ("enum", "IntFlag"),
+    ("dataclasses", "make_dataclass"),       # bases=(...), namespace={"__reduce__": f}
+    ("types", "new_class"), ("types", "prepare_class"),   # (the module is forbidden anyway)
+})
+
+# `type` is a builtin, not a module member, and its one-argument form is
+# legitimate and common. Enforce in visit_Call on the bare name: more positional
+# arguments than this, or any keyword argument, is the class-creating form.
+TYPE_CALL_MAX_ARGS = 1
+
+# ``class X(metaclass=M)`` hands class creation to M -- ABCMeta, EnumType, or a
+# user class deriving from `type` -- which is a class factory in disguise.
+# `abc.ABC` as a base covers the one legitimate use. Enforce in visit_ClassDef
+# on `node.keywords`.
+FORBIDDEN_CLASS_KEYWORDS: frozenset[str] = frozenset({"metaclass"})
+
+# Classes the program may never subclass, by any route: their method tables are
+# what the analysis' expression and guard semantics are *about*.
+SENSITIVE_CLASSES: frozenset[tuple[str, ...]] = frozenset({
+    ("str",), ("bytes",), ("bytearray",), ("type",),
+    ("pathlib", "Path"), ("pathlib", "PurePath"),
+    ("pathlib", "PosixPath"), ("pathlib", "PurePosixPath"),
+    ("pathlib", "WindowsPath"), ("pathlib", "PureWindowsPath"),
+    ("os", "PathLike"),
+    ("enum", "StrEnum"),                     # a str subclass by construction
+})
+
+# The static-inheritance rule: every base of a `class` statement must be a
+# *name* -- never a computed expression -- and that name must be either a class
+# the program itself defined with a `class` statement, or one of these. An
+# allowlist, not a blocklist: anything not listed is a violation, which is what
+# keeps SENSITIVE_CLASSES (and their stdlib subclasses) out without enumerating
+# the stdlib.
+#
+# Enforcement preconditions: names bound by `class` statements join the
+# unrebindable set (like imports and builtins), or ``class A: ...; A = str;
+# class B(A): ...`` reopens the hole; and a program-defined base must itself
+# have passed this check (transitively static).
+ALLOWED_BASES: frozenset[tuple[str, ...]] = frozenset({
+    ("object",),
+    ("dict",), ("list",), ("tuple",), ("set",), ("frozenset",), ("int",), ("float",),
+    ("enum", "Enum"), ("enum", "IntEnum"), ("enum", "Flag"), ("enum", "IntFlag"),
+    ("abc", "ABC"),
+    ("typing", "NamedTuple"), ("typing", "TypedDict"), ("typing", "Protocol"),
+    ("typing", "Generic"),
+}) | frozenset(
+    # every builtin exception class: `class MyError(ValueError)` is idiomatic
+    (name,)
+    for name, value in vars(builtins).items()
+    if isinstance(value, type) and issubclass(value, BaseException)
+)
+
+
+# ---------------------------------------------------------------------------
 # Receiver-independent attribute-name bans. These names are (a) non-dunder, so
 # the existing dunder check misses them, and (b) meaningless / vanishingly rare
 # on legitimate sandbox objects, so banning them regardless of receiver is safe
@@ -247,8 +391,8 @@ FORBIDDEN_ATTRIBUTES: frozenset[str] = frozenset({
     "load_extension", "enable_load_extension",
     # archive extraction (method on TarFile/ZipFile objects) -> zip-slip
     "extractall", "extract",
-    # pathlib Path methods (receiver is a Path variable, not the module)
-    "read_text", "read_bytes", "write_text", "write_bytes",
+    # pathlib Path methods that create links or leave the sandbox (the read/write/list family is
+    # a *sink* instead: legal iff the path's provenance is proven -- see PATH_SINK_METHODS)
     "unlink", "rmdir", "symlink_to", "hardlink_to", "lchmod",
     "expanduser",
     # module loader methods (from __loader__ / find_spec().loader)
@@ -302,6 +446,14 @@ REVIEW_BUILTINS: frozenset[str] = frozenset({
     # super()'s escape reputation is a RUNTIME-sandbox artifact: it bypasses
     # __getattribute__ proxies to read the raw object. certorail is static and
     # has no such proxy to bypass, so the reputation does not transfer.
+})
+
+REVIEW_CLASS_FACTORIES: frozenset[tuple[str, ...]] = frozenset({
+    # Classes from data, but harmless ones: the base is fixed (tuple / dict) and
+    # field names starting with "_" are rejected, so neither a sensitive base nor
+    # a dunder can get in. Ban only if "static inheritance" is to mean exactly that.
+    ("collections", "namedtuple"),
+    ("typing", "NamedTuple"), ("typing", "TypedDict"),   # the functional forms
 })
 
 REVIEW_ATTRIBUTES: frozenset[str] = frozenset({

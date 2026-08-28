@@ -26,6 +26,7 @@ from .analysis import (
     DirSplat,
     Exact,
     InvalidProgram,
+    Located,
     LocationFact,
     Matching,
     Named,
@@ -257,6 +258,7 @@ def _annotated(base: Term, metadata: Sequence[Term]) -> ValidationFact:
     atoms: set[AtomicFact] = set()
     regex: PseudoRegex | None = None
     containment: LocationFact | None = None
+    located_by: Term | None = None
     for m in metadata:
         match m:
             case Dotted((ns, atom_name)) if ns == NAMESPACE:
@@ -274,6 +276,7 @@ def _annotated(base: Term, metadata: Sequence[Term]) -> ValidationFact:
             if containment is not None:
                 raise _err(m, "at most one of within()/exactly()")
             containment = _location_of(m, name, args, kwargs)
+            located_by = m
         elif name in _REGEX_MARKERS:
             if isinstance(fact, PathFact):
                 raise _err(
@@ -285,13 +288,18 @@ def _annotated(base: Term, metadata: Sequence[Term]) -> ValidationFact:
         else:
             raise _err(m, f"unknown marker certora.{name}")
 
+    if containment is not None and located_by is not None:
+        # a located value is read as a path, not as text: text facts do not combine with it
+        if regex is not None or atoms:
+            raise _err(
+                located_by,
+                "within()/exactly() do not combine with text markers; constrain the leaf with "
+                "within(..., leaf=...) or exactly(..., <component>) instead",
+            )
+        return Located(containment, "str" if isinstance(fact, StrFact) else "path")
     if isinstance(fact, StrFact):
-        return StrFact(
-            regex=ANY_STR if regex is None else regex,
-            containment=containment,
-            atoms=frozenset(atoms),
-        )
-    return PathFact(containment=containment, atoms=frozenset(atoms))
+        return StrFact(regex=ANY_STR if regex is None else regex, atoms=frozenset(atoms))
+    return PathFact(atoms=frozenset(atoms))
 
 
 def _parse(t: Term) -> Fact | None:

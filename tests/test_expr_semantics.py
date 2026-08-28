@@ -25,6 +25,7 @@ from certorail.analysis import (
     DirSplat,
     Exact,
     InvalidProgram,
+    Located,
     LocationFact,
     Matching,
     Named,
@@ -59,8 +60,8 @@ def splat(*prefix: str | Component, final: Component = ANY) -> DirSplat:
     )
 
 
-def path_of(loc: LocationFact) -> PathFact:
-    return PathFact(containment=loc)
+def path_of(loc: LocationFact) -> Located:
+    return Located(loc, "path")
 
 
 def validated(*atoms: AtomicFact, regex: PseudoRegex | None = None) -> StrFact:
@@ -123,9 +124,12 @@ class TestPathFromName(unittest.TestCase):
     def test_splat_containment_passes_through(self) -> None:
         self.assertEqual(evaluate("pathlib.Path(d)", {"d": UNDER_BASE}), UNDER_BASE)
 
-    def test_fact_without_containment_is_unknown(self) -> None:
+    def test_single_component_string_is_located_under_the_root(self) -> None:
         st: State = {"s": validated("no-slash", "no-parent-traversal")}
-        self.assertIsNone(evaluate("pathlib.Path(s)", st))
+        self.assertEqual(evaluate("pathlib.Path(s)", st), path_of(static(ANY)))
+
+    def test_unvalidated_string_is_unknown(self) -> None:
+        self.assertIsNone(evaluate("pathlib.Path(s)", {"s": validated()}))
 
     def test_unbound_name_is_unknown(self) -> None:
         self.assertIsNone(evaluate("pathlib.Path(q)", {"p": BASE}))
@@ -207,10 +211,15 @@ class TestCallShapes(unittest.TestCase):
         self.assertIsNone(evaluate('Path("a")'))
 
     def test_other_attribute_call_is_unknown(self) -> None:
-        self.assertIsNone(evaluate("os.fspath(p)", {"p": BASE}))
+        self.assertIsNone(evaluate("os.getcwd()", {"p": BASE}))
 
     def test_other_name_call_is_unknown(self) -> None:
-        self.assertIsNone(evaluate("str(p)", {"p": BASE}))
+        self.assertIsNone(evaluate("len(p)", {"p": BASE}))
+
+    def test_str_of_a_path_is_the_same_location_spelled_as_str(self) -> None:
+        for src in ("str(p)", "os.fspath(p)"):
+            with self.subTest(src=src):
+                self.assertEqual(evaluate(src, {"p": BASE}), Located(static("base"), "str"))
 
     def test_super_method_call_is_unknown(self) -> None:
         self.assertIsNone(evaluate("super().resolve()", {"p": BASE}))
@@ -226,21 +235,21 @@ class TestCallShapes(unittest.TestCase):
 
 
 class TestComputedCallees(unittest.TestCase):
-    def test_lambda_callee_is_invalid(self) -> None:
-        with self.assertRaises(InvalidProgram):
-            evaluate("(lambda: 0)()")
+    """A callee with no name (``f()()``) is refused structurally; a computed *receiver*
+    (``f().g()``) is ``x = f(); x.g()`` -- allowed, and unknown unless the interpreter
+    understands the receiver."""
 
-    def test_call_of_call_is_invalid(self) -> None:
-        with self.assertRaises(InvalidProgram):
-            evaluate("f()()")
+    def test_nameless_callee_is_invalid(self) -> None:
+        for src in ("(lambda: 0)()", "f()()", "fs[0]()"):
+            with self.subTest(src=src):
+                with self.assertRaises(InvalidProgram):
+                    evaluate(src)
 
-    def test_subscript_callee_is_invalid(self) -> None:
-        with self.assertRaises(InvalidProgram):
-            evaluate("fs[0]()")
+    def test_method_on_a_computed_receiver_is_unknown(self) -> None:
+        self.assertIsNone(evaluate("f().g()"))
 
-    def test_method_on_call_result_is_invalid(self) -> None:
-        with self.assertRaises(InvalidProgram):
-            evaluate("f().g()")
+    def test_method_on_a_constructed_path_is_interpreted(self) -> None:
+        self.assertEqual(evaluate('str(pathlib.Path("a"))'), Located(static("a"), "str"))
 
 
 class TestJoinWithLiteral(unittest.TestCase):
@@ -429,7 +438,7 @@ class TestJoinOperandRestrictions(unittest.TestCase):
         self.assertIsNone(evaluate("p / q", {"p": BASE}))
 
     def test_string_typed_left_operand_is_unknown(self) -> None:
-        s = StrFact(containment=static("base"))
+        s = Located(static("base"), "str")
         self.assertIsNone(evaluate('s / "x"', {"s": s}))
 
     def test_path_without_containment_is_unknown(self) -> None:

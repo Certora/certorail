@@ -1,14 +1,19 @@
-from .analysis import ValidationAnalysis
+from .safepy import _ImportAnalysis, ValidationAnalysis
 from ast import parse
 import sys
 
 with open(sys.argv[1], "r") as r:
     file = parse(r.read(), sys.argv[1])
-    v = ValidationAnalysis()
-    v.visit(file)
 
-for (where, what) in v.violations:
-    print(f"Found illegal code @ line {where.lineno} -> {what}")
+i = _ImportAnalysis()
+i.visit(file)
 
-for audit in v.report:
-    print(audit)
+if i.report_violations():
+    sys.exit(1)
+
+a = ValidationAnalysis(frozenset(i._imports))
+a.visit(file)
+
+if a.report_violations():
+    sys.exit(1)
+sys.exit(0)

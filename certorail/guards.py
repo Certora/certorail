@@ -30,6 +30,7 @@ from .analysis import (
     Concat,
     DirSplat,
     Exact,
+    Located,
     LocationFact,
     Named,
     PathFact,
@@ -42,6 +43,8 @@ from .analysis import (
     alternation,
     concat,
     interpret_expr,
+    locate,
+    location_of,
     splat_under,
 )
 from .terms import (
@@ -149,23 +152,32 @@ def apply(fact: ValidationFact | None, r: Refinement) -> ValidationFact | None:
             fact = PathFact()
         case (StrFact(), "path") | (PathFact(), "str"):
             return fact
-        case (StrFact(), "str" | None) | (PathFact(), "path" | None):
+        case (Located(repr="str"), "path") | (Located(repr="path"), "str"):
+            return fact
+        case _:
             ...
     assert fact is not None
 
-    atoms = fact.atoms | r.atoms
-    refined: ValidationFact
-    if isinstance(fact, StrFact):
-        refined = StrFact(
-            regex=_prefer_regex(fact.regex, r.regex), containment=fact.containment, atoms=atoms
-        )
-    else:
-        refined = PathFact(containment=fact.containment, atoms=atoms)
+    refined: StrFact | PathFact
+    match fact:
+        case Located(location=loc, repr=rp):
+            # nothing is tracked about a located value's text, so text refinements are moot; only
+            # an unconditional (resolving) containment can sharpen where it points
+            if r.containment is not None and not r.containment_requires:
+                return Located(_prefer_containment(loc, r.containment) or loc, rp)
+            return fact
+        case StrFact(regex=regex, atoms=atoms):
+            refined = StrFact(regex=_prefer_regex(regex, r.regex), atoms=atoms | r.atoms)
+        case PathFact(atoms=atoms):
+            refined = PathFact(atoms=atoms | r.atoms)
 
     if r.containment is not None and all(a in refined for a in r.containment_requires):
-        refined = replace(
-            refined, containment=_prefer_containment(refined.containment, r.containment)
-        )
+        # the value gains its path reading; if its text already located it somewhere sharper
+        # (an exact literal, say), keep that
+        own = locate(refined)
+        loc = _prefer_containment(None if own is None else own.location, r.containment)
+        assert loc is not None
+        return Located(loc, "str" if isinstance(refined, StrFact) else "path")
     return refined
 
 
@@ -297,8 +309,7 @@ def _location_of(t: Term, st: Mapping[str, ValidationFact]) -> LocationFact | No
         ):
             return _location_of(inner, st)
         case _:
-            fact = _fact_of(t, st)
-            return None if fact is None else fact.containment
+            return location_of(_fact_of(t, st))
 
 
 def _prefix_location(t: Term, st: Mapping[str, ValidationFact]) -> LocationFact | None:
@@ -320,15 +331,14 @@ def _prefix_location(t: Term, st: Mapping[str, ValidationFact]) -> LocationFact 
 def _from_fact(fact: ValidationFact) -> Refinement:
     """Everything a fact says, as a refinement (for ``x == E`` transfer)."""
     match fact:
-        case StrFact(regex=regex, containment=cont, atoms=atoms):
+        case StrFact(regex=regex, atoms=atoms):
             return Refinement(
-                type_info="str",
-                atoms=atoms,
-                regex=None if regex == ANY_STR else regex,
-                containment=cont,
+                type_info="str", atoms=atoms, regex=None if regex == ANY_STR else regex
             )
-        case PathFact(containment=cont, atoms=atoms):
-            return Refinement(type_info="path", atoms=atoms, containment=cont)
+        case PathFact(atoms=atoms):
+            return Refinement(type_info="path", atoms=atoms)
+        case Located(location=loc, repr=rp):
+            return Refinement(type_info=rp, containment=loc)
 
 
 def _exact_or_alternation(literals: Sequence[str]) -> PseudoRegex:
