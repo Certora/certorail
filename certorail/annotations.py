@@ -15,6 +15,7 @@ is ``str``, one of the ``pathlib`` path classes, or a ``list``/``set``/``frozens
 ``dict`` of those. Anything else carries no fact (and may not carry markers).
 """
 import ast
+import inspect
 from dataclasses import dataclass
 from typing import Literal, Sequence
 
@@ -324,6 +325,63 @@ def _parse(t: Term) -> Fact | None:
 def parse_annotation(e: ast.expr) -> Fact | None:
     """The fact an annotation expresses, or ``None`` if it says nothing the analysis tracks."""
     return _parse(lower(e))
+
+
+# ---------------------------------------------------------------------------
+# binding a call to a definition
+# ---------------------------------------------------------------------------
+
+# stands in for a default's value: binding only needs to know that one exists
+_HAS_DEFAULT = object()
+
+type BoundArgument = ast.expr | tuple[ast.expr, ...] | dict[str, ast.expr]
+
+
+def signature_of(node: ast.FunctionDef) -> inspect.Signature:
+    """The definition's signature, with argument *expressions* in place of values."""
+    P = inspect.Parameter
+    a = node.args
+    positional = [*a.posonlyargs, *a.args]
+    first_default = len(positional) - len(a.defaults)
+    params: list[inspect.Parameter] = []
+    for i, arg in enumerate(positional):
+        kind = P.POSITIONAL_ONLY if i < len(a.posonlyargs) else P.POSITIONAL_OR_KEYWORD
+        params.append(P(arg.arg, kind, default=_HAS_DEFAULT if i >= first_default else P.empty))
+    if a.vararg is not None:
+        params.append(P(a.vararg.arg, P.VAR_POSITIONAL))
+    for arg, default in zip(a.kwonlyargs, a.kw_defaults):
+        params.append(P(arg.arg, P.KEYWORD_ONLY, default=_HAS_DEFAULT if default is not None else P.empty))
+    if a.kwarg is not None:
+        params.append(P(a.kwarg.arg, P.VAR_KEYWORD))
+    return inspect.Signature(params)
+
+
+def bind_arguments(call: ast.Call, node: ast.FunctionDef) -> dict[str, BoundArgument] | None:
+    """The call's argument expressions by parameter name, or None if the call cannot be bound
+    statically (a splat, too many positionals, an unknown or duplicated keyword, a missing
+    required parameter). A var-positional parameter receives a tuple, a var-keyword one a dict;
+    parameters left to their defaults are absent."""
+    if any(isinstance(arg, ast.Starred) for arg in call.args) or any(k.arg is None for k in call.keywords):
+        return None
+    try:
+        bound = signature_of(node).bind(*call.args, **{k.arg: k.value for k in call.keywords if k.arg is not None})
+    except TypeError:
+        return None
+    return dict(bound.arguments)
+
+
+def default_of(node: ast.FunctionDef, param: str) -> ast.expr | None:
+    """The default expression of *param*, if it has one."""
+    a = node.args
+    positional = [*a.posonlyargs, *a.args]
+    first_default = len(positional) - len(a.defaults)
+    for i, arg in enumerate(positional):
+        if arg.arg == param:
+            return a.defaults[i - first_default] if i >= first_default else None
+    for arg, default in zip(a.kwonlyargs, a.kw_defaults):
+        if arg.arg == param:
+            return default
+    return None
 
 
 def parse_function(node: ast.FunctionDef) -> Contract:

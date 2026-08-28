@@ -509,6 +509,46 @@ def location_to_regex(loc: LocationFact) -> PseudoRegex:
             return alternation(_joined(prefix) if prefix else ROOT, below)
 
 
+def pretty_regex(p: PseudoRegex) -> str:
+    """A regex-like spelling for reports: literals as themselves, ``.*`` for anything."""
+    match p:
+        case Exact(exact_str=s):
+            return s
+        case AnyStr():
+            return ".*"
+        case RegexLit(reg=r):
+            return f"/{r}/"
+        case Concat(seq=pieces):
+            return "".join(pretty_regex(q) for q in pieces)
+        case Alternation(any_of=branches):
+            return "(" + "|".join(pretty_regex(b) for b in branches) + ")"
+
+
+def pretty_component(c: Component) -> str:
+    match c:
+        case Named(name=n):
+            return n
+        case AnyName():
+            return "*"
+        case Matching(regex=r):
+            return f"<{pretty_regex(r)}>"
+        case OneOf(names=ns):
+            return "{" + ",".join(sorted(ns)) + "}"
+
+
+def pretty_location(loc: LocationFact) -> str:
+    """A glob-like spelling for reports: ``repos/*/foundry.toml``, ``data/**/<.*\\.txt>``, ``.``."""
+    match loc:
+        case StaticPath(path_components=()):
+            return "."
+        case StaticPath(path_components=cs):
+            return "/".join(pretty_component(c) for c in cs)
+        case DirSplat(static_prefix=ps, final_component=leaf):
+            prefix = "/".join(pretty_component(c) for c in ps)
+            tail = "**" if leaf == ANY_NAME else f"**/{pretty_component(leaf)}"
+            return f"{prefix}/{tail}" if prefix else tail
+
+
 def splat_under(loc: LocationFact) -> DirSplat:
     """The location "somewhere at or below *loc*"."""
     match loc:
@@ -797,6 +837,8 @@ def as_component(fact: StrFact | PathFact) -> Component | None:
             return Matching(regex)
 
 def _literal_location(s: str) -> StaticPath | None:
+    if not pathlib.PurePath(s).parts:
+        return StaticPath(())  # "", ".", "./": the current directory, i.e. the sandbox root
     parts = _safe_path_extension(s)
     return None if parts is None else StaticPath(tuple(Named(p) for p in parts))
 
@@ -828,6 +870,59 @@ def containment_of(fact: ValidationFact | None) -> LocationFact | None:
     located = locate(fact)
     return None if located is None else located.location
 
+# --- entailment ----------------------------------------------------------------------------------
+#
+# The rely/guarantee check: does what is known of a value establish what a contract requires?
+# Conservative throughout -- False means "not shown", never "disjoint".
+
+def location_le(actual: LocationFact, required: LocationFact) -> bool:
+    """Is every path *actual* may denote one that *required* denotes?"""
+    match actual, required:
+        case StaticPath(path_components=cs), StaticPath(path_components=ds):
+            return len(cs) == len(ds) and all(subsumes(d, c) for d, c in zip(ds, cs))
+        case StaticPath(path_components=cs), DirSplat(static_prefix=ps, final_component=leaf):
+            if len(cs) < len(ps) or not all(subsumes(p, c) for p, c in zip(ps, cs)):
+                return False
+            if len(cs) == len(ps):
+                return leaf == ANY_NAME  # the prefix itself is denoted only by an unconstrained leaf
+            return subsumes(leaf, cs[-1])
+        case DirSplat(), StaticPath():
+            return False
+        case DirSplat(static_prefix=ps, final_component=l), DirSplat(static_prefix=qs, final_component=m):
+            # a's leaves must satisfy m (an unconstrained l therefore needs an unconstrained m),
+            # and a's prefix must lie under b's
+            return (
+                len(ps) >= len(qs)
+                and all(subsumes(q, p) for q, p in zip(qs, ps))
+                and subsumes(m, l)
+            )
+
+def entails(actual: str | ValidationFact | None, required: ValidationFact) -> bool:
+    """Does what is known of *actual* establish *required*?"""
+    if actual is None:
+        return False
+    fact: ValidationFact = StrFact(regex=Exact(actual)) if isinstance(actual, str) else actual
+    match required:
+        case Located(location=loc, repr=rp):
+            got = locate(fact)
+            return got is not None and got.repr == rp and location_le(got.location, loc)
+        case StrFact(regex=regex, atoms=atoms):
+            match fact:
+                case StrFact():
+                    return _regex_subsumes(regex, fact.regex) and all(a in fact for a in atoms)
+                case Located(repr="str"):
+                    return regex == ANY_STR and not atoms  # a str, but nothing is tracked about its text
+                case _:
+                    return False
+        case PathFact(atoms=atoms):
+            match fact:
+                case PathFact():
+                    return all(a in fact for a in atoms)
+                case Located(repr="path"):
+                    return not atoms  # nothing lexical is tracked about a located value
+                case _:
+                    return False
+
 def combine_containment(
     cont: LocationFact,
     child: str | ValidationFact | None
@@ -838,6 +933,8 @@ def combine_containment(
         case None:
             return None
         case str():
+            if not pathlib.PurePath(child).parts:
+                return cont  # joining "." or "" adds nothing
             parts = _safe_path_extension(child)
             return None if parts is None else cont.extend_static(parts)
         case Located(location=loc):
@@ -1034,6 +1131,8 @@ class _Open(_Spelling):
         return self._close()
 
     def _close(self) -> LocationFact | None:
+        if all(isinstance(c, str) for c in self.chunks) and "".join(cast(str, c) for c in self.chunks) == ".":
+            return StaticPath(()) if self.prefix is None else self.prefix  # "." adds nothing
         match self.chunks:
             case ((StrFact() | PathFact()) as fact,):
                 # a lone text value is a whole path in its own right: an exact literal may have
@@ -1194,6 +1293,14 @@ def _fstring_pieces(e: ast.JoinedStr, st: dict[str, ValidationFact]) -> list[str
 
 _PATH_CONSTRUCTORS = ("Path", "PurePath", "PosixPath", "PurePosixPath")
 
+# str methods that return a str: on a str receiver the result is text about whose characters
+# nothing is known -- the type survives, the path reading (if any) does not
+_STR_RETURNING_METHODS = frozenset({
+    "replace", "lower", "upper", "casefold", "swapcase", "title", "capitalize",
+    "strip", "lstrip", "rstrip", "removeprefix", "removesuffix",
+    "format", "zfill", "center", "ljust", "rjust", "expandtabs", "join", "translate",
+})
+
 def interpret_expr(e: ast.expr, st: dict[str, ValidationFact]) -> ValidationFact | None:
     match e:
         case ast.Name(id=name):
@@ -1216,6 +1323,10 @@ def interpret_expr(e: ast.expr, st: dict[str, ValidationFact]) -> ValidationFact
                 return None if loc is None else Located(loc, "str")
             if len(args) == 1 and (call.matches("str") or call.matches("os", "fspath")):
                 return as_str_value(interpret_expr(args[0], st))
+            if isinstance(func, ast.Attribute) and func.attr in _STR_RETURNING_METHODS:
+                receiver = interpret_expr(func.value, st)
+                if isinstance(receiver, StrFact) or (isinstance(receiver, Located) and receiver.repr == "str"):
+                    return StrFact()  # text stays text; nothing is known about the new characters
             return None
         case ast.BinOp(left=left, op=ast.Div(), right=right):
             # ``str / x`` is a TypeError and ``"lit" / path`` (__rtruediv__) is not modelled

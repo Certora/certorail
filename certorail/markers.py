@@ -15,9 +15,30 @@ Surface syntax::
     typing.Annotated[str, certora.seq("report-", certora.matches(r"\\d+"), ".txt")]
     typing.Annotated[str, certora.within(".")]
 """
+import pathlib
+import subprocess
 from dataclasses import dataclass
 
 NAMESPACE = "certora"
+
+
+# ---------------------------------------------------------------------------
+# controlled APIs: the sandbox's replacements for forbidden surface
+# ---------------------------------------------------------------------------
+
+
+def exec(*cmd: str, cwd: pathlib.Path | str) -> subprocess.CompletedProcess[bytes]:
+    """The only way to run a subprocess: no shell, output always captured, ``cwd`` mandatory.
+
+    This is the runtime half. The static half (``walker``) additionally requires the program to
+    be a string literal, refuses ``*args``/``**kwargs`` and any keyword but ``cwd``, and treats
+    ``cwd`` as a sink whose location must be proven.
+    """
+    if not cmd:
+        raise ValueError("exec: no program given")
+    if not all(isinstance(part, str) for part in cmd):
+        raise TypeError("exec: every part of the command must be a str")
+    return subprocess.run(list(cmd), cwd=cwd, shell=False, capture_output=True, check=False)
 
 
 @dataclass(frozen=True)

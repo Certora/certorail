@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .analysis import (
+    ANY_STR,
+    Exact,
     InvalidConstantForm,
     InvalidProgram,
     Located,
@@ -38,14 +40,31 @@ from .analysis import (
     ValidationFact,
     as_const_or_default,
     bind_call_args,
+    entails,
     interpret_expr,
     is_path_typed,
     iteration_bindings,
-    location_to_regex,
+    operand_value,
+    pretty_location,
+    pretty_regex,
     resolve_callee,
 )
-from .dangerous import PATH_SINK_FUNCTIONS, PATH_SINK_METHODS
-from .annotations import parse_function
+from .dangerous import (
+    EXEC_ALLOWED_KEYWORDS,
+    EXEC_CALLEE,
+    EXEC_REQUIRED_KEYWORDS,
+    PATH_SINK_FUNCTIONS,
+    PATH_SINK_METHODS,
+)
+from .annotations import (
+    Contract,
+    ElementsFact,
+    Fact,
+    MappingFact,
+    bind_arguments,
+    default_of,
+    parse_function,
+)
 from .guards import apply, recognize
 from .markers import NAMESPACE
 from .safepy import ClassAnalysis, InheritanceAnalysis, ValidationAnalysis, ImportAnalysis
@@ -68,10 +87,31 @@ class SinkSite:
         return isinstance(self.fact, Located)
 
 
+@dataclass(frozen=True)
+class ExecSite:
+    """A ``certora.exec(program, *args, cwd=...)`` call: the controlled shell-out."""
+
+    node: ast.Call
+    program: str
+    arguments: tuple[str | ValidationFact | None, ...]
+    cwd: ValidationFact | None
+
+    @property
+    def what(self) -> str:
+        return f"exec({self.program!r})"
+
+    @property
+    def confined(self) -> bool:
+        return isinstance(self.cwd, Located)
+
+
+type Site = SinkSite | ExecSite
+
+
 @dataclass
 class Report:
     violations: list[tuple[ast.AST, str]] = field(default_factory=list)
-    sinks: list[SinkSite] = field(default_factory=list)
+    sinks: list[Site] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -158,6 +198,23 @@ def _negated(cond: ast.expr) -> ast.expr:
     return ast.copy_location(ast.UnaryOp(op=ast.Not(), operand=cond), cond)
 
 
+def _plain_type(fact: Fact | None) -> bool:
+    """A bare type annotation (``str``, ``pathlib.Path``, ``list[str]``, ...) carrying no marker.
+    These are enforced by the runtime guard injected at function entry, not discharged statically;
+    only marker-bearing relies and guarantees are the analysis' to check."""
+    match fact:
+        case None:
+            return True
+        case StrFact() | PathFact():
+            return fact == StrFact() or fact == PathFact()
+        case Located():
+            return False
+        case ElementsFact(element=element):
+            return _plain_type(element)
+        case MappingFact(key=key, value=value):
+            return _plain_type(key) and _plain_type(value)
+
+
 # ---------------------------------------------------------------------------
 # the dataflow walker
 # ---------------------------------------------------------------------------
@@ -178,7 +235,13 @@ class ValidationWalker(ast.NodeVisitor):
     def __init__(self, imports: frozenset[tuple[str, ...]]):
         self.state: State = {}
         self.violations: list[tuple[ast.AST, str]] = []
-        self.sinks: list[SinkSite] = []
+        self.sinks: list[Site] = []
+        # rely/guarantee: the module-level functions' contracts (a bare-name callee resolves to
+        # exactly one of these, which is what makes call-site checking possible), the guarantee
+        # of the function being walked, and how deep inside defs/classes we are
+        self.contracts: dict[str, tuple[ast.FunctionDef, Contract]] = {}
+        self._guarantees: list[Fact | None] = []
+        self._nesting = 0
         # the names that denote modules, for lowering: only what the program actually imported,
         # plus the marker namespace the sandbox injects
         self.modules: frozenset[str] = frozenset(root for (root, *_) in imports) | {NAMESPACE}
@@ -213,10 +276,21 @@ class ValidationWalker(ast.NodeVisitor):
         if isinstance(node.ctx, (ast.Store, ast.Del)):
             self.state.pop(node.id, None)
 
+    def _guaranteed(self, value: ast.expr) -> ValidationFact | None:
+        """The guarantee of ``f(...)`` for a module-level ``f`` with a return contract."""
+        match value:
+            case ast.Call(func=ast.Name(id=name)) if name in self.contracts:
+                returns = self.contracts[name][1].returns
+                return returns if isinstance(returns, (StrFact, PathFact, Located)) else None
+            case _:
+                return None
+
     def _assign(self, target: ast.expr, value: ast.expr) -> None:
         self.visit(value)  # for sinks inside the value, e.g. ``x = open(...)``
         if isinstance(target, ast.Name):
             fact = interpret_expr(value, self.state)
+            if fact is None:
+                fact = self._guaranteed(value)
             if fact is None:
                 self.state.pop(target.id, None)
             else:
@@ -246,11 +320,79 @@ class ValidationWalker(ast.NodeVisitor):
         if resolve_callee(node.func) is None:
             raise InvalidProgram(node.func, "computed callee")  # f()(): no name to reason about
         self._audit_sink(node)
+        if isinstance(node.func, ast.Name) and node.func.id in self.contracts:
+            self._check_rely(node, node.func.id)
         self.generic_visit(node)
+
+    def _check_rely(self, node: ast.Call, name: str) -> None:
+        """Every argument to a contracted parameter must establish its rely; a parameter left to
+        its default is checked against the default."""
+        fdef, contract = self.contracts[name]
+        if not contract.params:
+            return
+        bound = bind_arguments(node, fdef)
+        if bound is None:
+            self._violation(node, f"call to {name}: arguments cannot be bound statically, so its rely cannot be discharged")
+            return
+        for param, rely in contract.params.items():
+            if _plain_type(rely):
+                continue  # a type rely: the injected runtime guard's job, not ours
+            if not isinstance(rely, (StrFact, PathFact, Located)):
+                self._violation(node, f"call to {name}: the rely on {param} is a container fact, which cannot be checked yet")
+                continue
+            supplied = bound.get(param)
+            if supplied is None:
+                default = default_of(fdef, param)
+                if default is None:
+                    continue  # unbound without a default: bind() would have failed
+                if not entails(operand_value(default, {}), rely):
+                    self._violation(node, f"call to {name}: the default for {param} does not establish {_describe_value(rely)}")
+                continue
+            if not isinstance(supplied, ast.expr):
+                self._violation(node, f"call to {name}: arguments to *{param} cannot be checked against its rely")
+                continue
+            if not entails(operand_value(supplied, self.state), rely):
+                self._violation(supplied, f"call to {name}: the argument for {param} does not establish {_describe_value(rely)}")
+
+    def _audit_exec(self, node: ast.Call) -> None:
+        """``certora.exec(program, *args, cwd=...)``: the shape is checked here (violations), the
+        cwd's provenance is a sink question (``confined``), and the arguments are reported."""
+        if any(isinstance(a, ast.Starred) for a in node.args) or any(k.arg is None for k in node.keywords):
+            self._violation(node, "exec: *args / **kwargs are not admissible; spell the command out")
+            return
+        keywords = {k.arg: k.value for k in node.keywords if k.arg is not None}
+        for name in sorted(keywords.keys() - EXEC_ALLOWED_KEYWORDS):
+            self._violation(node, f"exec: keyword {name!r} is not part of the API")
+        for name in sorted(EXEC_REQUIRED_KEYWORDS - keywords.keys()):
+            self._violation(node, f"exec: {name}= is required")
+        if not node.args:
+            self._violation(node, "exec: no program given")
+            return
+        match interpret_expr(node.args[0], self.state):
+            case StrFact(regex=Exact(exact_str=program)):
+                pass
+            case _:
+                program = "?"
+                self._violation(
+                    node.args[0], "exec: the program must be a string literal (or a name bound to one)"
+                )
+        cwd_expr = keywords.get("cwd")
+        self.sinks.append(
+            ExecSite(
+                node,
+                program,
+                tuple(operand_value(a, self.state) for a in node.args[1:]),
+                None if cwd_expr is None else interpret_expr(cwd_expr, self.state),
+            )
+        )
 
     def _audit_sink(self, node: ast.Call) -> None:
         """Record a filesystem operation with what is known about the path it touches. The path's
         provenance is not a violation here; ``Report.ok`` decides on ``confined``."""
+        callee = resolve_callee(node.func)
+        if callee is not None and callee.matches(*EXEC_CALLEE):
+            self._audit_exec(node)
+            return
         match lower(node, self.modules):
             case Call(("open",), _, _):
                 bound = bind_call_args(node, PyOpenCall)
@@ -418,31 +560,76 @@ class ValidationWalker(ast.NodeVisitor):
             ends.append(self.state)  # the subject may match no case at all
         self.state = _join_all(ends)
 
-    # -- scopes -------------------------------------------------------------------------------
+    # -- scopes and contracts -----------------------------------------------------------------
 
-    def _params(self, node: ast.FunctionDef) -> State:
-        # the rely: only scalar facts fit the state for now; container facts (list[...], dict[...])
-        # wait on element-level tracking
-        return {
-            name: f
-            for name, f in parse_function(node).params.items()
-            if isinstance(f, (StrFact, PathFact, Located))
-        }
+    def visit_Module(self, node: ast.Module) -> Any:
+        for s in node.body:
+            if isinstance(s, ast.FunctionDef):
+                if s.name in self.contracts:
+                    self._violation(s, f"function {s.name} is defined more than once; its contract is ambiguous")
+                else:
+                    self.contracts[s.name] = (s, parse_function(s))
+        self._block(node.body)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> Any:
         for d in [*node.args.defaults, *node.args.kw_defaults]:
             if d is not None:
                 self.visit(d)
-        with self.state_snapshot():
-            self.state = self._params(node)
-            self._block(node.body)
+        if self._nesting == 0 and node.name in self.contracts:
+            contract: Contract | None = self.contracts[node.name][1]
+        else:
+            # only module-level functions have checkable call sites (a bare name resolving to one
+            # definition); a contract anywhere else would be assumed without ever being discharged
+            contract = None
+            nested = parse_function(node)
+            # plain type annotations are harmless here (nothing is assumed from them); marker-bearing
+            # ones would be a rely nobody discharges
+            if any(not _plain_type(f) for f in nested.params.values()) or (
+                nested.returns is not None and not _plain_type(nested.returns)
+            ):
+                self._violation(node, "marker contracts on nested functions and methods are not checked; move the function to module level")
+        # the rely: only scalar facts fit the state for now; container facts (list[...], dict[...])
+        # wait on element-level tracking
+        rely: State = (
+            {}
+            if contract is None
+            else {n: f for n, f in contract.params.items() if isinstance(f, (StrFact, PathFact, Located))}
+        )
+        guarantee = None if contract is None else contract.returns
+        self._nesting += 1
+        self._guarantees.append(guarantee)
+        try:
+            with self.state_snapshot():
+                self.state = rely
+                self._block(node.body)
+                if guarantee is not None and not _plain_type(guarantee) and _falls_through(node.body):
+                    self._violation(node, f"{node.name} may fall off its end without establishing its guarantee")
+        finally:
+            self._guarantees.pop()
+            self._nesting -= 1
         self.state.pop(node.name, None)
+
+    def visit_Return(self, node: ast.Return) -> Any:
+        if node.value is not None:
+            self.visit(node.value)
+        guarantee = self._guarantees[-1] if self._guarantees else None
+        if guarantee is None or _plain_type(guarantee):
+            return  # a plain return type is the type checker's business
+        if not isinstance(guarantee, (StrFact, PathFact, Located)):
+            self._violation(node, "container guarantees cannot be checked yet")
+            return
+        if node.value is None or not entails(operand_value(node.value, self.state), guarantee):
+            self._violation(node, f"return does not establish the guarantee {_describe_value(guarantee)}")
 
     def visit_ClassDef(self, node: ast.ClassDef) -> Any:
         for b in node.bases:
             self.visit(b)
-        with self.state_snapshot():
-            self._block(node.body)
+        self._nesting += 1
+        try:
+            with self.state_snapshot():
+                self._block(node.body)
+        finally:
+            self._nesting -= 1
         self.state.pop(node.name, None)
 
 
@@ -465,12 +652,15 @@ def analyze(source: str, filename: str = "<program>") -> Report:
     if classes.violations:
         return Report(violations=list(classes.violations))
 
-    inheritance = InheritanceAnalysis(known_classes=classes.known_classes, module_roots=imports.import_roots)
+    # the injected namespace is a module root like any import: its members may only be applied
+    module_roots = imports.import_roots | {NAMESPACE}
+
+    inheritance = InheritanceAnalysis(known_classes=classes.known_classes, module_roots=module_roots)
     inheritance.visit(tree)
     if inheritance.violations:
         return Report(violations=list(inheritance.violations))
 
-    lexical = ValidationAnalysis(known_classes=classes.known_classes, module_roots=imports.import_roots)
+    lexical = ValidationAnalysis(known_classes=classes.known_classes, module_roots=module_roots)
     lexical.visit(tree)
     if lexical.violations:
         return Report(violations=list(lexical.violations))
@@ -491,14 +681,32 @@ def _where(filename: str, node: ast.AST) -> str:
     return f"{filename}:{line}" if col is None else f"{filename}:{line}:{col + 1}"
 
 
-def _describe_sink(site: SinkSite) -> str:
-    match site.fact:
+def _describe_value(v: str | ValidationFact | None) -> str:
+    match v:
         case None:
+            return "unknown"
+        case str():
+            return repr(v)
+        case Located(location=loc, repr=rp):
+            return f"{rp} at {pretty_location(loc)}"
+        case StrFact(regex=regex, atoms=atoms):
+            text = "text" if regex == ANY_STR else f"text matching {pretty_regex(regex)}"
+            return text + (f" [{', '.join(sorted(atoms))}]" if atoms else "")
+        case PathFact(atoms=atoms):
+            return "path of unknown location" + (f" [{', '.join(sorted(atoms))}]" if atoms else "")
+
+
+def _describe_sink(site: Site) -> str:
+    match site:
+        case SinkSite(fact=None):
             return "nothing is known about the path"
-        case Located(location=loc):
-            return f"confined to {location_to_regex(loc)}"
-        case _:
+        case SinkSite(fact=Located(location=loc)):
+            return f"confined to {pretty_location(loc)}"
+        case SinkSite():
             return "the path is read as text; it is not confined"
+        case ExecSite(arguments=arguments, cwd=cwd):
+            args = ", ".join(_describe_value(a) for a in arguments) or "none"
+            return f"cwd {_describe_value(cwd)}; arguments: {args}"
 
 
 def main(argv: Sequence[str] | None = None) -> int:

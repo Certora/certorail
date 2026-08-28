@@ -109,12 +109,15 @@ class TestPathFromLiteral(unittest.TestCase):
             'pathlib.Path("../a")',
             'pathlib.Path("a/../b")',
             'pathlib.Path("a/..")',
-            'pathlib.Path("")',
-            'pathlib.Path(".")',
         ]
         for src in cases:
             with self.subTest(src=src):
                 self.assertIsNone(evaluate(src))
+
+    def test_dot_and_empty_are_the_root(self) -> None:
+        for src in ('pathlib.Path("")', 'pathlib.Path(".")', 'pathlib.Path("./")'):
+            with self.subTest(src=src):
+                self.assertEqual(evaluate(src), path_of(StaticPath(())))
 
 
 class TestPathFromName(unittest.TestCase):
@@ -188,11 +191,15 @@ class TestPathFromMultipleArgs(unittest.TestCase):
             'pathlib.Path("a", "/abs")',
             'pathlib.Path("a", "..")',
             'pathlib.Path("a", "b/../c")',
-            'pathlib.Path("a", "")',
         ]
         for src in cases:
             with self.subTest(src=src):
                 self.assertIsNone(evaluate(src))
+
+    def test_dot_and_empty_trailing_arguments_add_nothing(self) -> None:
+        for src in ('pathlib.Path("a", "")', 'pathlib.Path("a", ".")'):
+            with self.subTest(src=src):
+                self.assertEqual(evaluate(src), path_of(static("a")))
 
     def test_unbound_trailing_argument_is_unknown(self) -> None:
         self.assertIsNone(evaluate('pathlib.Path("a", q)', {"p": BASE}))
@@ -273,12 +280,15 @@ class TestJoinWithLiteral(unittest.TestCase):
             'p / "../x"',
             'p / "x/../y"',
             'p / "x/.."',
-            'p / ""',
-            'p / "."',
         ]
         for src in cases:
             with self.subTest(src=src):
                 self.assertIsNone(evaluate(src, {"p": BASE}))
+
+    def test_joining_the_current_directory_is_the_identity(self) -> None:
+        for src in ('p / ""', 'p / "."', 'p / "./"'):
+            with self.subTest(src=src):
+                self.assertEqual(evaluate(src, {"p": BASE}), BASE)
 
     def test_splat_fixes_final_component(self) -> None:
         cases: list[tuple[str, DirSplat]] = [
@@ -290,7 +300,7 @@ class TestJoinWithLiteral(unittest.TestCase):
                 self.assertEqual(evaluate(src, {"d": UNDER_BASE}), path_of(loc))
 
     def test_splat_rejects_unsafe_literal(self) -> None:
-        cases = ['d / "/abs"', 'd / ".."', 'd / "x/../y"', 'd / ""']
+        cases = ['d / "/abs"', 'd / ".."', 'd / "x/../y"']
         for src in cases:
             with self.subTest(src=src):
                 self.assertIsNone(evaluate(src, {"d": UNDER_BASE}))

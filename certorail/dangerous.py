@@ -41,6 +41,8 @@ Categories:
 
 import builtins
 
+from .markers import NAMESPACE
+
 # ---------------------------------------------------------------------------
 # Whole-module bans: no legitimate sandbox use; import is itself a violation.
 # (Enforce in visit_Import: reject if the imported dotted name, or any prefix
@@ -285,7 +287,31 @@ PATH_SINK_FUNCTIONS: dict[tuple[str, ...], int] = {
 PATH_SINK_METHODS: frozenset[str] = frozenset({
     "open", "read_text", "read_bytes", "write_text", "write_bytes",
     "iterdir", "glob", "rglob", "exists", "is_file", "is_dir",
+    "mkdir", "touch",
+    # NB: Path.rename is banned outright (FORBIDDEN_ATTRIBUTES); Path.replace(target) is not,
+    # because `replace` is also str.replace -- its *target* path goes unaudited today.
 })
+
+
+# ---------------------------------------------------------------------------
+# Controlled APIs: the sandbox's replacements for forbidden surface, reached
+# through the injected `certora` namespace (markers.py holds the runtime half).
+#
+# certora.exec(program, *args, cwd=...) is the only way to run a subprocess:
+# no shell, output always captured, cwd mandatory. Statically (walker):
+#   * no *args / **kwargs -- a command that cannot be read cannot be reported;
+#   * exactly the keywords below, with the required ones present;
+#   * the program is a string literal (or a name bound to exactly one): it is
+#     the thing a reviewer needs to see;
+#   * cwd is a sink like open(): legal iff its location is proven;
+#   * the remaining arguments are reported with whatever is known about them.
+# The namespace itself is a module root for the lexical rules, so `certora.exec`
+# may only ever be applied, never taken as a value.
+# ---------------------------------------------------------------------------
+
+EXEC_CALLEE: tuple[str, ...] = (NAMESPACE, "exec")
+EXEC_ALLOWED_KEYWORDS: frozenset[str] = frozenset({"cwd"})
+EXEC_REQUIRED_KEYWORDS: frozenset[str] = frozenset({"cwd"})
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +419,7 @@ FORBIDDEN_ATTRIBUTES: frozenset[str] = frozenset({
     "extractall", "extract",
     # pathlib Path methods that create links or leave the sandbox (the read/write/list family is
     # a *sink* instead: legal iff the path's provenance is proven -- see PATH_SINK_METHODS)
-    "unlink", "rmdir", "symlink_to", "hardlink_to", "lchmod",
+    "unlink", "rmdir", "rename", "symlink_to", "hardlink_to", "lchmod",
     "expanduser",
     # module loader methods (from __loader__ / find_spec().loader)
     "exec_module", "load_module", "get_code", "get_source", "create_module",

@@ -6,21 +6,29 @@
 #   3. Clones the winners into a confined `repos/` directory.
 #   4. "Does something": reports which clones look like Foundry (Solidity) projects.
 #
-# Subset rules exercised (and their consequences):
-#   * No `import x as y`, no `from x import y`  -> plain imports, full dotted use.
-#   * Modules appear ONLY as attribute receivers -> `json.loads(...)`, never `j = json`.
-#   * No dunder access at all -> the `if __name__ == "__main__":` idiom is gone;
-#     the entry point is just a top-level `main(sys.argv)` call (see bottom).
-#   * No bare `open`; file reads go through the certora_within/matches/open guard.
-#   * No subprocess module; every spawn goes through the auditable `certora_exec`.
+# What the current analysis asks of it (and what it costs):
+#   * Plain `import`s, full dotted use; a module name never appears as a value.
+#     -> `main(sys.argv)` is out (that hands the list itself around); `sys.argv[1:]` is fine.
+#   * Every filesystem operation is a *sink* whose path must have a proven location:
+#     `open`, `Path.mkdir`, ... The location comes from literals and `/`-joins, so the
+#     `repos/{slug}` paths are confined by construction -- *provided* `slug` is a safe
+#     component, which is exactly one runtime assertion (in `slugify`).
+#   * Relies/guarantees are `typing.Annotated` markers. `slugify` *guarantees* a safe
+#     component; `clone_repo`/`is_foundry_project` *rely* on receiving one. The guarantee is
+#     established by the assertion, the rely is discharged at the call sites by the guarantee.
+#     Plain type annotations are the runtime guard's business, not the analysis'.
+#   * Subprocesses go through `certora.exec(program, *args, cwd=...)`: literal program,
+#     mandatory `cwd` (a sink), no shell, output piped, and -- the visible cost -- no splatting,
+#     so the optional `-f after=<cursor>` needs the command spelled out twice.
+#   * No dunders anywhere, so no `if __name__ == "__main__":`; the entry point is a top-level
+#     `main()` call.
 #
-# Assumed contract for the (host-provided) `certora_exec` builtin:
-#   certora_exec(argv: list[str]) -> result, where argv[0] is the binary (kept a
-#   literal here so the auditor can see exactly what's spawned) and `result` has
-#   `.returncode: int`, `.stdout: str`, `.stderr: str`. No shell, ever.
+# Runtime assertions needed to get this accepted: one.
 
 import json
+import pathlib
 import sys
+import typing
 
 SEARCH_GQL = """
 query($q: String!, $after: String) {
@@ -39,23 +47,26 @@ query($q: String!, $after: String) {
 """
 
 
-def fetch_page(search_expr, cursor):
-    argv = [
-        "gh", "api", "graphql",
-        "-f", f"query={SEARCH_GQL}",
-        "-f", f"q={search_expr}",
-    ]
-    if cursor is not None:
-        argv.append("-f")
-        argv.append(f"after={cursor}")
-    result = certora_exec(argv)
+def fetch_page(search_expr: str, cursor: str | None) -> dict | None:
+    # no splatting: the command is spelled out for each shape it can take
+    if cursor is None:
+        result = certora.exec(
+            "gh", "api", "graphql", "-f", f"query={SEARCH_GQL}", "-f", f"q={search_expr}",
+            cwd=pathlib.Path("."),
+        )
+    else:
+        result = certora.exec(
+            "gh", "api", "graphql", "-f", f"query={SEARCH_GQL}", "-f", f"q={search_expr}",
+            "-f", f"after={cursor}",
+            cwd=pathlib.Path("."),
+        )
     if result.returncode != 0:
-        print(f"gh api failed: {result.stderr.strip()}")
+        print(f"gh api failed: {result.stderr.decode().strip()}")
         return None
     return json.loads(result.stdout)
 
 
-def collect_repos(search_expr, page_limit):
+def collect_repos(search_expr: str, page_limit: int) -> list[dict]:
     repos = []
     cursor = None
     pages = 0
@@ -74,7 +85,7 @@ def collect_repos(search_expr, page_limit):
     return repos
 
 
-def pick_repos(repos, min_stars, max_disk_kb, take):
+def pick_repos(repos: list[dict], min_stars: int, max_disk_kb: int, take: int) -> list[dict]:
     keep = []
     for r in repos:
         disk = r["diskUsage"]
@@ -86,39 +97,39 @@ def pick_repos(repos, min_stars, max_disk_kb, take):
     return keep[:take]
 
 
-def slugify(name_with_owner):
-    # `__` here is a string literal separator, not an identifier -- fine.
-    return name_with_owner.replace("/", "__")
+def slugify(name_with_owner: str) -> typing.Annotated[str, certora.no_slash, certora.not_dot_dot]:
+    # `name_with_owner` is untrusted GraphQL data. The guarantee -- a single safe path
+    # component -- is what lets `repos/{slug}` be confined downstream, and this assertion is
+    # what establishes it (and what makes the analysis accept the `return`).
+    slug = name_with_owner.replace("/", "__")
+    assert "/" not in slug and slug not in (".", "..")
+    return slug
 
 
-def clone_repo(url, slug):
-    # `slug` derives from untrusted GraphQL data, so the clone target is confined
-    # to `repos/` before it reaches certora_exec.
-    dest = f"repos/{slug}"
-    with certora_within(dest, "repos") as safe_dest:
-        result = certora_exec(["git", "clone", "--depth", "1", url, safe_dest])
+def clone_repo(url: str, slug: typing.Annotated[str, certora.no_slash, certora.not_dot_dot]) -> bool:
+    # cloning *into* `repos/` by making it the cwd: the clone target is the bare slug
+    result = certora.exec("git", "clone", "--depth", "1", url, slug, cwd=pathlib.Path("repos"))
     return result.returncode == 0
 
 
-def is_foundry_project(slug):
-    candidate = f"repos/{slug}/foundry.toml"
+def is_foundry_project(slug: typing.Annotated[str, certora.no_slash, certora.not_dot_dot]) -> bool:
+    candidate = f"repos/{slug}/foundry.toml"  # located: repos / <safe component> / foundry.toml
     try:
-        with (
-            certora_within(candidate, "repos") as safe,
-            certora_matches(safe, r"\.toml$") as checked,
-            open(checked, "r") as handle,
-        ):
+        with open(candidate, "r") as handle:
             body = handle.read()
     except FileNotFoundError:
         return False
     return "[profile" in body
 
 
-def main(argv):
-    if len(argv) < 2:
+def main() -> None:
+    args = sys.argv[1:]
+    if len(args) < 1:
         print("usage: repo_audit <github-search-expr>")
         return
-    search_expr = argv[1]
+    search_expr = args[0]
+
+    pathlib.Path("repos").mkdir(exist_ok=True)
 
     repos = collect_repos(search_expr, page_limit=3)
     print(f"fetched {len(repos)} repositories")
@@ -139,4 +150,4 @@ def main(argv):
         print(f"  {name}")
 
 
-main(sys.argv)
+main()
