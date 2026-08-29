@@ -15,11 +15,20 @@ Surface syntax::
     typing.Annotated[str, certora.seq("report-", certora.matches(r"\\d+"), ".txt")]
     typing.Annotated[str, certora.within(".")]
 """
+import functools
+import inspect
 import pathlib
 import subprocess
+import typing
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any, cast
 
 NAMESPACE = "certora"
+
+
+class ContractViolation(Exception):
+    """A value did not have its annotated type at runtime."""
 
 
 # ---------------------------------------------------------------------------
@@ -102,3 +111,55 @@ def within(prefix: Fragment, leaf: Fragment | None = None) -> Within:
 
 def exactly(*components: Fragment) -> Exactly:
     return Exactly(components)
+
+
+# ---------------------------------------------------------------------------
+# the runtime half: plain types
+#
+# ``@certora.checked`` is prepended to every module-level function with a contract before the
+# program runs (see rewrite.py). It checks the *types* -- the one part of an annotation the
+# analysis deliberately does not establish. The markers are not looked at: a rely is discharged
+# at every call site and a guarantee at every return, statically. Only scalar hints are checked;
+# containers are not traversed.
+# ---------------------------------------------------------------------------
+
+
+def _check_type(hint: Any, value: Any, where: str) -> None:
+    if typing.get_origin(hint) is typing.Annotated:
+        hint = typing.get_args(hint)[0]
+    if hint is None or hint is type(None):
+        if value is not None:
+            raise ContractViolation(f"{where}: expected None, got {type(value).__name__}")
+    elif isinstance(hint, type) and not isinstance(value, hint):
+        raise ContractViolation(f"{where}: expected {hint.__name__}, got {type(value).__name__}")
+    # anything else (containers, unions, Any, ...) is not checked
+
+
+def checked[F: Callable[..., Any]](f: F) -> F:
+    """Check a function's arguments and return value against their annotated types on every call."""
+    hints = typing.get_type_hints(f, include_extras=True)
+    signature = inspect.signature(f)
+
+    @functools.wraps(f)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        for name, value in bound.arguments.items():
+            if name not in hints:
+                continue
+            where = f"{f.__name__}(): parameter {name}"
+            match signature.parameters[name].kind:
+                case inspect.Parameter.VAR_POSITIONAL:
+                    for v in value:
+                        _check_type(hints[name], v, where)
+                case inspect.Parameter.VAR_KEYWORD:
+                    for v in value.values():
+                        _check_type(hints[name], v, where)
+                case _:
+                    _check_type(hints[name], value, where)
+        result = f(*args, **kwargs)
+        if "return" in hints:
+            _check_type(hints["return"], result, f"{f.__name__}(): return value")
+        return result
+
+    return cast(F, wrapper)

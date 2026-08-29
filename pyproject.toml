@@ -14,6 +14,11 @@ authors = [
 
 dependencies = ["typing-extensions"]
 
+# `uv tool install .` puts `certorail` on the PATH: analyse, check against the default
+# policy, and run --  `certorail program.py [--root DIR] [--check] [-- ARG ...]`
+[project.scripts]
+certorail = "certorail.host:main"
+
 [tool.setuptools.packages.find]
 include = ["certorail*"]
 

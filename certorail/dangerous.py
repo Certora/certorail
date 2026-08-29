@@ -40,6 +40,7 @@ Categories:
 """
 
 import builtins
+from typing import Literal
 
 from .markers import NAMESPACE
 
@@ -64,6 +65,9 @@ FORBIDDEN_MODULES: frozenset[str] = frozenset({
     # arbitrary code / import machinery
     "builtins", "__builtin__",
     "importlib", "imp", "zipimport", "pkgutil", "pkg_resources", "runpy",
+    "modulefinder",      # ModuleFinder scans/loads modules; freeze/packaging tooling only
+    "site", "sitecustomize", "usercustomize",  # sys.path + .pth machinery: addsitedir() runs .pth code
+    "certorail",         # the host itself: its runner takes a policy and a root of the caller's choosing
     "code", "codeop", "types", "marshal",
     "pickle", "_pickle", "cPickle", "copyreg", "shelve", "dbm", "dill",
     "jsonpickle",
@@ -92,7 +96,22 @@ FORBIDDEN_MODULES: frozenset[str] = frozenset({
     "antigravity", "turtle", "idlelib",
     # introspection into the live runtime
     "inspect", "traceback", "sysconfig", "distutils", "setuptools",
-    "venv", "ensurepip", "pip",
+    "venv", "ensurepip", "pip", "pydoc",
+    "mailbox",
+    "configparser",
+    "tkinter", "lib2to3", "wave",
+
+    # PEP 594 "dead batteries" (deprecated for removal; gone by 3.13). A few are live hazards, the
+    # rest are simply dead and have no business in a work script. crypt/spwd (credentials, above)
+    # and nntplib/telnetlib (network, above) complete the PEP 594 set.
+    "pipes",                     # pipes.Template shells out via os.system
+    "mailcap",                   # mailcap.findmatch -> command injection (CVE-2015-20107)
+    "nis",                       # Sun NIS / yellow-pages network lookups
+    "asynchat", "asyncore", "smtpd",         # async network I/O + an SMTP server
+    "cgi", "cgitb",
+    "aifc", "sunau", "chunk", "sndhdr", "imghdr", "audioop", "ossaudiodev",  # media parsers/codecs
+    "uu", "xdrlib",              # legacy encodings
+    "msilib",                    # windows installer
 })
 
 
@@ -111,6 +130,7 @@ DANGEROUS_MEMBERS: dict[tuple[str, ...], frozenset[str]] = {
     ("functools", ): frozenset({
         "reduce",          # reduce(getattr, names, obj) attribute walk
         "partial", "partialmethod",  # wrap an escape callable
+        "update_wrapper", "singledispatch", "wraps"
     }),
     ("inspect", ): frozenset({
         "getattr_static", "getmembers", "getmembers_static",
@@ -157,7 +177,7 @@ DANGEROUS_MEMBERS: dict[tuple[str, ...], frozenset[str]] = {
     ("compileall",): frozenset({"compile_dir", "compile_file"}),
     ("runpy",): frozenset({"run_path", "run_module", "_run_code",
                         "_run_module_code"}),
-
+    ("json",): frozenset({"tool"}),
     # ---- code / function / module object construction ----
     ("types",): frozenset({
         "FunctionType", "LambdaType", "CodeType", "CellType",
@@ -229,7 +249,9 @@ DANGEROUS_MEMBERS: dict[tuple[str, ...], frozenset[str]] = {
         "SetValueEx", "DeleteKey", "DeleteValue", "QueryValue",
         "QueryValueEx", "ConnectRegistry", "SaveKey", "LoadKey",
     }),
-    ("typing",): frozenset({"cast"})
+    ("typing",): frozenset({"cast"}),
+    ("site",): frozenset({"addpackage"}),
+    ("optparse",): frozenset({"read_file", "read_module"})
 }
 
 
@@ -239,6 +261,14 @@ DANGEROUS_MEMBERS: dict[tuple[str, ...], frozenset[str]] = {
 # environ, kill, ...) but carry a small sub-surface the analysis has semantics
 # for. The invariant this buys: everything reachable under such a module is
 # something the analysis *models*, so nothing is "allowed but unmodelled".
+#
+# `typing` is here for a second reason: it is a types-only module in this subset,
+# and its runtime-reflection members are the hazard -- `get_type_hints` in
+# particular eval()s string annotations, which re-animates a laundered callable
+# (`def g(x: "open"): ...; get_type_hints(g)["x"]` *is* the `open` builtin).
+# Allowlisting the annotation vocabulary denies get_type_hints/get_args/get_origin/
+# cast/assert_type/runtime_checkable/NewType/... by omission, which a denylist
+# would keep leaking.
 #
 # Enforce in visit_Attribute on the access path: if any prefix of the path is a
 # key here, the next component must be in its set (``os.path.join`` checks
@@ -260,6 +290,18 @@ ALLOWED_MEMBERS: dict[tuple[str, ...], frozenset[str]] = {
         "isabs", "normpath", "abspath", "realpath", "commonpath",
         "exists", "isfile", "isdir",
     }),
+    ("typing",): frozenset({
+        # annotation vocabulary only -- none of these evaluates a name or reflects
+        # on an object. The reflection members are absent on purpose (see above).
+        "Annotated", "Optional", "Union", "Literal", "Any", "Final", "ClassVar",
+        "Callable", "TypeAlias", "Self", "Never", "NoReturn", "LiteralString",
+        "Concatenate", "Unpack",
+        "TypeVar", "ParamSpec", "TypeVarTuple",
+        # these also name a base (see ALLOWED_BASES)
+        "NamedTuple", "TypedDict", "Protocol", "Generic",
+        # abstract collection types used in annotations
+        "Sequence", "Mapping", "MutableMapping", "Iterable", "Iterator", "Collection",
+    }),
 }
 
 
@@ -273,24 +315,33 @@ ALLOWED_MEMBERS: dict[tuple[str, ...], frozenset[str]] = {
 # Enforce in walker.ValidationWalker.visit_Call.
 # ---------------------------------------------------------------------------
 
-# builtins and module-level functions: dotted callee -> index of the path argument.
+# What a sink does to the path, for the security policy: "list" covers listing a directory and
+# probing for existence.
+type AccessKind = Literal["read", "write", "list"]
+
+# builtins and module-level functions: dotted callee -> (index of the path argument, kind).
 # A missing argument (``os.listdir()``) means the current directory, i.e. the sandbox root.
-PATH_SINK_FUNCTIONS: dict[tuple[str, ...], int] = {
-    ("open",): 0,
-    ("os", "listdir"): 0, ("os", "walk"): 0,
-    ("os", "path", "exists"): 0, ("os", "path", "isfile"): 0, ("os", "path", "isdir"): 0,
+# For ``open`` the mode decides between read and write; "read" is the default mode.
+PATH_SINK_FUNCTIONS: dict[tuple[str, ...], tuple[int, AccessKind]] = {
+    ("open",): (0, "read"),
+    ("os", "listdir"): (0, "list"), ("os", "walk"): (0, "list"),
+    ("os", "path", "exists"): (0, "list"), ("os", "path", "isfile"): (0, "list"),
+    ("os", "path", "isdir"): (0, "list"),
 }
 
 # pathlib.Path methods: the receiver is the path. An unknown receiver counts as unproven, not
 # as "probably not a Path": a user class may define these names, but a Path from an unknown
-# source must not slip through on that account.
-PATH_SINK_METHODS: frozenset[str] = frozenset({
-    "open", "read_text", "read_bytes", "write_text", "write_bytes",
-    "iterdir", "glob", "rglob", "exists", "is_file", "is_dir",
-    "mkdir", "touch",
+# source must not slip through on that account. For ``open`` the mode decides.
+PATH_SINK_METHODS: dict[str, AccessKind] = {
+    "open": "read",
+    "read_text": "read", "read_bytes": "read",
+    "write_text": "write", "write_bytes": "write", "mkdir": "write", "touch": "write",
+    "iterdir": "list", "glob": "list", "rglob": "list",
+    "exists": "list", "is_file": "list", "is_dir": "list", "replace": "write", "chmod": "write",
+    "link_to": "write"
     # NB: Path.rename is banned outright (FORBIDDEN_ATTRIBUTES); Path.replace(target) is not,
     # because `replace` is also str.replace -- its *target* path goes unaudited today.
-})
+}
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +440,19 @@ ALLOWED_BASES: frozenset[tuple[str, ...]] = frozenset({
     if isinstance(value, type) and issubclass(value, BaseException)
 )
 
+# The decorators a program may use, bare (`@staticmethod`) or applied
+# (`@dataclasses.dataclass(frozen=True)`). A decorator is an application without
+# a Call node -- `@p.unlink` would delete the file with nothing audited, `@f`
+# would run a contracted body with its rely undischarged -- and a work script has
+# no business defining its own, so this is an allowlist rather than an audit.
+ALLOWED_DECORATORS: frozenset[tuple[str, ...]] = frozenset({
+    ("staticmethod",), ("classmethod",), ("property",),
+    ("dataclasses", "dataclass"),
+    ("functools", "cache"), ("functools", "lru_cache"),
+    ("enum", "unique"),
+    ("abc", "abstractmethod"),
+})
+
 
 # ---------------------------------------------------------------------------
 # Receiver-independent attribute-name bans. These names are (a) non-dunder, so
@@ -423,6 +487,8 @@ FORBIDDEN_ATTRIBUTES: frozenset[str] = frozenset({
     "expanduser",
     # module loader methods (from __loader__ / find_spec().loader)
     "exec_module", "load_module", "get_code", "get_source", "create_module",
+    # field getters
+    "get_field",
 })
 
 

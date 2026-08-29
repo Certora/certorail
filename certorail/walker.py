@@ -44,6 +44,7 @@ from .analysis import (
     interpret_expr,
     is_path_typed,
     iteration_bindings,
+    locate,
     operand_value,
     pretty_location,
     pretty_regex,
@@ -55,19 +56,18 @@ from .dangerous import (
     EXEC_REQUIRED_KEYWORDS,
     PATH_SINK_FUNCTIONS,
     PATH_SINK_METHODS,
+    AccessKind,
 )
-from .annotations import (
-    Contract,
-    ElementsFact,
-    Fact,
-    MappingFact,
-    bind_arguments,
-    default_of,
-    parse_function,
-)
+from .annotations import Contract, bind_arguments, default_of, is_plain_type
 from .guards import apply, recognize
 from .markers import NAMESPACE
-from .safepy import ClassAnalysis, InheritanceAnalysis, ValidationAnalysis, ImportAnalysis
+from .safepy import (
+    ClassAnalysis,
+    FunctionAnalysis,
+    ImportAnalysis,
+    InheritanceAnalysis,
+    ValidationAnalysis,
+)
 from .terms import Call, Method, lower
 
 type State = dict[str, ValidationFact]
@@ -81,6 +81,7 @@ class SinkSite:
     node: ast.Call
     what: str
     fact: ValidationFact | None
+    kind: AccessKind
 
     @property
     def confined(self) -> bool:
@@ -157,6 +158,36 @@ def _assigned_names(nodes: Iterable[ast.AST]) -> set[str]:
     return out
 
 
+_OPAQUE_SCOPES = (
+    ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+    ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp,
+)
+
+
+def _module_scope_binds(body: Sequence[ast.stmt]) -> dict[str, int]:
+    """How many times each name is bound at module scope, not descending into function/class
+    bodies or comprehensions (each a fresh scope). Over-approximate is safe: it only makes the
+    single-assignment test for a constant stricter, never looser."""
+    counts: dict[str, int] = {}
+    stack: list[ast.AST] = list(body)
+    while stack:
+        node = stack.pop()
+        match node:
+            case ast.FunctionDef(name=name) | ast.AsyncFunctionDef(name=name) | ast.ClassDef(name=name):
+                counts[name] = counts.get(name, 0) + 1  # binds its own name; body is a separate scope
+                continue
+            case ast.Lambda() | ast.ListComp() | ast.SetComp() | ast.DictComp() | ast.GeneratorExp():
+                continue  # a separate scope: binds nothing at module level
+            case ast.Name(id=name, ctx=ast.Store() | ast.Del()):
+                counts[name] = counts.get(name, 0) + 1
+            case ast.ExceptHandler(name=str() as name):
+                counts[name] = counts.get(name, 0) + 1
+            case _:
+                pass
+        stack.extend(ast.iter_child_nodes(node))
+    return counts
+
+
 def _kill(st: State, names: set[str]) -> State:
     return {k: v for k, v in st.items() if k not in names}
 
@@ -198,21 +229,18 @@ def _negated(cond: ast.expr) -> ast.expr:
     return ast.copy_location(ast.UnaryOp(op=ast.Not(), operand=cond), cond)
 
 
-def _plain_type(fact: Fact | None) -> bool:
-    """A bare type annotation (``str``, ``pathlib.Path``, ``list[str]``, ...) carrying no marker.
-    These are enforced by the runtime guard injected at function entry, not discharged statically;
-    only marker-bearing relies and guarantees are the analysis' to check."""
-    match fact:
-        case None:
-            return True
-        case StrFact() | PathFact():
-            return fact == StrFact() or fact == PathFact()
-        case Located():
-            return False
-        case ElementsFact(element=element):
-            return _plain_type(element)
-        case MappingFact(key=key, value=value):
-            return _plain_type(key) and _plain_type(value)
+def _open_kind(mode: str | None) -> AccessKind:
+    """What an ``open`` does, from its mode; an unknown mode is taken as a write."""
+    if mode is None:
+        return "write"
+    return "write" if any(c in mode for c in "wax+") else "read"
+
+
+def _at_sink(fact: ValidationFact | None) -> ValidationFact | None:
+    """What a sink records about its path: the path reading when the value has one (a literal
+    ``"./out.txt"``, a validated name), otherwise the value as it was, for the report."""
+    located = locate(fact)
+    return fact if located is None else located
 
 
 # ---------------------------------------------------------------------------
@@ -232,19 +260,23 @@ class ValidationWalker(ast.NodeVisitor):
     assigned explicitly afterwards.
     """
 
-    def __init__(self, imports: frozenset[tuple[str, ...]]):
+    def __init__(
+        self,
+        imports: frozenset[tuple[str, ...]],
+        contracts: dict[str, tuple[ast.FunctionDef, Contract]],
+    ):
         self.state: State = {}
         self.violations: list[tuple[ast.AST, str]] = []
         self.sinks: list[Site] = []
-        # rely/guarantee: the module-level functions' contracts (a bare-name callee resolves to
-        # exactly one of these, which is what makes call-site checking possible), the guarantee
-        # of the function being walked, and how deep inside defs/classes we are
-        self.contracts: dict[str, tuple[ast.FunctionDef, Contract]] = {}
-        self._guarantees: list[Fact | None] = []
-        self._nesting = 0
+        # rely/guarantee: the module-level functions' contracts (collected and validated by
+        # FunctionAnalysis) and the guarantee of the function being walked, if it has one
+        self.contracts = contracts
+        self._guarantee: ValidationFact | None = None
         # the names that denote modules, for lowering: only what the program actually imported,
         # plus the marker namespace the sandbox injects
         self.modules: frozenset[str] = frozenset(root for (root, *_) in imports) | {NAMESPACE}
+        # facts for module-level constants, computed by visit_Module and seeded into function bodies
+        self.module_constants: State = {}
 
     def _violation(self, node: ast.AST, what: str) -> None:
         self.violations.append((node, what))
@@ -335,11 +367,8 @@ class ValidationWalker(ast.NodeVisitor):
             self._violation(node, f"call to {name}: arguments cannot be bound statically, so its rely cannot be discharged")
             return
         for param, rely in contract.params.items():
-            if _plain_type(rely):
+            if is_plain_type(rely):
                 continue  # a type rely: the injected runtime guard's job, not ours
-            if not isinstance(rely, (StrFact, PathFact, Located)):
-                self._violation(node, f"call to {name}: the rely on {param} is a container fact, which cannot be checked yet")
-                continue
             supplied = bound.get(param)
             if supplied is None:
                 default = default_of(fdef, param)
@@ -382,7 +411,7 @@ class ValidationWalker(ast.NodeVisitor):
                 node,
                 program,
                 tuple(operand_value(a, self.state) for a in node.args[1:]),
-                None if cwd_expr is None else interpret_expr(cwd_expr, self.state),
+                None if cwd_expr is None else _at_sink(interpret_expr(cwd_expr, self.state)),
             )
         )
 
@@ -406,20 +435,25 @@ class ValidationWalker(ast.NodeVisitor):
                     self._violation(node, "open(): mode must be a string literal")
                 fact = interpret_expr(bound.file, self.state)
                 what = f"open(mode={mode!r})"
+                kind = _open_kind(mode)
             case Call(callee, args, _) if callee in PATH_SINK_FUNCTIONS:
-                index = PATH_SINK_FUNCTIONS[callee]
+                index, kind = PATH_SINK_FUNCTIONS[callee]
                 if index < len(args):
                     fact = interpret_expr(args[index].node, self.state)
                 else:
                     fact = Located(StaticPath(()), "str")  # the current directory: the sandbox root
                 what = ".".join(callee)
-            case Method(recv, name, _, _) if name in PATH_SINK_METHODS:
+            case Method(recv, name, args, kwargs) if name in PATH_SINK_METHODS:
                 # an unknown receiver is unproven, not "probably not a Path"
                 fact = interpret_expr(recv.node, self.state)
                 what = f"<path>.{name}"
+                kind = PATH_SINK_METHODS[name]
+                if name == "open":  # Path.open(mode=...) / Path.open("w")
+                    mode_term = next((v for k, v in kwargs if k == "mode"), args[0] if args else None)
+                    kind = _open_kind("r" if mode_term is None else mode_term.as_str())
             case _:
                 return
-        self.sinks.append(SinkSite(node, what, fact))
+        self.sinks.append(SinkSite(node, what, _at_sink(fact), kind))
 
     # -- compound statements ------------------------------------------------------------------
 
@@ -563,73 +597,89 @@ class ValidationWalker(ast.NodeVisitor):
     # -- scopes and contracts -----------------------------------------------------------------
 
     def visit_Module(self, node: ast.Module) -> Any:
-        for s in node.body:
-            if isinstance(s, ast.FunctionDef):
-                if s.name in self.contracts:
-                    self._violation(s, f"function {s.name} is defined more than once; its contract is ambiguous")
-                else:
-                    self.contracts[s.name] = (s, parse_function(s))
-        self._block(node.body)
+        # a module-level constant (a name bound by exactly one unconditional top-level assignment)
+        # is immutable: module-level reassignment is forbidden and `global` is banned, so no code
+        # can rebind it. Its fact therefore holds in every function body and may seed it.
+        self.module_constants = self._module_constants(node)
+        self.generic_visit(node)
+
+    def _module_constants(self, module: ast.Module) -> State:
+        counts = _module_scope_binds(module.body)
+        state: State = {}
+        for s in module.body:
+            if isinstance(s, ast.Assign) and len(s.targets) == 1 and isinstance(s.targets[0], ast.Name):
+                name, value = s.targets[0].id, s.value
+            elif isinstance(s, ast.AnnAssign) and isinstance(s.target, ast.Name) and s.value is not None:
+                name, value = s.target.id, s.value
+            else:
+                continue
+            if counts.get(name, 0) != 1:
+                continue  # bound more than once at module scope: not a constant
+            try:
+                fact = interpret_expr(value, state)  # earlier constants are in scope for later ones
+            except InvalidProgram:
+                continue  # a malformed value; the main walk reports it
+            if fact is None:
+                fact = self._guaranteed(value)
+            if isinstance(fact, (StrFact, PathFact, Located)):
+                state[name] = fact
+        return state
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> Any:
+        # decorators and defaults are evaluated at definition time, in the enclosing scope: audited
+        # like any other expression there (a call inside a decorator is still a call)
+        for d in node.decorator_list:
+            self.visit(d)
         for d in [*node.args.defaults, *node.args.kw_defaults]:
             if d is not None:
                 self.visit(d)
-        if self._nesting == 0 and node.name in self.contracts:
-            contract: Contract | None = self.contracts[node.name][1]
-        else:
-            # only module-level functions have checkable call sites (a bare name resolving to one
-            # definition); a contract anywhere else would be assumed without ever being discharged
-            contract = None
-            nested = parse_function(node)
-            # plain type annotations are harmless here (nothing is assumed from them); marker-bearing
-            # ones would be a rely nobody discharges
-            if any(not _plain_type(f) for f in nested.params.values()) or (
-                nested.returns is not None and not _plain_type(nested.returns)
-            ):
-                self._violation(node, "marker contracts on nested functions and methods are not checked; move the function to module level")
-        # the rely: only scalar facts fit the state for now; container facts (list[...], dict[...])
-        # wait on element-level tracking
-        rely: State = (
-            {}
-            if contract is None
-            else {n: f for n, f in contract.params.items() if isinstance(f, (StrFact, PathFact, Located))}
-        )
+        # the contract belongs to one specific module-level node (FunctionAnalysis saw to that); a
+        # nested function or method -- even one sharing the name -- starts from nothing
+        entry = self.contracts.get(node.name)
+        contract = entry[1] if entry is not None and entry[0] is node else None
+        rely: State = {} if contract is None else dict(contract.params)
+        # seed the module constants the body may read. Exclude any name the function binds itself:
+        # in Python such a name is local throughout the body (it shadows the module name), and the
+        # rely then supplies the facts for the parameters.
+        a = node.args
+        local = {p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
+        for extra in (a.vararg, a.kwarg):
+            if extra is not None:
+                local.add(extra.arg)
+        local |= _assigned_names(node.body)
+        seed: State = {k: v for k, v in self.module_constants.items() if k not in local}
+        seed.update(rely)
         guarantee = None if contract is None else contract.returns
-        self._nesting += 1
-        self._guarantees.append(guarantee)
+        outer = self._guarantee
+        self._guarantee = guarantee
         try:
             with self.state_snapshot():
-                self.state = rely
+                self.state = seed
                 self._block(node.body)
-                if guarantee is not None and not _plain_type(guarantee) and _falls_through(node.body):
+                if guarantee is not None and not is_plain_type(guarantee) and _falls_through(node.body):
                     self._violation(node, f"{node.name} may fall off its end without establishing its guarantee")
         finally:
-            self._guarantees.pop()
-            self._nesting -= 1
+            self._guarantee = outer
         self.state.pop(node.name, None)
 
     def visit_Return(self, node: ast.Return) -> Any:
         if node.value is not None:
             self.visit(node.value)
-        guarantee = self._guarantees[-1] if self._guarantees else None
-        if guarantee is None or _plain_type(guarantee):
+        guarantee = self._guarantee
+        if guarantee is None or is_plain_type(guarantee):
             return  # a plain return type is the type checker's business
-        if not isinstance(guarantee, (StrFact, PathFact, Located)):
-            self._violation(node, "container guarantees cannot be checked yet")
-            return
         if node.value is None or not entails(operand_value(node.value, self.state), guarantee):
             self._violation(node, f"return does not establish the guarantee {_describe_value(guarantee)}")
 
     def visit_ClassDef(self, node: ast.ClassDef) -> Any:
+        for d in node.decorator_list:
+            self.visit(d)
         for b in node.bases:
             self.visit(b)
-        self._nesting += 1
-        try:
-            with self.state_snapshot():
-                self._block(node.body)
-        finally:
-            self._nesting -= 1
+        for kw in node.keywords:
+            self.visit(kw.value)
+        with self.state_snapshot():
+            self._block(node.body)
         self.state.pop(node.name, None)
 
 
@@ -652,6 +702,11 @@ def analyze(source: str, filename: str = "<program>") -> Report:
     if classes.violations:
         return Report(violations=list(classes.violations))
 
+    functions = FunctionAnalysis()
+    functions.visit(tree)
+    if functions.violations:
+        return Report(violations=list(functions.violations))
+
     # the injected namespace is a module root like any import: its members may only be applied
     module_roots = imports.import_roots | {NAMESPACE}
 
@@ -660,12 +715,16 @@ def analyze(source: str, filename: str = "<program>") -> Report:
     if inheritance.violations:
         return Report(violations=list(inheritance.violations))
 
-    lexical = ValidationAnalysis(known_classes=classes.known_classes, module_roots=module_roots)
+    lexical = ValidationAnalysis(
+        known_classes=classes.known_classes,
+        contracts=functions.contracts,
+        module_roots=module_roots,
+    )
     lexical.visit(tree)
     if lexical.violations:
         return Report(violations=list(lexical.violations))
 
-    walker = ValidationWalker(imports.imports)
+    walker = ValidationWalker(imports.imports, functions.contracts)
     try:
         walker.visit(tree)
     except InvalidProgram as e:
@@ -673,7 +732,7 @@ def analyze(source: str, filename: str = "<program>") -> Report:
     return Report(violations=walker.violations, sinks=walker.sinks)
 
 
-def _where(filename: str, node: ast.AST) -> str:
+def where(filename: str, node: ast.AST) -> str:
     line = getattr(node, "lineno", None)
     col = getattr(node, "col_offset", None)
     if line is None:
@@ -696,7 +755,7 @@ def _describe_value(v: str | ValidationFact | None) -> str:
             return "path of unknown location" + (f" [{', '.join(sorted(atoms))}]" if atoms else "")
 
 
-def _describe_sink(site: Site) -> str:
+def describe_sink(site: Site) -> str:
     match site:
         case SinkSite(fact=None):
             return "nothing is known about the path"
@@ -725,10 +784,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     for node, what in report.violations:
-        print(f"{_where(filename, node)}: violation: {what}")
+        print(f"{where(filename, node)}: violation: {what}")
     for site in report.sinks:
         status = "ok" if site.confined else "UNCONFINED"
-        print(f"{_where(filename, site.node)}: {site.what}: {status} -- {_describe_sink(site)}")
+        print(f"{where(filename, site.node)}: {site.what}: {status} -- {describe_sink(site)}")
     return 0 if report.ok else 1
 
 

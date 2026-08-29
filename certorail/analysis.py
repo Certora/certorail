@@ -25,7 +25,8 @@ sensitive_builtins = (
     "eval",
     "exec",
     "open",
-    "breakpoint"
+    "breakpoint",
+    "help"
 )
 
 validator_funcs = frozenset([

@@ -7,6 +7,7 @@ import builtins
 
 from certorail.terms import lower, Var, Dotted
 
+from .annotations import Contract, InvalidAnnotation, parse_function
 from .analysis import (
     NameAccess,
     is_dunder,
@@ -17,6 +18,7 @@ from .analysis import (
 )
 from .dangerous import (
     ALLOWED_BASES,
+    ALLOWED_DECORATORS,
     ALLOWED_MEMBERS,
     CLASS_FACTORIES,
     DANGEROUS_MEMBERS,
@@ -57,10 +59,10 @@ class _LexicalAnalysis(ast.NodeVisitor):
         return bool(self.violations)
             
 class AttributeContext(StrEnum):
-    load = "LOAD"
-    store = "STORE"
-    apply = "APPLY"
-    type = "TYPE"
+    load = "LOAD"    # taken as a value
+    store = "STORE"  # assigned to
+    apply = "APPLY"  # used without being taken as a value: called, subscripted, decorating
+    type = "TYPE"    # a type position: an annotation, an except clause, isinstance' second argument, a class base
 
 class ImportAnalysis(_LexicalAnalysis):
     def __init__(self):
@@ -80,7 +82,12 @@ class ImportAnalysis(_LexicalAnalysis):
         for a in node.names:
             if a.asname is not None:
                 self.violations.append((a, "as-alias"))
-            if _forbidden_module(a.name):
+            # a private module is its public twin with the guards off: `_io` is `io`, `_thread`
+            # is `threading`. Ban any dotted component that starts with "_" wholesale rather than
+            # chase each `_name` into DANGEROUS_MEMBERS.
+            if any(part.startswith("_") for part in a.name.split(".")):
+                self._violation(node, "private (underscore-prefixed) module import")
+            elif _forbidden_module(a.name):
                 self._violation(node, "forbidden module import")
             self._imports.add(tuple(a.name.split(".")))
         return self.generic_visit(node)
@@ -103,6 +110,52 @@ class ClassAnalysis(_LexicalAnalysis):
             self._violation(node, "class name redef")
         self._known_classes.add(node.name)
         return self.generic_visit(node)
+
+class FunctionAnalysis(_LexicalAnalysis):
+    """Module-level functions and their contracts.
+
+    A bare-name callee resolves to exactly one module-level definition, which is what lets the
+    walker discharge relies at call sites; so function names are defined once, and marker contracts
+    (anything beyond a plain type) are allowed on module-level functions only -- anywhere else they
+    would be assumed by the body and discharged by nobody.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._contracts: dict[str, tuple[ast.FunctionDef, Contract]] = {}
+        self._nesting = 0
+
+    @property
+    def contracts(self) -> dict[str, tuple[ast.FunctionDef, Contract]]:
+        """The module-level functions by name, with their contracts. Like class names, these names
+        may not be rebound; those with a rely may only be called directly (see ValidationAnalysis)."""
+        return dict(self._contracts)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> Any:
+        try:
+            contract: Contract | None = parse_function(node)
+        except InvalidAnnotation as e:
+            self._violation(e.node, str(e))
+            contract = None
+        if self._nesting == 0:
+            if node.name in self._contracts:
+                self._violation(node, f"function {node.name} is defined more than once; its contract is ambiguous")
+            elif contract is not None:
+                self._contracts[node.name] = (node, contract)
+        elif contract is not None and contract.has_markers:
+            self._violation(node, "marker contracts on nested functions and methods are not checked; move the function to module level")
+        self._nesting += 1
+        try:
+            self.generic_visit(node)
+        finally:
+            self._nesting -= 1
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> Any:
+        self._nesting += 1
+        try:
+            self.generic_visit(node)
+        finally:
+            self._nesting -= 1
 
 class InheritanceAnalysis(_LexicalAnalysis):
     def __init__(self, *, known_classes: frozenset[str], module_roots: frozenset[str]):
@@ -133,10 +186,21 @@ class InheritanceAnalysis(_LexicalAnalysis):
         self.generic_visit(node)
 
 class ValidationAnalysis(_LexicalAnalysis):
-    def __init__(self, *, module_roots: frozenset[str], known_classes: frozenset[str]):
+    def __init__(
+        self,
+        *,
+        module_roots: frozenset[str],
+        known_classes: frozenset[str],
+        contracts: dict[str, tuple[ast.FunctionDef, Contract]],
+    ):
         super().__init__()
         self._module_roots = module_roots
         self._known_classes = known_classes
+        self._known_functions = {name: node for name, (node, _) in contracts.items()}
+        # a rely is discharged by the walker at direct call sites and nowhere else, so the name of a
+        # function that has one may not travel (``sorted(xs, key=f)``, ``g = f``, ``@f``): like a
+        # module symbol, it is fully applied or not mentioned
+        self._contracted = frozenset(name for name, (_, c) in contracts.items() if c.has_rely_markers)
 
     def exp_to_access(self, node: ast.expr) -> NameAccess | ast.AST:
         if isinstance(node, ast.Name):
@@ -207,6 +271,16 @@ class ValidationAnalysis(_LexicalAnalysis):
             self.visit(base)
         is_import_path = attr.is_var_base and attr.base_name in self._module_roots
 
+        # `open` reached through a module is banned wholesale -- io.open, codecs.open, os.open,
+        # tokenize.open, dbm.open, webbrowser.open, and pathlib.Path.open (the *unbound* form, which
+        # the walker's `<path>.open()` audit never sees) are all file/fd/URL openers that sidestep
+        # the audited builtin. Too many entry points to chase one by one. The two legitimate opens
+        # are untouched: the bare builtin `open(...)` (a Name, never a dotted path) and
+        # `<path>.open()` on a pathlib value (its base is a variable, not a module).
+        if is_import_path and "open" in attr.field_names:
+            self._violation(node, "open through a module is forbidden; use the builtin open() or a pathlib path's .open()")
+            return
+
         if is_import_path and context == "LOAD":
             self._violation(node, "import name escape")
         elif is_import_path and context == "STORE":
@@ -245,6 +319,9 @@ class ValidationAnalysis(_LexicalAnalysis):
             self._violation(ctxt, "rebind import name")
         if nm in self._known_classes:
             self._violation(ctxt, "rebind class name")
+        # the definition itself is the one permitted binding of a module-level function's name
+        if nm in self._known_functions and self._known_functions[nm] is not ctxt:
+            self._violation(ctxt, "rebind function name")
         if nm in dir(builtins):
             self._violation(ctxt, "rebind builtin")
 
@@ -279,6 +356,27 @@ class ValidationAnalysis(_LexicalAnalysis):
             case _:
                 self.visit(e)  # marker calls, decorator factories, ...: the ordinary rules
 
+    def _visit_decorators(self, decorators: list[ast.expr]) -> None:
+        # A decorator is an application without a Call node (``@p.unlink`` would delete the file
+        # with nothing audited), and a work script has no business defining its own: only
+        # ALLOWED_DECORATORS, bare (``@staticmethod``) or applied (``@dataclasses.dataclass(frozen=True)``).
+        # The arguments of an applied one are ordinary expressions.
+        for d in decorators:
+            target = d.func if isinstance(d, ast.Call) else d
+            match lower(target, self._module_roots):
+                case Var(name=nm) if (nm,) in ALLOWED_DECORATORS:
+                    pass
+                case Dotted(path=path) if path in ALLOWED_DECORATORS:
+                    pass
+                case _:
+                    self._violation(d, "only the allowed decorators may be used")
+                    continue
+            if isinstance(d, ast.Call):
+                for a in d.args:
+                    self.visit(a)
+                for kw in d.keywords:
+                    self.visit(kw.value)
+
     def visit_arguments(self, node: ast.arguments) -> Any:
         params = [*node.posonlyargs, *node.args, *node.kwonlyargs]
         if node.vararg is not None:
@@ -298,8 +396,7 @@ class ValidationAnalysis(_LexicalAnalysis):
             self.violations.append((node, "define dunder"))
         if node.name in validator_funcs:
             self._violation(node, "validation alias")
-        for d in node.decorator_list:
-            self._visit_mention(d, AttributeContext.apply)
+        self._visit_decorators(node.decorator_list)
         for tp in node.type_params:
             self.visit(tp)
         self._visit_binding(node.name, node)
@@ -310,8 +407,7 @@ class ValidationAnalysis(_LexicalAnalysis):
             self.visit(s)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> Any:
-        for d in node.decorator_list:
-            self._visit_mention(d, AttributeContext.apply)
+        self._visit_decorators(node.decorator_list)
         for b in node.bases:
             self._visit_mention(b, AttributeContext.type)  # allowed or not is InheritanceAnalysis' call
         for kw in node.keywords:
@@ -342,15 +438,26 @@ class ValidationAnalysis(_LexicalAnalysis):
     def visit_ExceptHandler(self, node: ast.ExceptHandler) -> Any:
         if node.type is not None:
             self._visit_mention(node.type, AttributeContext.type)
+        if node.name is not None:
+            self._visit_binding(node.name, node)  # ``except E as name`` binds name
         for s in node.body:
             self.visit(s)
 
     def visit_name_str(self, name_str: str, node: ast.AST, visit_context: AttributeContext):
-        if name_str in sensitive_builtins and visit_context == "LOAD":
+        # `open` may be applied (it is a sink the walker audits); the other sensitive builtins may
+        # not appear at all
+        if name_str in sensitive_builtins and not (
+            name_str == "open" and visit_context == AttributeContext.apply
+        ):
             self.violations.append(
                 (node, "built in escape")
             )
-        
+        # (a STORE is already reported as a rebinding)
+        if name_str in self._contracted and visit_context not in (AttributeContext.apply, AttributeContext.store):
+            self._violation(
+                node, f"{name_str} has a marker contract: it may only be called directly, not passed or stored"
+            )
+
         if is_dunder(name_str):
             self._violation(node, "read dunder")
 
@@ -387,3 +494,9 @@ class ValidationAnalysis(_LexicalAnalysis):
 
     def visit_Nonlocal(self, node: ast.Nonlocal) -> Any:
         self._violation(node, "nonlocal")
+
+    def visit_Global(self, node: ast.Global) -> Any:
+        # the last direct way a function could rebind a module-level name: without it, an
+        # assignment inside a function is local. Banning it (with module-level names assigned
+        # once) makes module constants provably immutable, so the analysis may read them.
+        self._violation(node, "global")

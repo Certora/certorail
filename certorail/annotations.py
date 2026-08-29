@@ -11,13 +11,13 @@ argument has to be a constant or a nested marker. Malformed markers raise
 one would weaken a rely without anyone noticing.
 
 The marker vocabulary lives in ``markers.py`` and is reached as ``certora.<name>``; the base type
-is ``str``, one of the ``pathlib`` path classes, or a ``list``/``set``/``frozenset``/``tuple[T, ...]``/
-``dict`` of those. Anything else carries no fact (and may not carry markers).
+is ``str`` or one of the ``pathlib`` path classes. Anything else -- containers included -- carries
+no fact and may not carry markers.
 """
 import ast
 import inspect
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, Sequence
 
 from .analysis import (
     ANY_NAME,
@@ -44,7 +44,7 @@ from .analysis import (
     is_safe_name,
 )
 from .markers import NAMESPACE
-from .terms import Call, Const, Dotted, Items, Subscript, Term, Var, lower
+from .terms import Call, Dotted, Items, Subscript, Term, Var, lower
 
 
 class InvalidAnnotation(InvalidProgram):
@@ -59,34 +59,37 @@ def _err(t: Term, msg: str) -> InvalidAnnotation:
 # facts for parameters and returns
 # ---------------------------------------------------------------------------
 
-type ElementSort = Literal["list", "set", "frozenset", "tuple"]
-
-
-@dataclass(frozen=True)
-class ElementsFact:
-    """``list[T]``, ``set[T]``, ``frozenset[T]``, ``tuple[T, ...]``: every element satisfies ``element``."""
-
-    sort: ElementSort
-    element: "Fact"
-
-
-@dataclass(frozen=True)
-class MappingFact:
-    """``dict[K, V]``: every key satisfies ``key``, every value ``value`` (``None`` = nothing known)."""
-
-    key: "Fact | None"
-    value: "Fact | None"
-
-
-type Fact = ValidationFact | ElementsFact | MappingFact
-
 
 @dataclass(frozen=True)
 class Contract:
     """What a function relies on (per parameter) and guarantees (return)."""
 
-    params: dict[str, Fact]
-    returns: Fact | None
+    params: dict[str, ValidationFact]
+    returns: ValidationFact | None
+
+    @property
+    def has_rely_markers(self) -> bool:
+        """Does any parameter say more than a plain type? Such a rely is discharged at direct call
+        sites only, so the function's name may not travel (see ``safepy.ValidationAnalysis``)."""
+        return any(not is_plain_type(f) for f in self.params.values())
+
+    @property
+    def has_markers(self) -> bool:
+        """Does any part of the contract say more than a plain type?"""
+        return self.has_rely_markers or not is_plain_type(self.returns)
+
+
+def is_plain_type(fact: ValidationFact | None) -> bool:
+    """A bare type annotation (``str``, ``pathlib.Path``) carrying no marker. These are enforced by
+    the runtime guard injected at function entry, not discharged statically; only marker-bearing
+    relies and guarantees are the analysis' to check."""
+    match fact:
+        case None:
+            return True
+        case StrFact() | PathFact():
+            return fact == StrFact() or fact == PathFact()
+        case Located():
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -303,27 +306,26 @@ def _annotated(base: Term, metadata: Sequence[Term]) -> ValidationFact:
     return PathFact(atoms=frozenset(atoms))
 
 
-def _parse(t: Term) -> Fact | None:
+def _parse(t: Term) -> ValidationFact | None:
     match t:
         case Subscript(Dotted(("typing", "Annotated")), Items((base, *metadata))) if metadata:
             return _annotated(base, metadata)
         case Subscript(Dotted(("typing", "Annotated")), _):
             raise _err(t, "Annotated[type, marker, ...] needs at least one marker")
-        case Subscript(Var("list" | "set" | "frozenset" as sort), elem):
-            element = _parse(elem)
-            return None if element is None else ElementsFact(sort, element)
-        case Subscript(Var("tuple"), Items((elem, Const(ell)))) if ell is Ellipsis:
-            element = _parse(elem)
-            return None if element is None else ElementsFact("tuple", element)
-        case Subscript(Var("dict"), Items((key, value))):
-            kf, vf = _parse(key), _parse(value)
-            return None if kf is None and vf is None else MappingFact(kf, vf)
         case _:
-            return _scalar_fact(t)
+            fact = _scalar_fact(t)
+            if fact is None and _mentions_annotated(t.node):
+                raise _err(t, "Annotated inside a container is not tracked; put the markers where the elements are used")
+            return fact
 
 
-def parse_annotation(e: ast.expr) -> Fact | None:
-    """The fact an annotation expresses, or ``None`` if it says nothing the analysis tracks."""
+def _mentions_annotated(e: ast.AST) -> bool:
+    return any(isinstance(n, ast.Attribute) and n.attr == "Annotated" for n in ast.walk(e))
+
+
+def parse_annotation(e: ast.expr) -> ValidationFact | None:
+    """The fact an annotation expresses, or ``None`` if it says nothing the analysis tracks.
+    Containers say nothing, so ``Annotated`` inside one is refused rather than silently dropped."""
     return _parse(lower(e))
 
 
@@ -387,10 +389,11 @@ def default_of(node: ast.FunctionDef, param: str) -> ast.expr | None:
 def parse_function(node: ast.FunctionDef) -> Contract:
     """The rely (per annotated parameter) and guarantee (return) of a function.
 
-    ``*args`` becomes a ``tuple`` of its annotation, ``**kwargs`` a ``dict[str, ...]`` of it.
-    Parameters whose annotation says nothing (or have none) are absent from ``params``.
+    Parameters whose annotation says nothing (or have none) are absent from ``params``. ``*args``
+    and ``**kwargs`` carry no fact -- the analysis does not track containers -- so a marker on
+    either is refused rather than silently dropped.
     """
-    params: dict[str, Fact] = {}
+    params: dict[str, ValidationFact] = {}
     a = node.args
     for arg in [*a.posonlyargs, *a.args, *a.kwonlyargs]:
         if arg.annotation is None:
@@ -398,13 +401,12 @@ def parse_function(node: ast.FunctionDef) -> Contract:
         fact = parse_annotation(arg.annotation)
         if fact is not None:
             params[arg.arg] = fact
-    if a.vararg is not None and a.vararg.annotation is not None:
-        fact = parse_annotation(a.vararg.annotation)
-        if fact is not None:
-            params[a.vararg.arg] = ElementsFact("tuple", fact)
-    if a.kwarg is not None and a.kwarg.annotation is not None:
-        fact = parse_annotation(a.kwarg.annotation)
-        if fact is not None:
-            params[a.kwarg.arg] = MappingFact(StrFact(), fact)
+    for variadic in (a.vararg, a.kwarg):
+        if variadic is not None and variadic.annotation is not None:
+            if not is_plain_type(parse_annotation(variadic.annotation)):
+                raise InvalidAnnotation(
+                    variadic.annotation,
+                    f"markers on *{variadic.arg} are not checked; use explicit parameters",
+                )
     returns = parse_annotation(node.returns) if node.returns is not None else None
     return Contract(params, returns)
