@@ -85,7 +85,7 @@ FORBIDDEN_MODULES: frozenset[str] = frozenset({
     "urllib", "http", "ftplib", "poplib", "imaplib", "nntplib", "smtplib",
     "telnetlib", "xmlrpc", "socketserver", "wsgiref", "webbrowser",
     # xml attacks (prefer defusedxml if XML is truly needed)
-    "xml", "xmlrpc",
+    "xml", "xmlrpc", "pyexpat",
     # host / credentials / platform
     "platform",          # several functions shell out
     "pwd", "spwd", "grp", "crypt", "getpass", "netrc",
@@ -99,7 +99,7 @@ FORBIDDEN_MODULES: frozenset[str] = frozenset({
     "venv", "ensurepip", "pip", "pydoc",
     "mailbox",
     "configparser",
-    "tkinter", "lib2to3", "wave",
+    "tkinter", "lib2to3", "wave", "optparse", "tracemalloc", "zipapp", "filecmp"
 
     # PEP 594 "dead batteries" (deprecated for removal; gone by 3.13). A few are live hazards, the
     # rest are simply dead and have no business in a work script. crypt/spwd (credentials, above)
@@ -250,8 +250,8 @@ DANGEROUS_MEMBERS: dict[tuple[str, ...], frozenset[str]] = {
         "QueryValueEx", "ConnectRegistry", "SaveKey", "LoadKey",
     }),
     ("typing",): frozenset({"cast"}),
-    ("site",): frozenset({"addpackage"}),
-    ("optparse",): frozenset({"read_file", "read_module"})
+    ("zoneinfo",): frozenset({"reset_tzpath"}),
+    ("uuid",): frozenset({"_get_command_stdout"})
 }
 
 
