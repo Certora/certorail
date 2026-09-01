@@ -30,6 +30,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from .policy import DEFAULT_POLICY, Denial, Policy
+from .policyfile import PolicyFileError, load_policy_file
 from .rewrite import rewrite
 from .safepy import FunctionAnalysis
 from .walker import Report, analyze, describe_sink, where
@@ -58,13 +59,19 @@ class Accepted:
         return [f"{where(filename, s.node)}: {s.what}: {describe_sink(s)}" for s in self.report.sinks]
 
 
-def check(source: str, filename: str, policy: Policy) -> Accepted | Rejected:
-    """Analyse and evaluate; on success, the program as it will run. Raises ``SyntaxError``."""
+def check(
+    source: str, filename: str, policy: Policy, root: pathlib.Path | None = None
+) -> Accepted | Rejected:
+    """Analyse and evaluate; on success, the program as it will run. Raises ``SyntaxError``.
+
+    With *root*, the policy's literal checkers may run (under it) to discharge pure atoms on
+    statically-known text; without it, only regex-defined atoms are discharged statically."""
     tree = ast.parse(source, filename)
-    report = analyze(source, filename)
+    discharge = None if root is None else policy.discharger(root)
+    report = analyze(source, filename, policy.vocabulary(), discharge)
     if report.violations:
         return Rejected(report, violations=report.violations)
-    denials = policy.evaluate(report)  # includes sinks whose location is not proven
+    denials = policy.evaluate(report, discharge)  # includes sinks whose location is not proven
     if denials:
         return Rejected(report, denials=denials)
     functions = FunctionAnalysis()
@@ -82,6 +89,7 @@ import sys
 program, filename, *args = sys.argv[1:]
 sys.path.insert(0, __CERTORAIL_PARENT__)
 import certorail.markers
+certorail.markers._VALIDATIONS.update(__CERTORAIL_VALIDATIONS__)
 with open(program, encoding="utf-8") as f:
     source = f.read()
 sys.argv = [filename, *args]
@@ -98,11 +106,22 @@ def run(
     args: Sequence[str] = (),
     python: str = sys.executable,
 ) -> subprocess.CompletedProcess[bytes] | Rejected:
-    outcome = check(source, filename, policy)
+    outcome = check(source, filename, policy, root)
     if isinstance(outcome, Rejected):
         return outcome
     certorail_parent = str(pathlib.Path(__file__).resolve().parent.parent)
-    bootstrap = _BOOTSTRAP.replace("__CERTORAIL_PARENT__", repr(certorail_parent))
+    # the runtime half of the policy's validations: name -> evaluator argv template. A dict of
+    # strs/lists/dicts, so repr() is its own Python literal.
+    registry = {
+        v.name: {
+            "params": list(v.params),
+            "argv": [piece if isinstance(piece, str) else {"param": piece.name} for piece in v.argv],
+        }
+        for v in policy.validations
+    }
+    bootstrap = _BOOTSTRAP.replace("__CERTORAIL_PARENT__", repr(certorail_parent)).replace(
+        "__CERTORAIL_VALIDATIONS__", repr(registry)
+    )
     with tempfile.TemporaryDirectory(prefix="certorail_") as tmp:
         program = pathlib.Path(tmp) / pathlib.Path(filename).name
         program.write_text(outcome.source, encoding="utf-8")
@@ -116,6 +135,11 @@ def run(
 def load_policy(path: pathlib.Path | None) -> Policy:
     if path is None:
         return DEFAULT_POLICY
+    if path.suffix in (".toml", ".json"):
+        try:
+            return load_policy_file(path)
+        except PolicyFileError as e:
+            raise SystemExit(str(e))
     namespace = runpy.run_path(str(path))
     policy = namespace.get("POLICY")
     if not isinstance(policy, Policy):
@@ -129,7 +153,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("program", type=pathlib.Path, help="the Python source file")
     parser.add_argument("--root", type=pathlib.Path, default=pathlib.Path.cwd(), help="the sandbox root (cwd of the program)")
-    parser.add_argument("--policy", type=pathlib.Path, default=None, help="a Python file defining POLICY (default: the built-in policy)")
+    parser.add_argument("--policy", type=pathlib.Path, default=None, help="a policy: a .toml/.json document, or a Python file defining POLICY (default: the built-in policy)")
     parser.add_argument("--check", action="store_true", help="analyse and evaluate only; do not run")
     parser.add_argument("args", nargs=argparse.REMAINDER, help="arguments for the program (after --)")
     ns = parser.parse_args(argv)
@@ -140,7 +164,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         source = ns.program.read_text(encoding="utf-8")
         if ns.check:
-            outcome: Accepted | Rejected | subprocess.CompletedProcess[bytes] = check(source, filename, policy)
+            outcome: Accepted | Rejected | subprocess.CompletedProcess[bytes] = check(
+                source, filename, policy, ns.root.resolve()
+            )
         else:
             outcome = run(source, filename, policy, ns.root.resolve(), args)
     except SyntaxError as e:

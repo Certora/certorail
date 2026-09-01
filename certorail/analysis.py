@@ -8,8 +8,8 @@ import re
 import stat
 from turtle import isvisible
 from types import UnionType
-from typing import Any, cast, Callable, Literal, Sequence, final, override, reveal_type
-from dataclasses import dataclass, is_dataclass
+from typing import Any, cast, Callable, Literal, Mapping, Sequence, final, override, reveal_type
+from dataclasses import dataclass, is_dataclass, replace
 from typing_extensions import TypeForm
 from .dangerous import DANGEROUS_MEMBERS, FORBIDDEN_MODULES
 from .typed_ast_tsp import typed_ast
@@ -752,6 +752,12 @@ def _holds(atom: AtomicFact, atoms: frozenset[AtomicFact], regex: PseudoRegex) -
 #                    Nothing is tracked about its text; ``as_text`` is the forgetful map back.
 # Going into text is giving up on the path reading; the transfer functions stay in path-land for
 # as long as the operation is a path operation.
+#
+# Every fact additionally carries ``checks``: the policy-declared validations (certora.check) this
+# exact value has passed. Checks belong to the value as it was at the check site: they ride along
+# assignment and the same-value respellings (str(), locate), and everything that builds a *new*
+# value -- joins, string methods, concatenation -- starts with none. The walker kills them at
+# every call that may have effects.
 # ---------------------------------------------------------------------------
 
 type Repr = Literal["str", "path"]
@@ -761,6 +767,7 @@ class StrFact:
     """A ``str`` read as text."""
     regex: PseudoRegex = ANY_STR
     atoms: frozenset[AtomicFact] = frozenset()
+    checks: frozenset[str] = frozenset()
 
     def __contains__(self, atom: AtomicFact) -> bool:
         return _holds(atom, self.atoms, self.regex)
@@ -771,6 +778,7 @@ class PathFact:
     a single relative component, ``not-absolute`` means ``not p.is_absolute()``,
     ``no-parent-traversal`` means no ``..`` part."""
     atoms: frozenset[AtomicFact] = frozenset()
+    checks: frozenset[str] = frozenset()
 
     def __contains__(self, atom: AtomicFact) -> bool:
         return _holds(atom, self.atoms, ANY_STR)
@@ -780,6 +788,7 @@ class Located:
     """A value read as a path: where it points, spelled as a ``str`` or a ``pathlib.Path``."""
     location: LocationFact
     repr: Repr
+    checks: frozenset[str] = frozenset()
 
 type ValidationFact = StrFact | PathFact | Located
 
@@ -788,6 +797,47 @@ def is_path_typed(fact: ValidationFact | None) -> bool:
 
 def location_of(fact: ValidationFact | None) -> LocationFact | None:
     return fact.location if isinstance(fact, Located) else None
+
+def checks_of(fact: ValidationFact | None) -> frozenset[str]:
+    return frozenset() if fact is None else fact.checks
+
+def drop_checks(fact: ValidationFact, keep: frozenset[str] = frozenset()) -> ValidationFact:
+    """The value with its environment-dependent checks forgotten (the crude kill). *keep* is the
+    policy's pure atoms -- true of the value's text alone, so no effect can invalidate them."""
+    kept = fact.checks & keep
+    return fact if kept == fact.checks else replace(fact, checks=kept)
+
+def known_text(value: "str | ValidationFact | None") -> str | None:
+    """The exact text of a statically-known value: a literal, a str fact with an exact regex, or
+    a located value whose path is fully constant. This is what a *literal checker* can be run on."""
+    match value:
+        case str():
+            return value
+        case StrFact(regex=Exact(exact_str=s)):
+            return s
+        case Located(location=StaticPath(path_components=cs)) if all(
+            isinstance(c, Named) for c in cs
+        ):
+            return "/".join(c.name for c in cs if isinstance(c, Named)) or "."
+        case _:
+            return None
+
+def saturate(
+    value: "str | ValidationFact | None", defined: Mapping[str, PseudoRegex]
+) -> "str | ValidationFact | None":
+    """The value with every *defined* atom its known text entails added to ``checks``. A defined
+    atom is a pure text property (the policy's ``atom()``), so establishing it from the text is
+    sound anywhere -- this is how a literal satisfies an atom with no runtime check."""
+    if value is None or not defined:
+        return value
+    fact: ValidationFact = StrFact(regex=Exact(value)) if isinstance(value, str) else value
+    text = as_text(fact).regex
+    gained = frozenset(
+        name
+        for name, meaning in defined.items()
+        if name not in fact.checks and _regex_subsumes(meaning, text)
+    )
+    return fact if not gained else replace(fact, checks=fact.checks | gained)
 
 
 class InvalidProgram(Exception):
@@ -860,11 +910,11 @@ def locate(fact: ValidationFact | None) -> Located | None:
             rp: Repr = "str" if isinstance(fact, StrFact) else "path"
             if isinstance(fact, StrFact) and isinstance(fact.regex, Exact):
                 loc = _literal_location(fact.regex.exact_str)
-                return None if loc is None else Located(loc, rp)
+                return None if loc is None else Located(loc, rp, fact.checks)
             if (comp := as_component(fact)) is not None:
-                return Located(StaticPath((comp,)), rp)
+                return Located(StaticPath((comp,)), rp, fact.checks)
             if "no-parent-traversal" in fact and "not-absolute" in fact:
-                return Located(DirSplat((), ANY_NAME), rp)
+                return Located(DirSplat((), ANY_NAME), rp, fact.checks)
             return None
 
 def containment_of(fact: ValidationFact | None) -> LocationFact | None:
@@ -904,23 +954,34 @@ def entails(actual: str | ValidationFact | None, required: ValidationFact) -> bo
         return False
     fact: ValidationFact = StrFact(regex=Exact(actual)) if isinstance(actual, str) else actual
     match required:
-        case Located(location=loc, repr=rp):
+        case Located(location=loc, repr=rp, checks=checks):
             got = locate(fact)
-            return got is not None and got.repr == rp and location_le(got.location, loc)
-        case StrFact(regex=regex, atoms=atoms):
+            return (
+                got is not None
+                and got.repr == rp
+                and location_le(got.location, loc)
+                and checks <= got.checks
+            )
+        case StrFact(regex=regex, atoms=atoms, checks=checks):
             match fact:
                 case StrFact():
-                    return _regex_subsumes(regex, fact.regex) and all(a in fact for a in atoms)
+                    return (
+                        _regex_subsumes(regex, fact.regex)
+                        and all(a in fact for a in atoms)
+                        and checks <= fact.checks
+                    )
                 case Located(repr="str"):
-                    return regex == ANY_STR and not atoms  # a str, but nothing is tracked about its text
+                    # a str, but nothing is tracked about its text
+                    return regex == ANY_STR and not atoms and checks <= fact.checks
                 case _:
                     return False
-        case PathFact(atoms=atoms):
+        case PathFact(atoms=atoms, checks=checks):
             match fact:
                 case PathFact():
-                    return all(a in fact for a in atoms)
+                    return all(a in fact for a in atoms) and checks <= fact.checks
                 case Located(repr="path"):
-                    return not atoms  # nothing lexical is tracked about a located value
+                    # nothing lexical is tracked about a located value
+                    return not atoms and checks <= fact.checks
                 case _:
                     return False
 
@@ -941,6 +1002,8 @@ def combine_containment(
         case Located(location=loc):
             return cont.merge_other(loc)
         case StrFact(regex=Exact(exact_str=s)):
+            if not pathlib.PurePath(s).parts:
+                return cont  # a value known to be exactly "" or ".": joining it adds nothing
             parts = _safe_path_extension(s)  # a known literal, possibly several components
             return None if parts is None else cont.extend_static(parts)
         case _:
@@ -971,10 +1034,10 @@ def as_str_value(fact: ValidationFact | None) -> ValidationFact | None:
     match fact:
         case None:
             return None
-        case Located(location=loc):
-            return Located(loc, "str")
-        case PathFact(atoms=atoms):
-            return StrFact(atoms=atoms)
+        case Located(location=loc, checks=checks):
+            return Located(loc, "str", checks)
+        case PathFact(atoms=atoms, checks=checks):
+            return StrFact(atoms=atoms, checks=checks)
         case StrFact():
             return fact
 

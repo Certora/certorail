@@ -101,7 +101,8 @@ class TestPathFromLiteral(unittest.TestCase):
             with self.subTest(src=src):
                 self.assertEqual(evaluate(src), path_of(loc))
 
-    def test_unsafe_or_empty_literal_is_unknown(self) -> None:
+    def test_unsafe_literal_is_a_path_of_unknown_location(self) -> None:
+        # the location is not provable, but the value is still a path: the type survives
         cases = [
             'pathlib.Path("/etc/passwd")',
             'pathlib.Path("/")',
@@ -112,7 +113,7 @@ class TestPathFromLiteral(unittest.TestCase):
         ]
         for src in cases:
             with self.subTest(src=src):
-                self.assertIsNone(evaluate(src))
+                self.assertEqual(evaluate(src), PathFact())
 
     def test_dot_and_empty_are_the_root(self) -> None:
         for src in ('pathlib.Path("")', 'pathlib.Path(".")', 'pathlib.Path("./")'):
@@ -131,11 +132,11 @@ class TestPathFromName(unittest.TestCase):
         st: State = {"s": validated("no-slash", "no-parent-traversal")}
         self.assertEqual(evaluate("pathlib.Path(s)", st), path_of(static(ANY)))
 
-    def test_unvalidated_string_is_unknown(self) -> None:
-        self.assertIsNone(evaluate("pathlib.Path(s)", {"s": validated()}))
+    def test_unvalidated_string_is_a_path_of_unknown_location(self) -> None:
+        self.assertEqual(evaluate("pathlib.Path(s)", {"s": validated()}), PathFact())
 
-    def test_unbound_name_is_unknown(self) -> None:
-        self.assertIsNone(evaluate("pathlib.Path(q)", {"p": BASE}))
+    def test_unbound_name_is_a_path_of_unknown_location(self) -> None:
+        self.assertEqual(evaluate("pathlib.Path(q)", {"p": BASE}), PathFact())
 
 
 class TestPathFromMultipleArgs(unittest.TestCase):
@@ -186,7 +187,7 @@ class TestPathFromMultipleArgs(unittest.TestCase):
         st: State = {"s": validated("no-parent-traversal", "not-absolute")}
         self.assertEqual(evaluate('pathlib.Path("a", s)', st), path_of(splat("a")))
 
-    def test_unsafe_trailing_argument_is_unknown(self) -> None:
+    def test_unsafe_trailing_argument_is_a_path_of_unknown_location(self) -> None:
         cases = [
             'pathlib.Path("a", "/abs")',
             'pathlib.Path("a", "..")',
@@ -194,18 +195,18 @@ class TestPathFromMultipleArgs(unittest.TestCase):
         ]
         for src in cases:
             with self.subTest(src=src):
-                self.assertIsNone(evaluate(src))
+                self.assertEqual(evaluate(src), PathFact())
 
     def test_dot_and_empty_trailing_arguments_add_nothing(self) -> None:
         for src in ('pathlib.Path("a", "")', 'pathlib.Path("a", ".")'):
             with self.subTest(src=src):
                 self.assertEqual(evaluate(src), path_of(static("a")))
 
-    def test_unbound_trailing_argument_is_unknown(self) -> None:
-        self.assertIsNone(evaluate('pathlib.Path("a", q)', {"p": BASE}))
+    def test_unbound_trailing_argument_is_a_path_of_unknown_location(self) -> None:
+        self.assertEqual(evaluate('pathlib.Path("a", q)', {"p": BASE}), PathFact())
 
-    def test_unvalidated_trailing_string_is_unknown(self) -> None:
-        self.assertIsNone(evaluate('pathlib.Path("a", s)', {"s": validated()}))
+    def test_unvalidated_trailing_string_is_a_path_of_unknown_location(self) -> None:
+        self.assertEqual(evaluate('pathlib.Path("a", s)', {"s": validated()}), PathFact())
 
 
 class TestCallShapes(unittest.TestCase):
@@ -396,10 +397,9 @@ class TestJoinWithRegexDerivedAtoms(unittest.TestCase):
                 self.assertIsNone(evaluate("p / s", st))
 
     def test_exact_empty_joins_to_the_path_itself(self) -> None:
-        # "" has no slash and is not "..", so it is relative with no parent traversal; it is not a
-        # component, but the join is p itself, which the at-or-below reading of the splat covers
+        # a value known to be exactly "" adds nothing, same as the literal ``p / ""``
         st: State = {"p": BASE, "s": validated(regex=Exact(""))}
-        self.assertEqual(evaluate("p / s", st), path_of(splat("base")))
+        self.assertEqual(evaluate("p / s", st), BASE)
 
     def test_alternation_of_safe_exacts_extends(self) -> None:
         alt = Alternation([Exact("a.txt"), Exact("b.txt")])

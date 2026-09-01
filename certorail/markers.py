@@ -50,6 +50,38 @@ def exec(*cmd: str, cwd: pathlib.Path | str) -> subprocess.CompletedProcess[byte
     return subprocess.run(list(cmd), cwd=cwd, shell=False, capture_output=True, check=False)
 
 
+class CheckFailed(Exception):
+    """A ``certora.check`` evaluator refused the value (nonzero exit)."""
+
+
+# name -> {"params": [...], "argv": [str | {"param": name}]}: the runtime half of the policy's
+# validation() declarations, installed by the host's bootstrap. The confined program never sees
+# the policy file, only this argv registry.
+_VALIDATIONS: dict[str, dict[str, Any]] = {}
+
+
+def check(name: str, *, cwd: pathlib.Path | str, **params: str) -> None:
+    """Run the policy-declared evaluator for *name*; raise ``CheckFailed`` unless it exits 0.
+
+    The runtime half of ``certora.check``. The static half (``walker``) additionally requires the
+    statement form, a literal name, keywords matching the validation's declared parameters, and a
+    proven ``cwd`` -- and is what turns falling through this call into facts.
+    """
+    spec = _VALIDATIONS.get(name)
+    if spec is None:
+        raise CheckFailed(f"check: no validation named {name!r}")
+    expected, given = set(spec["params"]), set(params)
+    if expected != given:
+        raise TypeError(f"check {name!r}: expected arguments {sorted(expected)}, got {sorted(given)}")
+    if not all(isinstance(v, str) for v in params.values()):
+        raise TypeError(f"check {name!r}: every argument must be a str")
+    argv = [piece if isinstance(piece, str) else params[piece["param"]] for piece in spec["argv"]]
+    result = subprocess.run(argv, cwd=cwd, shell=False, capture_output=True, check=False)
+    if result.returncode != 0:
+        detail = result.stderr.decode(errors="replace").strip()
+        raise CheckFailed(f"check {name!r} failed ({result.returncode})" + (f": {detail}" if detail else ""))
+
+
 @dataclass(frozen=True)
 class Atom:
     name: str
@@ -103,6 +135,16 @@ def one_of(*names: str) -> OneOf:
 
 def seq(*pieces: Fragment) -> Seq:
     return Seq(pieces)
+
+
+@dataclass(frozen=True)
+class Validated:
+    """The value has passed the named policy validations (see ``check``)."""
+    tags: tuple[str, ...]
+
+
+def validated(*tags: str) -> Validated:
+    return Validated(tags)
 
 
 def within(prefix: Fragment, leaf: Fragment | None = None) -> Within:

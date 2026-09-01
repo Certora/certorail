@@ -160,16 +160,16 @@ def apply(fact: ValidationFact | None, r: Refinement) -> ValidationFact | None:
 
     refined: StrFact | PathFact
     match fact:
-        case Located(location=loc, repr=rp):
+        case Located(location=loc, repr=rp, checks=checks):
             # nothing is tracked about a located value's text, so text refinements are moot; only
             # an unconditional (resolving) containment can sharpen where it points
             if r.containment is not None and not r.containment_requires:
-                return Located(_prefer_containment(loc, r.containment) or loc, rp)
+                return Located(_prefer_containment(loc, r.containment) or loc, rp, checks)
             return fact
-        case StrFact(regex=regex, atoms=atoms):
-            refined = StrFact(regex=_prefer_regex(regex, r.regex), atoms=atoms | r.atoms)
-        case PathFact(atoms=atoms):
-            refined = PathFact(atoms=atoms | r.atoms)
+        case StrFact(regex=regex, atoms=atoms, checks=checks):
+            refined = StrFact(regex=_prefer_regex(regex, r.regex), atoms=atoms | r.atoms, checks=checks)
+        case PathFact(atoms=atoms, checks=checks):
+            refined = PathFact(atoms=atoms | r.atoms, checks=checks)
 
     if r.containment is not None and all(a in refined for a in r.containment_requires):
         # the value gains its path reading; if its text already located it somewhere sharper
@@ -177,7 +177,7 @@ def apply(fact: ValidationFact | None, r: Refinement) -> ValidationFact | None:
         own = locate(refined)
         loc = _prefer_containment(None if own is None else own.location, r.containment)
         assert loc is not None
-        return Located(loc, "str" if isinstance(refined, StrFact) else "path")
+        return Located(loc, "str" if isinstance(refined, StrFact) else "path", refined.checks)
     return refined
 
 

@@ -260,6 +260,7 @@ def _annotated(base: Term, metadata: Sequence[Term]) -> ValidationFact:
         raise _err(base, "markers apply to str and pathlib paths only")
 
     atoms: set[AtomicFact] = set()
+    checks: set[str] = set()
     regex: PseudoRegex | None = None
     containment: LocationFact | None = None
     located_by: Term | None = None
@@ -276,7 +277,10 @@ def _annotated(base: Term, metadata: Sequence[Term]) -> ValidationFact:
         if call is None:
             raise _err(m, f"expected a certora marker, got {type(m).__name__}")
         name, args, kwargs = call
-        if name in _LOCATION_MARKERS:
+        if name == "validated":
+            # policy validations the value has passed; combines with location AND text markers
+            checks.update(_str_args(m, args, kwargs, "validated"))
+        elif name in _LOCATION_MARKERS:
             if containment is not None:
                 raise _err(m, "at most one of within()/exactly()")
             containment = _location_of(m, name, args, kwargs)
@@ -300,10 +304,10 @@ def _annotated(base: Term, metadata: Sequence[Term]) -> ValidationFact:
                 "within()/exactly() do not combine with text markers; constrain the leaf with "
                 "within(..., leaf=...) or exactly(..., <component>) instead",
             )
-        return Located(containment, "str" if isinstance(fact, StrFact) else "path")
+        return Located(containment, "str" if isinstance(fact, StrFact) else "path", frozenset(checks))
     if isinstance(fact, StrFact):
-        return StrFact(regex=ANY_STR if regex is None else regex, atoms=frozenset(atoms))
-    return PathFact(atoms=frozenset(atoms))
+        return StrFact(regex=ANY_STR if regex is None else regex, atoms=frozenset(atoms), checks=frozenset(checks))
+    return PathFact(atoms=frozenset(atoms), checks=frozenset(checks))
 
 
 def _parse(t: Term) -> ValidationFact | None:

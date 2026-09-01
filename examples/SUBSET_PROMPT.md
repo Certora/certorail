@@ -130,6 +130,33 @@ A safe component needs both "no `/`" and "not `..`" (`".." not in s` or `s not i
   one); arguments are separate strings, no `*`/`**` splats; the only keyword is `cwd`, and it is required and
   must be a proven location. No shell; output is captured. Returns a `CompletedProcess` with `.returncode`,
   `.stdout` and `.stderr` (bytes).
+- The policy may pin subcommands: if it declares `git log` and `git push origin`, any other `git`
+  invocation — including one whose subcommand is not a literal — is rejected. Arguments after the
+  subcommand may be required to carry validation facts; a value whose text is statically known (a
+  literal, a constant path) automatically satisfies any fact the policy defines as a text
+  property or whose checker the host can run on the literal directly — no `certora.check` needed
+  for constants.
+
+## Runtime validations
+
+- The host's policy may declare named validations: runtime predicates, run as subprocesses, whose
+  success establishes policy-defined facts. `certora.check(name, key=value, ..., cwd=<located path>)`
+  runs the validation `name` (a string literal) and raises on failure, so the statements after it
+  may rely on what it established. It must be a bare statement. The keywords are fixed by the
+  validation's declaration; `cwd` is required and must be a proven location; other arguments are
+  strings.
+- A fact is established on the *variable* passed in the corresponding keyword — pass a plain
+  variable, not an expression. It is consumed by policy rules ("`git` requires a cwd validated by
+  X") and by `certora.validated("…")` markers in `typing.Annotated` contracts, which combine
+  freely with location and text markers.
+- Every validation fact dies when its variable is reassigned or a new value is derived from it.
+  A fact about the *environment* (e.g. "this directory is a clean checkout") additionally dies at
+  every call that may have effects — any call to a program-defined function, a method on a
+  non-path value, or a subprocess. Effect-free operations preserve it: `str()`, `print`,
+  `os.path.*`, `pathlib.Path(...)`, `re` matching, reads on a proven path, and validations the
+  policy declares effect-free. Check immediately before the operation that needs the fact; inside
+  a loop, check inside the body. Facts about the value's *text* alone (as declared by the policy)
+  survive any number of calls.
 
 ## Everything else
 

@@ -22,9 +22,9 @@ import argparse
 import ast
 import pathlib
 import sys
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .analysis import (
@@ -33,27 +33,35 @@ from .analysis import (
     InvalidConstantForm,
     InvalidProgram,
     Located,
+    NameAccess,
     PathFact,
+    PseudoRegex,
     PyOpenCall,
     StaticPath,
     StrFact,
     ValidationFact,
     as_const_or_default,
+    as_const_or_null,
     bind_call_args,
+    drop_checks,
     entails,
     interpret_expr,
     is_path_typed,
     iteration_bindings,
+    known_text,
     locate,
     operand_value,
     pretty_location,
     pretty_regex,
     resolve_callee,
+    saturate,
 )
 from .dangerous import (
+    CHECK_CALLEE,
     EXEC_ALLOWED_KEYWORDS,
     EXEC_CALLEE,
     EXEC_REQUIRED_KEYWORDS,
+    NON_KILLING_CALLEES,
     PATH_SINK_FUNCTIONS,
     PATH_SINK_METHODS,
     AccessKind,
@@ -106,7 +114,55 @@ class ExecSite:
         return isinstance(self.cwd, Located)
 
 
-type Site = SinkSite | ExecSite
+@dataclass(frozen=True)
+class CheckSite:
+    """A ``certora.check(name, key=value, ..., cwd=...)`` call: a policy-declared runtime
+    validation. Falling through it (success) establishes the validation's atoms on the bare-Name
+    arguments; the evaluator itself is a subprocess, so the site also kills every live check."""
+
+    node: ast.Call
+    name: str
+    arguments: dict[str, str | ValidationFact | None]
+    cwd: ValidationFact | None
+
+    @property
+    def what(self) -> str:
+        return f"check({self.name!r})"
+
+    @property
+    def confined(self) -> bool:
+        return isinstance(self.cwd, Located)
+
+
+type Site = SinkSite | ExecSite | CheckSite
+
+
+@dataclass(frozen=True)
+class CheckSignature:
+    """The analysis-side half of one policy ``validation()``: what ``certora.check(name, ...)``
+    takes and what its success establishes. Derived from the policy (``Policy.vocabulary``) and
+    handed to ``analyze`` -- the atom vocabulary is part of the language the program is written
+    against, the way user-defined types are; the evaluator itself stays policy-side."""
+
+    name: str
+    params: tuple[str, ...]
+    establishes: dict[str, frozenset[str]]  # parameter name, or "cwd" -> validation atoms
+    effect_free: bool = False  # the evaluator mutates nothing: its own run kills no atoms
+
+
+@dataclass(frozen=True)
+class Vocabulary:
+    """The policy's validations as the analysis sees them: the check signatures, plus which atoms
+    are *pure*. A pure atom is true of the value's text alone, so no effect can invalidate it --
+    it dies only with the value. An environment atom is about the world at a location, and dies
+    at every potentially-effectful call."""
+
+    signatures: dict[str, CheckSignature] = field(default_factory=dict)
+    pure_atoms: frozenset[str] = frozenset()
+    # *defined* atoms: name -> the text property that is its meaning. The analysis establishes
+    # one directly (``saturate``) on any value whose known text entails it -- a literal needs no
+    # runtime check -- and it is pure by construction (a subset of ``pure_atoms``).
+    defined: dict[str, PseudoRegex] = field(default_factory=dict)
 
 
 @dataclass
@@ -192,6 +248,11 @@ def _kill(st: State, names: set[str]) -> State:
     return {k: v for k, v in st.items() if k not in names}
 
 
+def _without_env_checks(st: State, pure: frozenset[str]) -> State:
+    """The crude kill over a whole state: every environment check dies; pure atoms ride."""
+    return {k: drop_checks(v, keep=pure) for k, v in st.items()}
+
+
 def _join(a: State, b: State) -> State:
     """Facts that hold on both paths. Equality for now; the lattice join (``join_loc`` &c.) slots
     in here once it lands."""
@@ -264,6 +325,8 @@ class ValidationWalker(ast.NodeVisitor):
         self,
         imports: frozenset[tuple[str, ...]],
         contracts: dict[str, tuple[ast.FunctionDef, Contract]],
+        vocabulary: Vocabulary | None = None,
+        discharge: Callable[[str, str], bool] | None = None,
     ):
         self.state: State = {}
         self.violations: list[tuple[ast.AST, str]] = []
@@ -271,6 +334,11 @@ class ValidationWalker(ast.NodeVisitor):
         # rely/guarantee: the module-level functions' contracts (collected and validated by
         # FunctionAnalysis) and the guarantee of the function being walked, if it has one
         self.contracts = contracts
+        # the policy's validations, as the analysis sees them (Policy.vocabulary)
+        self.vocabulary: Vocabulary = vocabulary if vocabulary is not None else Vocabulary()
+        # the host's literal-checker runner (Policy.discharger): given (atom, exact text), may an
+        # effect-free evaluator establish the pure atom on that text right now? None = no running.
+        self._discharge = discharge
         self._guarantee: ValidationFact | None = None
         # the names that denote modules, for lowering: only what the program actually imported,
         # plus the marker namespace the sandbox injects
@@ -346,15 +414,110 @@ class ValidationWalker(ast.NodeVisitor):
             self._assign(node.target, node.value)
 
     def visit_Assert(self, node: ast.Assert) -> Any:
+        self.generic_visit(node)  # sinks (and check-killing calls) inside the test are real
         self.state = self._refine(self.state, node.test)
 
+    def visit_Expr(self, node: ast.Expr) -> Any:
+        match node.value:
+            case ast.Call(func=func) as call if (
+                (callee := resolve_callee(func)) is not None and callee.matches(*CHECK_CALLEE)
+            ):
+                self.generic_visit(call)  # arguments first; the callee attribute itself is inert
+                self._audit_check(call)
+            case _:
+                self.visit(node.value)
+
     def visit_Call(self, node: ast.Call) -> Any:
-        if resolve_callee(node.func) is None:
+        callee = resolve_callee(node.func)
+        if callee is None:
             raise InvalidProgram(node.func, "computed callee")  # f()(): no name to reason about
+        if callee.matches(*CHECK_CALLEE):
+            # the gen postdominates only the statement form (visit_Expr); anywhere else there is
+            # no program point whose fall-through the success can speak for
+            self._violation(node, "check: certora.check(...) must be a bare statement")
+        self.generic_visit(node)  # children first: an inner call's effects precede the outer one
         self._audit_sink(node)
         if isinstance(node.func, ast.Name) and node.func.id in self.contracts:
             self._check_rely(node, node.func.id)
-        self.generic_visit(node)
+        # the crude kill: a call may run arbitrary program code (a module function, a lambda held
+        # in a variable, a subprocess) and any effect invalidates an environment check. The site's
+        # facts were read above, so check-then-use survives; check-call-then-use does not.
+        if not self._effect_free(node, callee):
+            self.state = _without_env_checks(self.state, self.vocabulary.pure_atoms)
+
+    def _effect_free(self, node: ast.Call, callee: NameAccess) -> bool:
+        """May this call be assumed to run no program code and mutate nothing? Only the
+        enumerated pure path/text operations, the allowlisted ``os.path`` surface, reads on a
+        proven pathlib value, and checks the policy declared effect-free. Everything else --
+        program functions, lambdas held in variables, instantiations, methods on unknown
+        receivers, subprocesses -- kills environment checks."""
+        if not callee.is_var_base:
+            return False
+        if callee.matches(*CHECK_CALLEE):
+            return self._effect_free_check(node)
+        full = callee.full_path
+        if full in NON_KILLING_CALLEES or (len(full) == 3 and full[:2] == ("os", "path")):
+            return True
+        if full in (("os", "listdir"), ("os", "walk")):
+            return True  # read sinks: audited, and they mutate nothing
+        if (
+            len(full) == 2
+            and full[1] != "open"  # Path.open("w") writes; the mode is the audit's business
+            and PATH_SINK_METHODS.get(full[1]) in ("read", "list")
+            and is_path_typed(self.state.get(full[0]))
+        ):
+            return True  # p.read_text() / p.exists() / p.iterdir() on a proven path
+        return False
+
+    def _effect_free_check(self, call: ast.Call) -> bool:
+        """Is this a ``certora.check`` of a validation the policy declared effect-free? Only a
+        direct literal name is recognized (this is also asked at block boundaries, without state)."""
+        if len(call.args) != 1:
+            return False
+        name = as_const_or_null(str, call.args[0])
+        signature = None if name is None else self.vocabulary.signatures.get(name)
+        return signature is not None and signature.effect_free
+
+    def _may_effect(self, nodes: Iterable[ast.AST]) -> bool:
+        """May these statements run an effectful call? For the states the walk does *not* pass
+        through -- a loop's iteration boundary, a try's handler entry, a with's escape path --
+        any contained effectful call must kill environment checks there too. Over-approximate
+        (the state-dependent exemptions of ``_effect_free`` are unavailable without a state), and
+        it only costs checks, never soundness."""
+        for root in nodes:
+            for n in ast.walk(root):
+                if not isinstance(n, ast.Call):
+                    continue
+                callee = resolve_callee(n.func)
+                if callee is None or not callee.is_var_base:
+                    return True
+                if callee.matches(*CHECK_CALLEE):
+                    if self._effect_free_check(n):
+                        continue
+                    return True
+                full = callee.full_path
+                if full in NON_KILLING_CALLEES or (len(full) == 3 and full[:2] == ("os", "path")):
+                    continue
+                if full in (("os", "listdir"), ("os", "walk")):
+                    continue
+                return True
+        return False
+
+    def _establishes(self, value: "str | ValidationFact | None", required: ValidationFact) -> bool:
+        """Does *value* establish *required*? ``entails`` after saturation, plus -- for a value
+        whose exact text is known -- running literal checkers for the atoms still missing."""
+        actual = saturate(value, self.vocabulary.defined)
+        if isinstance(actual, str):
+            actual = StrFact(regex=Exact(actual))
+        if entails(actual, required):
+            return True
+        if self._discharge is None or actual is None:
+            return False
+        text = known_text(actual)
+        if text is None:
+            return False
+        gained = frozenset(a for a in required.checks - actual.checks if self._discharge(a, text))
+        return bool(gained) and entails(replace(actual, checks=actual.checks | gained), required)
 
     def _check_rely(self, node: ast.Call, name: str) -> None:
         """Every argument to a contracted parameter must establish its rely; a parameter left to
@@ -374,14 +537,71 @@ class ValidationWalker(ast.NodeVisitor):
                 default = default_of(fdef, param)
                 if default is None:
                     continue  # unbound without a default: bind() would have failed
-                if not entails(operand_value(default, {}), rely):
+                if not self._establishes(operand_value(default, {}), rely):
                     self._violation(node, f"call to {name}: the default for {param} does not establish {_describe_value(rely)}")
                 continue
             if not isinstance(supplied, ast.expr):
                 self._violation(node, f"call to {name}: arguments to *{param} cannot be checked against its rely")
                 continue
-            if not entails(operand_value(supplied, self.state), rely):
+            if not self._establishes(operand_value(supplied, self.state), rely):
                 self._violation(supplied, f"call to {name}: the argument for {param} does not establish {_describe_value(rely)}")
+
+    def _audit_check(self, node: ast.Call) -> None:
+        """``certora.check(name, key=value, ..., cwd=...)``: run the policy's evaluator for
+        *name*; falling through (success) establishes the declared atoms on the bare-Name
+        arguments, for the statements after it. The shape mirrors ``certora.exec``: no splats, a
+        literal name, keywords fixed by the policy's declaration, cwd a sink like exec's."""
+        if any(isinstance(a, ast.Starred) for a in node.args) or any(k.arg is None for k in node.keywords):
+            self._violation(node, "check: *args / **kwargs are not admissible; spell the arguments out")
+            return
+        keywords = {k.arg: k.value for k in node.keywords if k.arg is not None}
+        if len(node.args) != 1:
+            self._violation(node, "check: exactly one positional argument, the validation name")
+            return
+        match interpret_expr(node.args[0], self.state):
+            case StrFact(regex=Exact(exact_str=name)):
+                pass
+            case _:
+                name = "?"
+                self._violation(
+                    node.args[0],
+                    "check: the validation name must be a string literal (or a name bound to one)",
+                )
+        signature = self.vocabulary.signatures.get(name)
+        if signature is None and name != "?":
+            self._violation(node, f"check: the policy declares no validation named {name!r}")
+        cwd_expr = keywords.get("cwd")
+        if cwd_expr is None:
+            self._violation(node, "check: cwd= is required")
+        if signature is not None:
+            expected, given = frozenset(signature.params), frozenset(keywords) - {"cwd"}
+            for missing in sorted(expected - given):
+                self._violation(node, f"check: {missing}= is required by validation {name!r}")
+            for extra in sorted(given - expected):
+                self._violation(node, f"check: keyword {extra!r} is not part of validation {name!r}")
+        self.sinks.append(
+            CheckSite(
+                node,
+                name,
+                {k: operand_value(v, self.state) for k, v in keywords.items() if k != "cwd"},
+                None if cwd_expr is None else _at_sink(interpret_expr(cwd_expr, self.state)),
+            )
+        )
+        # the evaluator is a subprocess like any other call: unless the policy declared it
+        # effect-free, it kills every environment check first ...
+        if signature is None or not signature.effect_free:
+            self.state = _without_env_checks(self.state, self.vocabulary.pure_atoms)
+        if signature is None:
+            return
+        # ... and its success -- the only way past this statement -- establishes the atoms, on
+        # arguments that are bare names: a fact needs a variable to live on. Anything else is
+        # dropped, soundly; checks only ever enable.
+        for target, atoms in signature.establishes.items():
+            expr = cwd_expr if target == "cwd" else keywords.get(target)
+            if isinstance(expr, ast.Name):
+                fact = self.state.get(expr.id)
+                if fact is not None:
+                    self.state[expr.id] = replace(fact, checks=fact.checks | atoms)
 
     def _audit_exec(self, node: ast.Call) -> None:
         """``certora.exec(program, *args, cwd=...)``: the shape is checked here (violations), the
@@ -485,6 +705,10 @@ class ValidationWalker(ast.NodeVisitor):
         # A ``for`` header rebinds its target on every iteration, so *bindings* is applied after the
         # kill and holds at every iteration start.
         killed = _kill(self.state, _assigned_names([node]))
+        if self._may_effect([node]):
+            # some iteration (or the header itself) runs an effectful call: no environment check
+            # survives an iteration boundary, so none enters the body and none survives the loop
+            killed = _without_env_checks(killed, self.vocabulary.pure_atoms)
         with self.state_snapshot():
             entry = killed if test is None else self._refine(killed, test)
             self.state = {**entry, **(bindings or {})}
@@ -539,6 +763,9 @@ class ValidationWalker(ast.NodeVisitor):
         # a manager that may swallow an exception makes the body a ``try`` with a catch-all
         # handler that falls through: whatever the body established may not have happened
         escaped = _kill(self.state, _assigned_names([node]))
+        if self._may_effect([node]):
+            # the body may have called before the escape
+            escaped = _without_env_checks(escaped, self.vocabulary.pure_atoms)
         with self.state_snapshot():
             bind_and_walk()
             body_end = self.state
@@ -553,6 +780,9 @@ class ValidationWalker(ast.NodeVisitor):
             # loses whatever the others assign
             killed_by += [s for h in node.handlers for s in h.body]
         handler_entry = _kill(self.state, _assigned_names(killed_by))
+        if self._may_effect(killed_by):
+            # the body may have called before raising
+            handler_entry = _without_env_checks(handler_entry, self.vocabulary.pure_atoms)
         ends: list[State] = []
         with self.state_snapshot():
             self._block(node.body)
@@ -647,7 +877,14 @@ class ValidationWalker(ast.NodeVisitor):
             if extra is not None:
                 local.add(extra.arg)
         local |= _assigned_names(node.body)
-        seed: State = {k: v for k, v in self.module_constants.items() if k not in local}
+        # a constant's location (and any pure atom: the value is immutable) holds everywhere; an
+        # environment check is anchored to a program point and does not survive into an arbitrary
+        # call of the function
+        seed: State = {
+            k: drop_checks(v, keep=self.vocabulary.pure_atoms)
+            for k, v in self.module_constants.items()
+            if k not in local
+        }
         seed.update(rely)
         guarantee = None if contract is None else contract.returns
         outer = self._guarantee
@@ -668,7 +905,9 @@ class ValidationWalker(ast.NodeVisitor):
         guarantee = self._guarantee
         if guarantee is None or is_plain_type(guarantee):
             return  # a plain return type is the type checker's business
-        if node.value is None or not entails(operand_value(node.value, self.state), guarantee):
+        if node.value is None or not self._establishes(
+            operand_value(node.value, self.state), guarantee
+        ):
             self._violation(node, f"return does not establish the guarantee {_describe_value(guarantee)}")
 
     def visit_ClassDef(self, node: ast.ClassDef) -> Any:
@@ -688,8 +927,18 @@ class ValidationWalker(ast.NodeVisitor):
 # ---------------------------------------------------------------------------
 
 
-def analyze(source: str, filename: str = "<program>") -> Report:
-    """Run the whole pipeline over *source*. Raises ``SyntaxError`` for unparsable input."""
+def analyze(
+    source: str,
+    filename: str = "<program>",
+    vocabulary: Vocabulary | None = None,
+    discharge: Callable[[str, str], bool] | None = None,
+) -> Report:
+    """Run the whole pipeline over *source*. Raises ``SyntaxError`` for unparsable input.
+
+    *vocabulary* is the policy's validation vocabulary (``Policy.vocabulary``); without it every
+    ``certora.check`` is a violation, since no validation is declared. *discharge*
+    (``Policy.discharger``) lets the walker run literal checkers while discharging relies and
+    guarantees; without it only regex-defined atoms are established on known text."""
     tree = ast.parse(source, filename)
 
     imports = ImportAnalysis()
@@ -724,7 +973,7 @@ def analyze(source: str, filename: str = "<program>") -> Report:
     if lexical.violations:
         return Report(violations=list(lexical.violations))
 
-    walker = ValidationWalker(imports.imports, functions.contracts)
+    walker = ValidationWalker(imports.imports, functions.contracts, vocabulary, discharge)
     try:
         walker.visit(tree)
     except InvalidProgram as e:
@@ -740,19 +989,27 @@ def where(filename: str, node: ast.AST) -> str:
     return f"{filename}:{line}" if col is None else f"{filename}:{line}:{col + 1}"
 
 
+def _checks_suffix(checks: frozenset[str]) -> str:
+    return f" (validated: {', '.join(sorted(checks))})" if checks else ""
+
+
 def _describe_value(v: str | ValidationFact | None) -> str:
     match v:
         case None:
             return "unknown"
         case str():
             return repr(v)
-        case Located(location=loc, repr=rp):
-            return f"{rp} at {pretty_location(loc)}"
-        case StrFact(regex=regex, atoms=atoms):
+        case Located(location=loc, repr=rp, checks=checks):
+            return f"{rp} at {pretty_location(loc)}" + _checks_suffix(checks)
+        case StrFact(regex=regex, atoms=atoms, checks=checks):
             text = "text" if regex == ANY_STR else f"text matching {pretty_regex(regex)}"
-            return text + (f" [{', '.join(sorted(atoms))}]" if atoms else "")
-        case PathFact(atoms=atoms):
-            return "path of unknown location" + (f" [{', '.join(sorted(atoms))}]" if atoms else "")
+            return text + (f" [{', '.join(sorted(atoms))}]" if atoms else "") + _checks_suffix(checks)
+        case PathFact(atoms=atoms, checks=checks):
+            return (
+                "path of unknown location"
+                + (f" [{', '.join(sorted(atoms))}]" if atoms else "")
+                + _checks_suffix(checks)
+            )
 
 
 def describe_sink(site: Site) -> str:
@@ -765,6 +1022,9 @@ def describe_sink(site: Site) -> str:
             return "the path is read as text; it is not confined"
         case ExecSite(arguments=arguments, cwd=cwd):
             args = ", ".join(_describe_value(a) for a in arguments) or "none"
+            return f"cwd {_describe_value(cwd)}; arguments: {args}"
+        case CheckSite(arguments=arguments, cwd=cwd):
+            args = ", ".join(f"{k}={_describe_value(v)}" for k, v in sorted(arguments.items())) or "none"
             return f"cwd {_describe_value(cwd)}; arguments: {args}"
 
 

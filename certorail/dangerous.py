@@ -206,8 +206,6 @@ DANGEROUS_MEMBERS: dict[tuple[str, ...], frozenset[str]] = {
 
     # ---- filesystem beyond the open() guard ----
     ("io",): frozenset({"open", "FileIO", "open_code"}),
-    # ("pathlib",): frozenset({"Path", "PosixPath", "WindowsPath",
-    #                       "PurePath", "PurePosixPath", "PureWindowsPath"}),
     ("shutil",): frozenset({
         "rmtree", "copy", "copy2", "copyfile", "copytree", "move",
         "which", "make_archive", "unpack_archive", "chown", "disk_usage",
@@ -249,7 +247,6 @@ DANGEROUS_MEMBERS: dict[tuple[str, ...], frozenset[str]] = {
         "SetValueEx", "DeleteKey", "DeleteValue", "QueryValue",
         "QueryValueEx", "ConnectRegistry", "SaveKey", "LoadKey",
     }),
-    ("typing",): frozenset({"cast"}),
     ("zoneinfo",): frozenset({"reset_tzpath"}),
     ("uuid",): frozenset({"_get_command_stdout"})
 }
@@ -363,6 +360,30 @@ PATH_SINK_METHODS: dict[str, AccessKind] = {
 EXEC_CALLEE: tuple[str, ...] = (NAMESPACE, "exec")
 EXEC_ALLOWED_KEYWORDS: frozenset[str] = frozenset({"cwd"})
 EXEC_REQUIRED_KEYWORDS: frozenset[str] = frozenset({"cwd"})
+
+# certora.check(name, key=value, ..., cwd=...) runs a policy-declared runtime validation (a
+# subprocess evaluator); its success establishes the validation's atoms on the argument
+# variables. Statically (walker): statement form only, a literal name, keywords fixed by the
+# policy's declaration, cwd a sink like exec's.
+CHECK_CALLEE: tuple[str, ...] = (NAMESPACE, "check")
+
+# The crude validation-kill (walker): ANY call may run program code with effects -- a module
+# function, a lambda held in a variable, a class instantiation, a subprocess -- so every call
+# kills every live validation check, EXCEPT the enumerated effect-free path/text operations
+# below (plus the whole allowlisted ``os.path`` surface, and read/list pathlib methods on a
+# proven path receiver, both special-cased in the walker). Extending this set widens what a
+# check survives; keep everything here incapable of reaching program code or the filesystem.
+# NB: callback-taking builtins (sorted with key=, map, filter) stay OUT: a stored lambda invoked
+# through them runs program code at call time, past the definition-point audit.
+NON_KILLING_CALLEES: frozenset[tuple[str, ...]] = frozenset({
+    ("str",), ("repr",), ("len",), ("print",), ("format",),
+    ("int",), ("float",), ("bool",), ("isinstance",),
+    ("os", "fspath"),
+    ("pathlib", "Path"), ("pathlib", "PurePath"),
+    ("pathlib", "PosixPath"), ("pathlib", "PurePosixPath"),
+    ("re", "fullmatch"), ("re", "match"), ("re", "search"), ("re", "compile"),
+    ("json", "dumps"), ("json", "loads"),
+})
 
 
 # ---------------------------------------------------------------------------
