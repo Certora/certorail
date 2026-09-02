@@ -390,6 +390,54 @@ class TestSubcommands(unittest.TestCase):
         )
 
 
+# a cwd-free validation: not-force-check is a pure text predicate, so it declares no cwd --
+# callers omit cwd=, no location is proven, and the policy asks nothing of the site
+CWD_FREE_POLICY = Policy.allow(
+    read=[markers.within(".")],
+    write=[markers.within(".")],
+    listing=[markers.within(".")],
+    validations=[
+        validation(
+            "not-force-check",
+            argv=("test", param("value"), "!=", "--force"),
+            params=("value",),
+            establishes={"value": [pure("not-force")]},
+            effect_free=True,
+        )
+    ],
+    programs=[
+        program(
+            "git",
+            subcommand="push origin",
+            cwd=markers.within("repos"),
+            argument_atoms=["not-force"],
+        )
+    ],
+)
+
+
+class TestCwdFreeChecks(unittest.TestCase):
+    def test_check_without_cwd_is_accepted_and_establishes(self) -> None:
+        source = HEADER + (
+            "import sys\n"
+            "branch = sys.argv[1]\n"
+            'certora.check("not-force-check", value=branch)\n'
+            + REPO
+            + 'certora.exec("git", "push", "origin", branch, cwd=repo)\n'
+        )
+        outcome = host_check(source, "<t>", CWD_FREE_POLICY, ROOT)
+        if isinstance(outcome, Rejected):
+            self.fail("\n".join(outcome.describe("<t>")))
+
+    def test_the_vocabulary_marks_cwd_free_checks(self) -> None:
+        self.assertFalse(CWD_FREE_POLICY.vocabulary().signatures["not-force-check"].needs_cwd)
+        self.assertTrue(ORG_POLICY.vocabulary().signatures["org-repo"].needs_cwd)
+
+    def test_a_cwd_free_check_cannot_establish_on_cwd(self) -> None:
+        with self.assertRaises(ValueError):
+            validation("v", argv=("true",), establishes={"cwd": ["atom-1"]})
+
+
 # unknown_arguments=False admits only vouched-for arguments: exactly-known text or a proven
 # path. A computed str is a StrFact, not the None sentinel, and must not slip past the gate.
 STRICT_POLICY = Policy.allow(

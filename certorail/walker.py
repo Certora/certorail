@@ -124,6 +124,9 @@ class CheckSite:
     name: str
     arguments: dict[str, str | ValidationFact | None]
     cwd: ValidationFact | None
+    # from the validation's declaration: False means the check runs anywhere, so the site has
+    # no cwd to prove
+    needs_cwd: bool = True
 
     @property
     def what(self) -> str:
@@ -131,7 +134,7 @@ class CheckSite:
 
     @property
     def confined(self) -> bool:
-        return isinstance(self.cwd, Located)
+        return not self.needs_cwd or isinstance(self.cwd, Located)
 
 
 type Site = SinkSite | ExecSite | CheckSite
@@ -148,6 +151,7 @@ class CheckSignature:
     params: tuple[str, ...]
     establishes: dict[str, frozenset[str]]  # parameter name, or "cwd" -> validation atoms
     effect_free: bool = False  # the evaluator mutates nothing: its own run kills no atoms
+    needs_cwd: bool = True  # False: the check does not care where it runs; cwd= may be omitted
 
 
 @dataclass(frozen=True)
@@ -571,7 +575,8 @@ class ValidationWalker(ast.NodeVisitor):
         if signature is None and name != "?":
             self._violation(node, f"check: the policy declares no validation named {name!r}")
         cwd_expr = keywords.get("cwd")
-        if cwd_expr is None:
+        needs_cwd = signature is None or signature.needs_cwd
+        if cwd_expr is None and needs_cwd:
             self._violation(node, "check: cwd= is required")
         if signature is not None:
             expected, given = frozenset(signature.params), frozenset(keywords) - {"cwd"}
@@ -585,6 +590,7 @@ class ValidationWalker(ast.NodeVisitor):
                 name,
                 {k: operand_value(v, self.state) for k, v in keywords.items() if k != "cwd"},
                 None if cwd_expr is None else _at_sink(interpret_expr(cwd_expr, self.state)),
+                needs_cwd,
             )
         )
         # the evaluator is a subprocess like any other call: unless the policy declared it

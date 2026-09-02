@@ -60,12 +60,14 @@ class CheckFailed(Exception):
 _VALIDATIONS: dict[str, dict[str, Any]] = {}
 
 
-def check(name: str, *, cwd: pathlib.Path | str, **params: str) -> None:
+def check(name: str, *, cwd: pathlib.Path | str | None = None, **params: str) -> None:
     """Run the policy-declared evaluator for *name*; raise ``CheckFailed`` unless it exits 0.
 
     The runtime half of ``certora.check``. The static half (``walker``) additionally requires the
     statement form, a literal name, keywords matching the validation's declared parameters, and a
-    proven ``cwd`` -- and is what turns falling through this call into facts.
+    proven ``cwd`` (unless the validation declares no cwd, in which case it may be omitted and
+    the evaluator runs at the sandbox root) -- and is what turns falling through this call into
+    facts.
     """
     spec = _VALIDATIONS.get(name)
     if spec is None:

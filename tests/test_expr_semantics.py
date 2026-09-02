@@ -37,6 +37,7 @@ from certorail.analysis import (
     StrFact,
     ValidationFact,
     interpret_expr,
+    iteration_bindings,
 )
 
 type State = dict[str, ValidationFact]
@@ -101,15 +102,21 @@ class TestPathFromLiteral(unittest.TestCase):
             with self.subTest(src=src):
                 self.assertEqual(evaluate(src), path_of(loc))
 
+    def test_absolute_literal_becomes_an_absolute_static_path(self) -> None:
+        self.assertEqual(
+            evaluate('pathlib.Path("/etc/passwd")'),
+            path_of(StaticPath((Named("etc"), Named("passwd")), absolute=True)),
+        )
+        self.assertEqual(evaluate('pathlib.Path("/")'), path_of(StaticPath((), absolute=True)))
+
     def test_unsafe_literal_is_a_path_of_unknown_location(self) -> None:
         # the location is not provable, but the value is still a path: the type survives
         cases = [
-            'pathlib.Path("/etc/passwd")',
-            'pathlib.Path("/")',
             'pathlib.Path("..")',
             'pathlib.Path("../a")',
             'pathlib.Path("a/../b")',
             'pathlib.Path("a/..")',
+            'pathlib.Path("/a/../b")',
         ]
         for src in cases:
             with self.subTest(src=src):
@@ -137,6 +144,30 @@ class TestPathFromName(unittest.TestCase):
 
     def test_unbound_name_is_a_path_of_unknown_location(self) -> None:
         self.assertEqual(evaluate("pathlib.Path(q)", {"p": BASE}), PathFact())
+
+
+class TestSysArgv(unittest.TestCase):
+    """Reads of ``sys.argv`` are strs of unknown text -- ``StrFact()``, never ``None`` -- so
+    guards and checks can refine them."""
+
+    def test_an_indexed_argument_is_a_string(self) -> None:
+        self.assertEqual(evaluate("sys.argv[1]"), StrFact())
+
+    def test_a_slice_is_not_a_scalar(self) -> None:
+        self.assertIsNone(evaluate("sys.argv[1:]"))
+
+    def test_iterating_argv_yields_strings(self) -> None:
+        for src in (
+            "for a in sys.argv:\n    pass",
+            "for a in sys.argv[1:]:\n    pass",
+            "for a in sorted(sys.argv[1:]):\n    pass",
+        ):
+            with self.subTest(src=src):
+                stmt = ast.parse(src).body[0]
+                assert isinstance(stmt, ast.For)
+                self.assertEqual(
+                    iteration_bindings(stmt.target, stmt.iter, {}), {"a": StrFact()}
+                )
 
 
 class TestPathFromMultipleArgs(unittest.TestCase):

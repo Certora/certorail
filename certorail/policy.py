@@ -59,6 +59,7 @@ from .analysis import (
     PseudoRegex,
     RegexLit,
     StaticPath,
+    _literal_location,
     _safe_path_extension,
     alternation,
     checks_of,
@@ -108,30 +109,47 @@ def _components_of(fragment: markers.Fragment) -> tuple[Component, ...]:
             return (Matching(_regex_of(fragment)),)
 
 
+def _absolute_prefix(s: str) -> StaticPath:
+    """A leading-"/" literal as an absolute location."""
+    loc = _literal_location(s)
+    if loc is None:
+        raise ValueError(f"absolute path {s!r} must be free of '..'")
+    return loc
+
+
 def location_of(where: Where) -> LocationFact:
-    """``within(...)``/``exactly(...)``/a literal path as a location; ``"."`` is the root. A
-    LocationFact passes through: the data-policy loader (``policyfile``) hands those in."""
+    """``within(...)``/``exactly(...)``/a literal path as a location; ``"."`` is the root, and a
+    leading "/" anchors the location at the filesystem root instead (the two anchors never
+    relate -- see ``location_le``). A LocationFact passes through: the data-policy loader
+    (``policyfile``) hands those in."""
     match where:
         case StaticPath() | DirSplat():
             return where
         case str():
             if where in (".", ""):
                 return StaticPath(())
+            if where.startswith("/"):
+                return _absolute_prefix(where)
             return StaticPath(_components_of(where))
         case markers.Exactly(components=components):
             if not components:
                 raise ValueError("exactly() needs at least one component")
             return StaticPath(tuple(c for f in components for c in _components_of(f)))
         case markers.Within(prefix=prefix, leaf=leaf):
-            prefix_components: tuple[Component, ...] = (
-                () if prefix in (".", "") else _components_of(prefix)
-            )
+            absolute = False
+            if prefix in (".", ""):
+                prefix_components: tuple[Component, ...] = ()
+            elif isinstance(prefix, str) and prefix.startswith("/"):
+                base = _absolute_prefix(prefix)
+                prefix_components, absolute = base.path_components, True
+            else:
+                prefix_components = _components_of(prefix)
             if leaf is None:
-                return DirSplat(prefix_components, ANY_NAME)
+                return DirSplat(prefix_components, ANY_NAME, absolute)
             leaf_components = _components_of(leaf)
             if len(leaf_components) != 1:
                 raise ValueError("within(leaf=...) must be a single component")
-            return DirSplat(prefix_components, leaf_components[0])
+            return DirSplat(prefix_components, leaf_components[0], absolute)
 
 
 def _locations(wheres: Iterable[Where]) -> tuple[LocationFact, ...]:
@@ -196,7 +214,9 @@ class Validation:
     name: str
     params: tuple[str, ...]
     argv: tuple[str | Param, ...]
-    cwd: LocationFact
+    # None: the check does not care where it runs -- callers may omit cwd=, and no location
+    # is required or proven. Such a check cannot establish atoms on cwd.
+    cwd: LocationFact | None
     establishes: dict[str, frozenset[str]]  # param name or CWD -> atoms
     pure_atoms: frozenset[str] = frozenset()  # the established atoms wrapped in pure()
     effect_free: bool = False  # the evaluator mutates nothing: its run kills no atoms
@@ -206,7 +226,7 @@ def validation(
     name: str,
     *,
     argv: Iterable[str | Param],
-    cwd: Where,
+    cwd: Where | None = None,
     params: Iterable[str] = (),
     establishes: Mapping[str, Iterable[str | Pure]],
     effect_free: bool = False,
@@ -243,7 +263,15 @@ def validation(
         raise ValueError(
             f"validation {name!r}: atoms declared both pure and environmental: {sorted(pure_set & env_set)}"
         )
-    return Validation(name, params_t, argv_t, location_of(cwd), est, frozenset(pure_set), effect_free)
+    if cwd is None and CWD in est:
+        raise ValueError(
+            f"validation {name!r}: a check that does not care about its cwd cannot establish "
+            "atoms on cwd"
+        )
+    return Validation(
+        name, params_t, argv_t, None if cwd is None else location_of(cwd), est,
+        frozenset(pure_set), effect_free,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +324,59 @@ def program(
         frozenset(requires),
         words,
         frozenset(argument_atoms),
+    )
+
+
+@dataclass(frozen=True)
+class NetworkRule:
+    """A permitted ``certora.network`` destination, enforced by the broker (``broker.py``) on
+    every request and on every redirect hop. Deny by default: a URL matching no rule is
+    refused. The exec'd-program analog is coarse by design (a ``program()`` grant folds in
+    whatever network that program needs); these rules govern only the confined program's own
+    requests, which all pass through the broker."""
+
+    # exact name, or "*.suffix" (matches subdomains, not the suffix itself)
+    host: str
+    schemes: frozenset[str] = frozenset({"https"})
+    # empty means the scheme's default port only
+    ports: frozenset[int] = frozenset()
+    # empty means any method; name methods to tighten ("GET": reads only)
+    methods: frozenset[str] = frozenset()
+    # permit destinations that are (or resolve to) loopback/private/link-local addresses
+    allow_nonpublic: bool = False
+    # per-destination overrides of the broker's global caps (None: the broker default), so one
+    # slow API can get a long leash without loosening the rest of the allowlist
+    read_timeout: float | None = None
+    total_timeout: float | None = None
+    max_response_bytes: int | None = None
+
+
+def network(
+    host: str,
+    *,
+    schemes: Iterable[str] = ("https",),
+    ports: Iterable[int] = (),
+    methods: Iterable[str] = (),
+    allow_nonpublic: bool = False,
+    read_timeout: float | None = None,
+    total_timeout: float | None = None,
+    max_response_bytes: int | None = None,
+) -> NetworkRule:
+    normalized = host.lower().rstrip(".")
+    if not normalized:
+        raise ValueError("network rule needs a host")
+    schemes_f = frozenset(s.lower() for s in schemes)
+    if not schemes_f or not schemes_f <= {"http", "https"}:
+        raise ValueError(f"network rule {host!r}: schemes must be among http, https")
+    return NetworkRule(
+        normalized,
+        schemes_f,
+        frozenset(int(p) for p in ports),
+        frozenset(m.upper() for m in methods),
+        allow_nonpublic,
+        None if read_timeout is None else float(read_timeout),
+        None if total_timeout is None else float(total_timeout),
+        None if max_response_bytes is None else int(max_response_bytes),
     )
 
 
@@ -353,6 +434,7 @@ class Policy:
     programs: tuple[Program, ...] = ()
     validations: tuple[Validation, ...] = ()
     atoms: tuple[AtomDef, ...] = ()
+    network: tuple[NetworkRule, ...] = ()
 
     @classmethod
     def allow(
@@ -364,6 +446,7 @@ class Policy:
         programs: Iterable[Program] = (),
         validations: Iterable[Validation] = (),
         atoms: Iterable[AtomDef] = (),
+        network: Iterable[NetworkRule] = (),
     ) -> "Policy":
         vals = tuple(validations)
         names = [v.name for v in vals]
@@ -400,13 +483,19 @@ class Policy:
         }
         if conflicted:
             raise ValueError(f"atoms declared both pure and environmental: {sorted(conflicted)}")
-        return cls(_locations(read), _locations(write), _locations(listing), progs, vals, atoms_t)
+        return cls(
+            _locations(read), _locations(write), _locations(listing), progs, vals, atoms_t,
+            tuple(network),
+        )
 
     def vocabulary(self) -> Vocabulary:
         """The analysis-side half of the validations and defined atoms, for ``analyze``."""
         return Vocabulary(
             signatures={
-                v.name: CheckSignature(v.name, v.params, dict(v.establishes), v.effect_free)
+                v.name: CheckSignature(
+                    v.name, v.params, dict(v.establishes), v.effect_free,
+                    needs_cwd=v.cwd is not None,
+                )
                 for v in self.validations
             },
             pure_atoms=frozenset(a for v in self.validations for a in v.pure_atoms)
@@ -487,6 +576,8 @@ class Policy:
                 declared = next((v for v in self.validations if v.name == name), None)
                 if declared is None:
                     return [Denial(site, f"validation {name!r} is not declared by the policy")]
+                if declared.cwd is None:
+                    return []  # the check declared no interest in where it runs
                 if not isinstance(cwd, Located):
                     return [Denial(site, "the cwd is not proven")]
                 if not location_le(cwd.location, declared.cwd):

@@ -362,49 +362,66 @@ ANY_NAME = AnyName()
 
 @dataclass(frozen=True)
 class StaticPath:
+    """``absolute`` anchors the components at the filesystem root instead of the sandbox root.
+    The two anchors never relate: no relative location lies within an absolute one or vice versa
+    (``location_le``), even when the sandbox root happens to sit under the absolute prefix."""
     path_components: tuple[Component, ...]
+    absolute: bool = False
 
     @property
     def final_component(self) -> Component:
         return self.path_components[-1]
 
     def merge_other(self, other: "LocationFact") -> "LocationFact":
+        if other.absolute:
+            return other  # joining onto an absolute path discards the left side (pathlib)
         if isinstance(other, StaticPath):
-            return StaticPath(self.path_components + other.path_components)
+            return StaticPath(self.path_components + other.path_components, self.absolute)
         else:
-            return DirSplat(self.path_components + other.static_prefix, other.final_component)
+            return DirSplat(
+                self.path_components + other.static_prefix, other.final_component, self.absolute
+            )
 
     def extend_static(self, other: tuple[str, ...]) -> "StaticPath":
-        return StaticPath(self.path_components + tuple(Named(i) for i in other))
+        return StaticPath(self.path_components + tuple(Named(i) for i in other), self.absolute)
 
     def extend_single(self, other: Component) -> "StaticPath":
-        return StaticPath(self.path_components + (other,))
+        return StaticPath(self.path_components + (other,), self.absolute)
 
     def to_splat(self, final_component: Component) -> "DirSplat":
-        return DirSplat(self.path_components, final_component)
+        return DirSplat(self.path_components, final_component, self.absolute)
 
 @dataclass(frozen=True)
 class DirSplat:
     static_prefix: tuple[Component, ...]
     final_component: Component
+    absolute: bool = False
 
-    def merge_other(self, other: "LocationFact") -> "DirSplat":
-        return DirSplat(static_prefix=self.static_prefix, final_component=other.final_component)
+    def merge_other(self, other: "LocationFact") -> "LocationFact":
+        if other.absolute:
+            return other  # joining onto an absolute path discards the left side (pathlib)
+        return DirSplat(
+            static_prefix=self.static_prefix,
+            final_component=other.final_component,
+            absolute=self.absolute,
+        )
 
     def extend_static(self, ext: tuple[str, ...]) -> "DirSplat":
         return DirSplat(
             static_prefix=self.static_prefix,
-            final_component=Named(ext[-1])
+            final_component=Named(ext[-1]),
+            absolute=self.absolute,
         )
 
     def extend_single(self, other: Component) -> "DirSplat":
         return DirSplat(
             self.static_prefix,
-            other
+            other,
+            self.absolute
         )
 
     def to_splat(self, final_component: Component) -> "DirSplat":
-        return DirSplat(self.static_prefix, final_component)
+        return DirSplat(self.static_prefix, final_component, self.absolute)
 
 
 type LocationFact = StaticPath | DirSplat
@@ -497,17 +514,25 @@ def location_to_regex(loc: LocationFact) -> PseudoRegex:
     Exact except where a ``Matching`` component is rendered (see ``component_to_regex``).
     """
     match loc:
-        case StaticPath(path_components=()):
-            return ROOT
-        case StaticPath(path_components=components):
-            return _joined(components)
-        case DirSplat(static_prefix=prefix, final_component=final):
+        case StaticPath(path_components=(), absolute=ab):
+            return SLASH if ab else ROOT
+        case StaticPath(path_components=components, absolute=ab):
+            joined = _joined(components)
+            return concat(SLASH, joined) if ab else joined
+        case DirSplat(static_prefix=prefix, final_component=final, absolute=ab):
             head: list[PseudoRegex] = [_joined(prefix), SLASH] if prefix else []
+            if ab:
+                head = [SLASH, *head]
             below = concat(*head, DESCENDANTS, component_to_regex(final))
             if final != ANY_NAME:
                 return below
             # an unconstrained leaf means "at or below": the prefix itself is denoted too
-            return alternation(_joined(prefix) if prefix else ROOT, below)
+            self_spelling = (
+                (concat(SLASH, _joined(prefix)) if ab else _joined(prefix))
+                if prefix
+                else (SLASH if ab else ROOT)
+            )
+            return alternation(self_spelling, below)
 
 
 def pretty_regex(p: PseudoRegex) -> str:
@@ -540,23 +565,23 @@ def pretty_component(c: Component) -> str:
 def pretty_location(loc: LocationFact) -> str:
     """A glob-like spelling for reports: ``repos/*/foundry.toml``, ``data/**/<.*\\.txt>``, ``.``."""
     match loc:
-        case StaticPath(path_components=()):
-            return "."
-        case StaticPath(path_components=cs):
-            return "/".join(pretty_component(c) for c in cs)
-        case DirSplat(static_prefix=ps, final_component=leaf):
+        case StaticPath(path_components=(), absolute=ab):
+            return "/" if ab else "."
+        case StaticPath(path_components=cs, absolute=ab):
+            return ("/" if ab else "") + "/".join(pretty_component(c) for c in cs)
+        case DirSplat(static_prefix=ps, final_component=leaf, absolute=ab):
             prefix = "/".join(pretty_component(c) for c in ps)
             tail = "**" if leaf == ANY_NAME else f"**/{pretty_component(leaf)}"
-            return f"{prefix}/{tail}" if prefix else tail
+            return ("/" if ab else "") + (f"{prefix}/{tail}" if prefix else tail)
 
 
 def splat_under(loc: LocationFact) -> DirSplat:
     """The location "somewhere at or below *loc*"."""
     match loc:
-        case StaticPath(path_components=components):
-            return DirSplat(components, ANY_NAME)
-        case DirSplat(static_prefix=prefix):
-            return DirSplat(prefix, ANY_NAME)
+        case StaticPath(path_components=components, absolute=ab):
+            return DirSplat(components, ANY_NAME, ab)
+        case DirSplat(static_prefix=prefix, absolute=ab):
+            return DirSplat(prefix, ANY_NAME, ab)
 
 
 # ---------------------------------------------------------------------------
@@ -815,10 +840,11 @@ def known_text(value: "str | ValidationFact | None") -> str | None:
             return value
         case StrFact(regex=Exact(exact_str=s)):
             return s
-        case Located(location=StaticPath(path_components=cs)) if all(
+        case Located(location=StaticPath(path_components=cs, absolute=ab)) if all(
             isinstance(c, Named) for c in cs
         ):
-            return "/".join(c.name for c in cs if isinstance(c, Named)) or "."
+            joined = "/".join(c.name for c in cs if isinstance(c, Named))
+            return "/" + joined if ab else joined or "."
         case _:
             return None
 
@@ -888,7 +914,13 @@ def as_component(fact: StrFact | PathFact) -> Component | None:
             return Matching(regex)
 
 def _literal_location(s: str) -> StaticPath | None:
-    if not pathlib.PurePath(s).parts:
+    as_path = pathlib.PurePath(s)
+    if as_path.is_absolute():
+        rest = as_path.parts[1:]  # parts[0] is the "/" anchor
+        if any(p == ".." for p in rest):
+            return None
+        return StaticPath(tuple(Named(p) for p in rest), absolute=True)
+    if not as_path.parts:
         return StaticPath(())  # "", ".", "./": the current directory, i.e. the sandbox root
     parts = _safe_path_extension(s)
     return None if parts is None else StaticPath(tuple(Named(p) for p in parts))
@@ -896,10 +928,10 @@ def _literal_location(s: str) -> StaticPath | None:
 def locate(fact: ValidationFact | None) -> Located | None:
     """The path reading of a value, if it has one.
 
-    A located value is returned as is. A text value is located iff its text is a safe relative
-    path: a known literal is parsed; a single safe component sits directly under the root; a
-    relative string free of ".." is somewhere at or below the root. Anything else has no path
-    reading (yet).
+    A located value is returned as is. A text value is located iff its text is a safe path: a
+    known literal is parsed (an absolute one anchors at the filesystem root); a single safe
+    component sits directly under the root; a relative string free of ".." is somewhere at or
+    below the root. Anything else has no path reading (yet).
     """
     match fact:
         case None:
@@ -927,7 +959,11 @@ def containment_of(fact: ValidationFact | None) -> LocationFact | None:
 # Conservative throughout -- False means "not shown", never "disjoint".
 
 def location_le(actual: LocationFact, required: LocationFact) -> bool:
-    """Is every path *actual* may denote one that *required* denotes?"""
+    """Is every path *actual* may denote one that *required* denotes? Anchors never relate: a
+    relative (sandbox-root) location is not within an absolute one or vice versa, even when the
+    sandbox root happens to lie under the absolute prefix."""
+    if actual.absolute != required.absolute:
+        return False
     match actual, required:
         case StaticPath(path_components=cs), StaticPath(path_components=ds):
             return len(cs) == len(ds) and all(subsumes(d, c) for d, c in zip(ds, cs))
@@ -1106,14 +1142,17 @@ class _Spelling:
         return None
 
     def located(self, loc: LocationFact) -> "_Spelling":
-        """Replay the spelling of a located value."""
+        """Replay the spelling of a located value. An absolute location spells a leading "/":
+        at the start of the text that anchors the result, anywhere else it is just a separator
+        (the concatenated *string* stays whatever the text says)."""
+        state: _Spelling = self.sep() if loc.absolute else self
         match loc:
-            case StaticPath(path_components=()):
-                return self.chunk(".")  # the root, as PurePath spells it
+            case StaticPath(path_components=(), absolute=ab):
+                return state if ab else state.chunk(".")  # "/", or the root as PurePath spells it
             case StaticPath(path_components=cs):
-                return self._components(cs)
+                return state._components(cs)
             case DirSplat(static_prefix=ps, final_component=leaf):
-                state = self._components(ps).sep() if ps else self
+                state = state._components(ps).sep() if ps else state
                 return state.splat().sep().chunk(_component_token(leaf))
 
     def _components(self, cs: Sequence[Component]) -> "_Spelling":
@@ -1152,7 +1191,7 @@ class _Start(_Spelling):
         return _Open(None, (c,))
 
     def sep(self) -> _Spelling:
-        return _DEAD  # a leading "/": absolute
+        return _Boundary(StaticPath((), absolute=True))  # a leading "/": absolute
 
     def splat(self) -> _Spelling:
         return _Boundary(DirSplat((), ANY_NAME))
@@ -1310,6 +1349,16 @@ class CurriedMonad[M, R]:
     def __call__(self, arg: OptionMonad[M]) -> OptionMonad[R]:
         return self.staged(arg)
 
+def _argv_read(e: ast.expr) -> bool:
+    """``sys.argv``, or a subscript of it: a source of strs of unknown text. (The type is the
+    whole fact -- a ``StrFact()`` instead of ``None`` is what lets guards and checks refine an
+    argument-vector value at all.)"""
+    if isinstance(e, ast.Subscript):
+        e = e.value
+    access = resolve_callee(e)
+    return access is not None and access.matches("sys", "argv")
+
+
 def operand_value(e: ast.expr, st: dict[str, ValidationFact]) -> str | ValidationFact | None:
     """An operand as the joins see it: a string literal stays a literal (so a multi-component
     literal can be split into components); anything else is interpreted."""
@@ -1406,6 +1455,10 @@ def interpret_expr(e: ast.expr, st: dict[str, ValidationFact]) -> ValidationFact
             return join_text(values)
         case ast.JoinedStr():
             return join_text(_fstring_pieces(e, st))
+        case ast.Subscript(value=value, slice=index) if _argv_read(value):
+            # an element of sys.argv is a str of unknown text; a slice is a list of them --
+            # no scalar fact, but the iteration transfer knows its elements
+            return None if isinstance(index, ast.Slice) else StrFact()
         case _:
             return None
 
@@ -1473,6 +1526,9 @@ def element_fact(iterable: ast.expr, st: dict[str, ValidationFact]) -> Validatio
             and callee.matches("os", "listdir")
         ):
             return _LISTED_NAME  # bare names, whatever the directory
+        case _ if _argv_read(iterable):
+            # sys.argv or a slice of it: command-line arguments, strs of unknown text
+            return StrFact()
         case _:
             return None
 
@@ -1534,6 +1590,8 @@ def join_loc(
     left: LocationFact,
     right: LocationFact
 ) -> LocationFact | None:
+    if left.absolute != right.absolute:
+        return None  # anchors never relate: there is no location covering both
     match left, right:
         case (DirSplat(static_prefix=dir_prefix) as splat, StaticPath(path_components=known_path) as _static) | \
              (StaticPath(path_components=known_path) as _static, DirSplat(static_prefix=dir_prefix) as splat):
@@ -1550,16 +1608,19 @@ def join_loc(
                 paths = tuple(join_component(
                     c1, c2
                 ) for (c1, c2) in zip(p1, p2))
-                return StaticPath(paths)
+                return StaticPath(paths, left.absolute)
             last_comps = join_component(p1[-1], p2[-1])
             static_prefix = tuple(join_component(
                 c1, c2
             ) for (c1, c2) in zip(p1[:-1], p2[:-1]))
-            return DirSplat(static_prefix=static_prefix, final_component=last_comps)
+            return DirSplat(
+                static_prefix=static_prefix, final_component=last_comps, absolute=left.absolute
+            )
         case DirSplat(static_prefix=p1, final_component=c1), DirSplat(static_prefix=p2, final_component=c2):
             return DirSplat(
                 final_component=join_component(c1, c2),
-                static_prefix=tuple(join_component(c1, c2) for (c1, c2) in zip(p1, p2))
+                static_prefix=tuple(join_component(c1, c2) for (c1, c2) in zip(p1, p2)),
+                absolute=left.absolute
             )
 
 def join_regex(

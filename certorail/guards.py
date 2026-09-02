@@ -32,14 +32,13 @@ from .analysis import (
     Exact,
     Located,
     LocationFact,
-    Named,
     PathFact,
     PseudoRegex,
     RegexLit,
     StaticPath,
     StrFact,
     ValidationFact,
-    _safe_path_extension,
+    _literal_location,
     alternation,
     concat,
     interpret_expr,
@@ -286,17 +285,13 @@ def _components_of(t: Term) -> Subject | None:
             return None
 
 
-def _static(parts: tuple[str, ...]) -> StaticPath:
-    return StaticPath(tuple(Named(p) for p in parts))
-
-
 def _location_of(t: Term, st: Mapping[str, ValidationFact]) -> LocationFact | None:
-    """The location an operand names: a literal path, or an expression with a containment fact,
-    looked at through any views (``BASE.resolve()``, ``str(BASE)``, ``os.path.realpath(BASE)``)."""
+    """The location an operand names: a literal path (relative to the sandbox root, or absolute
+    with a leading "/"), or an expression with a containment fact, looked at through any views
+    (``BASE.resolve()``, ``str(BASE)``, ``os.path.realpath(BASE)``)."""
     match t:
         case Const(str() as s):
-            parts = _safe_path_extension(s)
-            return None if parts is None else _static(parts)
+            return _literal_location(s)
         case Method(inner, "resolve", (), ()):
             return _location_of(inner, st)
         case Call(
@@ -320,8 +315,7 @@ def _prefix_location(t: Term, st: Mapping[str, ValidationFact]) -> LocationFact 
         case Const(str() as s):
             if not s.endswith("/"):
                 return None
-            parts = _safe_path_extension(s)  # PurePath drops the trailing slash
-            return None if parts is None else _static(parts)
+            return _literal_location(s)  # PurePath drops the trailing slash
         case BinOp(left, ast.Add, right) if _is_sep(right):
             return _location_of(left, st)
         case _:

@@ -31,9 +31,13 @@ Locations are the compact spelling the reports use (``pretty_location``): compon
 by "/", each a literal name, ``*`` (any one name), ``{a,b}`` (one of), or ``<regex>`` (a
 fullmatch, spelled raw -- the one place this syntax and the reports diverge); a trailing ``**``
 means "at or below", optionally followed by one leaf component (``repos/**/<\\w+\\.tar>``);
-``.`` is the root. Argv pieces are literals, except a whole-token ``${param}``, which
-substitutes the named parameter. Atoms are declared once, centrally: purity and any text meaning
+``.`` is the root. A leading ``/`` anchors the location at the *filesystem* root instead of the
+sandbox root (``/home/john/repos/**``); the two anchors never relate, so an absolute allowance
+says nothing about sandbox-relative paths and vice versa. Argv pieces are literals, except a
+whole-token ``${param}``, which substitutes the named parameter. Atoms are declared once, centrally: purity and any text meaning
 live in ``[atoms]``, and ``establishes``/``requires``/``argument-atoms`` refer to them by name.
+A validation's ``cwd`` is optional: omitted, the check does not care where it runs --
+``certora.check`` may then be called without ``cwd=`` -- and it may not establish atoms on cwd.
 
 The schema is strict and fails closed: unknown keys, undeclared atoms, malformed locations and
 mistyped values are all errors, and all of them are reported, not just the first. One default
@@ -115,15 +119,21 @@ def _parse_component(piece: str) -> Component:
 
 
 def parse_location(text: str) -> LocationFact:
-    """The location a compact spelling names; raises ``ValueError`` for a malformed one."""
+    """The location a compact spelling names; raises ``ValueError`` for a malformed one. A
+    leading "/" anchors the location at the filesystem root instead of the sandbox root."""
     if text in (".", ""):
         return StaticPath(())
+    absolute = text.startswith("/")
+    if absolute:
+        text = text[1:]
+        if not text:
+            return StaticPath((), absolute=True)  # "/": the filesystem root itself
     pieces = _split_components(text)
     if "" in pieces:
         raise ValueError(f"empty path component in {text!r}")
     splat_at = [i for i, p in enumerate(pieces) if p == "**"]
     if not splat_at:
-        return StaticPath(tuple(_parse_component(p) for p in pieces))
+        return StaticPath(tuple(_parse_component(p) for p in pieces), absolute)
     if len(splat_at) > 1 or splat_at[0] < len(pieces) - 2:
         raise ValueError(
             f"'**' may appear once, as the last component or followed by one leaf: {text!r}"
@@ -131,7 +141,7 @@ def parse_location(text: str) -> LocationFact:
     at = splat_at[0]
     prefix = tuple(_parse_component(p) for p in pieces[:at])
     leaf = ANY_NAME if at == len(pieces) - 1 else _parse_component(pieces[at + 1])
-    return DirSplat(prefix, leaf)
+    return DirSplat(prefix, leaf, absolute)
 
 
 _PARAM_REF = re.compile(r"\$\{(\w+)\}")
@@ -303,7 +313,10 @@ def from_data(data: object, where: str = "<policy>") -> Policy:
                 argv.append(_parse_argv_piece(piece))
             except ValueError as e:
                 loader.error(f"{path}.argv", str(e))
-        cwd = loader.location(path, t, "cwd")
+        # cwd is optional: omitted, the check does not care where it runs, and certora.check
+        # may be called without cwd=
+        cwd_given = "cwd" in t
+        cwd = loader.location(path, t, "cwd") if cwd_given else None
         effect_free = loader.field(path, t, "effect-free", bool) or False
         est_table = loader.table(
             f"{path}.establishes", t.get("establishes", {}), frozenset(params) | {"cwd"}
@@ -312,7 +325,7 @@ def from_data(data: object, where: str = "<policy>") -> Policy:
             key: [pure(a) if a in pure_names else a for a in loader.atom_names(f"{path}.establishes", est_table, key, declared_f)]
             for key in est_table.keys() & (frozenset(params) | {"cwd"})
         }
-        if name is None or cwd is None or not argv:
+        if name is None or (cwd_given and cwd is None) or not argv:
             continue
         try:
             validations.append(

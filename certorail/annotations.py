@@ -38,6 +38,7 @@ from .analysis import (
     StaticPath,
     StrFact,
     ValidationFact,
+    _literal_location,
     _safe_path_extension,
     alternation,
     concat,
@@ -228,13 +229,21 @@ def _location_of(t: Term, name: str, args: Args, kwargs: Kwargs) -> LocationFact
         case "within":
             prefix_t, leaf_t = _bind(t, args, kwargs, ("prefix", "leaf"), 1, "within")
             assert prefix_t is not None
-            # "." is the sandbox root: an empty prefix
-            if prefix_t.as_str() in (".", ""):
+            absolute = False
+            prefix_str = prefix_t.as_str()
+            # "." is the sandbox root: an empty prefix; a leading "/" the filesystem root
+            if prefix_str in (".", ""):
                 prefix: tuple[Component, ...] = ()
+            elif prefix_str is not None and prefix_str.startswith("/"):
+                base = _literal_location(prefix_str)
+                if base is None:
+                    raise _err(t, f"absolute path {prefix_str!r} must be free of '..'")
+                prefix = base.path_components
+                absolute = True
             else:
                 prefix = _components_of(prefix_t)
             leaf = ANY_NAME if leaf_t is None else _single_component(leaf_t, "within(leaf=)")
-            return DirSplat(prefix, leaf)
+            return DirSplat(prefix, leaf, absolute)
         case _:
             raise _err(t, f"unknown marker certora.{name}")
 

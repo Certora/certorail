@@ -193,7 +193,8 @@ class TestStrictness(unittest.TestCase):
         self.assertIn("pure by construction", msg)
 
     def test_every_problem_is_reported(self) -> None:
-        msg = self.err('policy-version = 3\n[[program]]\nname = "git"\ncwd = "/abs"\n')
+        # "/abs" is a valid (absolute) location these days; ".." is still malformed
+        msg = self.err('policy-version = 3\n[[program]]\nname = "git"\ncwd = ".."\n')
         self.assertIn("unsupported", msg)
         self.assertIn("cwd", msg)
 
@@ -203,6 +204,26 @@ class TestStrictness(unittest.TestCase):
             p.write_text("policy-version = \n")
             with self.assertRaises(PolicyFileError):
                 load_policy_file(p)
+
+
+class TestCwdFreeValidations(unittest.TestCase):
+    def test_a_validation_without_cwd_is_cwd_free(self) -> None:
+        pol = loads("""
+            policy-version = 1
+
+            [atoms]
+            not-force = { pure = true }
+
+            [[validation]]
+            name        = "not-force-check"
+            params      = ["value"]
+            argv        = ["test", "${value}", "!=", "--force"]
+            effect-free = true
+            establishes = { value = ["not-force"] }
+        """)
+        (v,) = pol.validations
+        self.assertIsNone(v.cwd)
+        self.assertFalse(pol.vocabulary().signatures["not-force-check"].needs_cwd)
 
 
 if __name__ == "__main__":
