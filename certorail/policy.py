@@ -40,14 +40,18 @@ exec's cwd must carry them, live, at the site.
 Evaluation presupposes ``Report.ok``: every site already has a proven location. The policy
 decides whether that location is one the host permits.
 """
+from os import PathLike
 import pathlib
 import subprocess
-from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+import urllib.parse
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, replace
+from typing import Literal
 
 from . import markers
 from .analysis import (
     ANY_NAME,
+    Alternation,
     Component,
     DirSplat,
     Exact,
@@ -70,9 +74,19 @@ from .analysis import (
     location_le,
     pretty_location,
     saturate,
+    url_of,
     ValidationFact
 )
-from .walker import CheckSignature, CheckSite, ExecSite, Report, SinkSite, Site, Vocabulary
+from .walker import (
+    CheckSignature,
+    CheckSite,
+    ExecSite,
+    NetworkSite,
+    Report,
+    SinkSite,
+    Site,
+    Vocabulary,
+)
 
 # ---------------------------------------------------------------------------
 # the marker vocabulary -> the location domain (the runtime-object twin of annotations.py)
@@ -328,6 +342,44 @@ def program(
 
 
 @dataclass(frozen=True)
+class RequiredAtom:
+    """One atom a network rule requires of the URL value, with its treatment at a redirect --
+    a URL the static analysis never saw:
+
+    - ``"recheck"``: re-established from the hop URL's text (a defined atom's regex, or a
+      literal checker); only textually-establishable atoms qualify.
+    - ``"stop"``: the atom cannot vouch for an unseen URL, so the rule refuses to authorize
+      redirect hops (another rule without it may still cover the hop).
+    - ``"waive"``: the atom speaks about the original request only (say, "no auth-key
+      parameter"); hops do not re-demand it, so a pre-signed redirect target with a
+      colliding parameter name is not tanked.
+    - ``None``: decide at ``Policy.allow`` -- recheck when the atom is textual, stop
+      otherwise.
+
+    Whatever the mode, the static check demands the atom on the original URL at every
+    ``certora.network`` site."""
+
+    name: str
+    on_redirect: Literal["recheck", "stop", "waive"] | None = None
+
+
+def waived(atom_name: str) -> RequiredAtom:
+    """The atom applies to the original request only; redirects do not re-demand it."""
+    return RequiredAtom(atom_name, "waive")
+
+
+def rechecked(atom_name: str) -> RequiredAtom:
+    """The atom is re-established from every hop URL's text; ``Policy.allow`` rejects this
+    for atoms that are not textually establishable."""
+    return RequiredAtom(atom_name, "recheck")
+
+
+def no_redirect(atom_name: str) -> RequiredAtom:
+    """The atom refuses redirects outright, even when it could be re-checked textually."""
+    return RequiredAtom(atom_name, "stop")
+
+
+@dataclass(frozen=True)
 class NetworkRule:
     """A permitted ``certora.network`` destination, enforced by the broker (``broker.py``) on
     every request and on every redirect hop. Deny by default: a URL matching no rule is
@@ -344,6 +396,10 @@ class NetworkRule:
     methods: frozenset[str] = frozenset()
     # permit destinations that are (or resolve to) loopback/private/link-local addresses
     allow_nonpublic: bool = False
+    # atoms the URL value must carry at the call site -- by a live certora.check, or (for an
+    # exactly-known URL) discharged from its text -- each with its redirect treatment; see
+    # RequiredAtom. The static check always demands all of them on the original URL.
+    requires: frozenset[RequiredAtom] = frozenset()
     # per-destination overrides of the broker's global caps (None: the broker default), so one
     # slow API can get a long leash without loosening the rest of the allowlist
     read_timeout: float | None = None
@@ -358,6 +414,7 @@ def network(
     ports: Iterable[int] = (),
     methods: Iterable[str] = (),
     allow_nonpublic: bool = False,
+    requires: Iterable[str | RequiredAtom] = (),
     read_timeout: float | None = None,
     total_timeout: float | None = None,
     max_response_bytes: int | None = None,
@@ -374,10 +431,65 @@ def network(
         frozenset(int(p) for p in ports),
         frozenset(m.upper() for m in methods),
         allow_nonpublic,
+        frozenset(r if isinstance(r, RequiredAtom) else RequiredAtom(r) for r in requires),
         None if read_timeout is None else float(read_timeout),
         None if total_timeout is None else float(total_timeout),
         None if max_response_bytes is None else int(max_response_bytes),
     )
+
+
+def _host_matches(pattern: str, host: str) -> bool:
+    if pattern.startswith("*."):
+        suffix = pattern[1:]              # ".example.com"
+        return host.endswith(suffix) and len(host) > len(suffix)
+    return host == pattern
+
+
+def default_port(scheme: str) -> int:
+    return 443 if scheme == "https" else 80
+
+
+def matches_endpoint(rule: NetworkRule, scheme: str, host: str, port: int, method: str) -> bool:
+    """Does *rule* permit *method* against ``scheme://host:port``? The one definition of the
+    rule semantics: the broker asks it per redirect hop at runtime, ``Policy.evaluate`` per
+    statically-proven endpoint."""
+    if not _host_matches(rule.host, host):
+        return False
+    if scheme not in rule.schemes:
+        return False
+    if rule.ports:
+        if port not in rule.ports:
+            return False
+    elif port != default_port(scheme):
+        return False
+    if rule.methods and method not in rule.methods:
+        return False
+    return True
+
+
+def _netloc_endpoints(netloc: PseudoRegex) -> list[tuple[str, int | None]] | None:
+    """The (host, explicit-port) pairs an exactly-known netloc denotes: an Exact, or an
+    alternation of Exacts. None otherwise -- a netloc only partially known cannot be held
+    against the allowlist."""
+    match netloc:
+        case Exact(exact_str=s):
+            texts = [s]
+        case Alternation(any_of=branches) if all(isinstance(b, Exact) for b in branches):
+            texts = [b.exact_str for b in branches if isinstance(b, Exact)]
+        case _:
+            return None
+    out: list[tuple[str, int | None]] = []
+    for text in texts:
+        try:
+            # urlsplit does the netloc surgery: lowercases, strips userinfo and brackets
+            parts = urllib.parse.urlsplit(f"//{text}")
+            host, port = parts.hostname, parts.port
+        except ValueError:
+            return None
+        if host is None:
+            return None
+        out.append((host.rstrip("."), port))
+    return out
 
 
 def _prefix_matches(prefix: tuple[str, ...], arguments: tuple) -> bool:
@@ -483,9 +595,38 @@ class Policy:
         }
         if conflicted:
             raise ValueError(f"atoms declared both pure and environmental: {sorted(conflicted)}")
+        # resolve each network requirement's redirect treatment: a textually-establishable
+        # atom (defined, or with a literal checker: an effect-free single-input validation)
+        # defaults to being re-checked by the broker on every hop; anything else defaults to
+        # refusing hops. Only an *explicit* recheck of a non-textual atom is an error.
+        recheckable = defined_names | {
+            a
+            for v in vals
+            for established in v.establishes.values()
+            for a in established
+            if _literal_slot(v, a) is not None
+        }
+        net_rules = []
+        for r in network:
+            resolved = set()
+            for ra in r.requires:
+                if ra.on_redirect is None:
+                    resolved.add(
+                        replace(ra, on_redirect="recheck" if ra.name in recheckable else "stop")
+                    )
+                elif ra.on_redirect == "recheck" and ra.name not in recheckable:
+                    raise ValueError(
+                        f"network rule {r.host!r}: atom {ra.name!r} is declared "
+                        "recheck-on-redirect but cannot be re-checked from the URL text alone "
+                        "(it is neither a defined atom nor established by an effect-free "
+                        "single-parameter validation)"
+                    )
+                else:
+                    resolved.add(ra)
+            net_rules.append(replace(r, requires=frozenset(resolved)))
         return cls(
             _locations(read), _locations(write), _locations(listing), progs, vals, atoms_t,
-            tuple(network),
+            tuple(net_rules),
         )
 
     def vocabulary(self) -> Vocabulary:
@@ -507,7 +648,41 @@ class Policy:
     def _defined(self) -> dict[str, PseudoRegex]:
         return {a.name: a.regex for a in self.atoms}
 
-    def discharger(self, root: pathlib.Path | str) -> Callable[[str, str], bool]:
+    def exec_refusal(
+        self, program_name: str, arguments: Sequence[str], cwd: str
+    ) -> str | None:
+        """The broker's defense-in-depth re-check of one concrete exec invocation.
+
+        Necessarily incomplete against the full rules -- runtime strings carry no provenance,
+        checks or facts, so ``unknown_arguments``, ``argument_locations``, ``argument_atoms``
+        and ``requires`` are the static analysis' alone. What IS decidable on concrete values
+        is decided: the program must be permitted, a subcommand-bearing program must match a
+        declared subcommand exactly (fail closed), and the cwd must lie (lexically) within an
+        applicable rule's location."""
+        rules = [p for p in self.programs if p.name == program_name]
+        if not rules:
+            return f"program {program_name!r} is not permitted"
+        cwd_loc = _literal_location(cwd)
+        if cwd_loc is None:
+            return f"cwd {cwd!r} has no safe location"
+        if any(r.subcommand for r in rules):
+            rule = next(
+                (r for r in rules if _prefix_matches(r.subcommand, tuple(arguments))), None
+            )
+            if rule is None:
+                return (
+                    f"arguments match no declared subcommand of {program_name!r} "
+                    "(subcommands fail closed)"
+                )
+            rules = [rule]
+        reasons = []
+        for rule in rules:
+            if location_le(cwd_loc, rule.cwd):
+                return None
+            reasons.append(f"cwd {cwd!r} is not within {pretty_location(rule.cwd)}")
+        return "; ".join(reasons)
+
+    def discharger(self, root: PathLike[str] | str) -> Callable[[str, str], bool]:
         """A runner for literal checkers: ``discharge(atom, text)`` is True when some effect-free
         validation establishing the pure *atom* through a single slot accepts the exact *text*,
         run right now under *root*. Cached per (atom, text); handed to ``evaluate`` and to
@@ -572,6 +747,53 @@ class Policy:
                         return []
                     reasons.append(reason)
                 return [Denial(site, "; ".join(reasons))]
+            case NetworkSite(method=method, url=url):
+                lifted = url_of(url)
+                if lifted is None or lifted.scheme is None or lifted.netloc is None:
+                    return [
+                        Denial(
+                            site,
+                            "the URL is not proven: its scheme and netloc must be known "
+                            "(a literal URL, or urllib.parse.urlsplit guards)",
+                        )
+                    ]
+                endpoints = _netloc_endpoints(lifted.netloc)
+                if endpoints is None:
+                    return [Denial(site, "the URL's netloc is not a known, finite set of hosts")]
+                for host, port in endpoints:
+                    resolved = port if port is not None else default_port(lifted.scheme)
+                    candidates = [
+                        rule
+                        for rule in self.network
+                        if matches_endpoint(rule, lifted.scheme, host, resolved, method)
+                    ]
+                    if not candidates:
+                        return [
+                            Denial(
+                                site,
+                                f"{method} {lifted.scheme}://{host}:{resolved} matches no "
+                                "network rule",
+                            )
+                        ]
+                    # whatever their redirect treatment, every required atom is demanded of
+                    # the original URL here
+                    missing = min(
+                        (
+                            self._missing_atoms(
+                                url, frozenset(ra.name for ra in rule.requires), discharge
+                            )
+                            for rule in candidates
+                        ),
+                        key=len,
+                    )
+                    if missing:
+                        return [
+                            Denial(
+                                site,
+                                f"the URL is not validated by: {', '.join(sorted(missing))}",
+                            )
+                        ]
+                return []
             case CheckSite(name=name, cwd=cwd):
                 declared = next((v for v in self.validations if v.name == name), None)
                 if declared is None:

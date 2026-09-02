@@ -26,12 +26,16 @@ from .dangerous import (
     FORBIDDEN_CLASS_KEYWORDS,
     FORBIDDEN_MODULES,
     PATH_SINK_METHODS,
+    PERMITTED_SUBMODULES,
     TYPE_CALL_MAX_ARGS,
 )
 
 
 def _forbidden_module(dotted: str) -> bool:
-    """``import os.path`` binds ``os``: a module is forbidden if any prefix of its name is."""
+    """``import os.path`` binds ``os``: a module is forbidden if any prefix of its name is.
+    A carved-out submodule (``urllib.parse``) is importable by its exact name only."""
+    if dotted in PERMITTED_SUBMODULES:
+        return False
     parts = dotted.split(".")
     return any(".".join(parts[:i]) in FORBIDDEN_MODULES for i in range(1, len(parts) + 1))
 

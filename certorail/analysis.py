@@ -1,18 +1,12 @@
 import ast
-from contextlib import contextmanager
 import fnmatch
-import functools
 import inspect
 import pathlib
 import re
-import stat
-from turtle import isvisible
-from types import UnionType
-from typing import Any, cast, Callable, Literal, Mapping, Sequence, final, override, reveal_type
+import urllib.parse
+from typing import Any, cast, Callable, Literal, Mapping, Sequence
 from dataclasses import dataclass, is_dataclass, replace
 from typing_extensions import TypeForm
-from .dangerous import DANGEROUS_MEMBERS, FORBIDDEN_MODULES
-from .typed_ast_tsp import typed_ast
 
 sensitive_builtins = (
     "getattr",
@@ -770,13 +764,15 @@ def _holds(atom: AtomicFact, atoms: frozenset[AtomicFact], regex: PseudoRegex) -
 # ---------------------------------------------------------------------------
 # Facts
 #
-# A value is read in one of two ways, never both:
+# A value is read in one of these ways, never several at once:
 #   * as *text*   -- StrFact / PathFact: what its characters look like (regex, atoms). Nothing is
 #                    known about it as a path; ``locate`` is the partial lift to the path reading.
 #   * as a *path* -- Located: where it points, and whether it is spelled as a str or a Path.
 #                    Nothing is tracked about its text; ``as_text`` is the forgetful map back.
-# Going into text is giving up on the path reading; the transfer functions stay in path-land for
-# as long as the operation is a path operation.
+#   * as a *URL*  -- UrlString: claims about its urlsplit reading (netloc, path, scheme).
+#                    Nothing is tracked about its text either; ``url_of`` is the partial lift.
+# Going into text is giving up on the path (or URL) reading; the transfer functions stay in
+# path-land for as long as the operation is a path operation.
 #
 # Every fact additionally carries ``checks``: the policy-declared validations (certora.check) this
 # exact value has passed. Checks belong to the value as it was at the check site: they ride along
@@ -815,7 +811,25 @@ class Located:
     repr: Repr
     checks: frozenset[str] = frozenset()
 
-type ValidationFact = StrFact | PathFact | Located
+@dataclass(frozen=True)
+class UrlString:
+    """A ``str`` read as a URL: claims about its ``urllib.parse.urlsplit`` reading. Each
+    component is one claim, ``None`` claiming nothing -- the netloc's text lies in the regex's
+    language, the (server-absolute, hence anchored) path is one the LocationFact denotes, the
+    scheme is exactly the literal. Nothing else is tracked about the text: reading a value as
+    a URL gives up its text reading, as ``Located`` gives up text for paths.
+
+    The claims are ``urlsplit`` claims. ``urlparse`` agrees on scheme and netloc but shears
+    ``;params`` off the last path segment, so a ``.path`` observed through ``urlparse`` is NOT
+    evidence about the urlsplit path (the guards only trust ``urlsplit`` for it). Path claims
+    are lexical: dot-segments are not resolved, so a location claim can only be built from
+    text shown free of ``..`` (the same discipline as filesystem containment)."""
+    netloc: PseudoRegex | None = None
+    path: LocationFact | None = None
+    scheme: Literal["http", "https"] | None = None
+    checks: frozenset[str] = frozenset()
+
+type ValidationFact = StrFact | PathFact | Located | UrlString
 
 def is_path_typed(fact: ValidationFact | None) -> bool:
     return isinstance(fact, PathFact) or (isinstance(fact, Located) and fact.repr == "path")
@@ -948,6 +962,31 @@ def locate(fact: ValidationFact | None) -> Located | None:
             if "no-parent-traversal" in fact and "not-absolute" in fact:
                 return Located(DirSplat((), ANY_NAME), rp, fact.checks)
             return None
+        case UrlString():
+            return None  # a URL is not a filesystem path
+
+
+def url_of(value: str | ValidationFact | None) -> UrlString | None:
+    """The URL reading of a value: a ``UrlString`` as is; exactly-known text parsed by
+    ``urlsplit``. The lift is partial -- of anything else, nothing."""
+    if isinstance(value, UrlString):
+        return value
+    text = known_text(value)
+    if text is None:
+        return None
+    try:
+        parts = urllib.parse.urlsplit(text)
+    except ValueError:
+        return None
+    scheme = parts.scheme if parts.scheme in ("http", "https") else None
+    # a ".."-bearing path has no location (lexical claims only); the netloc stays exact
+    return UrlString(
+        netloc=Exact(parts.netloc),
+        path=_literal_location(parts.path),
+        scheme=scheme,
+        checks=checks_of(value) if not isinstance(value, str) else frozenset(),
+    )
+
 
 def containment_of(fact: ValidationFact | None) -> LocationFact | None:
     located = locate(fact)
@@ -990,6 +1029,21 @@ def entails(actual: str | ValidationFact | None, required: ValidationFact) -> bo
         return False
     fact: ValidationFact = StrFact(regex=Exact(actual)) if isinstance(actual, str) else actual
     match required:
+        case UrlString(netloc=netloc, path=path, scheme=scheme, checks=checks):
+            # component-wise: each stated claim must be established; None claims nothing.
+            # url_of makes exactly-known text discharge with no guard ceremony.
+            got = url_of(fact)
+            if got is None:
+                return False
+            if netloc is not None and (
+                got.netloc is None or not _regex_subsumes(netloc, got.netloc)
+            ):
+                return False
+            if path is not None and (got.path is None or not location_le(got.path, path)):
+                return False
+            if scheme is not None and got.scheme != scheme:
+                return False
+            return checks <= got.checks
         case Located(location=loc, repr=rp, checks=checks):
             got = locate(fact)
             return (
@@ -1006,7 +1060,7 @@ def entails(actual: str | ValidationFact | None, required: ValidationFact) -> bo
                         and all(a in fact for a in atoms)
                         and checks <= fact.checks
                     )
-                case Located(repr="str"):
+                case Located(repr="str") | UrlString():
                     # a str, but nothing is tracked about its text
                     return regex == ANY_STR and not atoms and checks <= fact.checks
                 case _:
@@ -1037,6 +1091,8 @@ def combine_containment(
             return None if parts is None else cont.extend_static(parts)
         case Located(location=loc):
             return cont.merge_other(loc)
+        case UrlString():
+            return None  # a URL glued onto a path is no longer a path we can place
         case StrFact(regex=Exact(exact_str=s)):
             if not pathlib.PurePath(s).parts:
                 return cont  # a value known to be exactly "" or ".": joining it adds nothing
@@ -1064,6 +1120,8 @@ def as_text(v: str | ValidationFact | None) -> StrFact:
             return StrFact(atoms=atoms)
         case Located(location=loc):
             return StrFact(regex=location_to_regex(loc))
+        case UrlString():
+            return StrFact()  # component claims do not (yet) reconstruct the text
 
 def as_str_value(fact: ValidationFact | None) -> ValidationFact | None:
     """``str(x)`` / ``os.fspath(x)``: the same value, spelled as a str."""
@@ -1074,8 +1132,8 @@ def as_str_value(fact: ValidationFact | None) -> ValidationFact | None:
             return Located(loc, "str", checks)
         case PathFact(atoms=atoms, checks=checks):
             return StrFact(atoms=atoms, checks=checks)
-        case StrFact():
-            return fact
+        case StrFact() | UrlString():
+            return fact  # already a str; str() is the identity and every claim survives
 
 # --- concatenated text ---------------------------------------------------------------------------
 #
@@ -1178,6 +1236,8 @@ class _Spelling:
                 return state
             case Located(location=loc):
                 return self.located(loc)
+            case UrlString():
+                return self.unknown()  # nothing is tracked about a URL-read value's text
             case StrFact() | PathFact():
                 return self.chunk(p)
 
@@ -1438,7 +1498,9 @@ def interpret_expr(e: ast.expr, st: dict[str, ValidationFact]) -> ValidationFact
                 return as_str_value(interpret_expr(args[0], st))
             if isinstance(func, ast.Attribute) and func.attr in _STR_RETURNING_METHODS:
                 receiver = interpret_expr(func.value, st)
-                if isinstance(receiver, StrFact) or (isinstance(receiver, Located) and receiver.repr == "str"):
+                if isinstance(receiver, (StrFact, UrlString)) or (
+                    isinstance(receiver, Located) and receiver.repr == "str"
+                ):
                     return StrFact()  # text stays text; nothing is known about the new characters
             return None
         case ast.BinOp(left=left, op=ast.Div(), right=right):

@@ -20,7 +20,16 @@ from certorail.analysis import (
     pretty_location,
 )
 from certorail.host import load_policy
-from certorail.policy import Policy, atom, param, program, pure, validation
+from certorail.policy import (
+    Policy,
+    RequiredAtom,
+    atom,
+    network,
+    param,
+    program,
+    pure,
+    validation,
+)
 from certorail.policyfile import PolicyFileError, from_data, load_policy_file, parse_location
 
 
@@ -204,6 +213,68 @@ class TestStrictness(unittest.TestCase):
             p.write_text("policy-version = \n")
             with self.assertRaises(PolicyFileError):
                 load_policy_file(p)
+
+
+class TestNetworkTables(unittest.TestCase):
+    def test_network_rules_load(self) -> None:
+        pol = loads("""
+            policy-version = 1
+
+            [[network]]
+            host    = "api.github.com"
+            methods = ["get"]
+
+            [[network]]
+            host            = "*.example.com"
+            schemes         = ["http", "https"]
+            ports           = [8080]
+            allow-nonpublic = true
+            read-timeout    = 30
+        """)
+        self.assertEqual(
+            pol.network,
+            (
+                network("api.github.com", methods=["GET"]),
+                network(
+                    "*.example.com",
+                    schemes=["http", "https"],
+                    ports=[8080],
+                    allow_nonpublic=True,
+                    read_timeout=30.0,
+                ),
+            ),
+        )
+
+    def test_unknown_network_keys_are_errors(self) -> None:
+        with self.assertRaises(PolicyFileError):
+            loads('policy-version = 1\n[[network]]\nhost = "a.com"\nmethod = ["GET"]\n')
+
+    def test_network_requires_with_redirect_modes(self) -> None:
+        pol = loads("""
+            policy-version = 1
+
+            [atoms]
+            not-prod = { matches = 'https://x.com/db/(dev|staging)' }
+            vetted   = { pure = true }
+
+            [[network]]
+            host     = "x.com"
+            requires = ["not-prod", { atom = "vetted", on-redirect = "waive" }]
+        """)
+        (rule,) = pol.network
+        self.assertEqual(
+            rule.requires,
+            frozenset({RequiredAtom("not-prod", "recheck"), RequiredAtom("vetted", "waive")}),
+        )
+
+    def test_a_bad_redirect_mode_is_an_error(self) -> None:
+        with self.assertRaises(PolicyFileError):
+            loads(
+                "policy-version = 1\n"
+                "[atoms]\nvetted = { pure = true }\n"
+                '[[network]]\nhost = "a.com"\n'
+                'requires = [{ atom = "vetted", on-redirect = "sometimes" }]\n'
+            )
 
 
 class TestCwdFreeValidations(unittest.TestCase):

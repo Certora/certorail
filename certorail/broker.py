@@ -1,9 +1,14 @@
-"""The network broker: the runtime half of ``certora.network``.
+"""The broker: the runtime half of ``certora.network`` and ``certora.exec``.
 
-The confined program runs with no network at all (an empty network namespace on Linux, a
-Seatbelt deny on macOS); the broker is the host-side process that talks to the network on its
-behalf, over a Unix socket -- the single, auditable hole in the wall. TLS terminates here:
-the sandboxed program never sees a certificate, a proxy variable, or a DNS answer.
+The confined program runs jailed -- no network (an empty network namespace on Linux, a
+Seatbelt deny on macOS) and eventually no subprocesses; the broker is the host-side process
+that acts on its behalf, over a Unix socket -- the single, auditable hole in the wall. TLS
+terminates here: the sandboxed program never sees a certificate, a proxy variable, or a DNS
+answer. Exec'd children are spawned here, outside the jail, after re-checking the decidable
+half of the exec rules (program, fail-closed subcommand, cwd containment -- defense in depth;
+the full validation rules were enforced statically), and their output is drained and returned
+wholesale: ``certora.exec`` keeps its ``CompletedProcess`` contract to the byte. A client
+hangup mid-exec kills the child's whole process group.
 
 One connection carries exactly one request. The client connects, sends one framed request,
 and blocks on the framed response; hanging up is the cancellation protocol. When the client
@@ -30,7 +35,16 @@ Wire protocol (both directions): 4-byte big-endian length prefix + UTF-8 JSON.
   response  {"ok": true, "status": 200, "reason": "OK",
              "headers": [[name, value], ...], "body_b64": "...",
              "url": "<final URL after redirects>"}
+  exec req  {"kind": "exec", "program": "git", "arguments": ["log"], "cwd": "repos/x"}
+  exec resp {"ok": true, "returncode": 0, "stdout_b64": "...", "stderr_b64": "..."}
+  check req {"kind": "check", "name": "org-repo", "params": {...}, "cwd": "repos/x"}
+  check rsp {"ok": true, "returncode": 0, "stderr_b64": "..."}
         or  {"ok": false, "error": "policy_denied", "detail": "..."}
+
+``certora.check`` evaluators run through here too, and for the same reason in reverse: a
+validation like "is not a production database" consults inventory the jail deliberately
+cannot reach. The check's declaration is its whole runtime contract, so the broker enforces
+it completely: declared name, exact parameters, cwd within the declared location.
 """
 import base64
 import contextlib
@@ -39,16 +53,21 @@ import ipaddress
 import json
 import logging
 import os
+import pathlib
 import select
+import signal
 import socket
 import socketserver
 import ssl
 import struct
+import subprocess
 import threading
 import time
 import urllib.parse
+from collections.abc import Callable, Sequence
 
-from .policy import NetworkRule, Policy
+from .analysis import _literal_location, location_le, pretty_location
+from .policy import NetworkRule, Policy, matches_endpoint
 
 log = logging.getLogger("certorail.broker")
 
@@ -63,13 +82,18 @@ _CREDENTIAL_HEADERS = {"authorization", "cookie"}
 
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 
-# Global caps; a rule may override the last three per destination.
+# Global caps; a network rule may override the last three per destination.
 MAX_REQUEST_BYTES = 16 * 2**20   # cap on the request *frame* (bodies are base64: ~3/4 of this)
 MAX_RESPONSE_BYTES = 16 * 2**20
 MAX_REDIRECTS = 5
 CONNECT_TIMEOUT = 10.0
 READ_TIMEOUT = 600.0    # the longest permitted *silence* between bytes of a response
 TOTAL_TIMEOUT = 900.0   # wall clock for the whole request, redirects included
+
+# Exec tunnel caps. The output cap bounds the reply frame, not the broker's memory: the child
+# is policy-approved software, so an over-cap drain is an error, not an attack surface.
+MAX_OUTPUT_BYTES = 8 * 2**20     # per stream (stdout, stderr)
+EXEC_TIMEOUT = 900.0             # wall clock for one exec'd child
 
 
 class BrokerError(Exception):
@@ -78,6 +102,12 @@ class BrokerError(Exception):
 
 class PolicyDenied(BrokerError):
     code = "policy_denied"
+
+
+class BadRequest(BrokerError):
+    """A malformed invocation (wrong check parameters): the client maps this to TypeError."""
+
+    code = "bad_request"
 
 
 class ResponseTooLarge(BrokerError):
@@ -93,16 +123,42 @@ class ClientGone(BrokerError):
 # ---------------------------------------------------------------------------
 
 
-def _host_matches(pattern: str, host: str) -> bool:
-    if pattern.startswith("*."):
-        suffix = pattern[1:]              # ".example.com"
-        return host.endswith(suffix) and len(host) > len(suffix)
-    return host == pattern
+def _rule_refusal(
+    policy: Policy,
+    rule: NetworkRule,
+    url: str,
+    initial: bool,
+    discharge: Callable[[str, str], bool] | None,
+) -> str | None:
+    """Why an endpoint-matching *rule* refuses this *url*, or None. The initial request's
+    ``requires`` were proven statically; the broker's own obligations are the redirect hops:
+    a "recheck" atom is re-discharged from the URL text (a defined atom's regex, a literal
+    checker), a "stop" atom refuses hops outright, a "waive" atom asks nothing of them."""
+    if not initial:
+        stops = sorted(ra.name for ra in rule.requires if ra.on_redirect == "stop")
+        if stops:
+            return (
+                f"redirect refused: {', '.join(stops)} cannot vouch for a URL the analysis "
+                "never saw"
+            )
+    to_recheck = frozenset(ra.name for ra in rule.requires if ra.on_redirect == "recheck")
+    missing = policy._missing_atoms(url, to_recheck, discharge)
+    if missing:
+        return f"{url} is not validated by: {', '.join(sorted(missing))}"
+    return None
 
 
-def _check(policy: Policy, method: str, url: str) -> tuple[str, str, int, NetworkRule]:
+def _check(
+    policy: Policy,
+    method: str,
+    url: str,
+    initial: bool,
+    discharge: Callable[[str, str], bool] | None,
+) -> tuple[str, str, int, NetworkRule]:
     """The (scheme, host, port, rule) permitting *method* on *url*, or ``PolicyDenied``.
-    Applied to every redirect hop, so a redirect cannot escape the allowlist."""
+    Applied to every redirect hop, so a redirect cannot escape the allowlist. The endpoint
+    semantics live in ``policy.matches_endpoint``, shared with the static evaluation; the
+    per-hop treatment of a rule's ``requires`` is ``_rule_refusal``'s."""
     parts = urllib.parse.urlsplit(url)
     scheme = (parts.scheme or "").lower()
     if scheme not in ("http", "https"):
@@ -115,22 +171,16 @@ def _check(policy: Policy, method: str, url: str) -> tuple[str, str, int, Networ
         port = parts.port
     except ValueError:
         raise PolicyDenied(f"invalid port in URL {url!r}")
-    default_port = 443 if scheme == "https" else 80
-    port = port or default_port
+    port = port or (443 if scheme == "https" else 80)
+    refusal: str | None = None
     for rule in policy.network:
-        if not _host_matches(rule.host, host):
+        if not matches_endpoint(rule, scheme, host, port, method):
             continue
-        if scheme not in rule.schemes:
-            continue
-        if rule.ports:
-            if port not in rule.ports:
-                continue
-        elif port != default_port:
-            continue
-        if rule.methods and method not in rule.methods:
-            continue
-        return scheme, host, port, rule
-    raise PolicyDenied(f"{method} {scheme}://{host}:{port} matches no network rule")
+        why = _rule_refusal(policy, rule, url, initial, discharge)
+        if why is None:
+            return scheme, host, port, rule
+        refusal = refusal or why
+    raise PolicyDenied(refusal or f"{method} {scheme}://{host}:{port} matches no network rule")
 
 
 def _screen_addresses(host: str, port: int) -> None:
@@ -162,7 +212,7 @@ def _tls_context() -> ssl.SSLContext:
     if bundle:
         return ssl.create_default_context(cafile=bundle)
     try:
-        import truststore
+        import truststore #type: ignore[reportMissingImports]
         return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     except ImportError:
         return ssl.create_default_context()
@@ -174,24 +224,24 @@ def _tls_context() -> ssl.SSLContext:
 
 
 class _HangupWatcher:
-    """Watches the client socket while the handler is blocked on one upstream hop.
+    """Watches the client socket while the handler is blocked on upstream work -- a network
+    hop's socket reads, an exec'd child's ``communicate``.
 
     Under one-request-per-connection the client has nothing more to say after its request
     frame, so *any* readability on its socket is a hangup (or a protocol violation -- equally
-    moot). On hangup, shut down the upstream socket: shutdown() from another thread wakes a
-    blocked recv, close() does not.
+    moot). On hangup, *cancel* is invoked until it reports that the cancellation landed (a
+    False buys a retry: a network hop's upstream socket may not exist yet mid-connect).
 
-    A context manager scoped to the hop: entering starts the watch, exiting joins it and
-    raises ``ClientGone`` -- superseding whatever error the shutdown provoked in the blocked
-    I/O -- if the client hung up. Nest it *inside* ``closing(conn)`` so the join happens
-    before the sockets it touches are closed; that ordering is the whole race-freedom
-    argument."""
+    A context manager scoped to the blocked work: entering starts the watch, exiting joins it
+    and raises ``ClientGone`` -- superseding whatever error the cancellation provoked in the
+    blocked call -- if the client hung up. Enter it only while everything *cancel* touches
+    strictly outlives the with-block; that ordering is the whole race-freedom argument."""
 
     _POLL = 0.5
 
-    def __init__(self, client: socket.socket, upstream: http.client.HTTPConnection):
+    def __init__(self, client: socket.socket, cancel: Callable[[], bool]):
         self._client = client
-        self._upstream = upstream
+        self._cancel = cancel
         self._done = threading.Event()
         self.cancelled = False
         self._thread = threading.Thread(
@@ -202,12 +252,11 @@ class _HangupWatcher:
         self._thread.start()
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> bool:
+    def __exit__(self, exc_type, exc, tb):
         self._done.set()
         self._thread.join()
         if self.cancelled:
             raise ClientGone("client disconnected") from None
-        return False
 
     def _run(self) -> None:
         while not self._done.is_set():
@@ -216,15 +265,10 @@ class _HangupWatcher:
                 return
             if readable:
                 self.cancelled = True
-                # the hangup may arrive while the connect is still in flight and the socket
-                # does not exist yet; wait for it so the cancel actually lands
+                if self._cancel():
+                    return
                 while not self._done.wait(0.05):
-                    sock = self._upstream.sock
-                    if sock is not None:
-                        try:
-                            sock.shutdown(socket.SHUT_RDWR)
-                        except OSError:
-                            pass          # already torn down
+                    if self._cancel():
                         return
                 return
 
@@ -281,8 +325,21 @@ def _hop(
         conn = http.client.HTTPSConnection(host, port, timeout=connect_timeout, context=tls)
     else:
         conn = http.client.HTTPConnection(host, port, timeout=connect_timeout)
+
+    def shutdown_upstream() -> bool:
+        # shutdown() from another thread wakes a blocked recv, close() does not; the socket
+        # may not exist yet mid-connect, in which case the watcher retries
+        sock = conn.sock
+        if sock is None:
+            return False
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass          # already torn down
+        return True
+
     # exit order: the watcher joins before closing() touches the connection it watches
-    with contextlib.closing(conn), _HangupWatcher(client, conn):
+    with contextlib.closing(conn), _HangupWatcher(client, shutdown_upstream):
         try:
             conn.request(method, target, body=body, headers=headers)
             if conn.sock is not None:
@@ -304,6 +361,7 @@ def _hop(
 def _execute(
     policy: Policy,
     tls: ssl.SSLContext,
+    discharge: Callable[[str, str], bool] | None,
     client: socket.socket,
     method: str,
     url: str,
@@ -319,7 +377,7 @@ def _execute(
     total_cap = TOTAL_TIMEOUT
     while True:
         # policy is enforced on EVERY hop, so a redirect cannot escape the allowlist
-        scheme, host, port, rule = _check(policy, method, current)
+        scheme, host, port, rule = _check(policy, method, current, hops == 0, discharge)
         if not rule.allow_nonpublic:
             _screen_addresses(host, port)
         if first_host is None:
@@ -375,6 +433,124 @@ def _execute(
 
 
 # ---------------------------------------------------------------------------
+# the exec tunnel
+# ---------------------------------------------------------------------------
+
+
+def _resolve(root: pathlib.Path, cwd: str) -> pathlib.Path:
+    given = pathlib.Path(cwd)
+    return given if given.is_absolute() else root / given
+
+
+def _spawn_drained(
+    client: socket.socket, argv: list[str], workdir: pathlib.Path
+) -> tuple[int, bytes, bytes]:
+    """Spawn host-side and drain the output wholesale. A client hangup kills the child's
+    whole process group (it gets its own, so descendants die with it)."""
+    try:
+        proc = subprocess.Popen(
+            argv,
+            cwd=workdir,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise BrokerError(f"spawn: {exc}")
+
+    def kill_child() -> bool:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass          # already gone
+        return True
+
+    with _HangupWatcher(client, kill_child):
+        try:
+            out, err = proc.communicate(timeout=EXEC_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            kill_child()
+            proc.communicate()
+            raise BrokerError(f"timeout ({EXEC_TIMEOUT:g}s) exceeded") from None
+    if len(out) > MAX_OUTPUT_BYTES or len(err) > MAX_OUTPUT_BYTES:
+        raise ResponseTooLarge(f"output exceeds {MAX_OUTPUT_BYTES} bytes per stream")
+    return proc.returncode, out, err
+
+
+def _run_exec(
+    policy: Policy,
+    root: pathlib.Path | None,
+    client: socket.socket,
+    program: str,
+    arguments: list[str],
+    cwd: str,
+) -> dict:
+    """One brokered ``certora.exec``: re-check the decidable half of the exec rules
+    (``Policy.exec_refusal`` -- defense in depth; the full rules were enforced statically),
+    spawn the child host-side, and return its drained output wholesale."""
+    refusal = policy.exec_refusal(program, arguments, cwd)
+    if refusal is not None:
+        raise PolicyDenied(refusal)
+    if root is None:
+        raise BrokerError("exec: the broker was built without a root")
+    returncode, out, err = _spawn_drained(client, [program, *arguments], _resolve(root, cwd))
+    log.info("EXEC %s (cwd=%s) -> %d (out %d bytes, err %d bytes)",
+             " ".join([program, *arguments]), cwd, returncode, len(out), len(err))
+    return {
+        "returncode": returncode,
+        "stdout_b64": base64.b64encode(out).decode("ascii"),
+        "stderr_b64": base64.b64encode(err).decode("ascii"),
+    }
+
+
+def _run_check(
+    policy: Policy,
+    root: pathlib.Path | None,
+    client: socket.socket,
+    name: str,
+    params: dict,
+    cwd: str | None,
+) -> dict:
+    """One brokered ``certora.check``: run the declared evaluator host-side -- outside the
+    jail, where whatever it consults (an inventory service, credentials, the org's tooling)
+    actually lives -- and return its verdict. Unlike exec's rules, a check's declaration IS
+    its whole runtime contract, so this re-check is complete: name, parameters and cwd are
+    all decidable here."""
+    declared = next((v for v in policy.validations if v.name == name), None)
+    if declared is None:
+        raise PolicyDenied(f"check: no validation named {name!r}")
+    if set(params) != set(declared.params) or not all(
+        isinstance(v, str) for v in params.values()
+    ):
+        raise BadRequest(
+            f"check {name!r}: expected str arguments {sorted(declared.params)}, "
+            f"got {sorted(params)}"
+        )
+    if root is None:
+        raise BrokerError("check: the broker was built without a root")
+    if declared.cwd is not None:
+        if cwd is None:
+            raise PolicyDenied(f"check {name!r}: cwd= is required")
+        loc = _literal_location(cwd)
+        if loc is None or not location_le(loc, declared.cwd):
+            raise PolicyDenied(
+                f"check {name!r} may not run at {cwd!r} "
+                f"(permitted: {pretty_location(declared.cwd)})"
+            )
+    workdir = root if cwd is None else _resolve(root, cwd)
+    argv = [piece if isinstance(piece, str) else params[piece.name]
+            for piece in declared.argv]
+    returncode, _, err = _spawn_drained(client, argv, workdir)
+    log.info("CHECK %s (cwd=%s) -> %d", name, cwd if cwd is not None else ".", returncode)
+    return {
+        "returncode": returncode,
+        "stderr_b64": base64.b64encode(err).decode("ascii"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # framed-JSON server over a Unix socket
 # ---------------------------------------------------------------------------
 
@@ -418,29 +594,44 @@ class _Handler(socketserver.BaseRequestHandler):
             return
 
     def _respond(self, conn: socket.socket, payload: bytes) -> bytes | None:
+        assert isinstance(self.server, _Server)
         """The framed reply, or None when the client is gone and nobody is left to read it."""
-        method, url = "?", "?"
+        what = "?"
         try:
             req = json.loads(payload)
-            method = str(req.get("method", "GET")).upper()
-            url = req["url"]
-            body = (base64.b64decode(req["body_b64"])
-                    if req.get("body_b64") else None)
-            timeout = float(req["timeout"]) if req.get("timeout") else None
-            result = _execute(self.server.policy, self.server.tls, conn,
-                              method, url, req.get("headers"), body, timeout)
+            if req.get("kind") == "exec":
+                program = str(req.get("program", "?"))
+                arguments = [str(a) for a in req.get("arguments", [])]
+                what = "exec " + " ".join([program, *arguments])
+                result = _run_exec(self.server.policy, self.server.root, conn,
+                                   program, arguments, str(req.get("cwd", "")))
+            elif req.get("kind") == "check":
+                name = str(req.get("name", "?"))
+                what = f"check {name}"
+                cwd_value = req.get("cwd")
+                result = _run_check(self.server.policy, self.server.root, conn,
+                                    name, dict(req.get("params") or {}),
+                                    None if cwd_value is None else str(cwd_value))
+            else:
+                method = str(req.get("method", "GET")).upper()
+                url = req["url"]
+                what = f"{method} {url}"
+                body = (base64.b64decode(req["body_b64"])
+                        if req.get("body_b64") else None)
+                timeout = float(req["timeout"]) if req.get("timeout") else None
+                result = _execute(self.server.policy, self.server.tls, self.server.discharge,
+                                  conn, method, url, req.get("headers"), body, timeout)
             return json.dumps({"ok": True, **result}).encode()
         except ClientGone:
-            log.info("ABORT %s %s :: client disconnected; upstream connection closed",
-                     method, url)
+            log.info("ABORT %s :: client disconnected; upstream work cancelled", what)
             return None
         except BrokerError as exc:
             tag = "DENY" if exc.code == "policy_denied" else "FAIL"
-            log.info("%s  %s %s :: %s", tag, method, url, exc)
+            log.info("%s  %s :: %s", tag, what, exc)
             return json.dumps({"ok": False, "error": exc.code,
                                "detail": str(exc)}).encode()
         except Exception as exc:
-            log.warning("ERROR %s %s :: %s: %s", method, url, type(exc).__name__, exc)
+            log.warning("ERROR %s :: %s: %s", what, type(exc).__name__, exc)
             return json.dumps({"ok": False, "error": "broker_error",
                                "detail": f"{type(exc).__name__}: {exc}"}).encode()
 
@@ -450,17 +641,31 @@ class _Server(socketserver.ThreadingUnixStreamServer):
 
     daemon_threads = True
 
-    def __init__(self, socket_path: str, policy: Policy):
+    def __init__(
+        self,
+        socket_path: str,
+        policy: Policy,
+        discharge: Callable[[str, str], bool] | None,
+        root: pathlib.Path | None,
+    ):
         self.policy = policy
         self.tls = _tls_context()
+        self.discharge = discharge
+        self.root = root
         super().__init__(socket_path, _Handler)
 
 
-def build_server(socket_path: str | os.PathLike[str], policy: Policy) -> _Server:
+def build_server(
+    socket_path: str | os.PathLike[str],
+    policy: Policy,
+    root: str | os.PathLike[str] | None = None,
+) -> _Server:
     """A broker server on *socket_path*, enforcing *policy*'s ``network`` rules. The caller
     runs it (``serve_forever`` on a thread) for the lifetime of one confined program and
     tears it down after. The socket is created mode 0600 in a 0700 directory: filesystem
-    permission is the authentication."""
+    permission is the authentication. *root* anchors the exec tunnel's relative cwds and
+    enables literal-checker discharge of network rules' ``requires`` atoms
+    (``Policy.discharger``); without it only defined atoms discharge and exec is refused."""
     path = os.fspath(socket_path)
     sock_dir = os.path.dirname(path)
     if sock_dir:
@@ -470,30 +675,19 @@ def build_server(socket_path: str | os.PathLike[str], policy: Policy) -> _Server
         os.unlink(path)
     old_umask = os.umask(0o177)
     try:
-        return _Server(path, policy)
+        return _Server(
+            path,
+            policy,
+            None if root is None else policy.discharger(root),
+            None if root is None else pathlib.Path(root),
+        )
     finally:
         os.umask(old_umask)
 
 
-def request(
-    socket_path: str | os.PathLike[str],
-    method: str,
-    url: str,
-    *,
-    headers: dict | None = None,
-    body: bytes | None = None,
-    timeout: float | None = None,
-) -> dict:
-    """One brokered request: the client half of the wire protocol, as the runtime half of
-    ``certora.network`` will speak it. Closing the socket (a timeout, an exception in the
+def _roundtrip(socket_path: str | os.PathLike[str], payload: dict) -> dict:
+    """One framed request-reply exchange. Closing the socket (a timeout, an exception in the
     caller) is what cancels the request broker-side."""
-    payload: dict = {"method": method, "url": url}
-    if headers:
-        payload["headers"] = dict(headers)
-    if body is not None:
-        payload["body_b64"] = base64.b64encode(body).decode("ascii")
-    if timeout is not None:
-        payload["timeout"] = timeout
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
         s.connect(os.fspath(socket_path))
         _send_frame(s, json.dumps(payload).encode())
@@ -505,3 +699,41 @@ def request(
         if frame is None:
             raise BrokerError("broker closed mid-frame")
     return json.loads(frame)
+
+
+def request(
+    socket_path: str | os.PathLike[str],
+    method: str,
+    url: str,
+    *,
+    headers: dict | None = None,
+    body: bytes | None = None,
+    timeout: float | None = None,
+) -> dict:
+    """One brokered network request: the client half of the wire protocol, as the runtime
+    half of ``certora.network`` speaks it."""
+    payload: dict = {"method": method, "url": url}
+    if headers:
+        payload["headers"] = dict(headers)
+    if body is not None:
+        payload["body_b64"] = base64.b64encode(body).decode("ascii")
+    if timeout is not None:
+        payload["timeout"] = timeout
+    return _roundtrip(socket_path, payload)
+
+
+def exec_request(
+    socket_path: str | os.PathLike[str],
+    program: str,
+    arguments: Sequence[str] = (),
+    *,
+    cwd: str,
+) -> dict:
+    """One brokered exec: the client half of the exec tunnel, as ``certora.exec``'s runtime
+    speaks it."""
+    return _roundtrip(socket_path, {
+        "kind": "exec",
+        "program": program,
+        "arguments": list(arguments),
+        "cwd": cwd,
+    })

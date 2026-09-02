@@ -15,9 +15,14 @@ Surface syntax::
     typing.Annotated[str, certora.seq("report-", certora.matches(r"\\d+"), ".txt")]
     typing.Annotated[str, certora.within(".")]
 """
+import base64
 import functools
 import inspect
+import json
+import os
 import pathlib
+import socket
+import struct
 import subprocess
 import typing
 from collections.abc import Callable
@@ -36,8 +41,19 @@ class ContractViolation(Exception):
 # ---------------------------------------------------------------------------
 
 
+class ExecFailed(RuntimeError):
+    """A brokered exec failed before completing: denied by the broker's re-check, over a
+    cap, or transport trouble. (A child that ran and exited non-zero is NOT this: that is a
+    normal ``CompletedProcess`` with its returncode.)"""
+
+
 def exec(*cmd: str, cwd: pathlib.Path | str) -> subprocess.CompletedProcess[bytes]:
-    """The only way to run a subprocess: no shell, output always captured, ``cwd`` mandatory.
+    """The only way to run a subprocess: tunneled to the host's broker, which re-checks the
+    decidable half of the exec rules (program, fail-closed subcommand, cwd containment --
+    defense in depth; the full rules were enforced statically), spawns the child outside the
+    sandbox, drains its output, and returns it wholesale. No shell, output always captured,
+    ``cwd`` mandatory: exactly the ``subprocess.run(..., capture_output=True)`` this once
+    was, one socket away.
 
     This is the runtime half. The static half (``walker``) additionally requires the program to
     be a string literal, refuses ``*args``/``**kwargs`` and any keyword but ``cwd``, and treats
@@ -47,41 +63,182 @@ def exec(*cmd: str, cwd: pathlib.Path | str) -> subprocess.CompletedProcess[byte
         raise ValueError("exec: no program given")
     if not all(isinstance(part, str) for part in cmd):
         raise TypeError("exec: every part of the command must be a str")
-    return subprocess.run(list(cmd), cwd=cwd, shell=False, capture_output=True, check=False)
+    socket_path = os.environ.get("CERTORAIL_BROKER_SOCKET")
+    if socket_path is None:
+        raise ExecFailed("no broker: the policy permits no programs")
+    program, *arguments = cmd
+    try:
+        reply = _broker_roundtrip(
+            socket_path,
+            {"kind": "exec", "program": program, "arguments": arguments,
+             "cwd": os.fspath(cwd)},
+            timeout=None,
+        )
+    except OSError as exc:
+        raise ExecFailed(f"broker transport failure: {exc}")
+    if not reply.get("ok"):
+        raise ExecFailed(f"{reply.get('error', 'error')}: {reply.get('detail', '')}")
+    return subprocess.CompletedProcess(
+        args=list(cmd),
+        returncode=int(reply["returncode"]),
+        stdout=base64.b64decode(reply.get("stdout_b64", "")),
+        stderr=base64.b64decode(reply.get("stderr_b64", "")),
+    )
 
 
 class CheckFailed(Exception):
     """A ``certora.check`` evaluator refused the value (nonzero exit)."""
 
 
-# name -> {"params": [...], "argv": [str | {"param": name}]}: the runtime half of the policy's
-# validation() declarations, installed by the host's bootstrap. The confined program never sees
-# the policy file, only this argv registry.
-_VALIDATIONS: dict[str, dict[str, Any]] = {}
-
-
 def check(name: str, *, cwd: pathlib.Path | str | None = None, **params: str) -> None:
     """Run the policy-declared evaluator for *name*; raise ``CheckFailed`` unless it exits 0.
 
-    The runtime half of ``certora.check``. The static half (``walker``) additionally requires the
-    statement form, a literal name, keywords matching the validation's declared parameters, and a
-    proven ``cwd`` (unless the validation declares no cwd, in which case it may be omitted and
-    the evaluator runs at the sandbox root) -- and is what turns falling through this call into
-    facts.
+    The runtime half of ``certora.check``, tunneled to the host's broker: the evaluator runs
+    *outside* the jail, where whatever it consults -- an inventory service, credentials, the
+    org's tooling -- actually lives. The broker holds the policy's declarations, so name,
+    parameters and a declared cwd are all re-enforced there. The static half (``walker``)
+    additionally requires the statement form, a literal name, keywords matching the declared
+    parameters, and a proven ``cwd`` (unless the validation declares none) -- and is what
+    turns falling through this call into facts.
     """
-    spec = _VALIDATIONS.get(name)
-    if spec is None:
-        raise CheckFailed(f"check: no validation named {name!r}")
-    expected, given = set(spec["params"]), set(params)
-    if expected != given:
-        raise TypeError(f"check {name!r}: expected arguments {sorted(expected)}, got {sorted(given)}")
-    if not all(isinstance(v, str) for v in params.values()):
-        raise TypeError(f"check {name!r}: every argument must be a str")
-    argv = [piece if isinstance(piece, str) else params[piece["param"]] for piece in spec["argv"]]
-    result = subprocess.run(argv, cwd=cwd, shell=False, capture_output=True, check=False)
-    if result.returncode != 0:
-        detail = result.stderr.decode(errors="replace").strip()
-        raise CheckFailed(f"check {name!r} failed ({result.returncode})" + (f": {detail}" if detail else ""))
+    socket_path = os.environ.get("CERTORAIL_BROKER_SOCKET")
+    if socket_path is None:
+        raise CheckFailed("check: no broker (the policy declares no validations)")
+    try:
+        reply = _broker_roundtrip(
+            socket_path,
+            {"kind": "check", "name": name, "params": dict(params),
+             "cwd": None if cwd is None else os.fspath(cwd)},
+            timeout=None,
+        )
+    except OSError as exc:
+        raise CheckFailed(f"check: broker transport failure: {exc}")
+    if not reply.get("ok"):
+        if reply.get("error") == "bad_request":
+            raise TypeError(str(reply.get("detail", "")))
+        raise CheckFailed(f"check: {reply.get('detail', reply.get('error', 'error'))}")
+    returncode = int(reply["returncode"])
+    if returncode != 0:
+        detail = (
+            base64.b64decode(reply.get("stderr_b64", "")).decode(errors="replace").strip()
+        )
+        raise CheckFailed(
+            f"check {name!r} failed ({returncode})" + (f": {detail}" if detail else "")
+        )
+
+
+class NetworkError(RuntimeError):
+    """A brokered request failed: denied by policy, over a cap, or transport trouble."""
+
+
+@dataclass(frozen=True)
+class NetworkResponse:
+    status: int
+    reason: str
+    headers: tuple[tuple[str, str], ...]
+    body: bytes
+    url: str  # the final URL, after any redirects the broker followed
+
+
+def _recv_exact(conn: socket.socket, n: int) -> bytes | None:
+    buf = b""
+    while len(buf) < n:
+        chunk = conn.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+def _broker_roundtrip(
+    socket_path: str, payload: dict[str, Any], timeout: float | None
+) -> dict[str, Any]:
+    """One framed exchange with the host's broker (one connection per request). Transport
+    failures surface as OSError for the caller to wrap; closing the socket -- this timeout,
+    the program dying -- is what cancels the request broker-side."""
+    frame = json.dumps(payload).encode("utf-8")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        # the broker always answers within its own deadlines; the slack keeps its precise
+        # timeout error ahead of this blunt one
+        s.settimeout(timeout + 30.0 if timeout is not None else None)
+        s.connect(socket_path)
+        s.sendall(struct.pack("!I", len(frame)) + frame)
+        header = _recv_exact(s, 4)
+        if header is None:
+            raise ConnectionError("the broker closed the connection")
+        (length,) = struct.unpack("!I", header)
+        reply_frame = _recv_exact(s, length)
+        if reply_frame is None:
+            raise ConnectionError("the broker closed mid-frame")
+    return json.loads(reply_frame)
+
+
+class _Network:
+    """The runtime half of ``certora.network``: one Unix-socket connection to the host's
+    broker per request (the socket path arrives in ``CERTORAIL_BROKER_SOCKET``; absent, the
+    policy granted no network). Closing the connection -- a timeout here, the program dying --
+    is what cancels the in-flight request broker-side. The static half (walker) admits only
+    these methods, a single URL argument whose scheme and netloc are proven, and the
+    enumerated keywords."""
+
+    def get(self, url: str, *, headers: dict[str, str] | None = None,
+            timeout: float | None = None) -> NetworkResponse:
+        return self._request("GET", url, headers, None, timeout)
+
+    def head(self, url: str, *, headers: dict[str, str] | None = None,
+             timeout: float | None = None) -> NetworkResponse:
+        return self._request("HEAD", url, headers, None, timeout)
+
+    def delete(self, url: str, *, headers: dict[str, str] | None = None,
+               timeout: float | None = None) -> NetworkResponse:
+        return self._request("DELETE", url, headers, None, timeout)
+
+    def post(self, url: str, *, headers: dict[str, str] | None = None,
+             body: bytes | None = None, timeout: float | None = None) -> NetworkResponse:
+        return self._request("POST", url, headers, body, timeout)
+
+    def put(self, url: str, *, headers: dict[str, str] | None = None,
+            body: bytes | None = None, timeout: float | None = None) -> NetworkResponse:
+        return self._request("PUT", url, headers, body, timeout)
+
+    def patch(self, url: str, *, headers: dict[str, str] | None = None,
+              body: bytes | None = None, timeout: float | None = None) -> NetworkResponse:
+        return self._request("PATCH", url, headers, body, timeout)
+
+    def _request(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str] | None,
+        body: bytes | None,
+        timeout: float | None,
+    ) -> NetworkResponse:
+        socket_path = os.environ.get("CERTORAIL_BROKER_SOCKET")
+        if socket_path is None:
+            raise NetworkError("no broker: the policy grants no network access")
+        payload: dict[str, Any] = {"method": method, "url": url}
+        if headers:
+            payload["headers"] = dict(headers)
+        if body is not None:
+            payload["body_b64"] = base64.b64encode(body).decode("ascii")
+        if timeout is not None:
+            payload["timeout"] = timeout
+        try:
+            reply = _broker_roundtrip(socket_path, payload, timeout)
+        except OSError as exc:
+            raise NetworkError(f"broker transport failure: {exc}")
+        if not reply.get("ok"):
+            raise NetworkError(f"{reply.get('error', 'error')}: {reply.get('detail', '')}")
+        return NetworkResponse(
+            status=int(reply["status"]),
+            reason=str(reply.get("reason", "")),
+            headers=tuple((str(k), str(v)) for k, v in reply.get("headers", [])),
+            body=base64.b64decode(reply["body_b64"]) if reply.get("body_b64") else b"",
+            url=str(reply.get("url", url)),
+        )
+
+
+network = _Network()
 
 
 @dataclass(frozen=True)
@@ -145,8 +302,26 @@ class Validated:
     tags: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class Url:
+    """The value is a URL: claims about its urlsplit reading (``analysis.UrlString``). Each
+    component given is a claim; an omitted one claims nothing."""
+    scheme: str | None
+    netloc: Fragment | None
+    path_within: str | None
+
+
 def validated(*tags: str) -> Validated:
     return Validated(tags)
+
+
+def url(
+    *,
+    scheme: str | None = None,
+    netloc: Fragment | None = None,
+    path_within: str | None = None,
+) -> Url:
+    return Url(scheme, netloc, path_within)
 
 
 def within(prefix: Fragment, leaf: Fragment | None = None) -> Within:

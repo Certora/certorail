@@ -30,7 +30,9 @@ from .markers import NAMESPACE
 
 # Names whose dotted attributes the analysis interprets. The walker can pass its actual imports
 # instead; the default is the vocabulary the recognizers know about.
-KNOWN_MODULES: frozenset[str] = frozenset({"os", "pathlib", "re", "sys", "typing", NAMESPACE})
+KNOWN_MODULES: frozenset[str] = frozenset(
+    {"os", "pathlib", "re", "sys", "typing", "urllib", NAMESPACE}
+)
 
 
 @dataclass(frozen=True)

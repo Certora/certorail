@@ -39,6 +39,7 @@ from .analysis import (
     PyOpenCall,
     StaticPath,
     StrFact,
+    UrlString,
     ValidationFact,
     as_const_or_default,
     as_const_or_null,
@@ -55,12 +56,16 @@ from .analysis import (
     pretty_regex,
     resolve_callee,
     saturate,
+    url_of,
 )
 from .dangerous import (
     CHECK_CALLEE,
     EXEC_ALLOWED_KEYWORDS,
     EXEC_CALLEE,
     EXEC_REQUIRED_KEYWORDS,
+    NETWORK_BODY_METHODS,
+    NETWORK_METHODS,
+    NETWORK_NAMESPACE,
     NON_KILLING_CALLEES,
     PATH_SINK_FUNCTIONS,
     PATH_SINK_METHODS,
@@ -137,7 +142,25 @@ class CheckSite:
         return not self.needs_cwd or isinstance(self.cwd, Located)
 
 
-type Site = SinkSite | ExecSite | CheckSite
+@dataclass(frozen=True)
+class NetworkSite:
+    """A ``certora.network.<method>(url, ...)`` call: one brokered, policy-checked request."""
+
+    node: ast.Call
+    method: str  # the HTTP method, upper-case
+    url: str | ValidationFact | None
+
+    @property
+    def what(self) -> str:
+        return f"network.{self.method.lower()}"
+
+    @property
+    def confined(self) -> bool:
+        lifted = url_of(self.url)
+        return lifted is not None and lifted.scheme is not None and lifted.netloc is not None
+
+
+type Site = SinkSite | ExecSite | CheckSite | NetworkSite
 
 
 @dataclass(frozen=True)
@@ -641,6 +664,32 @@ class ValidationWalker(ast.NodeVisitor):
             )
         )
 
+    def _audit_network(self, node: ast.Call, method: str) -> None:
+        """``certora.network.<method>(url, *, headers=..., body=..., timeout=...)``: one
+        brokered request. The URL is the sink -- the policy must know where it points -- and
+        the rest is data the broker caps at runtime."""
+        if any(isinstance(a, ast.Starred) for a in node.args) or any(
+            k.arg is None for k in node.keywords
+        ):
+            self._violation(node, "network: *args / **kwargs are not admissible")
+            return
+        if len(node.args) != 1:
+            self._violation(node, "network: exactly one positional argument, the URL")
+            return
+        allowed = {"headers", "timeout"} | (
+            {"body"} if method in NETWORK_BODY_METHODS else set()
+        )
+        for k in node.keywords:
+            if k.arg is not None and k.arg not in allowed:
+                self._violation(
+                    node, f"network: keyword {k.arg!r} is not admissible for {method}"
+                )
+        # the fact is stored unlifted: the policy lifts (url_of) for the endpoint check, while
+        # the raw fact keeps its exactly-known text for literal-checker discharge of `requires`
+        self.sinks.append(
+            NetworkSite(node, method.upper(), interpret_expr(node.args[0], self.state))
+        )
+
     def _audit_sink(self, node: ast.Call) -> None:
         """Record a filesystem operation with what is known about the path it touches. The path's
         provenance is not a violation here; ``Report.ok`` decides on ``confined``."""
@@ -648,6 +697,13 @@ class ValidationWalker(ast.NodeVisitor):
         if callee is not None and callee.matches(*EXEC_CALLEE):
             self._audit_exec(node)
             return
+        if callee is not None:
+            method = next(
+                (m for m in NETWORK_METHODS if callee.matches(*NETWORK_NAMESPACE, m)), None
+            )
+            if method is not None:
+                self._audit_network(node, method)
+                return
         match lower(node, self.modules):
             case Call(("open",), _, _):
                 bound = bind_call_args(node, PyOpenCall)
@@ -1016,6 +1072,17 @@ def _describe_value(v: str | ValidationFact | None) -> str:
                 + (f" [{', '.join(sorted(atoms))}]" if atoms else "")
                 + _checks_suffix(checks)
             )
+        case UrlString(netloc=netloc, path=path, scheme=scheme, checks=checks):
+            claims = ", ".join(
+                bit
+                for bit in (
+                    f"scheme {scheme}" if scheme is not None else None,
+                    f"netloc {pretty_regex(netloc)}" if netloc is not None else None,
+                    f"path {pretty_location(path)}" if path is not None else None,
+                )
+                if bit is not None
+            )
+            return f"url ({claims or 'nothing known'})" + _checks_suffix(checks)
 
 
 def describe_sink(site: Site) -> str:
@@ -1026,6 +1093,8 @@ def describe_sink(site: Site) -> str:
             return f"confined to {pretty_location(loc)}"
         case SinkSite():
             return "the path is read as text; it is not confined"
+        case NetworkSite(method=method, url=url):
+            return f"{method} {_describe_value(url)}"
         case ExecSite(arguments=arguments, cwd=cwd):
             args = ", ".join(_describe_value(a) for a in arguments) or "none"
             return f"cwd {_describe_value(cwd)}; arguments: {args}"

@@ -17,7 +17,7 @@ no fact and may not carry markers.
 import ast
 import inspect
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .analysis import (
     ANY_NAME,
@@ -37,12 +37,15 @@ from .analysis import (
     RegexLit,
     StaticPath,
     StrFact,
+    UrlString,
+    UrlString,
     ValidationFact,
     _literal_location,
     _safe_path_extension,
     alternation,
     concat,
     is_safe_name,
+    splat_under,
 )
 from .markers import NAMESPACE
 from .terms import Call, Dotted, Items, Subscript, Term, Var, lower
@@ -87,8 +90,8 @@ def is_plain_type(fact: ValidationFact | None) -> bool:
     match fact:
         case None:
             return True
-        case StrFact() | PathFact():
-            return fact == StrFact() or fact == PathFact()
+        case StrFact() | PathFact() | UrlString():
+            return fact == StrFact() or fact == PathFact() or fact == UrlString()
         case Located():
             return False
 
@@ -253,6 +256,33 @@ def _location_of(t: Term, name: str, args: Args, kwargs: Kwargs) -> LocationFact
 # ---------------------------------------------------------------------------
 
 
+def _url_fact(t: Term, args: Args, kwargs: Kwargs) -> UrlString:
+    """``certora.url(scheme=..., netloc=..., path_within=...)``: claims about the value's
+    urlsplit reading. netloc takes a literal or a regex marker; path_within is a literal
+    URL-path prefix (server-absolute), meaning "at or below"."""
+    scheme_t, netloc_t, path_t = _bind(
+        t, args, kwargs, ("scheme", "netloc", "path_within"), 0, "url"
+    )
+    scheme = None
+    if scheme_t is not None:
+        scheme = scheme_t.as_str()
+        if scheme not in ("http", "https"):
+            raise _err(scheme_t, 'url(scheme=...) must be "http" or "https"')
+    netloc = None if netloc_t is None else _fragment_regex(netloc_t)
+    path = None
+    if path_t is not None:
+        prefix = path_t.as_str()
+        if prefix is None or not prefix.startswith("/"):
+            raise _err(path_t, 'url(path_within=...) must be a string literal starting with "/"')
+        loc = _literal_location(prefix)
+        if loc is None:
+            raise _err(path_t, "url(path_within=...) must be free of '..'")
+        path = splat_under(loc)
+    if scheme is None and netloc is None and path is None:
+        raise _err(t, "url() needs at least one of scheme=, netloc=, path_within=")
+    return UrlString(netloc=netloc, path=path, scheme=scheme)
+
+
 def _scalar_fact(t: Term) -> ValidationFact | None:
     match t:
         case Var("str"):
@@ -273,6 +303,8 @@ def _annotated(base: Term, metadata: Sequence[Term]) -> ValidationFact:
     regex: PseudoRegex | None = None
     containment: LocationFact | None = None
     located_by: Term | None = None
+    url_fact: UrlString | None = None
+    url_by: Term | None = None
     for m in metadata:
         match m:
             case Dotted((ns, atom_name)) if ns == NAMESPACE:
@@ -289,6 +321,13 @@ def _annotated(base: Term, metadata: Sequence[Term]) -> ValidationFact:
         if name == "validated":
             # policy validations the value has passed; combines with location AND text markers
             checks.update(_str_args(m, args, kwargs, "validated"))
+        elif name == "url":
+            if url_fact is not None:
+                raise _err(m, "at most one url()")
+            if isinstance(fact, PathFact):
+                raise _err(m, "url() applies to str, not paths")
+            url_fact = _url_fact(m, args, kwargs)
+            url_by = m
         elif name in _LOCATION_MARKERS:
             if containment is not None:
                 raise _err(m, "at most one of within()/exactly()")
@@ -305,6 +344,12 @@ def _annotated(base: Term, metadata: Sequence[Term]) -> ValidationFact:
         else:
             raise _err(m, f"unknown marker certora.{name}")
 
+    if url_fact is not None and url_by is not None:
+        # a URL-read value is textless, like a located one: text and location markers do not
+        # combine with url()
+        if regex is not None or atoms or containment is not None:
+            raise _err(url_by, "url() does not combine with text or location markers")
+        return replace(url_fact, checks=frozenset(checks))
     if containment is not None and located_by is not None:
         # a located value is read as a path, not as text: text facts do not combine with it
         if regex is not None or atoms:

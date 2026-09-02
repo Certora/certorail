@@ -5,11 +5,14 @@ The vocabulary (which checks exist, what they establish, what is pure) is policy
 threaded into ``analyze``; the dataflow tests use a hand-built ``Vocabulary``, the end-to-end
 tests go through ``host.check`` with a real ``Policy``.
 """
+import os
 import pathlib
 import tempfile
+import threading
 import unittest
 
 from certorail import markers
+from certorail.broker import build_server
 from certorail.analysis import RegexLit, checks_of
 from certorail.host import Accepted, Rejected
 from certorail.host import check as host_check
@@ -497,14 +500,34 @@ class TestUnknownArguments(unittest.TestCase):
 
 
 class TestRuntimeCheck(unittest.TestCase):
-    def setUp(self) -> None:
-        markers._VALIDATIONS["always"] = {"params": [], "argv": ["true"]}
-        markers._VALIDATIONS["never"] = {"params": [], "argv": ["false"]}
-        markers._VALIDATIONS["nonempty"] = {"params": ["what"], "argv": ["test", "-n", {"param": "what"}]}
+    """The runtime half of certora.check: tunneled to the broker, run host-side -- outside
+    the jail, where whatever a validation consults actually lives."""
 
-    def tearDown(self) -> None:
-        for name in ("always", "never", "nonempty"):
-            markers._VALIDATIONS.pop(name, None)
+    @classmethod
+    def setUpClass(cls) -> None:
+        policy = Policy.allow(
+            validations=[
+                validation("always", argv=("true",), establishes={}),
+                validation("never", argv=("false",), establishes={}),
+                validation(
+                    "nonempty",
+                    argv=("test", "-n", param("what")),
+                    params=("what",),
+                    establishes={},
+                ),
+            ]
+        )
+        cls.root = pathlib.Path(tempfile.mkdtemp())
+        cls.sock = os.path.join(tempfile.mkdtemp(), "broker.sock")
+        cls.server = build_server(cls.sock, policy, cls.root)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        os.environ["CERTORAIL_BROKER_SOCKET"] = cls.sock
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        os.environ.pop("CERTORAIL_BROKER_SOCKET", None)
+        cls.server.shutdown()
+        cls.server.server_close()
 
     def test_success_returns_none(self) -> None:
         self.assertIsNone(markers.check("always", cwd="."))
@@ -514,17 +537,17 @@ class TestRuntimeCheck(unittest.TestCase):
             markers.check("never", cwd=".")
 
     def test_parameters_substitute_into_the_argv(self) -> None:
-        self.assertIsNone(markers.check("nonempty", what="x", cwd="."))
+        self.assertIsNone(markers.check("nonempty", what="x"))
         with self.assertRaises(CheckFailed):
-            markers.check("nonempty", what="", cwd=".")
+            markers.check("nonempty", what="")
 
     def test_unknown_validation_raises(self) -> None:
         with self.assertRaises(CheckFailed):
-            markers.check("unregistered", cwd=".")
+            markers.check("unregistered")
 
     def test_wrong_keywords_raise(self) -> None:
         with self.assertRaises(TypeError):
-            markers.check("always", extra="x", cwd=".")
+            markers.check("always", extra="x")
 
 
 if __name__ == "__main__":

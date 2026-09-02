@@ -37,6 +37,7 @@ from .analysis import (
     RegexLit,
     StaticPath,
     StrFact,
+    UrlString,
     ValidationFact,
     _literal_location,
     alternation,
@@ -75,11 +76,14 @@ class Refinement:
     atoms: frozenset[AtomicFact] = frozenset()
     regex: PseudoRegex | None = None  # None: the guard says nothing about the regex
     containment: LocationFact | None = None
-    # Atoms that must already hold on the subject for ``containment`` to be trusted. Lexical
-    # containment checks (``p.is_relative_to(base)``, ``x.startswith("data/")``) only amount to
-    # containment once ".." components are excluded; resolving checks (``p.resolve()...``) need
-    # nothing.
+    # Atoms that must already hold on the subject for ``containment`` (and a ``url`` claim
+    # carrying a path) to be trusted. Lexical containment checks (``p.is_relative_to(base)``,
+    # ``x.startswith("data/")``, ``urlsplit(x).path.startswith("/v1/")``) only amount to
+    # containment once ".." components are excluded; resolving checks (``p.resolve()...``)
+    # need nothing.
     containment_requires: frozenset[AtomicFact] = frozenset()
+    # claims about the subject's urlsplit reading (``urlsplit(x).netloc == "api.github.com"``)
+    url: UrlString | None = None
 
 
 NOTHING = Refinement()
@@ -136,6 +140,16 @@ def _prefer_containment(cur: LocationFact | None, new: LocationFact | None) -> L
             return cur
 
 
+def _merge_url(cur: UrlString, new: UrlString) -> UrlString:
+    # both claims hold of the value; keep the sharper one per component
+    return UrlString(
+        netloc=new.netloc if cur.netloc is None else _prefer_regex(cur.netloc, new.netloc),
+        path=_prefer_containment(cur.path, new.path),
+        scheme=cur.scheme if cur.scheme is not None else new.scheme,
+        checks=cur.checks,
+    )
+
+
 def apply(fact: ValidationFact | None, r: Refinement) -> ValidationFact | None:
     """Refine *fact* (``None`` = nothing known) with *r*; sound on the guard's fall-through path.
 
@@ -165,10 +179,24 @@ def apply(fact: ValidationFact | None, r: Refinement) -> ValidationFact | None:
             if r.containment is not None and not r.containment_requires:
                 return Located(_prefer_containment(loc, r.containment) or loc, rp, checks)
             return fact
+        case UrlString():
+            # likewise textless; another URL claim merges, unless it is requires-gated (a
+            # UrlString carries no atoms, so the gate cannot be shown)
+            if r.url is not None and not r.containment_requires:
+                return _merge_url(fact, r.url)
+            return fact
         case StrFact(regex=regex, atoms=atoms, checks=checks):
             refined = StrFact(regex=_prefer_regex(regex, r.regex), atoms=atoms | r.atoms, checks=checks)
         case PathFact(atoms=atoms, checks=checks):
             refined = PathFact(atoms=atoms | r.atoms, checks=checks)
+
+    if (
+        r.url is not None
+        and isinstance(refined, StrFact)
+        and all(a in refined for a in r.containment_requires)
+    ):
+        # the value gains its URL reading; the text reading is given up (as with containment)
+        return UrlString(r.url.netloc, r.url.path, r.url.scheme, refined.checks)
 
     if r.containment is not None and all(a in refined for a in r.containment_requires):
         # the value gains its path reading; if its text already located it somewhere sharper
@@ -238,13 +266,20 @@ def _guard(sub: Subject | None, r: Refinement) -> list[Guard]:
     if sub.viewed:
         r = replace(r, type_info=None)
     if sub.normalizing:
-        r = replace(r, atoms=r.atoms - {"no-slash"})
+        # PurePath() rewrites the text ("h://a" becomes "h:/a"): URL claims about the view say
+        # nothing about the variable
+        r = replace(r, atoms=r.atoms - {"no-slash"}, url=None)
     if sub.collapsing:
         # the view is a different string (regex, slashes, "..") but keeps absoluteness; its
         # containment stays conditional on the variable's own no-parent-traversal
-        r = replace(r, atoms=r.atoms - {"no-slash", "no-parent-traversal", "not-dot-dot"}, regex=None)
+        r = replace(
+            r, atoms=r.atoms - {"no-slash", "no-parent-traversal", "not-dot-dot"}, regex=None,
+            url=None,
+        )
     if sub.resolving:
-        r = replace(r, atoms=frozenset(), regex=None, containment_requires=frozenset())
+        r = replace(
+            r, atoms=frozenset(), regex=None, containment_requires=frozenset(), url=None
+        )
     if r == NOTHING:
         return []
     return [Guard(sub.name, r)]
@@ -333,6 +368,8 @@ def _from_fact(fact: ValidationFact) -> Refinement:
             return Refinement(type_info="path", atoms=atoms)
         case Located(location=loc, repr=rp):
             return Refinement(type_info=rp, containment=loc)
+        case UrlString(netloc=netloc, path=path, scheme=scheme):
+            return Refinement(type_info="str", url=UrlString(netloc, path, scheme))
 
 
 def _exact_or_alternation(literals: Sequence[str]) -> PseudoRegex:
@@ -345,6 +382,33 @@ def _within(loc: LocationFact) -> Refinement:
     return Refinement(
         containment=splat_under(loc), containment_requires=frozenset({"no-parent-traversal"})
     )
+
+
+def _url_view(t: Term) -> tuple[Term, str, bool] | None:
+    """``urlsplit(x).<comp>`` / ``urlparse(x).<comp>`` -> (x, component, via urlsplit).
+
+    The two agree on scheme and netloc, but urlparse shears ``;params`` off the last path
+    segment, so a ``.path`` observed through urlparse is NOT evidence about the urlsplit path
+    (which is what a ``UrlString`` claims and what the broker checks)."""
+    match t:
+        case Attr(Call(("urllib", "parse", ("urlsplit" | "urlparse") as fn), (inner,), ()), comp):
+            return inner, comp, fn == "urlsplit"
+        case _:
+            return None
+
+
+def _url_refinement(comp: str, from_split: bool, value: str) -> Refinement | None:
+    """The claim ``urlsplit(x).<comp> == value`` makes about x, if it is one we can state."""
+    match comp:
+        case "netloc":
+            return Refinement(type_info="str", url=UrlString(netloc=Exact(value)))
+        case "scheme" if value in ("http", "https"):
+            return Refinement(type_info="str", url=UrlString(scheme=value))
+        case "path" if from_split:
+            loc = _literal_location(value)  # rejects ".." (lexical claims only)
+            return None if loc is None else Refinement(type_info="str", url=UrlString(path=loc))
+        case _:
+            return None
 
 
 def _same_variable(a: Term, b: Term) -> bool:
@@ -515,6 +579,15 @@ def _not_in(left: Term, right: Term) -> list[Guard]:
 def _in(left: Term, right: Term, st: Mapping[str, ValidationFact]) -> list[Guard]:
     # x in ("a", "b")  (x in "literal" is a substring test and proves nothing)
     lits = right.str_items()
+    if lits and (uv := _url_view(left)) is not None:
+        # urlsplit(u).netloc in ("a.com", "b.com")
+        inner, comp, _ = uv
+        if comp != "netloc":
+            return []
+        return _guard(
+            subject_of(inner),
+            Refinement(type_info="str", url=UrlString(netloc=_exact_or_alternation(lits))),
+        )
     if lits:
         return _guard(
             subject_of(left), Refinement(type_info="str", regex=_exact_or_alternation(lits))
@@ -530,6 +603,12 @@ def _in(left: Term, right: Term, st: Mapping[str, ValidationFact]) -> list[Guard
 
 def _eq(a: Term, b: Term, st: Mapping[str, ValidationFact]) -> list[Guard]:
     """``a == b`` with the "interesting" operand on the left; called in both orientations."""
+    # urlsplit(x).netloc == "api.github.com" and friends: a claim about x's urlsplit reading
+    if (uv := _url_view(a)) is not None:
+        inner, comp, from_split = uv
+        value = b.as_str()
+        r = None if value is None else _url_refinement(comp, from_split, value)
+        return [] if r is None else _guard(subject_of(inner), r)
     match a:
         # os.path.basename(x) == x
         case Call(("os", "path", "basename"), (inner,), ()):
@@ -641,6 +720,27 @@ def _method(
                 return _guard(subject_of(x), Refinement(type_info="str", regex=RegexLit(r)))
             case _:
                 return []
+
+    # urlsplit(u).path.startswith("/v1/"): the urlsplit path lies under /v1 -- lexically, so
+    # like every prefix check it is trusted only once ".." is excluded
+    if name == "startswith" and positive and (uv := _url_view(recv)) is not None:
+        inner, comp, from_split = uv
+        if comp != "path" or not from_split or len(args) != 1:
+            return []
+        prefix = args[0].as_str()
+        if prefix is None or not prefix.endswith("/"):
+            return []  # "/data" also prefixes "/database"
+        loc = _literal_location(prefix)  # PurePath drops the trailing slash
+        if loc is None or not loc.absolute:
+            return []  # a URL path with a netloc is server-absolute; anything else is exotic
+        return _guard(
+            subject_of(inner),
+            Refinement(
+                type_info="str",
+                url=UrlString(path=splat_under(loc)),
+                containment_requires=frozenset({"no-parent-traversal"}),
+            ),
+        )
 
     sub = subject_of(recv)
     if sub is None:

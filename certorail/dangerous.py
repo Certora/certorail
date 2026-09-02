@@ -82,6 +82,7 @@ FORBIDDEN_MODULES: frozenset[str] = frozenset({
     "sqlite3",           # connect(path) + load_extension(.so)
     # network / exfiltration / SSRF
     "socket", "_socket", "ssl", "asyncio",
+    # urllib is banned at the root; urllib.parse alone is carved back in (PERMITTED_SUBMODULES)
     "urllib", "http", "ftplib", "poplib", "imaplib", "nntplib", "smtplib",
     "telnetlib", "xmlrpc", "socketserver", "wsgiref", "webbrowser",
     # xml attacks (prefer defusedxml if XML is truly needed)
@@ -113,6 +114,12 @@ FORBIDDEN_MODULES: frozenset[str] = frozenset({
     "uu", "xdrlib",              # legacy encodings
     "msilib",                    # windows installer
 })
+
+# Submodules importable even though their root is banned: pure-computation islands inside a
+# dangerous package. ``import urllib.parse`` binds the name ``urllib``, but the surface stays
+# closed: from-imports and as-aliases are violations, a submodule exists as an attribute only
+# once imported, and ALLOWED_MEMBERS gates the bound root down to the carved-out submodule.
+PERMITTED_SUBMODULES: frozenset[str] = frozenset({"urllib.parse"})
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +294,15 @@ ALLOWED_MEMBERS: dict[tuple[str, ...], frozenset[str]] = {
         "isabs", "normpath", "abspath", "realpath", "commonpath",
         "exists", "isfile", "isdir",
     }),
+    # the root name is bound by ``import urllib.parse`` (see PERMITTED_SUBMODULES); nothing of
+    # the rest of the package is reachable through it
+    ("urllib",): frozenset({"parse"}),
+    ("urllib", "parse"): frozenset({
+        # the pure text half of the module: split/join/quote. No opener, no network.
+        "urlsplit", "urlparse", "urlunsplit", "urlunparse", "urljoin",
+        "urlencode", "quote", "quote_plus", "unquote", "unquote_plus",
+        "parse_qs", "parse_qsl",
+    }),
     ("typing",): frozenset({
         # annotation vocabulary only -- none of these evaluates a name or reflects
         # on an object. The reflection members are absent on purpose (see above).
@@ -366,6 +382,15 @@ EXEC_REQUIRED_KEYWORDS: frozenset[str] = frozenset({"cwd"})
 # variables. Statically (walker): statement form only, a literal name, keywords fixed by the
 # policy's declaration, cwd a sink like exec's.
 CHECK_CALLEE: tuple[str, ...] = (NAMESPACE, "check")
+
+# certora.network.<method>(url, *, headers=..., body=..., timeout=...) is the only way to touch
+# the network: one brokered, policy-checked request per call (broker.py; the runtime half lives
+# in markers.network). Statically (walker): no splats, exactly one positional argument -- the
+# URL, whose scheme and netloc must be proven (a literal, or urllib.parse.urlsplit guards) --
+# and only the enumerated keywords, body on the body-bearing methods alone.
+NETWORK_NAMESPACE: tuple[str, ...] = (NAMESPACE, "network")
+NETWORK_METHODS: frozenset[str] = frozenset({"get", "head", "delete", "post", "put", "patch"})
+NETWORK_BODY_METHODS: frozenset[str] = frozenset({"post", "put", "patch"})
 
 # The crude validation-kill (walker): ANY call may run program code with effects -- a module
 # function, a lambda held in a variable, a class instantiation, a subprocess -- so every call

@@ -8,12 +8,14 @@ stripping keys on.
 import base64
 import http.server
 import os
+import pathlib
 import tempfile
 import threading
 import unittest
 
-from certorail.broker import build_server, request
-from certorail.policy import Policy, network
+from certorail import markers
+from certorail.broker import build_server, exec_request, request
+from certorail.policy import Policy, atom, network, param, program, pure, validation, waived
 
 
 class _Origin(http.server.BaseHTTPRequestHandler):
@@ -42,6 +44,8 @@ class _Origin(http.server.BaseHTTPRequestHandler):
                 self._reply(302, headers=[("Location", "/ok")])
             case "/bounce-auth":
                 self._reply(302, headers=[("Location", "/auth")])
+            case "/bounce-bad":
+                self._reply(302, headers=[("Location", "/big")])
             case "/hop":
                 self._reply(302, headers=[
                     ("Location", f"http://127.0.0.1:{self.other_port}/auth")])
@@ -149,6 +153,180 @@ class TestBroker(unittest.TestCase):
         self.assertFalse(reply["ok"])
         self.assertEqual(reply["error"], "policy_denied")
         self.assertIn("non-public", reply["detail"])
+
+
+class TestBrokerRequires(unittest.TestCase):
+    """A rule's ``requires`` atoms are re-discharged from the URL text on every hop: a
+    redirect the analysis never saw meets the same bar as the first request."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.origin = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Origin)
+        cls.port = cls.origin.server_address[1]
+        threading.Thread(target=cls.origin.serve_forever, daemon=True).start()
+        policy = Policy.allow(
+            atoms=[
+                atom(
+                    "ok-path",
+                    markers.matches(rf"http://localhost:{cls.port}/(ok|bounce|bounce-bad)"),
+                )
+            ],
+            network=[
+                network("localhost", schemes=["http"], ports=[cls.port],
+                        allow_nonpublic=True, requires=["ok-path"])
+            ],
+        )
+        cls.sock = os.path.join(tempfile.mkdtemp(), "broker.sock")
+        cls.server = build_server(cls.sock, policy)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.origin.shutdown()
+
+    def test_a_discharged_url_is_allowed(self) -> None:
+        reply = request(self.sock, "GET", f"http://localhost:{self.port}/ok")
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(_body(reply), b"hello")
+
+    def test_an_undischarged_url_is_denied(self) -> None:
+        reply = request(self.sock, "GET", f"http://localhost:{self.port}/big")
+        self.assertFalse(reply["ok"])
+        self.assertEqual(reply["error"], "policy_denied")
+        self.assertIn("not validated by: ok-path", reply["detail"])
+
+    def test_a_redirect_hop_meets_the_same_bar(self) -> None:
+        # /bounce carries the atom and lands on /ok, which also carries it
+        reply = request(self.sock, "GET", f"http://localhost:{self.port}/bounce")
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(_body(reply), b"hello")
+        # /bounce-bad itself carries the atom, but it hops to /big, which does not: the
+        # hop -- a URL the static analysis never saw -- is refused
+        reply = request(self.sock, "GET", f"http://localhost:{self.port}/bounce-bad")
+        self.assertFalse(reply["ok"])
+        self.assertEqual(reply["error"], "policy_denied")
+        self.assertIn("not validated by: ok-path", reply["detail"])
+
+
+class TestBrokerRedirectModes(unittest.TestCase):
+    """Non-textual atoms: "stop" (the default for them) refuses hops outright; "waive" asks
+    nothing of them. Either way the initial request rides on its static proof."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.origin = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Origin)
+        cls.port = cls.origin.server_address[1]
+        threading.Thread(target=cls.origin.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.origin.shutdown()
+
+    def _broker(self, requires) -> str:
+        policy = Policy.allow(
+            validations=[
+                validation(
+                    "vetting",
+                    argv=("vet", param("value")),
+                    params=("value",),
+                    establishes={"value": [pure("vetted")]},
+                )
+            ],
+            network=[
+                network("localhost", schemes=["http"], ports=[self.port],
+                        allow_nonpublic=True, requires=requires)
+            ],
+        )
+        sock = os.path.join(tempfile.mkdtemp(), "broker.sock")
+        server = build_server(sock, policy)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return sock
+
+    def test_a_stop_atom_permits_the_initial_request(self) -> None:
+        sock = self._broker(["vetted"])  # non-textual: redirects default to "stop"
+        reply = request(sock, "GET", f"http://localhost:{self.port}/ok")
+        self.assertTrue(reply["ok"], reply)
+
+    def test_a_stop_atom_refuses_redirect_hops(self) -> None:
+        sock = self._broker(["vetted"])
+        reply = request(sock, "GET", f"http://localhost:{self.port}/bounce")
+        self.assertFalse(reply["ok"])
+        self.assertEqual(reply["error"], "policy_denied")
+        self.assertIn("cannot vouch", reply["detail"])
+
+    def test_a_waived_atom_lets_redirects_through(self) -> None:
+        sock = self._broker([waived("vetted")])
+        reply = request(sock, "GET", f"http://localhost:{self.port}/bounce")
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(_body(reply), b"hello")
+
+
+class TestBrokerExec(unittest.TestCase):
+    """The exec tunnel: the broker re-checks the decidable half of the exec rules, spawns the
+    child host-side, and returns the drained output wholesale."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.root = pathlib.Path(tempfile.mkdtemp())
+        (cls.root / "repos" / "x").mkdir(parents=True)
+        policy = Policy.allow(
+            programs=[
+                program("echo", cwd=markers.within(".")),
+                program("pwd", cwd=markers.within("repos")),
+                program("git", subcommand="log", cwd=markers.within("repos")),
+            ],
+        )
+        cls.sock = os.path.join(tempfile.mkdtemp(), "broker.sock")
+        cls.server = build_server(cls.sock, policy, cls.root)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def test_an_allowed_program_runs_and_returns_output(self) -> None:
+        reply = exec_request(self.sock, "echo", ["hi"], cwd=".")
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(reply["returncode"], 0)
+        self.assertEqual(base64.b64decode(reply["stdout_b64"]), b"hi\n")
+
+    def test_an_unlisted_program_is_denied_unspawned(self) -> None:
+        reply = exec_request(self.sock, "rm", ["-rf", "everything"], cwd=".")
+        self.assertFalse(reply["ok"])
+        self.assertEqual(reply["error"], "policy_denied")
+        self.assertIn("not permitted", reply["detail"])
+
+    def test_subcommands_fail_closed(self) -> None:
+        reply = exec_request(self.sock, "git", ["status"], cwd="repos/x")
+        self.assertFalse(reply["ok"])
+        self.assertEqual(reply["error"], "policy_denied")
+        self.assertIn("fail closed", reply["detail"])
+
+    def test_cwd_containment(self) -> None:
+        reply = exec_request(self.sock, "pwd", [], cwd=".")
+        self.assertFalse(reply["ok"])
+        self.assertEqual(reply["error"], "policy_denied")
+        self.assertIn("not within", reply["detail"])
+
+    def test_a_relative_cwd_resolves_against_the_root(self) -> None:
+        reply = exec_request(self.sock, "pwd", [], cwd="repos/x")
+        self.assertTrue(reply["ok"], reply)
+        out = base64.b64decode(reply["stdout_b64"]).decode().strip()
+        self.assertTrue(out.endswith("repos/x"), out)
+
+    def test_markers_exec_round_trip(self) -> None:
+        os.environ["CERTORAIL_BROKER_SOCKET"] = self.sock
+        self.addCleanup(os.environ.pop, "CERTORAIL_BROKER_SOCKET", None)
+        result = markers.exec("echo", "hi there", cwd=".")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b"hi there\n")
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(result.args, ["echo", "hi there"])
 
 
 if __name__ == "__main__":
