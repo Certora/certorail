@@ -61,6 +61,7 @@ from .analysis import (
 )
 from .dangerous import (
     CHECK_CALLEE,
+    CHECK_SINGLE_CALLEE,
     EXEC_ALLOWED_KEYWORDS,
     EXEC_CALLEE,
     EXEC_REQUIRED_KEYWORDS,
@@ -141,6 +142,14 @@ def _roster_blessings(
                             bless(bound.get(param))
             case ast.For(iter=it):
                 bless(it)  # a wrapper call in iter position is covered by the Call case
+            case (
+                ast.ListComp(generators=gens)
+                | ast.SetComp(generators=gens)
+                | ast.GeneratorExp(generators=gens)
+                | ast.DictComp(generators=gens)
+            ):
+                for g in gens:
+                    bless(g.iter)  # iterating a tracked container in a comprehension reads it
             case ast.Subscript(value=v, ctx=ast.Load()):
                 bless(v)  # an index reads an element; a slice-load is a copy
             case ast.Assign(targets=[ast.Subscript(value=v, slice=s)]) if not isinstance(
@@ -550,6 +559,8 @@ class ValidationWalker(ast.NodeVisitor):
             if fact is None:
                 fact = self._guaranteed(value)
             if fact is None:
+                fact = self._check_single_fact(value, self.state)
+            if fact is None:
                 self.state.pop(target.id, None)
             else:
                 self.state[target.id] = fact
@@ -647,13 +658,56 @@ class ValidationWalker(ast.NodeVisitor):
                     )
                     return False
                 return True
+            case ast.ListComp(elt=elt, generators=[gen]) if (
+                declared.kind == "list" and not gen.is_async
+            ):
+                return self._comprehension_conforms(value, elt, gen, declared)
+            case ast.SetComp(elt=elt, generators=[gen]) if (
+                declared.kind == "set" and not gen.is_async
+            ):
+                return self._comprehension_conforms(value, elt, gen, declared)
             case _:
                 self._violation(
                     value,
                     f"container: not a recognized {declared.kind} constructor "
-                    f"(a display, {declared.kind}(), or {declared.kind}(tracked))",
+                    f"(a display, a comprehension, {declared.kind}(), or "
+                    f"{declared.kind}(tracked))",
                 )
                 return False
+
+    def _comprehension_conforms(
+        self, comp: ast.expr, elt: ast.expr, gen: ast.comprehension, declared: Container
+    ) -> bool:
+        """A single-generator comprehension as a constructor: the element expression,
+        evaluated under the iteration bindings and the ``if`` refinements, must establish the
+        declared element fact. When any iteration may run an effectful call, environmental
+        checks cannot accumulate across iterations -- iteration i+1's effects kill what
+        iteration i established -- so only pure atoms survive into the container fact
+        (CONTAINERS.md: an effectful check_single usefully establishes only its pure atoms
+        here)."""
+        targets = {
+            n.id for n in ast.walk(gen.target) if isinstance(n, ast.Name)
+        }
+        inner: State = {k: v for k, v in self.state.items() if k not in targets}
+        inner.update(iteration_bindings(gen.target, gen.iter, self.state))
+        for cond in gen.ifs:
+            inner = self._refine(inner, cond)
+        fact = self._check_single_fact(elt, inner)
+        if fact is None:
+            fact = operand_value(elt, inner)
+        if (
+            fact is not None
+            and not isinstance(fact, str)
+            and self._may_effect([comp])
+        ):
+            fact = drop_checks(fact, keep=self.vocabulary.pure_atoms)
+        if not self._establishes(fact, declared.elem):
+            self._violation(
+                elt,
+                f"the comprehension element does not establish {_describe_value(declared.elem)}",
+            )
+            return False
+        return True
 
     def _elements_establish(self, elts: Sequence[ast.expr], elem: ValidationFact) -> bool:
         ok = True
@@ -746,7 +800,7 @@ class ValidationWalker(ast.NodeVisitor):
         receivers, subprocesses -- kills environment checks."""
         if not callee.is_var_base:
             return False
-        if callee.matches(*CHECK_CALLEE):
+        if callee.matches(*CHECK_CALLEE) or callee.matches(*CHECK_SINGLE_CALLEE):
             return self._effect_free_check(node)
         full = callee.full_path
         if full in NON_KILLING_CALLEES or (len(full) == 3 and full[:2] == ("os", "path")):
@@ -814,9 +868,10 @@ class ValidationWalker(ast.NodeVisitor):
         self.state.pop(name, None)
 
     def _effect_free_check(self, call: ast.Call) -> bool:
-        """Is this a ``certora.check`` of a validation the policy declared effect-free? Only a
-        direct literal name is recognized (this is also asked at block boundaries, without state)."""
-        if len(call.args) != 1:
+        """Is this a ``certora.check``/``check_single`` of a validation the policy declared
+        effect-free? Only a direct literal name is recognized (this is also asked at block
+        boundaries, without state)."""
+        if not call.args:
             return False
         name = as_const_or_null(str, call.args[0])
         signature = None if name is None else self.vocabulary.signatures.get(name)
@@ -835,7 +890,7 @@ class ValidationWalker(ast.NodeVisitor):
                 callee = resolve_callee(n.func)
                 if callee is None or not callee.is_var_base:
                     return True
-                if callee.matches(*CHECK_CALLEE):
+                if callee.matches(*CHECK_CALLEE) or callee.matches(*CHECK_SINGLE_CALLEE):
                     if self._effect_free_check(n):
                         continue
                     return True
@@ -992,6 +1047,84 @@ class ValidationWalker(ast.NodeVisitor):
                 if fact is not None and not isinstance(fact, Container):
                     self.state[expr.id] = replace(fact, checks=fact.checks | atoms)
 
+    def _audit_check_single(self, node: ast.Call) -> None:
+        """``certora.check_single(name, value, cwd=...)``: the functional check. Exactly one
+        declared parameter, and the shape of ``check`` otherwise; the RESULT's fact is
+        ``_check_single_fact``'s business, the site is a ``CheckSite`` like its statement
+        sibling, and the kill is ``visit_Call``'s (this is an expression, not a statement)."""
+        if any(isinstance(a, ast.Starred) for a in node.args) or any(
+            k.arg is None for k in node.keywords
+        ):
+            self._violation(node, "check_single: *args / **kwargs are not admissible")
+            return
+        keywords = {k.arg: k.value for k in node.keywords if k.arg is not None}
+        for extra in sorted(frozenset(keywords) - {"cwd"}):
+            self._violation(node, f"check_single: keyword {extra!r} is not admissible")
+        if len(node.args) != 2:
+            self._violation(
+                node, "check_single: exactly two positional arguments, the name and the value"
+            )
+            return
+        match interpret_expr(node.args[0], self.state):
+            case StrFact(regex=Exact(exact_str=name)):
+                pass
+            case _:
+                name = "?"
+                self._violation(
+                    node.args[0],
+                    "check_single: the validation name must be a string literal",
+                )
+        signature = self.vocabulary.signatures.get(name)
+        if signature is None and name != "?":
+            self._violation(node, f"check_single: the policy declares no validation named {name!r}")
+        if signature is not None and len(signature.params) != 1:
+            self._violation(
+                node,
+                f"check_single: validation {name!r} declares {len(signature.params)} "
+                "parameters; check_single takes exactly one",
+            )
+        cwd_expr = keywords.get("cwd")
+        needs_cwd = signature is None or signature.needs_cwd
+        if cwd_expr is None and needs_cwd:
+            self._violation(node, "check_single: cwd= is required")
+        param = signature.params[0] if signature is not None and signature.params else "value"
+        self.sinks.append(
+            CheckSite(
+                node,
+                name,
+                {param: operand_value(node.args[1], self.state)},
+                None if cwd_expr is None else _at_sink(interpret_expr(cwd_expr, self.state)),
+                needs_cwd,
+            )
+        )
+
+    def _check_single_fact(self, value: ast.expr, st: State) -> ValidationFact | None:
+        """The result fact of a direct ``certora.check_single(name, v)``: v's fact plus the
+        validation's atoms on its single parameter. Success postdominates the expression and
+        the broker refuses non-str values, so the str reading is sound even for an unknown
+        argument. (Recognized in assignment and comprehension-element position; anywhere
+        else the result is simply unknown.)"""
+        match value:
+            case ast.Call(func=func, args=[name_expr, arg], keywords=kws) if (
+                (callee := resolve_callee(func)) is not None
+                and callee.matches(*CHECK_SINGLE_CALLEE)
+                and all(k.arg == "cwd" for k in kws)
+            ):
+                pass
+            case _:
+                return None
+        name = as_const_or_null(str, name_expr)
+        signature = None if name is None else self.vocabulary.signatures.get(name)
+        if signature is None or len(signature.params) != 1:
+            return None  # the audit reported the shape problem; the result stays unknown
+        atoms = signature.establishes.get(signature.params[0], frozenset())
+        base = operand_value(arg, st)
+        if isinstance(base, str):
+            base = StrFact(regex=Exact(base))
+        elif base is None:
+            base = StrFact()
+        return replace(base, checks=base.checks | atoms)
+
     def _audit_exec(self, node: ast.Call) -> None:
         """``certora.exec(program, *args, cwd=...)``: the shape is checked here (violations), the
         cwd's provenance is a sink question (``confined``), and the arguments are reported."""
@@ -1057,6 +1190,9 @@ class ValidationWalker(ast.NodeVisitor):
         if callee is not None and callee.matches(*EXEC_CALLEE):
             self._audit_exec(node)
             return
+        if callee is not None and callee.matches(*CHECK_SINGLE_CALLEE):
+            self._audit_check_single(node)
+            return
         if callee is not None:
             method = next(
                 (m for m in NETWORK_METHODS if callee.matches(*NETWORK_NAMESPACE, m)), None
@@ -1086,8 +1222,15 @@ class ValidationWalker(ast.NodeVisitor):
                     fact = Located(StaticPath(()), "str")  # the current directory: the sandbox root
                 what = ".".join(callee)
             case Method(recv, name, args, kwargs) if name in PATH_SINK_METHODS:
-                # an unknown receiver is unproven, not "probably not a Path"
+                # an unknown receiver is unproven, not "probably not a Path" -- but a receiver
+                # KNOWN to be a str is no Path at all (str subclasses are banned), and its
+                # `.replace` is str.replace, not the rename sink
                 fact = interpret_expr(recv.node, self.state)
+                match fact:
+                    case StrFact() | UrlString() | Located(repr="str"):
+                        return
+                    case _:
+                        pass
                 what = f"<path>.{name}"
                 kind = PATH_SINK_METHODS[name]
                 if name == "open":  # Path.open(mode=...) / Path.open("w")

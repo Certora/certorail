@@ -51,14 +51,21 @@ Exit status: the program's own when it ran; 1 when rejected; 2 when it does not 
 
 ```
 uv tool install .
-certorail program.py [--root DIR] [--policy policy.py] [--check] [-- ARG ...]
+certorail program.py [--root DIR] [--policy POLICY] [--check] [-- ARG ...]
+certorail -c SOURCE  [--root DIR] [--policy POLICY] [--check] [-- ARG ...]
 ```
 
 `--check` analyses and evaluates without running. `--root` defaults to the current directory.
+`-c` takes the program inline, for agents that generate and run in one step.
 
-The policy file is **trusted** Python defining `POLICY`, written in the same location vocabulary
-as the annotations (so "the policy permits reads within `data`" and "this function relies on a
-path within `data`" mean the same thing):
+The policy is **trusted**. It is normally a TOML document ([`examples/policy.toml`](examples/policy.toml);
+the schema is documented in [`certorail/policyfile.py`](certorail/policyfile.py)), passed with
+`--policy` or discovered ambiently under `~/.certorail/` for the sandbox root. The
+[`certorail-policy`](.claude/skills/certorail-policy/SKILL.md) skill walks a Claude Code session
+through deriving one from what your scripts need to do, including the checker programs its
+runtime validations run. A policy may also be Python defining `POLICY`, written in the same
+location vocabulary as the annotations (so "the policy permits reads within `data`" and "this
+function relies on a path within `data`" mean the same thing):
 
 ```python
 from certorail import markers

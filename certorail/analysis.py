@@ -265,7 +265,17 @@ class AnyStr:
     does not match a newline, is not actually top.
     """
 
-type PseudoRegex = Alternation | Concat | RegexLit | Exact | AnyStr
+@dataclass(frozen=True)
+class Both:
+    """The intersection of its parts: every conjunct holds of the value. Built by ``both`` when
+    two independent readings of one value's text meet -- the shape an f-string gave it and the
+    regex a ``re.fullmatch`` guard asserted -- each a sound description on its own, neither
+    implying the other. Only ``both`` constructs one, and it never holds a wildcard, a duplicate,
+    a nested Both or a finite part (those resolve); the parts are in canonical order, so equal
+    conjunctions are structurally equal (``walker._join`` compares facts for equality)."""
+    all_of: list["PseudoRegex"]
+
+type PseudoRegex = Alternation | Concat | RegexLit | Exact | AnyStr | Both
 
 ANY_STR = AnyStr()
 
@@ -437,11 +447,55 @@ def alternation(*ps: PseudoRegex) -> PseudoRegex:
     return Alternation(flat)
 
 
+def _finite(p: PseudoRegex) -> list[str] | None:
+    """The strings of a finite language: an Exact, or an Alternation of Exacts."""
+    match p:
+        case Exact(exact_str=s):
+            return [s]
+        case Alternation(any_of=branches) if all(isinstance(b, Exact) for b in branches):
+            return [b.exact_str for b in branches if isinstance(b, Exact)]
+        case _:
+            return None
+
+
+def both(*ps: PseudoRegex) -> PseudoRegex:
+    """Intersection: the meet of the string domain. Flattens nested Boths, drops wildcards and
+    duplicates, and resolves a finite part against the rest exactly -- ``{a,b,c} & {b,c,d}`` is
+    ``{b,c}``, ``{a,b} & [ab]`` is ``{a,b}``, and an exact text absorbs everything (``abc & \\w+``
+    is ``abc``). A finite part none of whose strings the others accept describes a dead path
+    (``x == "abc" and re.fullmatch(r"\\d+", x)``): its fall-through is unreachable, so keeping
+    the finite part claims nothing false there. What remains is sorted into a canonical order.
+
+    Why a meet: a guard's regex and the regex the value already carried both hold, and keeping
+    one by preference (as ``guards.apply`` once did) dropped whichever a later question needed --
+    a ``re.fullmatch`` guard on an f-string-shaped value could discharge neither a regex
+    guarantee nor a defined atom.
+    """
+    flat: list[PseudoRegex] = []
+    for p in ps:
+        for q in (p.all_of if isinstance(p, Both) else [p]):
+            if q != ANY_STR and q not in flat:
+                flat.append(q)
+    for i, q in enumerate(flat):
+        strings = _finite(q)
+        if strings is None:
+            continue
+        others = flat[:i] + flat[i + 1 :]
+        survivors = [s for s in strings if all(_regex_accepts(o, s) for o in others)]
+        return alternation(*(Exact(s) for s in (survivors or strings)))
+    if not flat:
+        return ANY_STR
+    if len(flat) == 1:
+        return flat[0]
+    return Both(sorted(flat, key=repr))
+
+
 def component_to_regex(c: Component) -> PseudoRegex:
     """The string language of one component.
 
-    Exact except for ``Matching``, whose "is a safe component" conjunct has to be dropped because
-    PseudoRegex has no intersection: the result is looser there, never tighter.
+    Exact except for ``Matching``, whose "is a safe component" conjunct is dropped (``both`` could
+    keep it; nothing downstream needs the tighter language): the result is looser there, never
+    tighter.
     """
     match c:
         case Named(name=name):
@@ -503,6 +557,8 @@ def pretty_regex(p: PseudoRegex) -> str:
             return "".join(pretty_regex(q) for q in pieces)
         case Alternation(any_of=branches):
             return "(" + "|".join(pretty_regex(b) for b in branches) + ")"
+        case Both(all_of=parts):
+            return "(" + "&".join(pretty_regex(q) for q in parts) + ")"
 
 
 def pretty_component(c: Component) -> str:
@@ -565,6 +621,8 @@ def _regex_accepts(p: PseudoRegex, s: str) -> bool:
             return any(_regex_accepts(b, s) for b in branches)
         case Concat(seq=pieces):
             return _concat_accepts(pieces, s)
+        case Both(all_of=parts):
+            return all(_regex_accepts(p, s) for p in parts)
 
 
 def _concat_accepts(pieces: Sequence[PseudoRegex], s: str) -> bool:
@@ -578,14 +636,30 @@ def _concat_accepts(pieces: Sequence[PseudoRegex], s: str) -> bool:
 
 
 def _regex_subsumes(general: PseudoRegex, specific: PseudoRegex) -> bool:
-    """L(specific) ⊆ L(general), by the obvious rules."""
+    """L(specific) ⊆ L(general), by the obvious rules.
+
+    A conjunction on the general side is exact: inside every conjunct. On the specific side it is
+    sufficient -- some conjunct already inside, as the intersection lies within each -- but not
+    complete: ``[ab]+ & [bc]+`` is ``b+`` and is not shown to lie within ``b+``. The general-side
+    arm comes first. With a conjunction on both sides that reads "for every conjunct of general,
+    some conjunct of specific implies it", which is insensitive to order and to extra conjuncts
+    on the specific side; the other order would demand one conjunct of specific implying all of
+    general, and fail ``a & b ⊆ b & a``.
+    """
     if general == specific or general == ANY_STR:
         return True
+    match general:
+        case Both(all_of=parts):
+            return all(_regex_subsumes(g, specific) for g in parts)
+        case _:
+            ...
     match specific:
         case Exact(exact_str=s):
             return _regex_accepts(general, s)
         case Alternation(any_of=branches):
             return all(_regex_subsumes(general, b) for b in branches)
+        case Both(all_of=parts):
+            return any(_regex_subsumes(general, p) for p in parts)
         case _:
             ...
     match general:
@@ -662,6 +736,8 @@ def _explicit_check_no_parent(regex: PseudoRegex) -> bool:
             return False
         case Concat():
             return False
+        case Both(all_of=parts):
+            return any(_explicit_check_no_parent(p) for p in parts)
 
 def _explicit_check_no_slash(regex: PseudoRegex) -> bool:
     match regex:
@@ -673,6 +749,8 @@ def _explicit_check_no_slash(regex: PseudoRegex) -> bool:
             return False
         case Concat():
             return all(_explicit_check_no_slash(p) for p in regex.seq)
+        case Both(all_of=parts):
+            return any(_explicit_check_no_slash(p) for p in parts)
 
 def _explicit_check_not_absolute(regex: PseudoRegex) -> bool:
     match regex:
@@ -684,6 +762,8 @@ def _explicit_check_not_absolute(regex: PseudoRegex) -> bool:
             return False
         case Concat():
             return _explicit_check_not_absolute(regex.seq[0])
+        case Both(all_of=parts):
+            return any(_explicit_check_not_absolute(p) for p in parts)
 
 def _explicit_check_not_dot_dot(regex: PseudoRegex) -> bool:
     match regex:
@@ -696,6 +776,8 @@ def _explicit_check_not_dot_dot(regex: PseudoRegex) -> bool:
         case Concat():
             # some literal piece contributes a character other than "."
             return any(isinstance(p, Exact) and p.exact_str.strip(".") != "" for p in regex.seq)
+        case Both(all_of=parts):
+            return any(_explicit_check_not_dot_dot(p) for p in parts)
 
 def _explicit_check(other: AtomicFact, regex: PseudoRegex) -> bool:
     match other:

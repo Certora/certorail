@@ -101,15 +101,27 @@ def check(name: str, *, cwd: pathlib.Path | str | None = None, **params: str) ->
     parameters, and a proven ``cwd`` (unless the validation declares none) -- and is what
     turns falling through this call into facts.
     """
+    _brokered_check(name, {"params": dict(params), "cwd": None if cwd is None else os.fspath(cwd)})
+
+
+def check_single(name: str, value: str, *, cwd: pathlib.Path | str | None = None) -> str:
+    """Run the single-parameter evaluator for *name* on *value*; return *value* on success,
+    raise ``CheckFailed`` otherwise. The functional sibling of ``check``: an expression whose
+    result carries the established atoms statically (the fact rides the value), which is
+    what makes it usable inside comprehensions, where no name exists to establish on."""
+    _brokered_check(
+        name, {"single": value, "cwd": None if cwd is None else os.fspath(cwd)}
+    )
+    return value
+
+
+def _brokered_check(name: str, request: dict[str, Any]) -> None:
     socket_path = os.environ.get("CERTORAIL_BROKER_SOCKET")
     if socket_path is None:
         raise CheckFailed("check: no broker (the policy declares no validations)")
     try:
         reply = _broker_roundtrip(
-            socket_path,
-            {"kind": "check", "name": name, "params": dict(params),
-             "cwd": None if cwd is None else os.fspath(cwd)},
-            timeout=None,
+            socket_path, {"kind": "check", "name": name, **request}, timeout=None
         )
     except OSError as exc:
         raise CheckFailed(f"check: broker transport failure: {exc}")

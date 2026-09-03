@@ -441,6 +441,82 @@ class TestCwdFreeChecks(unittest.TestCase):
             validation("v", argv=("true",), establishes={"cwd": ["atom-1"]})
 
 
+class TestCheckSingle(unittest.TestCase):
+    """certora.check_single: the functional check. The atoms ride the RESULT value."""
+
+    def test_the_result_carries_the_atoms(self) -> None:
+        source = HEADER + (
+            "import sys\n"
+            'branch = certora.check_single("not-force-check", sys.argv[1])\n'
+            + REPO
+            + 'certora.exec("git", "push", "origin", branch, cwd=repo)\n'
+        )
+        outcome = host_check(source, "<t>", CWD_FREE_POLICY, ROOT)
+        if isinstance(outcome, Rejected):
+            self.fail("\n".join(outcome.describe("<t>")))
+
+    def test_the_argument_itself_gains_nothing(self) -> None:
+        # the fact rides the returned value; a discarded result vouches for nobody
+        source = HEADER + (
+            "import sys\n"
+            "raw = sys.argv[1]\n"
+            'certora.check_single("not-force-check", raw)\n'
+            + REPO
+            + 'certora.exec("git", "push", "origin", raw, cwd=repo)\n'
+        )
+        outcome = host_check(source, "<t>", CWD_FREE_POLICY, ROOT)
+        assert isinstance(outcome, Rejected)
+        self.assertTrue(any("not validated" in d.reason for d in outcome.denials))
+
+    def test_check_single_in_a_comprehension(self) -> None:
+        source = HEADER + (
+            "import sys\n"
+            'branches: list[typing.Annotated[str, certora.validated("not-force")]] = '
+            '[certora.check_single("not-force-check", s) for s in sys.argv[1:]]\n'
+        )
+        outcome = host_check(source, "<t>", CWD_FREE_POLICY, ROOT)
+        if isinstance(outcome, Rejected):
+            self.fail("\n".join(outcome.describe("<t>")))
+
+    def test_an_effectful_check_establishes_nothing_in_a_comprehension(self) -> None:
+        # iteration i+1's effectful evaluator kills what iteration i established: only
+        # pure atoms accumulate across a comprehension (CONTAINERS.md)
+        vocabulary = Policy.allow(
+            validations=[
+                validation(
+                    "env-single",
+                    argv=("probe", param("value")),
+                    params=("value",),
+                    establishes={"value": ["env-mark"]},
+                )
+            ]
+        ).vocabulary()
+        report = analyze(
+            HEADER
+            + "import sys\n"
+            'ms: list[typing.Annotated[str, certora.validated("env-mark")]] = '
+            '[certora.check_single("env-single", s) for s in sys.argv[1:]]\n',
+            vocabulary=vocabulary,
+        )
+        self.assertTrue(
+            any("comprehension element does not establish" in what for _, what in report.violations)
+        )
+
+    def test_shape_violations(self) -> None:
+        report = analyze(
+            HEADER + 'x = certora.check_single("nope", "v")\n',
+            vocabulary=CWD_FREE_POLICY.vocabulary(),
+        )
+        self.assertTrue(
+            any("declares no validation" in what for _, what in report.violations)
+        )
+        report = analyze(
+            HEADER + 'x = certora.check_single("org-repo", "v")\n',
+            vocabulary=ORG_POLICY.vocabulary(),
+        )
+        self.assertTrue(any("exactly one" in what for _, what in report.violations))
+
+
 # unknown_arguments=False admits only vouched-for arguments: exactly-known text or a proven
 # path. A computed str is a StrFact, not the None sentinel, and must not slip past the gate.
 STRICT_POLICY = Policy.allow(
@@ -548,6 +624,15 @@ class TestRuntimeCheck(unittest.TestCase):
     def test_wrong_keywords_raise(self) -> None:
         with self.assertRaises(TypeError):
             markers.check("always", extra="x")
+
+    def test_check_single_returns_the_value(self) -> None:
+        self.assertEqual(markers.check_single("nonempty", "x"), "x")
+        with self.assertRaises(CheckFailed):
+            markers.check_single("nonempty", "")
+
+    def test_check_single_demands_a_single_parameter(self) -> None:
+        with self.assertRaises(TypeError):
+            markers.check_single("always", "x")  # zero declared parameters
 
 
 if __name__ == "__main__":

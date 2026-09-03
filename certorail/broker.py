@@ -512,6 +512,7 @@ def _run_check(
     name: str,
     params: dict,
     cwd: str | None,
+    single: object = None,
 ) -> dict:
     """One brokered ``certora.check``: run the declared evaluator host-side -- outside the
     jail, where whatever it consults (an inventory service, credentials, the org's tooling)
@@ -521,6 +522,18 @@ def _run_check(
     declared = next((v for v in policy.validations if v.name == name), None)
     if declared is None:
         raise PolicyDenied(f"check: no validation named {name!r}")
+    if single is not None:
+        # the check_single form: the value binds the one declared parameter by position
+        if params:
+            raise BadRequest(f"check {name!r}: the single-value form takes no other parameters")
+        if len(declared.params) != 1:
+            raise BadRequest(
+                f"check {name!r}: check_single needs exactly one declared parameter, "
+                f"it has {len(declared.params)}"
+            )
+        if not isinstance(single, str):
+            raise BadRequest(f"check {name!r}: the value must be a str")
+        params = {declared.params[0]: single}
     if set(params) != set(declared.params) or not all(
         isinstance(v, str) for v in params.values()
     ):
@@ -611,7 +624,8 @@ class _Handler(socketserver.BaseRequestHandler):
                 cwd_value = req.get("cwd")
                 result = _run_check(self.server.policy, self.server.root, conn,
                                     name, dict(req.get("params") or {}),
-                                    None if cwd_value is None else str(cwd_value))
+                                    None if cwd_value is None else str(cwd_value),
+                                    req.get("single"))
             else:
                 method = str(req.get("method", "GET")).upper()
                 url = req["url"]

@@ -1,6 +1,7 @@
 """The host: analyse a program, evaluate the security policy, rewrite, run -- jailed.
 
     certorail program.py [--root DIR] [--policy policy.py] [--check] [--no-jail] [-- ARG ...]
+    certorail -c SOURCE  [same options]     # inline source: the agentic path
 
 (``certorail`` is the ``[project.scripts]`` entry point, installed by ``uv tool install .``;
 ``python -m certorail.host`` is the same thing.)
@@ -255,7 +256,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="certorail", description="Analyse a program, check it against a policy, and run it."
     )
-    parser.add_argument("program", type=pathlib.Path, help="the Python source file")
+    parser.add_argument(
+        "program", type=pathlib.Path, nargs="?", default=None, help="the Python source file"
+    )
+    parser.add_argument(
+        "-c",
+        "--command",
+        metavar="SOURCE",
+        default=None,
+        help="run the program given inline instead of from a file (the agentic path)",
+    )
     parser.add_argument("--root", type=pathlib.Path, default=pathlib.Path.cwd(), help="the sandbox root (cwd of the program)")
     parser.add_argument(
         "--policy",
@@ -271,15 +281,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="run without the srt OS jail (the static analysis and the broker still apply)",
     )
-    parser.add_argument("args", nargs=argparse.REMAINDER, help="arguments for the program (after --)")
+    # not REMAINDER: that would swallow every option after the program path (`prog.py --check`
+    # would RUN prog.py with argv ["--check"] under the default policy). With "*", argparse
+    # keeps parsing options anywhere, and `--` is the documented way to pass option-like
+    # arguments through to the program.
+    parser.add_argument("args", nargs="*", help="arguments for the program (after --)")
     ns = parser.parse_args(argv)
 
-    filename = str(ns.program)
+    if (ns.program is None) == (ns.command is None):
+        parser.error("exactly one of PROGRAM or -c SOURCE is required")
+    if ns.command is not None:
+        source, filename = ns.command, "<command>"
+    else:
+        source, filename = ns.program.read_text(encoding="utf-8"), str(ns.program)
     root = ns.root.resolve()
     policy = load_policy(ns.policy, root)
     args = ns.args[1:] if ns.args[:1] == ["--"] else ns.args
     try:
-        source = ns.program.read_text(encoding="utf-8")
         if ns.check:
             outcome: Accepted | Rejected | subprocess.CompletedProcess[bytes] = check(
                 source, filename, policy, root

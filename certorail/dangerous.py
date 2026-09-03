@@ -100,7 +100,7 @@ FORBIDDEN_MODULES: frozenset[str] = frozenset({
     "venv", "ensurepip", "pip", "pydoc",
     "mailbox",
     "configparser",
-    "tkinter", "lib2to3", "wave", "optparse", "tracemalloc", "zipapp", "filecmp"
+    "tkinter", "lib2to3", "wave", "optparse", "tracemalloc", "zipapp", "filecmp",
 
     # PEP 594 "dead batteries" (deprecated for removal; gone by 3.13). A few are live hazards, the
     # rest are simply dead and have no business in a work script. crypt/spwd (credentials, above)
@@ -382,6 +382,12 @@ EXEC_REQUIRED_KEYWORDS: frozenset[str] = frozenset({"cwd"})
 # variables. Statically (walker): statement form only, a literal name, keywords fixed by the
 # policy's declaration, cwd a sink like exec's.
 CHECK_CALLEE: tuple[str, ...] = (NAMESPACE, "check")
+
+# certora.check_single(name, value, cwd=...) is the functional sibling: an EXPRESSION that
+# returns *value* on success (raises otherwise), for validations with exactly one declared
+# parameter. The established atoms ride the RESULT value -- which is what makes it usable
+# where no name exists to establish on: comprehensions.
+CHECK_SINGLE_CALLEE: tuple[str, ...] = (NAMESPACE, "check_single")
 
 # certora.network.<method>(url, *, headers=..., body=..., timeout=...) is the only way to touch
 # the network: one brokered, policy-checked request per call (broker.py; the runtime half lives

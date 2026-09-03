@@ -25,9 +25,7 @@ from .analysis import (
     ALL_ATOMS,
     ANY_STR,
     Alternation,
-    AnyStr,
     AtomicFact,
-    Concat,
     DirSplat,
     Exact,
     Located,
@@ -42,6 +40,7 @@ from .analysis import (
     ValidationFact,
     _literal_location,
     alternation,
+    both,
     concat,
     interpret_expr,
     locate,
@@ -101,26 +100,11 @@ class Guard:
 # ---------------------------------------------------------------------------
 
 
-def _regex_rank(p: PseudoRegex) -> int:
-    # Both regexes hold of the value, so keeping either is sound; prefer the one whose atoms
-    # ``_explicit_check`` can see through.
-    match p:
-        case Exact():
-            return 0
-        case Alternation():
-            return 1
-        case Concat():
-            return 2
-        case RegexLit():
-            return 3
-        case AnyStr():
-            return 4
-
-
-def _prefer_regex(cur: PseudoRegex, new: PseudoRegex | None) -> PseudoRegex:
-    if new is None:
-        return cur
-    return new if _regex_rank(new) < _regex_rank(cur) else cur
+def _meet_regex(cur: PseudoRegex, new: PseudoRegex | None) -> PseudoRegex:
+    """Both regexes hold of the value, so keep both: ``both`` is the meet (a finite one resolves
+    against the other, an exact text absorbs everything). Keeping one by preference used to drop
+    a ``re.fullmatch`` guard on any value whose text already had a shape."""
+    return cur if new is None else both(cur, new)
 
 
 def _prefer_containment(cur: LocationFact | None, new: LocationFact | None) -> LocationFact | None:
@@ -144,7 +128,7 @@ def _prefer_containment(cur: LocationFact | None, new: LocationFact | None) -> L
 def _merge_url(cur: UrlString, new: UrlString) -> UrlString:
     # both claims hold of the value; keep the sharper one per component
     return UrlString(
-        netloc=new.netloc if cur.netloc is None else _prefer_regex(cur.netloc, new.netloc),
+        netloc=new.netloc if cur.netloc is None else _meet_regex(cur.netloc, new.netloc),
         path=_prefer_containment(cur.path, new.path),
         scheme=cur.scheme if cur.scheme is not None else new.scheme,
         checks=cur.checks,
@@ -187,7 +171,7 @@ def apply(fact: ValidationFact | None, r: Refinement) -> ValidationFact | None:
                 return _merge_url(fact, r.url)
             return fact
         case StrFact(regex=regex, atoms=atoms, checks=checks):
-            refined = StrFact(regex=_prefer_regex(regex, r.regex), atoms=atoms | r.atoms, checks=checks)
+            refined = StrFact(regex=_meet_regex(regex, r.regex), atoms=atoms | r.atoms, checks=checks)
         case PathFact(atoms=atoms, checks=checks):
             refined = PathFact(atoms=atoms | r.atoms, checks=checks)
 

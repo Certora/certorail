@@ -100,6 +100,59 @@ class TestEscape(unittest.TestCase):
         self.assertTrue(any("escapes" in v for v in got))
 
 
+class TestComprehensions(unittest.TestCase):
+    def test_a_guarded_comprehension_constructs(self) -> None:
+        source = (
+            "import sys\n"
+            f'xs: list[{P}] = [s for s in sys.argv[1:] if "/" not in s and ".." not in s]\n'
+        )
+        self.assertEqual(violations(source), [])
+
+    def test_an_unguarded_comprehension_does_not(self) -> None:
+        source = "import sys\n" + f"xs: list[{P}] = [s for s in sys.argv[1:]]\n"
+        got = violations(source)
+        self.assertTrue(
+            any("comprehension element does not establish" in v for v in got)
+        )
+
+    def test_a_comprehension_over_a_tracked_container_reads_it(self) -> None:
+        # P implies Q elementwise, and iterating xs in the comprehension is a read: it
+        # stays tracked for the use after
+        source = USE + DECL + f"ys: list[{Q}] = [v for v in xs]\n" + "use(xs[0])\n"
+        self.assertEqual(violations(source), [])
+
+    def test_the_kinds_still_match(self) -> None:
+        got = violations(f'ss: set[{Q}] = [s for s in ["a"]]\n')
+        self.assertTrue(any("not a recognized set constructor" in v for v in got))
+
+    def test_multiple_generators_fail_closed(self) -> None:
+        got = violations(f'xs: list[{P}] = [s for row in [["a", "b"]] for s in row]\n')
+        self.assertTrue(any("not a recognized list constructor" in v for v in got))
+
+    def test_a_nested_comprehension_element_fails_closed(self) -> None:
+        # the inner comprehension is a list, which establishes no scalar element fact
+        got = violations(f'xs: list[{P}] = [[t for t in ["a"]] for s in ["x"]]\n')
+        self.assertTrue(
+            any("comprehension element does not establish" in v for v in got)
+        )
+
+    def test_escapes_are_seen_inside_comprehensions(self) -> None:
+        # generic_visit and the blessing pass both descend into comprehension bodies:
+        # handing xs to print inside one is still the escape it would be outside
+        got = violations(DECL + 'ys = [print(xs) for s in ["a"]]\n')
+        self.assertTrue(any("escapes" in v for v in got))
+
+    def test_a_nested_iter_yields_unknown_elements(self) -> None:
+        # the inner comprehension has no element fact, and atom guards establish nothing
+        # on a value of unknown type (the standing scalar rule): fail closed
+        got = violations(
+            f'xs: list[{P}] = [s for s in [t for t in ["a"]] if "/" not in s and ".." not in s]\n'
+        )
+        self.assertTrue(
+            any("comprehension element does not establish" in v for v in got)
+        )
+
+
 class TestStoreShapes(unittest.TestCase):
     """Only the direct, single-target element store is the blessed shape: every other store
     spelling escapes the container rather than writing it unobligated."""
