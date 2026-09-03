@@ -19,7 +19,7 @@ so the recognizers below are plain structural patterns.
 """
 import ast
 from dataclasses import dataclass, replace
-from typing import Literal, Mapping, Sequence
+from typing import Literal, Sequence
 
 from .analysis import (
     ALL_ATOMS,
@@ -36,6 +36,7 @@ from .analysis import (
     PseudoRegex,
     RegexLit,
     StaticPath,
+    StateMap,
     StrFact,
     UrlString,
     ValidationFact,
@@ -290,8 +291,8 @@ def _guard(sub: Subject | None, r: Refinement) -> list[Guard]:
 # ---------------------------------------------------------------------------
 
 
-def _fact_of(t: Term, st: Mapping[str, ValidationFact]) -> ValidationFact | None:
-    return interpret_expr(t.node, dict(st))
+def _fact_of(t: Term, st: StateMap) -> ValidationFact | None:
+    return interpret_expr(t.node, st)
 
 
 def _literals(t: Term) -> list[str] | None:
@@ -320,7 +321,7 @@ def _components_of(t: Term) -> Subject | None:
             return None
 
 
-def _location_of(t: Term, st: Mapping[str, ValidationFact]) -> LocationFact | None:
+def _location_of(t: Term, st: StateMap) -> LocationFact | None:
     """The location an operand names: a literal path (relative to the sandbox root, or absolute
     with a leading "/"), or an expression with a containment fact, looked at through any views
     (``BASE.resolve()``, ``str(BASE)``, ``os.path.realpath(BASE)``)."""
@@ -342,7 +343,7 @@ def _location_of(t: Term, st: Mapping[str, ValidationFact]) -> LocationFact | No
             return location_of(_fact_of(t, st))
 
 
-def _prefix_location(t: Term, st: Mapping[str, ValidationFact]) -> LocationFact | None:
+def _prefix_location(t: Term, st: StateMap) -> LocationFact | None:
     """The location named by a ``startswith`` prefix: ``"data/"``, ``str(BASE) + "/"``,
     ``BASE + os.sep``. A prefix without a trailing separator names nothing (``/data`` vs
     ``/database``)."""
@@ -476,7 +477,7 @@ NOT_DOT_DOT = Refinement(atoms=frozenset({"not-dot-dot"}))
 BARE_NAME = Refinement(atoms=frozenset({"no-slash", "not-absolute"}))
 
 
-def recognize(cond: ast.expr | Term, st: Mapping[str, ValidationFact]) -> list[Guard]:
+def recognize(cond: ast.expr | Term, st: StateMap) -> list[Guard]:
     """The guards established by *cond* being true. Unrecognized shapes yield nothing.
 
     Accepts a Term so a caller that lowers with its own module set can pass the result directly.
@@ -485,7 +486,7 @@ def recognize(cond: ast.expr | Term, st: Mapping[str, ValidationFact]) -> list[G
     return _rec(term, True, st)
 
 
-def _rec(t: Term, positive: bool, st: Mapping[str, ValidationFact]) -> list[Guard]:
+def _rec(t: Term, positive: bool, st: StateMap) -> list[Guard]:
     match t:
         case Not(inner):
             return _rec(inner, not positive, st)
@@ -507,7 +508,7 @@ def _rec(t: Term, positive: bool, st: Mapping[str, ValidationFact]) -> list[Guar
 
 
 def _compare(
-    left: Term, op: type[ast.cmpop], right: Term, st: Mapping[str, ValidationFact]
+    left: Term, op: type[ast.cmpop], right: Term, st: StateMap
 ) -> list[Guard]:
     if (probed := _probe_compare(left, op, right)) is not None:
         return probed
@@ -576,7 +577,7 @@ def _not_in(left: Term, right: Term) -> list[Guard]:
     return []
 
 
-def _in(left: Term, right: Term, st: Mapping[str, ValidationFact]) -> list[Guard]:
+def _in(left: Term, right: Term, st: StateMap) -> list[Guard]:
     # x in ("a", "b")  (x in "literal" is a substring test and proves nothing)
     lits = right.str_items()
     if lits and (uv := _url_view(left)) is not None:
@@ -601,7 +602,7 @@ def _in(left: Term, right: Term, st: Mapping[str, ValidationFact]) -> list[Guard
             return []
 
 
-def _eq(a: Term, b: Term, st: Mapping[str, ValidationFact]) -> list[Guard]:
+def _eq(a: Term, b: Term, st: StateMap) -> list[Guard]:
     """``a == b`` with the "interesting" operand on the left; called in both orientations."""
     # urlsplit(x).netloc == "api.github.com" and friends: a claim about x's urlsplit reading
     if (uv := _url_view(a)) is not None:
@@ -683,7 +684,7 @@ def _pattern_of(callee: tuple[str, ...], pat: Term) -> PseudoRegex | None:
     return None
 
 
-def _call(t: Term, positive: bool, st: Mapping[str, ValidationFact]) -> list[Guard]:
+def _call(t: Term, positive: bool, st: StateMap) -> list[Guard]:
     match t:
         # bool(C)
         case Call(("bool",), (inner,), ()):
@@ -710,7 +711,7 @@ def _method(
     name: str,
     args: tuple[Term, ...],
     positive: bool,
-    st: Mapping[str, ValidationFact],
+    st: StateMap,
 ) -> list[Guard]:
     # re.compile(r"...").fullmatch(x) is a call on a pattern, not a method on a subject. (A compiled
     # pattern held in a name can't be resolved here.)
@@ -777,7 +778,7 @@ def _method(
             return []
 
 
-def _startswith(sub: Subject, arg: Term, st: Mapping[str, ValidationFact]) -> list[Guard]:
+def _startswith(sub: Subject, arg: Term, st: StateMap) -> list[Guard]:
     guards: list[Guard] = []
     # the string begins with the literal(s): Concat([Exact|Alternation, AnyStr]); its Exact head
     # also lets __contains__ derive not-absolute
@@ -794,7 +795,7 @@ def _startswith(sub: Subject, arg: Term, st: Mapping[str, ValidationFact]) -> li
     return guards
 
 
-def _disjunction(parts: Sequence[Term], st: Mapping[str, ValidationFact]) -> list[Guard]:
+def _disjunction(parts: Sequence[Term], st: StateMap) -> list[Guard]:
     """``x == "a" or x == "b" or x in ("c", "d")`` -> one Alternation. Any other disjunction
     establishes nothing."""
     subject: str | None = None

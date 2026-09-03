@@ -18,12 +18,14 @@ import ast
 import inspect
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from typing import Literal
 
 from .analysis import (
     ANY_NAME,
     ANY_STR,
     AtomicFact,
     Component,
+    Container,
     DirSplat,
     Exact,
     InvalidProgram,
@@ -68,8 +70,8 @@ def _err(t: Term, msg: str) -> InvalidAnnotation:
 class Contract:
     """What a function relies on (per parameter) and guarantees (return)."""
 
-    params: dict[str, ValidationFact]
-    returns: ValidationFact | None
+    params: dict[str, ValidationFact | Container]
+    returns: ValidationFact | Container | None
 
     @property
     def has_rely_markers(self) -> bool:
@@ -83,7 +85,7 @@ class Contract:
         return self.has_rely_markers or not is_plain_type(self.returns)
 
 
-def is_plain_type(fact: ValidationFact | None) -> bool:
+def is_plain_type(fact: ValidationFact | Container | None) -> bool:
     """A bare type annotation (``str``, ``pathlib.Path``) carrying no marker. These are enforced by
     the runtime guard injected at function entry, not discharged statically; only marker-bearing
     relies and guarantees are the analysis' to check."""
@@ -94,6 +96,8 @@ def is_plain_type(fact: ValidationFact | None) -> bool:
             return fact == StrFact() or fact == PathFact() or fact == UrlString()
         case Located():
             return False
+        case Container(elem=elem):
+            return is_plain_type(elem)
 
 
 # ---------------------------------------------------------------------------
@@ -364,26 +368,50 @@ def _annotated(base: Term, metadata: Sequence[Term]) -> ValidationFact:
     return PathFact(atoms=frozenset(atoms), checks=frozenset(checks))
 
 
-def _parse(t: Term) -> ValidationFact | None:
+def _parse(t: Term) -> ValidationFact | Container | None:
     match t:
         case Subscript(Dotted(("typing", "Annotated")), Items((base, *metadata))) if metadata:
             return _annotated(base, metadata)
         case Subscript(Dotted(("typing", "Annotated")), _):
             raise _err(t, "Annotated[type, marker, ...] needs at least one marker")
+        case Subscript(Var("list" | "set" as kind), inner):
+            return _container(t, kind, inner)
+        case Subscript(Dotted(("typing", "Sequence")), inner):
+            return _container(t, "sequence", inner)
         case _:
             fact = _scalar_fact(t)
             if fact is None and _mentions_annotated(t.node):
-                raise _err(t, "Annotated inside a container is not tracked; put the markers where the elements are used")
+                raise _err(
+                    t,
+                    "Annotated is tracked inside list[...], set[...] and typing.Sequence[...] "
+                    "only; put the markers where the elements are used",
+                )
             return fact
+
+
+def _container(
+    t: Term, kind: Literal["list", "set", "sequence"], inner: Term
+) -> Container | None:
+    """``list[...]`` / ``set[...]`` / ``typing.Sequence[...]``: tracked iff the element type
+    carries markers (CONTAINERS.md). A plain element type says nothing the analysis owns --
+    it stays the runtime type guard's business -- so it yields no fact at all."""
+    elem = _parse(inner)
+    if isinstance(elem, Container):
+        raise _err(inner, "nested containers are not tracked (yet)")
+    if elem is None or is_plain_type(elem):
+        return None  # opt-in only: no markers, no tracking
+    return Container(kind, elem)
 
 
 def _mentions_annotated(e: ast.AST) -> bool:
     return any(isinstance(n, ast.Attribute) and n.attr == "Annotated" for n in ast.walk(e))
 
 
-def parse_annotation(e: ast.expr) -> ValidationFact | None:
-    """The fact an annotation expresses, or ``None`` if it says nothing the analysis tracks.
-    Containers say nothing, so ``Annotated`` inside one is refused rather than silently dropped."""
+def parse_annotation(e: ast.expr) -> ValidationFact | Container | None:
+    """The fact an annotation expresses -- a scalar fact, a tracked container
+    (``list[Annotated[...]]`` &c., CONTAINERS.md) -- or ``None`` if it says nothing the
+    analysis tracks. ``Annotated`` inside an untracked container is refused rather than
+    silently dropped."""
     return _parse(lower(e))
 
 
@@ -451,7 +479,7 @@ def parse_function(node: ast.FunctionDef) -> Contract:
     and ``**kwargs`` carry no fact -- the analysis does not track containers -- so a marker on
     either is refused rather than silently dropped.
     """
-    params: dict[str, ValidationFact] = {}
+    params: dict[str, ValidationFact | Container] = {}
     a = node.args
     for arg in [*a.posonlyargs, *a.args, *a.kwonlyargs]:
         if arg.annotation is None:

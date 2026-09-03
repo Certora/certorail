@@ -141,15 +141,18 @@ class TestUrlContracts(unittest.TestCase):
         self.assertTrue(any("does not establish" in what for _, what in report.violations))
 
     def test_a_guarded_value_discharges(self) -> None:
+        # conjunct order matters (guards apply in source order, no fixpoint): the text facts
+        # -- the ".." exclusion and the gated path prefix -- must precede the scheme/netloc
+        # guards, whose upgrade to the (textless) URL reading would strand them
         report = analyze(
             "import sys\n"
             "import urllib.parse\n"
             + self.RELY
             + "u = sys.argv[1]\n"
-            + 'if urllib.parse.urlsplit(u).scheme == "https" and '
-            'urllib.parse.urlsplit(u).netloc == "api.github.com" and '
-            '".." not in u and '
-            'urllib.parse.urlsplit(u).path.startswith("/repos/"):\n'
+            + 'if ".." not in u and '
+            'urllib.parse.urlsplit(u).path.startswith("/repos/") and '
+            'urllib.parse.urlsplit(u).scheme == "https" and '
+            'urllib.parse.urlsplit(u).netloc == "api.github.com":\n'
             "    fetch(u)\n"
         )
         self.assertEqual(report.violations, [])

@@ -197,7 +197,7 @@ def _screen_addresses(host: str, port: int) -> None:
             infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
         except socket.gaierror as exc:
             raise PolicyDenied(f"cannot resolve {host!r}: {exc}")
-        ips = {ipaddress.ip_address(info[4][0].split("%", 1)[0]) for info in infos}
+        ips = {ipaddress.ip_address(str(info[4][0]).split("%", 1)[0]) for info in infos}
     for ip in ips:
         if not ip.is_global:
             raise PolicyDenied(f"{host} resolves to non-public address {ip}")

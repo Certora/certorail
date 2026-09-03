@@ -96,10 +96,16 @@ def check(
 
 # The child interpreter: bind the marker namespace, set argv, run the program as __main__.
 _BOOTSTRAP = r'''
+import os
 import sys
 program, filename, *args = sys.argv[1:]
 sys.path.insert(0, __CERTORAIL_PARENT__)
 import certorail.markers
+if os.environ.get("CERTORAIL_SELF_JAIL"):
+    import certorail.selfjail
+    warning = certorail.selfjail.deny_process_creation()
+    if warning is not None:
+        print("certorail: process-creation denial not installed: " + warning, file=sys.stderr)
 with open(program, encoding="utf-8") as f:
     source = f.read()
 sys.argv = [filename, *args]
@@ -172,7 +178,7 @@ def run(
         # trivially quotable
         boot = tmpdir / "_bootstrap.py"
         boot.write_text(bootstrap, encoding="utf-8")
-        env = None
+        env = dict(os.environ)
         server = None
         socket_path = None
         if policy.network or policy.programs or policy.validations:
@@ -184,7 +190,12 @@ def run(
             threading.Thread(
                 target=server.serve_forever, name="certorail-broker", daemon=True
             ).start()
-            env = {**os.environ, "CERTORAIL_BROKER_SOCKET": str(socket_path)}
+            env["CERTORAIL_BROKER_SOCKET"] = str(socket_path)
+        if jail:
+            # the self-jail: process creation denied from inside (seccomp / sandbox_init),
+            # since srt restricts reach, not operations. Everything the program may
+            # legitimately do to the world goes through the broker socket.
+            env["CERTORAIL_SELF_JAIL"] = "1"
         command = [python, "-I", "-P", str(boot), str(program), filename, *args]
         if jail:
             srt = shutil.which("srt")

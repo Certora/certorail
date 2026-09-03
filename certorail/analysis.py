@@ -6,7 +6,6 @@ import re
 import urllib.parse
 from typing import Any, cast, Callable, Literal, Mapping, Sequence
 from dataclasses import dataclass, is_dataclass, replace
-from typing_extensions import TypeForm
 
 sensitive_builtins = (
     "getattr",
@@ -20,7 +19,12 @@ sensitive_builtins = (
     "exec",
     "open",
     "breakpoint",
-    "help"
+    "help",
+    # first-class slice objects would type-confuse the subscript transfers: xs[s] with s a
+    # runtime slice yields a *list* where the analysis, seeing a non-Slice index expression,
+    # claims an element fact. With the constructor banned, an index is a syntactic ast.Slice
+    # or a runtime int, and the syntactic test is complete.
+    "slice",
 )
 
 validator_funcs = frozenset([
@@ -179,49 +183,6 @@ def as_const_or_null[T](t: type[T], elem: ast.expr) -> T | None:
     if not isinstance(elem.value, t):
         return None
     return elem.value
-
-@dataclass(frozen=True)
-class OptionMonad[T]:
-    s: T | None
-
-    def map[S](self, m: Callable[[T], S]) -> "OptionMonad[S]":
-        if self.s is None:
-            return OptionMonad(None)
-        d = m(self.s)
-        if d is None:
-            raise ValueError("You maybe don't know how monads work")
-        return OptionMonad(d)
-
-    def bind[S](self, m: "Callable[[T], S | None | OptionMonad[S]]") -> "OptionMonad[S]":
-        if self.s is None:
-            return OptionMonad(None)
-        res =  m(self.s)
-        if isinstance(res, OptionMonad):
-            return res
-        return OptionMonad(res)
-
-    def downcast[X](self, t: type[X]) -> "OptionMonad[X]":
-        if self.s is None or not isinstance(self.s, t):
-            return OptionMonad(None)
-        return OptionMonad(self.s)
-
-    @classmethod
-    def lift[R](cls, s: R | None) -> "OptionMonad[R]":
-        return OptionMonad(s)
-
-    def unwrap(self) -> T | None:
-        return self.s
-
-    def unwrap_or(self, default: T) -> T:
-        if self.s is None:
-            return default
-        return self.s
-
-@dataclass
-class CertoraMatch:
-    target: ast.expr
-    matches: ast.expr
-
 
 @dataclass
 class PyOpenCall:
@@ -831,6 +792,27 @@ class UrlString:
 
 type ValidationFact = StrFact | PathFact | Located | UrlString
 
+@dataclass(frozen=True)
+class Container:
+    """A tracked ``list``/``set``: the reduced-product partner of the scalar facts
+    (CONTAINERS.md). Deliberately NOT a ValidationFact: the scalar transfer functions never
+    see one -- ``interpret_expr`` yields None for a container-valued name -- and the two
+    domains meet only at the roster operations the walker recognizes.
+
+    ``elem`` is an ordinary ValidationFact: the *current* element fact, degraded by kills
+    like any scalar (the annotation is only the birth/interface invariant). ``kind``
+    "sequence" is the read-only borrow a ``Sequence[...]`` parameter receives: no mutators,
+    ever. ``param`` provenance -- received through a function boundary, directly or by
+    aliasing -- makes escape an error instead of a forget."""
+    kind: Literal["list", "set", "sequence"]
+    elem: ValidationFact
+    param: bool = False
+
+# what the expression semantics read facts from: the walker's state. A Mapping, not a dict,
+# both because these functions only ever read it and because covariance then lets a plain
+# dict[str, ValidationFact] (tests, sub-states) flow in despite dict's invariance.
+type StateMap = Mapping[str, ValidationFact | Container]
+
 def is_path_typed(fact: ValidationFact | None) -> bool:
     return isinstance(fact, PathFact) or (isinstance(fact, Located) and fact.repr == "path")
 
@@ -1340,75 +1322,6 @@ def join_text(pieces: Sequence[str | ValidationFact | None]) -> ValidationFact:
     loc = state.finish()
     return Located(loc, "str") if loc is not None else _text_of_pieces(pieces)
 
-def bind[T, R](f: Callable[[T], OptionMonad[R] | R | None]) -> Callable[[OptionMonad[T]], OptionMonad[R]]:
-    return lambda m: m.bind(f)
-
-def map_[T, R](f: Callable[[T], R]) -> Callable[[OptionMonad[T]], OptionMonad[R]]:
-    return lambda m: m.map(f)
-
-
-class OperandInterpreter():
-    def __init__(self, st: dict[str, ValidationFact]):
-        self.st = st
-
-    def interp[R](
-        self,
-        e: ast.expr,
-        on_str: Callable[[OptionMonad[str]], OptionMonad[R]],
-        on_fact: Callable[[OptionMonad[ValidationFact]], OptionMonad[R]],
-        on_expr: Callable[[OptionMonad[ast.expr]], OptionMonad[R]] | None = None
-    ) -> R | None:
-        if (as_str := as_const_or_null(str, e)):
-            return on_str(OptionMonad(as_str)).unwrap()
-        if not isinstance(e, ast.Name):
-            if on_expr is None:
-                return None
-            return on_expr(OptionMonad(e)).unwrap()
-        res = self.st.get(e.id)
-        if res is None:
-            return None
-        return on_fact(OptionMonad(res)).unwrap()
-
-    def interp_bind[R](
-        self,
-        e: ast.expr,
-        on_str: Callable[[OptionMonad[str]], OptionMonad[R]],
-        on_fact: Callable[[OptionMonad[ValidationFact]], OptionMonad[R]],
-        on_expr : Callable[[OptionMonad[ast.expr]], OptionMonad[R]] | None = None
-    ) -> OptionMonad[R]:
-        return OptionMonad.lift(self.interp(e, on_str, on_fact, on_expr))
-
-def type_cast[T](t: TypeForm[T]) -> Callable[[T], T]:
-    return lambda x: x
-
-
-def take_if[T](pred: Callable[[T], bool]) -> Callable[[T], T | None]:
-    def to_ret(it: T) -> T | None:
-        if not pred(it):
-            return None
-        else:
-            return it
-    return to_ret
-
-class _default:
-    @classmethod
-    def BindNone[T, R](cls) -> Callable[[OptionMonad[T]], OptionMonad[R]]:
-        return lambda _ign: OptionMonad.lift(None)
-
-    @classmethod
-    def Cast[R](cls, ty: TypeForm[R]) -> Callable[[OptionMonad[R]], OptionMonad[R]]:
-        return lambda x: x.bind(type_cast(ty))
-
-@dataclass(frozen=True, eq=False)
-class CurriedMonad[M, R]:
-    staged: Callable[[OptionMonad[M]], OptionMonad[R]]
-
-    def bind_curried[S](self, c: Callable[[R], OptionMonad[S] | S | None]) -> "CurriedMonad[M, S]":
-        return CurriedMonad(lambda to_exec: self.staged(to_exec).bind(c))
-
-    def __call__(self, arg: OptionMonad[M]) -> OptionMonad[R]:
-        return self.staged(arg)
-
 def _argv_read(e: ast.expr) -> bool:
     """``sys.argv``, or a subscript of it: a source of strs of unknown text. (The type is the
     whole fact -- a ``StrFact()`` instead of ``None`` is what lets guards and checks refine an
@@ -1419,7 +1332,7 @@ def _argv_read(e: ast.expr) -> bool:
     return access is not None and access.matches("sys", "argv")
 
 
-def operand_value(e: ast.expr, st: dict[str, ValidationFact]) -> str | ValidationFact | None:
+def operand_value(e: ast.expr, st: StateMap) -> str | ValidationFact | None:
     """An operand as the joins see it: a string literal stays a literal (so a multi-component
     literal can be split into components); anything else is interpreted."""
     if (s := as_const_or_null(str, e)) is not None:
@@ -1435,7 +1348,7 @@ def _head_location(v: str | ValidationFact | None) -> LocationFact | None:
         case _:
             return containment_of(v)
 
-def join_args(args: Sequence[ast.expr], st: dict[str, ValidationFact]) -> LocationFact | None:
+def join_args(args: Sequence[ast.expr], st: StateMap) -> LocationFact | None:
     """``pathlib.Path(a, b, ...)`` / ``os.path.join(a, b, ...)``: the first argument's location,
     extended by the rest."""
     loc = _head_location(operand_value(args[0], st))
@@ -1452,7 +1365,7 @@ def _flatten_add(e: ast.expr) -> list[ast.expr]:
         case _:
             return [e]
 
-def _fstring_pieces(e: ast.JoinedStr, st: dict[str, ValidationFact]) -> list[str | ValidationFact | None]:
+def _fstring_pieces(e: ast.JoinedStr, st: StateMap) -> list[str | ValidationFact | None]:
     out: list[str | ValidationFact | None] = []
     for v in e.values:
         match v:
@@ -1474,12 +1387,21 @@ _STR_RETURNING_METHODS = frozenset({
     "format", "zfill", "center", "ljust", "rjust", "expandtabs", "join", "translate",
 })
 
-def interpret_expr(e: ast.expr, st: dict[str, ValidationFact]) -> ValidationFact | None:
+def interpret_expr(e: ast.expr, st: StateMap) -> ValidationFact | None:
     match e:
         case ast.Name(id=name):
-            return st.get(name)
+            found = st.get(name)
+            # a container-valued name has no scalar reading: the container domain is the
+            # walker's, and only the roster touchpoints below reach into it
+            return None if isinstance(found, Container) else found
         case ast.Constant(value=str() as s):
             return StrFact(regex=Exact(s))
+        case ast.Call(func=ast.Attribute(value=ast.Name(id=rname), attr="pop"), args=pargs) if (
+            isinstance((popped := st.get(rname)), Container)
+            and popped.kind != "sequence"
+            and len(pargs) <= 1
+        ):
+            return popped.elem  # x.pop(): one element, with the container's current fact
         case ast.Call(func=func, args=args, keywords=keywords):
             call = resolve_callee(func)
             if call is None:
@@ -1521,6 +1443,12 @@ def interpret_expr(e: ast.expr, st: dict[str, ValidationFact]) -> ValidationFact
             # an element of sys.argv is a str of unknown text; a slice is a list of them --
             # no scalar fact, but the iteration transfer knows its elements
             return None if isinstance(index, ast.Slice) else StrFact()
+        case ast.Subscript(value=ast.Name(id=cname), slice=index) if (
+            isinstance((indexed := st.get(cname)), Container)
+            and indexed.kind in ("list", "sequence")
+            and not isinstance(index, ast.Slice)
+        ):
+            return indexed.elem  # x[i]: an element; a slice is a fresh, untracked copy
         case _:
             return None
 
@@ -1556,14 +1484,14 @@ def _glob_location(base: LocationFact, pattern: str) -> LocationFact | None:
             return None
     return loc
 
-def _path_location(recv: ast.expr, st: dict[str, ValidationFact]) -> LocationFact | None:
+def _path_location(recv: ast.expr, st: StateMap) -> LocationFact | None:
     """The location of a receiver that must be a ``pathlib.Path`` (``iterdir``/``glob`` exist only there)."""
     located = locate(interpret_expr(recv, st))
     return located.location if located is not None and located.repr == "path" else None
 
 _ELEMENT_WRAPPERS = ("sorted", "list", "tuple", "reversed", "iter")
 
-def element_fact(iterable: ast.expr, st: dict[str, ValidationFact]) -> ValidationFact | None:
+def element_fact(iterable: ast.expr, st: StateMap) -> ValidationFact | None:
     """The fact for ``p`` in ``for p in <iterable>``, when the iterable is a directory traversal."""
     match iterable:
         case ast.Call(func=ast.Name(id=wrapper), args=[inner], keywords=kws) if (
@@ -1591,11 +1519,15 @@ def element_fact(iterable: ast.expr, st: dict[str, ValidationFact]) -> Validatio
         case _ if _argv_read(iterable):
             # sys.argv or a slice of it: command-line arguments, strs of unknown text
             return StrFact()
+        case ast.Name(id=name) if isinstance(st.get(name), Container):
+            container = st[name]
+            assert isinstance(container, Container)
+            return container.elem  # iterating a tracked container: its current element fact
         case _:
             return None
 
 def iteration_bindings(
-    target: ast.expr, iterable: ast.expr, st: dict[str, ValidationFact]
+    target: ast.expr, iterable: ast.expr, st: StateMap
 ) -> dict[str, ValidationFact]:
     """Facts for the names ``for <target> in <iterable>`` binds, for the traversal iterables."""
     match target, iterable:

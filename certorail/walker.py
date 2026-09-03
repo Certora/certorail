@@ -22,13 +22,14 @@ import argparse
 import ast
 import pathlib
 import sys
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .analysis import (
     ANY_STR,
+    Container,
     Exact,
     InvalidConstantForm,
     InvalidProgram,
@@ -71,7 +72,7 @@ from .dangerous import (
     PATH_SINK_METHODS,
     AccessKind,
 )
-from .annotations import Contract, bind_arguments, default_of, is_plain_type
+from .annotations import Contract, bind_arguments, default_of, is_plain_type, parse_annotation
 from .guards import apply, recognize
 from .markers import NAMESPACE
 from .safepy import (
@@ -83,7 +84,95 @@ from .safepy import (
 )
 from .terms import Call, Method, lower
 
-type State = dict[str, ValidationFact]
+type State = dict[str, ValidationFact | Container]
+
+# the container roster (CONTAINERS.md): the method surface that keeps a tracked list/set
+# tracked. Writes carry an entailment obligation; "sequence" -- the borrowed view a
+# Sequence[...] parameter receives -- admits none of the mutators.
+_CONTAINER_METHODS: frozenset[str] = frozenset(
+    {"append", "insert", "extend", "add", "remove", "discard", "clear", "sort", "pop"}
+)
+# which kinds carry which method (a mismatch is a violation, not an escape)
+_METHOD_KINDS: dict[str, tuple[str, ...]] = {
+    "append": ("list",), "insert": ("list",), "extend": ("list",), "sort": ("list",),
+    "add": ("set",), "discard": ("set",),
+    "remove": ("list", "set"), "clear": ("list", "set"), "pop": ("list", "set"),
+}
+# bare-name calls that only read a container handed to them
+_CONTAINER_READ_CALLS: frozenset[str] = frozenset(
+    {"len", "sorted", "list", "set", "tuple", "iter", "reversed", "enumerate"}
+)
+
+
+def _roster_blessings(
+    root: ast.AST, contracts: dict[str, tuple[ast.FunctionDef, Contract]]
+) -> set[int]:
+    """The ``ast.Name`` occurrences (by ``id``) in container-roster positions: the blessed
+    shapes of CONTAINERS.md, computed syntactically in one pass over the whole tree.
+    ``visit_Name`` treats any other Load of a tracked container as its escape -- a
+    violation, always, so no escaped-set ever needs propagating to block boundaries: for
+    any program that survives, that set is empty.
+
+    A call to a contracted function blesses only the arguments bound to *container*
+    parameters -- handing a tracked container to a scalar or unannotated parameter is an
+    escape (the callee would hold an unobligated alias)."""
+    blessed: set[int] = set()
+
+    def bless(e: object) -> None:
+        if isinstance(e, ast.Name):
+            blessed.add(id(e))
+
+    for n in ast.walk(root):
+        match n:
+            case ast.Call(func=ast.Attribute(value=recv, attr=method), args=args):
+                if method in _CONTAINER_METHODS:
+                    bless(recv)
+                if method == "extend" and args:
+                    bless(args[0])
+            case ast.Call(func=ast.Name(id=f), args=args):
+                if f in _CONTAINER_READ_CALLS:
+                    for a in args:
+                        bless(a)
+                elif f in contracts:
+                    fdef, contract = contracts[f]
+                    bound = bind_arguments(n, fdef)
+                    for param, rely in contract.params.items():
+                        if isinstance(rely, Container) and bound is not None:
+                            bless(bound.get(param))
+            case ast.For(iter=it):
+                bless(it)  # a wrapper call in iter position is covered by the Call case
+            case ast.Subscript(value=v, ctx=ast.Load()):
+                bless(v)  # an index reads an element; a slice-load is a copy
+            case ast.Assign(targets=[ast.Subscript(value=v, slice=s)]) if not isinstance(
+                s, ast.Slice
+            ):
+                # the ONE store shape the semantics handle (_container_store imposes the
+                # obligation): a direct, single-target element store. Every other spelling
+                # -- tuple targets, x[0] = y[0] = v, x[i] += v, for x[i] in ... -- is
+                # unblessed and therefore an escape, never a silently unobligated write.
+                bless(v)
+            case ast.AnnAssign(target=ast.Subscript(value=v, slice=s)) if not isinstance(
+                s, ast.Slice
+            ):
+                bless(v)
+            case ast.Compare(ops=ops, comparators=comparators):
+                for op, comp in zip(ops, comparators):
+                    if isinstance(op, (ast.In, ast.NotIn)):
+                        bless(comp)
+            case ast.If(test=t) | ast.While(test=t) | ast.Assert(test=t):
+                bless(t)  # bare-name truthiness
+            case ast.UnaryOp(op=ast.Not(), operand=operand):
+                bless(operand)
+            case ast.BoolOp(values=values):
+                for v in values:
+                    bless(v)
+            case ast.Return(value=v):
+                bless(v)  # move or alias: visit_Return decides which
+            case ast.AugAssign(value=v):
+                bless(v)  # x += y reads y; the extend semantics check it
+            case _:
+                pass
+    return blessed
 
 
 @dataclass(frozen=True)
@@ -276,8 +365,17 @@ def _kill(st: State, names: set[str]) -> State:
 
 
 def _without_env_checks(st: State, pure: frozenset[str]) -> State:
-    """The crude kill over a whole state: every environment check dies; pure atoms ride."""
-    return {k: drop_checks(v, keep=pure) for k, v in st.items()}
+    """The crude kill over a whole state: every environment check dies; pure atoms ride.
+    A container's element fact degrades the same way (the annotation is only the birth
+    invariant; reads yield the current, possibly degraded fact)."""
+    return {
+        k: (
+            replace(v, elem=drop_checks(v.elem, keep=pure))
+            if isinstance(v, Container)
+            else drop_checks(v, keep=pure)
+        )
+        for k, v in st.items()
+    }
 
 
 def _join(a: State, b: State) -> State:
@@ -366,12 +464,16 @@ class ValidationWalker(ast.NodeVisitor):
         # the host's literal-checker runner (Policy.discharger): given (atom, exact text), may an
         # effect-free evaluator establish the pure atom on that text right now? None = no running.
         self._discharge = discharge
-        self._guarantee: ValidationFact | None = None
+        self._guarantee: ValidationFact | Container | None = None
         # the names that denote modules, for lowering: only what the program actually imported,
         # plus the marker namespace the sandbox injects
         self.modules: frozenset[str] = frozenset(root for (root, *_) in imports) | {NAMESPACE}
-        # facts for module-level constants, computed by visit_Module and seeded into function bodies
-        self.module_constants: State = {}
+        # facts for module-level constants, computed by visit_Module and seeded into function
+        # bodies. Scalars only: containers are never module constants.
+        self.module_constants: dict[str, ValidationFact] = {}
+        # ast.Name occurrences (by id) in container-roster positions; any other Load of a
+        # tracked container is its escape. Filled once per module by visit_Module.
+        self._blessed: set[int] = set()
 
     def _violation(self, node: ast.AST, what: str) -> None:
         self.violations.append((node, what))
@@ -392,7 +494,10 @@ class ValidationWalker(ast.NodeVisitor):
         """*st* with everything *cond* being true establishes."""
         out = dict(st)
         for g in recognize(lower(cond, self.modules), out):
-            refined = apply(out.get(g.subject), g.refinement)
+            current = out.get(g.subject)
+            if isinstance(current, Container):
+                continue  # guards speak about scalars; the container domain has its own rules
+            refined = apply(current, g.refinement)
             if refined is not None:
                 out[g.subject] = refined
         return out
@@ -402,13 +507,39 @@ class ValidationWalker(ast.NodeVisitor):
     def visit_Name(self, node: ast.Name) -> Any:
         if isinstance(node.ctx, (ast.Store, ast.Del)):
             self.state.pop(node.id, None)
+            return
+        tracked = self.state.get(node.id)
+        if isinstance(tracked, Container) and id(node) not in self._blessed:
+            self._escape(node, node.id, tracked)
 
-    def _guaranteed(self, value: ast.expr) -> ValidationFact | None:
-        """The guarantee of ``f(...)`` for a module-level ``f`` with a return contract."""
+    def _escape(self, node: ast.AST, name: str, container: Container) -> None:
+        """Any use outside the roster: an error, always (CONTAINERS.md). A typed container
+        is an opt-in assertion by code written de novo to be analyzable; silently dropping
+        the state and complaining later -- if the thrown-away fact even turns out to matter
+        -- serves nobody here. Provenance still decides *returns* (a local moves out, a
+        parameter would alias), not the loudness of an escape."""
+        self._violation(
+            node,
+            f"container {name!r} escapes: a typed container may only be used through "
+            "the container operations",
+        )
+        self.state.pop(name, None)
+
+    def _guaranteed(self, value: ast.expr) -> ValidationFact | Container | None:
+        """The guarantee of ``f(...)`` for a module-level ``f`` with a return contract. A
+        container guarantee is a move in: the caller receives fresh ownership."""
         match value:
             case ast.Call(func=ast.Name(id=name)) if name in self.contracts:
                 returns = self.contracts[name][1].returns
-                return returns if isinstance(returns, (StrFact, PathFact, Located)) else None
+                if isinstance(returns, Container):
+                    # a contract container is always param=False (the annotations
+                    # constructor never sets it): the caller receives fresh ownership as-is
+                    return returns
+                return (
+                    returns
+                    if isinstance(returns, (StrFact, PathFact, Located, UrlString))
+                    else None
+                )
             case _:
                 return None
 
@@ -422,8 +553,30 @@ class ValidationWalker(ast.NodeVisitor):
                 self.state.pop(target.id, None)
             else:
                 self.state[target.id] = fact
+        elif (
+            isinstance(target, ast.Subscript)
+            and isinstance(target.value, ast.Name)
+            and isinstance((c := self.state.get(target.value.id)), Container)
+        ):
+            self._container_store(target.value.id, target, value, c)
         else:
+            assert isinstance(target, ast.Tuple)
             self.visit(target)  # tuple/attribute/subscript targets: kill the names involved
+
+    def _container_store(
+        self, name: str, target: ast.Subscript, value: ast.expr, c: Container
+    ) -> None:
+        """``x[i] = v``: an element write, with the usual obligation. A slice store is the
+        punted escape; a set is unsubscriptable; a Sequence parameter is read-only."""
+        if c.kind == "sequence":
+            self._violation(target, f"{name!r} is a Sequence parameter: read-only")
+            return
+        if c.kind == "set" or isinstance(target.slice, ast.Slice):
+            self._escape(target, name, c)
+            return
+        self.visit(target.slice)
+        if not self._establishes(operand_value(value, self.state), c.elem):
+            self._unvouched_write(value, name, c, "the assigned element does not establish")
 
     def visit_Assign(self, node: ast.Assign) -> Any:
         if len(node.targets) == 1:
@@ -434,11 +587,123 @@ class ValidationWalker(ast.NodeVisitor):
             self.visit(t)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> Any:
+        declared = self._container_annotation(node.annotation)
+        if declared is not None:
+            self._construct_container(node, declared)
+            return
         # a local's annotation is unchecked at runtime, so it establishes nothing; the value does
         if node.value is None:
             self.visit(node.target)
         else:
             self._assign(node.target, node.value)
+
+    def _container_annotation(self, annotation: ast.expr) -> Container | None:
+        try:
+            fact = parse_annotation(annotation)
+        except InvalidProgram:
+            return None  # malformed annotations are FunctionAnalysis' report, not ours
+        return fact if isinstance(fact, Container) else None
+
+    def _construct_container(self, node: ast.AnnAssign, declared: Container) -> None:
+        """The opt-in construction site (CONTAINERS.md): an annotated assignment whose value
+        is a known constructor, every element establishing the declared element fact."""
+        if not isinstance(node.target, ast.Name):
+            self._violation(node, "container: the target must be a bare name")
+            self.visit(node.target)
+            return
+        target = node.target.id
+        if declared.kind == "sequence":
+            self._violation(node, "Sequence is a borrowed view; construct a list or a set")
+            self.state.pop(target, None)
+            return
+        if node.value is None:
+            self._violation(node, "container: the annotation opts in at a construction site; assign a constructor")
+            self.state.pop(target, None)
+            return
+        self.visit(node.value)  # sinks inside elements; a nested tracked container escapes
+        if self._constructed(node.value, declared):
+            self.state[target] = Container(declared.kind, declared.elem)
+        else:
+            self.state.pop(target, None)
+
+    def _constructed(self, value: ast.expr, declared: Container) -> bool:
+        match value:
+            case ast.List(elts=elts) if declared.kind == "list":
+                return self._elements_establish(elts, declared.elem)
+            case ast.Set(elts=elts) if declared.kind == "set":
+                return self._elements_establish(elts, declared.elem)
+            case ast.Call(func=ast.Name(id=ctor), args=[], keywords=[]) if ctor == declared.kind:
+                return True  # list() / set(): empty, trivially conforming
+            case ast.Call(func=ast.Name(id=ctor), args=[ast.Name(id=src)], keywords=[]) if (
+                ctor == declared.kind
+                and isinstance((source := self.state.get(src)), Container)
+            ):
+                # the copy constructor: the blessed "alias" -- a fresh container whose
+                # elements come vouched-for by the source's current element fact
+                if not self._establishes(source.elem, declared.elem):
+                    self._violation(
+                        value,
+                        f"the copied elements do not establish {_describe_value(declared.elem)}",
+                    )
+                    return False
+                return True
+            case _:
+                self._violation(
+                    value,
+                    f"container: not a recognized {declared.kind} constructor "
+                    f"(a display, {declared.kind}(), or {declared.kind}(tracked))",
+                )
+                return False
+
+    def _elements_establish(self, elts: Sequence[ast.expr], elem: ValidationFact) -> bool:
+        ok = True
+        for i, e in enumerate(elts):
+            if isinstance(e, ast.Starred) or not self._establishes(
+                operand_value(e, self.state), elem
+            ):
+                self._violation(e, f"element {i + 1} does not establish {_describe_value(elem)}")
+                ok = False
+        return ok
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> Any:
+        if isinstance(node.target, ast.Name) and isinstance(
+            (c := self.state.get(node.target.id)), Container
+        ):
+            self.visit(node.value)
+            if c.kind == "list" and isinstance(node.op, ast.Add):
+                self._extend(node, node.target.id, c, node.value)
+            else:
+                self._escape(node, node.target.id, c)
+            return
+        self.generic_visit(node)
+
+    def _extend(self, node: ast.AST, name: str, c: Container, source: ast.expr) -> None:
+        if c.kind == "sequence":
+            self._violation(node, f"{name!r} is a Sequence parameter: read-only")
+            return
+        match source:
+            case ast.Name(id=src) if isinstance((other := self.state.get(src)), Container):
+                if not self._establishes(other.elem, c.elem):
+                    self._unvouched_write(
+                        source, name, c, "the extended elements do not establish"
+                    )
+            case ast.List(elts=elts) | ast.Set(elts=elts) | ast.Tuple(elts=elts):
+                if not self._elements_ok(elts, c.elem):
+                    self._unvouched_write(
+                        source, name, c, "the extended elements do not establish"
+                    )
+            case _:
+                # an unvouched iterable: nothing speaks for its elements
+                self._unvouched_write(
+                    source, name, c, "the extended elements do not establish"
+                )
+
+    def _elements_ok(self, elts: Sequence[ast.expr], elem: ValidationFact) -> bool:
+        return all(
+            not isinstance(e, ast.Starred)
+            and self._establishes(operand_value(e, self.state), elem)
+            for e in elts
+        )
 
     def visit_Assert(self, node: ast.Assert) -> Any:
         self.generic_visit(node)  # sinks (and check-killing calls) inside the test are real
@@ -462,6 +727,7 @@ class ValidationWalker(ast.NodeVisitor):
             # the gen postdominates only the statement form (visit_Expr); anywhere else there is
             # no program point whose fall-through the success can speak for
             self._violation(node, "check: certora.check(...) must be a bare statement")
+        self._container_call(node, callee)
         self.generic_visit(node)  # children first: an inner call's effects precede the outer one
         self._audit_sink(node)
         if isinstance(node.func, ast.Name) and node.func.id in self.contracts:
@@ -487,14 +753,65 @@ class ValidationWalker(ast.NodeVisitor):
             return True
         if full in (("os", "listdir"), ("os", "walk")):
             return True  # read sinks: audited, and they mutate nothing
+        receiver = self.state.get(full[0]) if len(full) == 2 else None
         if (
             len(full) == 2
             and full[1] != "open"  # Path.open("w") writes; the mode is the audit's business
             and PATH_SINK_METHODS.get(full[1]) in ("read", "list")
-            and is_path_typed(self.state.get(full[0]))
+            and not isinstance(receiver, Container)
+            and is_path_typed(receiver)
         ):
             return True  # p.read_text() / p.exists() / p.iterdir() on a proven path
+        if (
+            len(full) == 2
+            and full[1] in _CONTAINER_METHODS
+            and isinstance(self.state.get(full[0]), Container)
+        ):
+            # a roster mutation runs no program code; its own obligation was already applied
+            return True
         return False
+
+    def _container_call(self, node: ast.Call, callee: NameAccess) -> None:
+        """The roster methods on a tracked container: obligations for the writes, kind
+        conformance, and the Sequence read-only rule. Pure reads need nothing here --
+        ``interpret_expr`` knows ``pop`` and subscripts -- and an off-roster method is an
+        escape, via ``visit_Name`` and the blessing pass."""
+        if not callee.is_var_base:
+            return  # a method on a computed receiver: full_path does not even exist
+        full = callee.full_path
+        if len(full) != 2:
+            return
+        name, method = full
+        c = self.state.get(name)
+        if not isinstance(c, Container) or method not in _CONTAINER_METHODS:
+            return
+        if c.kind == "sequence":
+            self._violation(node, f"{name!r} is a Sequence parameter: read-only")
+            return
+        if c.kind not in _METHOD_KINDS[method]:
+            self._violation(node, f"a {c.kind} has no {method}()")
+            return
+        if method in ("append", "add") and len(node.args) == 1:
+            if not self._establishes(operand_value(node.args[0], self.state), c.elem):
+                self._unvouched_write(
+                    node.args[0], name, c, "the appended element does not establish"
+                )
+        elif method == "insert" and len(node.args) == 2:
+            if not self._establishes(operand_value(node.args[1], self.state), c.elem):
+                self._unvouched_write(
+                    node.args[1], name, c, "the inserted element does not establish"
+                )
+        elif method == "extend" and len(node.args) == 1:
+            self._extend(node, name, c, node.args[0])
+
+    def _unvouched_write(
+        self, node: ast.AST, name: str, container: Container, what: str
+    ) -> None:
+        """A write that does not establish the element fact: a violation like any other
+        escape. The container is dropped afterwards only to keep the (already rejected)
+        remainder of the walk from cascading."""
+        self._violation(node, f"{what} {_describe_value(container.elem)}")
+        self.state.pop(name, None)
 
     def _effect_free_check(self, call: ast.Call) -> bool:
         """Is this a ``certora.check`` of a validation the policy declared effect-free? Only a
@@ -559,6 +876,9 @@ class ValidationWalker(ast.NodeVisitor):
         for param, rely in contract.params.items():
             if is_plain_type(rely):
                 continue  # a type rely: the injected runtime guard's job, not ours
+            if isinstance(rely, Container):
+                self._check_container_argument(node, name, param, rely, bound.get(param))
+                continue
             supplied = bound.get(param)
             if supplied is None:
                 default = default_of(fdef, param)
@@ -572,6 +892,46 @@ class ValidationWalker(ast.NodeVisitor):
                 continue
             if not self._establishes(operand_value(supplied, self.state), rely):
                 self._violation(supplied, f"call to {name}: the argument for {param} does not establish {_describe_value(rely)}")
+
+    def _check_container_argument(
+        self, node: ast.Call, fname: str, param: str, rely: Container, supplied: object
+    ) -> None:
+        """A container parameter: a ``list``/``set`` rely is invariant -- the callee may
+        write, so the element types must coincide (mutual entailment: the equivalence the
+        entailment preorder induces, not structural equality) -- while a ``Sequence`` rely is
+        a read-only borrow and admits any container whose elements entail its."""
+        if not isinstance(supplied, ast.Name):
+            self._violation(
+                node, f"call to {fname}: the argument for {param} must be a tracked container name"
+            )
+            return
+        c = self.state.get(supplied.id)
+        if not isinstance(c, Container):
+            self._violation(
+                supplied, f"call to {fname}: {supplied.id!r} is not a tracked container"
+            )
+            return
+        if rely.kind == "sequence":
+            if not self._establishes(c.elem, rely.elem):
+                self._violation(
+                    supplied,
+                    f"call to {fname}: the elements of {supplied.id!r} do not establish "
+                    f"{_describe_value(rely.elem)}",
+                )
+            return
+        if c.kind != rely.kind:
+            self._violation(
+                supplied, f"call to {fname}: {param} takes a {rely.kind}, got a {c.kind}"
+            )
+            return
+        if not (
+            self._establishes(c.elem, rely.elem) and self._establishes(rely.elem, c.elem)
+        ):
+            self._violation(
+                supplied,
+                f"call to {fname}: {param} requires exactly {_describe_value(rely.elem)} "
+                "elements (invariance: the callee may write)",
+            )
 
     def _audit_check(self, node: ast.Call) -> None:
         """``certora.check(name, key=value, ..., cwd=...)``: run the policy's evaluator for
@@ -629,7 +989,7 @@ class ValidationWalker(ast.NodeVisitor):
             expr = cwd_expr if target == "cwd" else keywords.get(target)
             if isinstance(expr, ast.Name):
                 fact = self.state.get(expr.id)
-                if fact is not None:
+                if fact is not None and not isinstance(fact, Container):
                     self.state[expr.id] = replace(fact, checks=fact.checks | atoms)
 
     def _audit_exec(self, node: ast.Call) -> None:
@@ -760,12 +1120,18 @@ class ValidationWalker(ast.NodeVisitor):
                 self.state = {}  # unreachable
 
     def _loop(
-        self, node: ast.For | ast.While, test: ast.expr | None, bindings: State | None = None
+        self,
+        node: ast.For | ast.While,
+        test: ast.expr | None,
+        bindings: Mapping[str, ValidationFact] | None = None,
     ) -> None:
         # names assigned in the loop are unknown at every iteration boundary; one pass over the body
         # in that state covers all iterations, and nothing the body established survives the loop.
         # A ``for`` header rebinds its target on every iteration, so *bindings* is applied after the
         # kill and holds at every iteration start.
+        # a container escaping anywhere in the body is a violation reported by the walked
+        # pass itself: no escaped-set propagates to the boundary, because for any program
+        # that survives, that set is empty (CONTAINERS.md)
         killed = _kill(self.state, _assigned_names([node]))
         if self._may_effect([node]):
             # some iteration (or the header itself) runs an effectful call: no environment check
@@ -783,6 +1149,9 @@ class ValidationWalker(ast.NodeVisitor):
 
     def visit_For(self, node: ast.For) -> Any:
         self.visit(node.iter)
+        # a Name target is a rebinding kill; a subscript target reaches visit_Name, so
+        # ``for x[0] in ...`` is the container escape it deserves to be
+        self.visit(node.target)
         # the iterable is evaluated once, before the loop, in the pre-loop state
         self._loop(node, None, iteration_bindings(node.target, node.iter, self.state))
 
@@ -889,15 +1258,17 @@ class ValidationWalker(ast.NodeVisitor):
     # -- scopes and contracts -----------------------------------------------------------------
 
     def visit_Module(self, node: ast.Module) -> Any:
+        # container-roster positions, classified once, syntactically, for the whole tree
+        self._blessed = _roster_blessings(node, self.contracts)
         # a module-level constant (a name bound by exactly one unconditional top-level assignment)
         # is immutable: module-level reassignment is forbidden and `global` is banned, so no code
         # can rebind it. Its fact therefore holds in every function body and may seed it.
         self.module_constants = self._module_constants(node)
         self.generic_visit(node)
 
-    def _module_constants(self, module: ast.Module) -> State:
+    def _module_constants(self, module: ast.Module) -> dict[str, ValidationFact]:
         counts = _module_scope_binds(module.body)
-        state: State = {}
+        state: dict[str, ValidationFact] = {}
         for s in module.body:
             if isinstance(s, ast.Assign) and len(s.targets) == 1 and isinstance(s.targets[0], ast.Name):
                 name, value = s.targets[0].id, s.value
@@ -929,7 +1300,11 @@ class ValidationWalker(ast.NodeVisitor):
         # nested function or method -- even one sharing the name -- starts from nothing
         entry = self.contracts.get(node.name)
         contract = entry[1] if entry is not None and entry[0] is node else None
-        rely: State = {} if contract is None else dict(contract.params)
+        rely: State = {}
+        if contract is not None:
+            for k, v in contract.params.items():
+                # a container parameter arrives with param provenance: its escape is an error
+                rely[k] = replace(v, param=True) if isinstance(v, Container) else v
         # seed the module constants the body may read. Exclude any name the function binds itself:
         # in Python such a name is local throughout the body (it shadows the module name), and the
         # rely then supplies the facts for the parameters.
@@ -962,15 +1337,58 @@ class ValidationWalker(ast.NodeVisitor):
         self.state.pop(node.name, None)
 
     def visit_Return(self, node: ast.Return) -> Any:
-        if node.value is not None:
-            self.visit(node.value)
+        value = node.value
+        if isinstance(value, ast.Name) and isinstance(
+            (c := self.state.get(value.id)), Container
+        ):
+            self._return_container(node, value.id, c)
+            return
+        if value is not None:
+            self.visit(value)
         guarantee = self._guarantee
         if guarantee is None or is_plain_type(guarantee):
             return  # a plain return type is the type checker's business
-        if node.value is None or not self._establishes(
-            operand_value(node.value, self.state), guarantee
-        ):
+        if isinstance(guarantee, Container):
+            self._violation(
+                node,
+                "return does not establish the container guarantee (return a tracked local)",
+            )
+            return
+        if value is None or not self._establishes(operand_value(value, self.state), guarantee):
             self._violation(node, f"return does not establish the guarantee {_describe_value(guarantee)}")
+
+    def _return_container(self, node: ast.Return, name: str, c: Container) -> None:
+        """Returning a tracked container: a *move* for a local -- the name dies, no alias
+        survives, the return annotation is the guarantee -- and an aliasing error for a
+        parameter, which would hand the caller a second name for its own container."""
+        if c.param:
+            self._violation(
+                node,
+                f"returning {name!r} aliases the caller's container: a parameter container "
+                "may not be returned",
+            )
+            self.state.pop(name, None)
+            return
+        guarantee = self._guarantee
+        if not isinstance(guarantee, Container):
+            self._violation(
+                node,
+                f"returning container {name!r} needs a container return annotation "
+                "(the move's guarantee)",
+            )
+        elif guarantee.kind == "sequence":
+            if not self._establishes(c.elem, guarantee.elem):
+                self._violation(node, "return does not establish the Sequence guarantee")
+        elif guarantee.kind != c.kind or not (
+            self._establishes(c.elem, guarantee.elem)
+            and self._establishes(guarantee.elem, c.elem)
+        ):
+            self._violation(
+                node,
+                f"return does not establish the container guarantee (a {guarantee.kind} of "
+                f"exactly {_describe_value(guarantee.elem)})",
+            )
+        self.state.pop(name, None)  # moved out
 
     def visit_ClassDef(self, node: ast.ClassDef) -> Any:
         for d in node.decorator_list:
@@ -1055,10 +1473,12 @@ def _checks_suffix(checks: frozenset[str]) -> str:
     return f" (validated: {', '.join(sorted(checks))})" if checks else ""
 
 
-def _describe_value(v: str | ValidationFact | None) -> str:
+def _describe_value(v: str | ValidationFact | Container | None) -> str:
     match v:
         case None:
             return "unknown"
+        case Container(kind=kind, elem=elem):
+            return f"{kind} of {_describe_value(elem)}"
         case str():
             return repr(v)
         case Located(location=loc, repr=rp, checks=checks):

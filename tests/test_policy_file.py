@@ -67,7 +67,7 @@ class TestParseLocation(unittest.TestCase):
 
     def test_malformed_spellings(self) -> None:
         for text in (
-            "/abs", "a//b", "a/../b", "..", "**/a/b", "a/**/**",
+            "//abs", "a//b", "a/../b", "..", "**/a/b", "a/**/**",
             "<unclosed", "{}/x", "{a,/b}/x",
         ):
             with self.subTest(text=text):
