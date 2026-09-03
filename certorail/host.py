@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from .analysis import Named, StaticPath
 from .broker import build_server
 from .policy import DEFAULT_POLICY, Denial, Policy
+from .policydir import AmbientPolicyError, find_policy
 from .policyfile import PolicyFileError, load_policy_file
 from .rewrite import rewrite
 from .safepy import FunctionAnalysis
@@ -117,7 +118,7 @@ exec(compile(source, filename, "exec"), namespace)
 def _jail_write_paths(policy: Policy, root: pathlib.Path, tmp: pathlib.Path) -> list[str]:
     """The jail's write allowance: the sandbox root and the run's scratch dir -- which cover
     every root-relative write location -- plus the concrete prefix of every *absolute* write
-    location the policy grants (a statically-approved ``/home/.../verisafe/**`` write must
+    location the policy grants (a statically-approved ``/srv/checkouts/**`` write must
     not die in the jail). Coarser than the policy on purpose: precision is the analysis'
     job, the jail is the backstop."""
     paths = [str(root), str(tmp)]
@@ -222,8 +223,21 @@ def run(
                 server.server_close()
 
 
-def load_policy(path: pathlib.Path | None) -> Policy:
+def load_policy(path: pathlib.Path | None, root: pathlib.Path | None = None) -> Policy:
     if path is None:
+        if root is not None:
+            try:
+                found = find_policy(root)
+            except AmbientPolicyError as e:
+                raise SystemExit(str(e))
+            if found is not None:
+                policy_file, prefix = found
+                # a security tool picking up ambient configuration is never silent about it
+                print(f"certorail: policy from {policy_file} (root {prefix})", file=sys.stderr)
+                try:
+                    return load_policy_file(policy_file)
+                except PolicyFileError as e:
+                    raise SystemExit(str(e))
         return DEFAULT_POLICY
     if path.suffix in (".toml", ".json"):
         try:
@@ -243,7 +257,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("program", type=pathlib.Path, help="the Python source file")
     parser.add_argument("--root", type=pathlib.Path, default=pathlib.Path.cwd(), help="the sandbox root (cwd of the program)")
-    parser.add_argument("--policy", type=pathlib.Path, default=None, help="a policy: a .toml/.json document, or a Python file defining POLICY (default: the built-in policy)")
+    parser.add_argument(
+        "--policy",
+        type=pathlib.Path,
+        default=None,
+        help="a policy: a .toml/.json document, or a Python file defining POLICY "
+        "(default: the nearest ambient policy under ~/.certorail for this root, "
+        "else the built-in policy)",
+    )
     parser.add_argument("--check", action="store_true", help="analyse and evaluate only; do not run")
     parser.add_argument(
         "--no-jail",
@@ -254,18 +275,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     ns = parser.parse_args(argv)
 
     filename = str(ns.program)
-    policy = load_policy(ns.policy)
+    root = ns.root.resolve()
+    policy = load_policy(ns.policy, root)
     args = ns.args[1:] if ns.args[:1] == ["--"] else ns.args
     try:
         source = ns.program.read_text(encoding="utf-8")
         if ns.check:
             outcome: Accepted | Rejected | subprocess.CompletedProcess[bytes] = check(
-                source, filename, policy, ns.root.resolve()
+                source, filename, policy, root
             )
         else:
-            outcome = run(
-                source, filename, policy, ns.root.resolve(), args, jail=not ns.no_jail
-            )
+            outcome = run(source, filename, policy, root, args, jail=not ns.no_jail)
     except SyntaxError as e:
         print(f"{filename}:{e.lineno}: syntax error: {e.msg}", file=sys.stderr)
         return 2

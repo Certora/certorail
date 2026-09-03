@@ -54,14 +54,14 @@ class TestSelfJail(unittest.TestCase):
         policy = Policy.allow(
             write=[
                 markers.within("repos"),                        # relative: the root covers it
-                markers.within("/home/john/certora/verisafe"),  # absolute: its own allowance
+                markers.within("/srv/checkouts"),               # absolute: its own allowance
                 markers.within("/opt", leaf=markers.matches(r"\w+\.log")),  # concrete prefix
             ],
         )
         settings = _srt_settings(policy, ROOT, TMP, None)
         self.assertEqual(
             settings["filesystem"]["allowWrite"],
-            ["/work", "/tmp/run", "/home/john/certora/verisafe", "/opt"],
+            ["/work", "/tmp/run", "/srv/checkouts", "/opt"],
         )
 
 

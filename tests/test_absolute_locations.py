@@ -47,9 +47,9 @@ class TestAnchorSeparation(unittest.TestCase):
         self.assertFalse(location_le(absolute("repos", "x"), under_rel))
 
     def test_absolute_within_absolute(self) -> None:
-        under = DirSplat((Named("home"), Named("john")), ANY_NAME, absolute=True)
-        self.assertTrue(location_le(absolute("home", "john", "x"), under))
-        self.assertFalse(location_le(absolute("home", "eve", "x"), under))
+        under = DirSplat((Named("srv"), Named("work")), ANY_NAME, absolute=True)
+        self.assertTrue(location_le(absolute("srv", "work", "x"), under))
+        self.assertFalse(location_le(absolute("srv", "other", "x"), under))
 
 
 class TestRendering(unittest.TestCase):
@@ -58,7 +58,7 @@ class TestRendering(unittest.TestCase):
         self.assertEqual(known_text(Located(StaticPath((), absolute=True), "path")), "/")
 
     def test_pretty_location_round_trips_through_parse(self) -> None:
-        for spelling in (".", "/", "/a/b", "/home/john/**", "/a/{b,c}", "repos/**"):
+        for spelling in (".", "/", "/a/b", "/srv/work/**", "/a/{b,c}", "repos/**"):
             with self.subTest(spelling=spelling):
                 self.assertEqual(pretty_location(parse_location(spelling)), spelling)
 
@@ -70,17 +70,17 @@ class TestRendering(unittest.TestCase):
 
 class TestPythonSpelling(unittest.TestCase):
     def test_literal_string_location(self) -> None:
-        self.assertEqual(location_of("/home/john/x"), absolute("home", "john", "x"))
+        self.assertEqual(location_of("/srv/work/x"), absolute("srv", "work", "x"))
 
     def test_within_absolute_prefix(self) -> None:
         self.assertEqual(
-            location_of(markers.within("/home/john")),
-            DirSplat((Named("home"), Named("john")), ANY_NAME, absolute=True),
+            location_of(markers.within("/srv/work")),
+            DirSplat((Named("srv"), Named("work")), ANY_NAME, absolute=True),
         )
 
     def test_traversal_in_an_absolute_prefix_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
-            location_of(markers.within("/home/../etc"))
+            location_of(markers.within("/srv/../etc"))
 
 
 class TestTransfer(unittest.TestCase):

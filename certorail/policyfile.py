@@ -36,7 +36,7 @@ by "/", each a literal name, ``*`` (any one name), ``{a,b}`` (one of), or ``<reg
 fullmatch, spelled raw -- the one place this syntax and the reports diverge); a trailing ``**``
 means "at or below", optionally followed by one leaf component (``repos/**/<\\w+\\.tar>``);
 ``.`` is the root. A leading ``/`` anchors the location at the *filesystem* root instead of the
-sandbox root (``/home/john/repos/**``); the two anchors never relate, so an absolute allowance
+sandbox root (``/srv/checkouts/**``); the two anchors never relate, so an absolute allowance
 says nothing about sandbox-relative paths and vice versa. Argv pieces are literals, except a
 whole-token ``${param}``, which substitutes the named parameter. Atoms are declared once, centrally: purity and any text meaning
 live in ``[atoms]``, and ``establishes``/``requires``/``argument-atoms`` refer to them by name.
@@ -326,7 +326,9 @@ class _Loader:
         return value
 
 
-_TOP_KEYS = frozenset({"policy-version", "filesystem", "atoms", "validation", "program", "network"})
+_TOP_KEYS = frozenset(
+    {"policy-version", "root", "filesystem", "atoms", "validation", "program", "network"}
+)
 _ATOM_KEYS = frozenset({"pure", "matches"})
 _VALIDATION_KEYS = frozenset({"name", "params", "argv", "cwd", "establishes", "effect-free"})
 _NETWORK_KEYS = frozenset({
@@ -351,6 +353,12 @@ def from_data(data: object, where: str = "<policy>") -> Policy:
         version = loader.field("policy", top, "policy-version", int)
         if version is not None and version != 1:
             loader.error("policy", f"unsupported policy-version {version}")
+
+    # the self-identification for ambiently-discovered policies (policydir): which sandbox
+    # root this document governs. Optional here; the ambient lookup requires and matches it.
+    root_id = loader.field("policy", top, "root", str)
+    if root_id is not None and not root_id.startswith("/"):
+        loader.error("policy.root", "expected an absolute path")
 
     fs = loader.table("filesystem", top.get("filesystem", {}), frozenset({"read", "write", "list"}))
     read = loader.locations("filesystem", fs, "read")
