@@ -58,7 +58,7 @@ certorail -c SOURCE  [--root DIR] [--policy POLICY] [--check] [-- ARG ...]
 `--check` analyses and evaluates without running. `--root` defaults to the current directory.
 `-c` takes the program inline, for agents that generate and run in one step.
 
-The policy is **trusted**. It is normally a TOML document ([`examples/policy.toml`](examples/policy.toml);
+The policy is **trusted**. It is normally a TOML document ([`examples/policies/`](examples/policies/);
 the schema is documented in [`certorail/policyfile.py`](certorail/policyfile.py)), passed with
 `--policy` or discovered ambiently under `~/.certorail/` for the sandbox root. The
 [`certorail-policy`](.claude/skills/certorail-policy/SKILL.md) skill walks a Claude Code session
@@ -110,6 +110,13 @@ model that is generating confined programs. The short version:
 pages a GitHub GraphQL search via `gh`, clones selected repos into a confined `repos/` directory,
 and inspects the clones — with exactly one runtime assertion needed to make untrusted API data a
 proven-safe path component.
+
+[`examples/policies/`](examples/policies/) holds five worked policies, each with its checkers, a
+conforming program and probes that overstep: a cloud CLI gated on which account the credentials
+resolve to, a container pinned by digest, a submission gated on a budget that has to be
+re-checked, a dependency pin gated on a revision that exists upstream, and text gated on a scan
+it cannot route around by writing to a file. They run offline and each one is checked by the
+test suite.
 
 ## What this is not
 

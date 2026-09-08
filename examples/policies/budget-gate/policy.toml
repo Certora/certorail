@@ -1,0 +1,26 @@
+policy-version = 1
+
+[filesystem]
+list = ["jobs/**"]
+
+[atoms]
+# Environmental, and deliberately so: "this account is under its cap" is true of a moment,
+# not of a value. It dies at every possibly-effectful call -- including the previous
+# submission -- so the gate has to be re-established for each job.
+under-budget = {}
+
+[[validation]]
+name        = "budget-gate"
+argv        = ["/bin/sh", "checkers/budget-gate.sh"]
+cwd         = "."
+establishes = { cwd = ["under-budget"] }
+
+[[program]]
+name       = "submit-job"
+subcommand = "submit"
+cwd        = "."
+# `requires` is about the exec's cwd, not its arguments: the fact rides the directory the
+# submission is made from.
+requires           = ["under-budget"]
+argument-locations = ["jobs/**"]
+unknown-arguments  = false
