@@ -6,11 +6,14 @@ these hold:
 
   * the payload names a Bash command that invoked ``certorail`` (parsed with shlex, not matched
     as text);
-  * the tool's output carries certorail's own rejection marker, ``": rejected"``, which
-    ``certorail`` prints and nothing else does;
-  * a ``certorail`` is on PATH.
+  * the tool's output carries certorail's own rejection marker, ``": rejected"``;
+  * a ``certorail`` is on PATH;
+  * ``certorail explain``, run on that invocation's own arguments, itself reports a rejection.
 
-Then it runs ``certorail explain`` with that invocation's own arguments -- the program, --root,
+The marker is a heuristic -- any output quoting another tool's refusal carries it too -- so the
+verdict is taken from ``explain``'s exit status, not from the text that got the hook this far.
+
+It runs ``certorail explain`` with that invocation's own arguments -- the program, --root,
 --policy -- minus the ones that only mean something for a run, and returns the explanation as
 additional context. It never runs the program: ``explain`` cannot.
 
@@ -42,15 +45,16 @@ path will be refused identically.
 `certorail explain` says exactly why, below, and for each problem it names two remedies. Those
 are the only two legitimate ones:
 
-1. Change the program so the fact is provable. The analysis is never fooled, it just learns
-   nothing -- build paths from literals under the root, guard an untrusted component before using
-   it, spell a subcommand out, call the declared validation that establishes the atom. The
+1. Change the program so the fact is provable. The analysis does not guess: it refused because it
+   could not prove the fact, not because it disliked the spelling, so the same shape written again
+   is refused again. Build paths from literals under the root, guard an untrusted component before
+   using it, spell a subcommand out, call the declared validation that establishes the atom. The
    "program:" line of each problem says which.
 
 2. Change the policy, deliberately. The policy is the trusted, reviewed artifact, so widening it
-   is a security decision rather than a build fix. The "policy:" line gives the smallest edit that
-   would permit the site. Show the user that edit and get their agreement before making it, and
-   never widen more than the one site needs.
+   is a security decision rather than a build fix. The "policy:" line gives an edit that would
+   permit the site. Where it says the edit covers more than the site needs, narrow it first. Show
+   the user the edit and get their agreement before making it.
 
 Do neither of these: do not disable, bypass or re-invoke certorail without it; do not move the
 work into a subprocess, a shell, or an unconfined script; do not ask the user to run the command
@@ -107,7 +111,9 @@ def main() -> None:
         cwd=payload.get("cwd") or None,
         check=False,
     )
-    if not result.stdout.strip():
+    # 1 is the rejected verdict; 0 is accepted and 2 unparsable, and injecting a refusal preamble
+    # over either would tell the model something that did not happen
+    if result.returncode != 1 or not result.stdout.strip():
         return
 
     json.dump(

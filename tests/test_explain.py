@@ -11,6 +11,7 @@ import json
 import os
 import pathlib
 import tempfile
+import tomllib
 import unittest
 
 from certorail import markers
@@ -52,7 +53,7 @@ from certorail.policy import (
     program,
     validation,
 )
-from certorail.policyfile import parse_location
+from certorail.policyfile import from_data, parse_location
 from certorail.walker import CheckSite, analyze
 
 HEADER = "import pathlib\nimport sys\n"
@@ -226,6 +227,117 @@ class TestDenials(unittest.TestCase):
         assert isinstance(cause, CheckCwdOutside)
         self.assertEqual(cause.name, "org-repo")
         self.assertEqual(policy_edits(e)[0].path, "validation[0].cwd")
+
+
+# a validation that takes one parameter and declares a cwd: check_single must then be called with
+# cwd=, so the snippet a remedy prints has to carry it
+VETTING_POLICY = Policy.allow(
+    read=[markers.within("repos")],
+    programs=[
+        program("cat", cwd=markers.within("repos"), argument_atoms=["vetted"])
+    ],
+    validations=[
+        validation(
+            "vet",
+            params=("value",),
+            argv=("true", "${value}"),
+            cwd=markers.within("repos"),
+            establishes={"value": ["vetted"]},
+        )
+    ],
+)
+
+
+class TestRemediesAreRunnable(unittest.TestCase):
+    """A program-channel snippet is advice a model pastes, so it has to survive the next run."""
+
+    def test_check_single_carries_the_cwd_its_validation_declares(self) -> None:
+        body = HEADER + REPO + 'value = "notes.txt"\ncertora.exec("cat", value, cwd=repo)\n'
+        e = explained(body, VETTING_POLICY)
+        self.assertIn("check_single(\"vet\", value, cwd=", channel_text(e, "program"))
+
+        followed = (
+            HEADER
+            + REPO
+            + 'value = "notes.txt"\n'
+            + 'value = certora.check_single("vet", value, cwd=repo)\n'
+            + 'certora.exec("cat", value, cwd=repo)\n'
+        )
+        self.assertTrue(explained(followed, VETTING_POLICY).accepted)
+
+    def test_a_new_network_rule_names_the_method_the_site_used(self) -> None:
+        # an omitted "methods" reads as any method, which is not what one POST asked for
+        e = explained(HEADER + 'certora.network.post("https://api.other.com/x", body=b"")\n')
+        edit = next(edit for edit in policy_edits(e) if edit.path == "network")
+        self.assertIn('methods = ["POST"]', edit.add)
+        self.assertEqual(edit.op, "add")
+
+    def test_every_edit_says_what_to_do_with_its_text(self) -> None:
+        # a consumer applies edit.add at edit.path according to edit.op, and never reads English
+        # out of add; "remove" carries names, "note" carries nothing
+        removal = explained(
+            HEADER + REPO + 'certora.exec("git", "log", "--oneline", cwd=repo)\n'
+        )
+        edit = next(e for e in policy_edits(removal) if e.path == "program[0].argument-atoms")
+        self.assertEqual((edit.op, edit.add), ("remove", "no-flag"))
+
+        near_miss = explained(
+            HEADER + 'certora.network.post("https://api.example.com/x", body=b"")\n'
+        )
+        note = next(e for e in policy_edits(near_miss) if e.path == "network[0]")
+        self.assertEqual((note.op, note.add), ("note", ""))
+
+
+SUBCOMMAND_DOCUMENT = """policy-version = 1
+
+[filesystem]
+read = ["data/**"]
+
+[[program]]
+name       = "git"
+subcommand = "log"
+cwd        = "repos/**"
+"""
+
+
+class TestSuggestedBlocksLoad(unittest.TestCase):
+    """A ``[[program]]`` block a remedy prints is only a remedy if the policy loader accepts it.
+
+    ``Policy.allow`` refuses the whole document when one program name mixes a bare rule with
+    subcommand rules, or when two of its subcommands are prefix-related -- so a suggestion that
+    trips either would stop every program under that policy from being checked."""
+
+    def setUp(self) -> None:
+        self.base = from_data(tomllib.loads(SUBCOMMAND_DOCUMENT), "<base>")
+
+    def emitted_block(self, body: str, policy: Policy) -> str | None:
+        edits = [edit for edit in policy_edits(explained(body, policy)) if edit.path == "program"]
+        return edits[0].add if edits else None
+
+    def test_the_block_it_prints_parses_and_permits_the_site(self) -> None:
+        body = HEADER + REPO + 'certora.exec("git", "status", cwd=repo)\n'
+        block = self.emitted_block(body, self.base)
+        assert block is not None
+        # raises if the suggested rule cannot coexist with the one already declared
+        amended = from_data(tomllib.loads(SUBCOMMAND_DOCUMENT + "\n" + block), "<amended>")
+        self.assertIn("status", [" ".join(r.subcommand) for r in amended.programs])
+        self.assertTrue(explained(body, amended).accepted)
+
+    def test_a_computed_subcommand_gets_prose_and_no_block(self) -> None:
+        # the leading argument is not literal, and a rule with subcommand = "" is a bare rule,
+        # which the loader refuses to mix with the declared subcommands
+        body = HEADER + REPO + 'certora.exec("git", sys.argv[1], cwd=repo)\n'
+        self.assertIsNone(self.emitted_block(body, self.base))
+        self.assertIn("not literals", channel_text(explained(body, self.base), "policy"))
+
+    def test_a_subcommand_that_would_overlap_gets_prose_and_no_block(self) -> None:
+        overlapping = Policy.allow(
+            read=[markers.within("data")],
+            programs=[program("git", cwd=markers.within("repos"), subcommand="remote add")],
+        )
+        e = explained(HEADER + REPO + 'certora.exec("git", "remote", cwd=repo)\n', overlapping)
+        self.assertEqual(policy_edits(e), [])
+        self.assertIn("overlap", channel_text(e, "policy"))
 
 
 class TestUndeclaredValidation(unittest.TestCase):

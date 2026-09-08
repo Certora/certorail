@@ -1,7 +1,8 @@
 # The certorail Claude Code pack: what it installs, and the wiring that makes an agent use it.
 #
 # The manifest is the source of truth. install.py knows three verbs and nothing about Claude Code;
-# every path it touches is named here. Variables are expanded at install time:
+# every path it touches is a [[wiring]] step here, and a wiring step is all there is: a file the
+# manifest does not wire is a file no install writes. Variables are expanded at install time:
 #
 #   $PACK_DIR    this directory
 #   $REPO_DIR    the certorail checkout this pack lives in (two levels up)
@@ -13,15 +14,6 @@
 pack-version = 1
 name         = "certorail-claude-code"
 description  = "Turn a certorail rejection into an explanation the model can act on."
-
-[[artifact]]
-kind   = "hook"
-source = "hooks/explain_hook.py"
-mode   = "755"
-
-[[artifact]]
-kind   = "patch"
-source = "wiring/hooks.json"
 
 [[wiring]]
 type   = "write_file"

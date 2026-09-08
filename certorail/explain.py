@@ -15,9 +15,10 @@ What it does not do, by construction:
   no ``--no-jail``.
 - It never relaxes a check to have more to say: the verdict and the exit status are the ones
   ``--check`` gives.
-- It reports policy content only where a site in the program asked for it -- the allowances for a
-  kind the program attempted, the rules for a program it named. It never enumerates the policy,
-  so it cannot become a way to read an ambient policy the program's author was not handed.
+- It quotes the policy where a remedy needs it: a denied read is reported alongside the locations
+  ``[filesystem] read`` does grant, an unknown program alongside the program names the policy does
+  name. So an explanation carries policy content the program's author was not handed, and is host
+  output: hand it to whoever may see the policy.
 
 One thing it does share with ``--check``: given ``--root``, the policy's own literal checkers may
 run (``Policy.discharger``), because running one on known text is how a pure atom is discharged.
@@ -45,6 +46,7 @@ from .analysis import (
     Matching,
     Named,
     OneOf,
+    is_prefix,
     PseudoRegex,
     RegexLit,
     StaticPath,
@@ -109,14 +111,25 @@ class Span:
 
 @dataclass(frozen=True)
 class Edit:
-    """A policy change, as a schema path plus the text to put there.
+    """A policy change, as a schema path, an operation, and the text that operation carries.
+
+    ``op`` says what to do at ``path``, so a consumer that applies edits mechanically never has to
+    read English out of ``add``:
+
+      add     append ``add`` to the list at ``path``, or the TOML fragment in ``add`` to the
+              document
+      set     put ``add`` at ``path``, replacing what is there
+      remove  take the comma-separated names in ``add`` out of the list at ``path``
+      note    ``add`` is empty; the rule at ``path`` is worth a human's attention and the remedy's
+              own text says why
 
     Not a line number: ``tomllib`` reports no positions, so a document line is not obtainable and
     is not promised."""
 
     path: str  # "filesystem.read", "program[0].cwd", "network", "validation"
-    add: str  # the value, or the TOML fragment
+    add: str  # a value, a TOML fragment, the names to remove, or "" for a note
     widens: bool = False  # the edit permits more than this one site needs
+    op: Literal["add", "set", "remove", "note"] = "add"
 
 
 @dataclass(frozen=True)
@@ -308,16 +321,24 @@ def _atom_program_remedy(policy: Policy, atom_name: str, slot: str) -> str:
         )
     calls = []
     for validation, established_on in found:
+        # a validation that declares a cwd takes one: omitting cwd= is a dataflow violation, so a
+        # snippet without it would be rejected on the next run
+        cwd_argument = (
+            ""
+            if validation.cwd is None
+            else f", cwd=<a directory within {pretty_location(validation.cwd)}>"
+        )
         if established_on == CWD:
-            calls.append(f'certora.check("{validation.name}", cwd=<the directory>)')
+            # a validation with no cwd cannot establish atoms on one, so cwd_argument is set here
+            calls.append(f'certora.check("{validation.name}"{cwd_argument})')
         elif len(validation.params) == 1:
             calls.append(
-                f'value = certora.check_single("{validation.name}", value)'
+                f'value = certora.check_single("{validation.name}", value{cwd_argument})'
                 " -- the atoms ride the returned value"
             )
         else:
             calls.append(
-                f'certora.check("{validation.name}", {established_on}=value, cwd=...)'
+                f'certora.check("{validation.name}", {established_on}=value{cwd_argument})'
             )
     return (
         f"{slot}: call the validation that establishes {atom_name}, immediately before the "
@@ -332,6 +353,23 @@ def _program_block(name: str, cwd_value: str, subcommand: str | None = None) -> 
         lines.append(f'subcommand = "{subcommand}"')
     lines.append(f'cwd        = "{cwd_value}"')
     return "\n".join(lines) + "\n"
+
+
+def _subcommand_candidate(policy: Policy, name: str, words: Sequence[str]) -> str | None:
+    """The subcommand a new ``[[program]]`` rule for *name* can carry so that it matches a call
+    whose leading arguments are *words*, or None when the language admits no such rule.
+
+    ``Policy.allow`` refuses a document whose rules for one program name mix a bare rule with
+    subcommand rules, or whose subcommands are not prefix-free. Both refusals are of the whole
+    document, so a suggestion that trips one is worse than no suggestion: it would stop every
+    program under that policy from being checked."""
+    candidate = tuple(words[:2])
+    if not candidate:
+        return None
+    declared = [p.subcommand for p in policy.programs if p.name == name and p.subcommand]
+    if any(is_prefix(candidate, d) or is_prefix(d, candidate) for d in declared):
+        return None
+    return " ".join(candidate)
 
 
 def _named(items: Sequence[str], nothing: str) -> str:
@@ -362,7 +400,7 @@ def _exec_detail_remedies(
                     "policy",
                     f'widen program[{index}].cwd to cover "{value}", or add a second [[program]] '
                     f"rule for {program_name!r} with that cwd",
-                    Edit(f"program[{index}].cwd", value, widens),
+                    Edit(f"program[{index}].cwd", value, widens, op="set"),
                 ),
                 Remedy(
                     "program",
@@ -376,7 +414,7 @@ def _exec_detail_remedies(
                     "policy",
                     f"drop the obligation deliberately: remove {names} from "
                     f"program[{index}].requires",
-                    Edit(f"program[{index}].requires", f"remove {names}", widens=True),
+                    Edit(f"program[{index}].requires", names, widens=True, op="remove"),
                 ),
                 Remedy(
                     "program",
@@ -391,7 +429,7 @@ def _exec_detail_remedies(
                     "policy",
                     "in a TOML policy unknown-arguments defaults to false; setting it true "
                     "admits arguments of unknown provenance",
-                    Edit(f"program[{index}].unknown-arguments", "true", widens=True),
+                    Edit(f"program[{index}].unknown-arguments", "true", widens=True, op="set"),
                 ),
                 Remedy(
                     "program",
@@ -419,7 +457,7 @@ def _exec_detail_remedies(
                     "policy",
                     f"drop the obligation deliberately: remove {names} from "
                     f"program[{index}].argument-atoms",
-                    Edit(f"program[{index}].argument-atoms", f"remove {names}", widens=True),
+                    Edit(f"program[{index}].argument-atoms", names, widens=True, op="remove"),
                 ),
                 Remedy(
                     "program",
@@ -457,7 +495,7 @@ def _network_near_misses(
                 Remedy(
                     "policy",
                     f"network[{i}] already names host {rule.host!r} but " + "; ".join(failed),
-                    Edit(f"network[{i}]", "; ".join(failed), widens=True),
+                    Edit(f"network[{i}]", "", widens=True, op="note"),
                 )
             )
     return tuple(out)
@@ -508,13 +546,19 @@ def _unproven_remedies(subject: Literal["path", "cwd", "url"]) -> tuple[Remedy, 
 
 
 def remedies_for(policy: Policy, site: Site, cause: Cause) -> tuple[Remedy, ...]:
-    """The smallest policy change that would permit *site*, and where the program could instead
-    prove the fact itself. Both channels are always present, policy first.
+    """A policy change that would permit *site*, and where the program could instead prove the
+    fact itself. Both channels are always present, policy first.
 
-    Every policy edit here is one of four shapes the language actually has: adding an entry to a
+    The change is exact where the policy language can spell the site: a location the document
+    grammar can write, a host, a program name. Where it cannot -- a path whose first component is
+    a regex, a program rule that can only be granted for every argument -- the edit is the
+    narrowest thing that *is* spellable and carries ``widens``, which means it grants more than
+    this site needs and wants a human's judgement before it is applied.
+
+    Every policy edit here is one of the shapes the language actually has: adding an entry to a
     list, replacing one location, removing a ``requires`` entry, or setting ``unknown-arguments``.
-    Where no policy edit exists -- an unproven value, a subset rule -- the policy remedy says so
-    rather than inventing a key."""
+    Where no policy edit exists -- an unproven value, a subset rule, a subcommand no rule can name
+    -- the policy remedy says so rather than inventing a key."""
     match cause:
         case NotPermitted(kind=kind, location=loc):
             value, widens = _location_value(loc)
@@ -557,7 +601,7 @@ def remedies_for(policy: Policy, site: Site, cause: Cause) -> tuple[Remedy, ...]
                     "policy",
                     f"no [[program]] rule names {name!r} (the policy names: "
                     f"{_named(granted, 'no programs at all')}); add one",
-                    Edit("program", _program_block(name, value)),
+                    Edit("program", _program_block(name, value), widens=True),
                 ),
                 Remedy(
                     "program",
@@ -577,16 +621,32 @@ def remedies_for(policy: Policy, site: Site, cause: Cause) -> tuple[Remedy, ...]
                     words.append(text)
             cwd = site.cwd if isinstance(site, ExecSite) else None
             value = _location_value(cwd.location)[0] if isinstance(cwd, Located) else "."
-            return (
-                Remedy(
+            candidate = _subcommand_candidate(policy, name, words)
+            listed = f"the declared subcommands of {name!r} are: {_named(declared, 'none')}"
+            if candidate is None:
+                policy_remedy = Remedy(
                     "policy",
-                    f"the declared subcommands of {name!r} are: {_named(declared, 'none')}; "
-                    "add a rule for this one",
+                    f"{listed}; none can be added for this call -- "
+                    + (
+                        "its leading arguments are not literals, and a subcommand is matched "
+                        "against literal words"
+                        if not words
+                        else f"a rule for {words[0]!r} would overlap one of those, and the "
+                        "applicable rule must be unique"
+                    ),
+                )
+            else:
+                policy_remedy = Remedy(
+                    "policy",
+                    f"{listed}; add a rule for this one",
                     Edit(
                         "program",
-                        _program_block(name, value, " ".join(words[:2]) if words else ""),
+                        _program_block(name, value, candidate),
+                        widens=True,
                     ),
-                ),
+                )
+            return (
+                policy_remedy,
                 Remedy(
                     "program",
                     "spell the subcommand out as literal strings; a computed subcommand matches "
@@ -603,7 +663,9 @@ def remedies_for(policy: Policy, site: Site, cause: Cause) -> tuple[Remedy, ...]
                 )
             return tuple(out)
         case EndpointUnmatched(method=method, scheme=scheme, host=host, port=port):
-            lines = ["[[network]]", f'host    = "{host}"']
+            # every field the site pinned down is written out: an omitted "methods" reads as any
+            # method, which would grant far more than the one request being explained
+            lines = ["[[network]]", f'host    = "{host}"', f'methods = ["{method}"]']
             if scheme != "https":
                 lines.append(f'schemes = ["{scheme}"]')
             if port != default_port(scheme):
@@ -625,7 +687,7 @@ def remedies_for(policy: Policy, site: Site, cause: Cause) -> tuple[Remedy, ...]
                     "policy",
                     f"drop the obligation deliberately: remove {names} from "
                     f"network[{index}].requires",
-                    Edit(f"network[{index}].requires", f"remove {names}", widens=True),
+                    Edit(f"network[{index}].requires", names, widens=True, op="remove"),
                 ),
                 Remedy(
                     "program",
@@ -656,7 +718,7 @@ def remedies_for(policy: Policy, site: Site, cause: Cause) -> tuple[Remedy, ...]
                 Remedy(
                     "policy",
                     f'widen validation[{index}].cwd to cover "{value}"',
-                    Edit(f"validation[{index}].cwd", value, widens),
+                    Edit(f"validation[{index}].cwd", value, widens, op="set"),
                 ),
                 Remedy(
                     "program",
@@ -950,7 +1012,12 @@ def _remedy_json(remedy: Remedy) -> dict:
         "text": remedy.text,
         "edit": None
         if remedy.edit is None
-        else {"path": remedy.edit.path, "add": remedy.edit.add, "widens": remedy.edit.widens},
+        else {
+            "path": remedy.edit.path,
+            "op": remedy.edit.op,
+            "add": remedy.edit.add,
+            "widens": remedy.edit.widens,
+        },
     }
 
 

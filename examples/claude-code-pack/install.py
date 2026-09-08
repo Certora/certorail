@@ -73,15 +73,25 @@ def json_merge(target: Any, patch: Any, path: list[str], additions: list[dict]) 
 
     Objects merge key by key. Arrays APPEND entries not already present by value, rather than
     replacing the array. Scalars take the patch's value, and the previous one is recorded so
-    uninstall can put it back."""
+    uninstall can put it back.
+
+    A key the document does not have yet is recorded as the empty container plus a record per
+    leaf beneath it, never as one record for the whole subtree: ``hooks`` is usually missing on a
+    fresh config, and one record for it would make uninstall take away every hook the user
+    configured afterwards."""
     if isinstance(target, dict) and isinstance(patch, dict):
         merged = dict(target)
         for key, value in patch.items():
             if key in merged:
                 merged[key] = json_merge(merged[key], value, [*path, key], additions)
+                continue
+            additions.append({"op": "add-key", "path": path, "key": key})
+            if isinstance(value, dict):
+                merged[key] = json_merge({}, value, [*path, key], additions)
+            elif isinstance(value, list):
+                merged[key] = json_merge([], value, [*path, key], additions)
             else:
                 merged[key] = copy.deepcopy(value)
-                additions.append({"op": "add-key", "path": path, "key": key})
         return merged
     if isinstance(target, list) and isinstance(patch, list):
         merged = list(target)
@@ -110,8 +120,12 @@ def json_unmerge(document: Any, additions: list[dict]) -> Any:
             continue
         match addition["op"]:
             case "add-key":
-                if isinstance(container, dict):
-                    container.pop(addition["key"], None)
+                # the key goes only if what it holds is back to what this pack created it as: a
+                # container someone has since put their own entries in stays
+                if isinstance(container, dict) and addition["key"] in container:
+                    held = container[addition["key"]]
+                    if not (isinstance(held, (dict, list)) and held):
+                        container.pop(addition["key"])
             case "append":
                 if isinstance(container, list) and addition["value"] in container:
                     container.remove(addition["value"])
@@ -300,6 +314,24 @@ def uninstall(records: list[dict], installer: Installer) -> None:
                 installer.say("unmerged", str(file))
 
 
+def write_record(record_file: pathlib.Path, manifest: dict, records: list[dict]) -> None:
+    """What this install did, where the next one and the uninstall will look for it."""
+    record_file.parent.mkdir(parents=True, exist_ok=True)
+    record_file.write_text(
+        json.dumps(
+            {
+                "pack": manifest.get("name", "certorail-claude-code"),
+                "pack-version": manifest.get("pack-version", 0),
+                "installed-at": datetime.datetime.now(datetime.UTC).isoformat(),
+                "records": records,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     here = pathlib.Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
@@ -334,6 +366,7 @@ def main(argv: list[str] | None = None) -> int:
         previous_records = json.loads(record_file.read_text(encoding="utf-8")).get("records", [])
 
     installer = Installer(claude_dir, ns.dry_run, ns.quiet, previous_records)
+    manifest: dict = {}
     try:
         if ns.uninstall:
             uninstall(previous_records, installer)
@@ -347,21 +380,13 @@ def main(argv: list[str] | None = None) -> int:
             # reinstall does not churn its timestamp
             settled = installer.changed == 0 and installer.records == previous_records
             if not ns.dry_run and not settled:
-                record_file.parent.mkdir(parents=True, exist_ok=True)
-                record_file.write_text(
-                    json.dumps(
-                        {
-                            "pack": manifest["name"],
-                            "pack-version": manifest["pack-version"],
-                            "installed-at": datetime.datetime.now(datetime.UTC).isoformat(),
-                            "records": installer.records,
-                        },
-                        indent=2,
-                    )
-                    + "\n",
-                    encoding="utf-8",
-                )
+                write_record(record_file, manifest, installer.records)
     except InstallError as e:
+        # the steps that ran before the refusal are already on disk, so they are recorded too:
+        # the record is what lets --uninstall take them back out, and what lets the next install
+        # recognise its own files instead of refusing to touch them
+        if not ns.uninstall and not ns.dry_run and installer.records:
+            write_record(record_file, manifest, installer.records)
         print(f"install.py: {e}", file=sys.stderr)
         return 1
 

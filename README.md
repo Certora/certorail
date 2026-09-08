@@ -69,9 +69,10 @@ program's. `--json` emits the same content machine-readably; the exit status is 
 gives (0 accepted, 1 rejected, 2 unparsable), and the report goes to stdout in both verdicts.
 
 It never runs the program, and it weakens nothing to have more to say: the verdict is the verdict
-`--check` gives. It reports policy content only where a site in the program asked for it, so it
-cannot become a way to read an ambient policy the program's author was not handed. A file
-literally named `explain` is shadowed by the subcommand; pass `./explain`.
+`--check` gives. It does quote the policy where a remedy needs it -- a denied read is reported
+alongside the locations `[filesystem] read` does grant -- so an explanation carries policy content
+and belongs to whoever may see the policy. A file literally named `explain` is shadowed by the
+subcommand; pass `./explain`.
 
 [`examples/claude-code-pack/`](examples/claude-code-pack/README.md) puts it in front of an agent
 at the moment of the refusal: a hook that runs `certorail explain` on a certorail rejection and
@@ -137,9 +138,8 @@ proven-safe path component.
   a static checker; bound them with OS limits on the child process.
 - **Not an in-process sandbox.** The analysis is sound only for programs it accepts, running
   under the host's isolation; the isolated interpreter and the OS are the trusted base.
-- **Not finished.** This is v0.1.x; the checker's surface is under active adversarial review —
-  [`ESCAPE_ENUMERATION.md`](ESCAPE_ENUMERATION.md) is the running catalogue of candidate bypasses
-  (many pre-dating current checks) kept as a source of test cases.
+- **Not finished.** This is v0.1.x; the checker's surface is under active adversarial review, and
+  each candidate bypass found there is kept as a test case under `tests/`.
 
 ## License
 
