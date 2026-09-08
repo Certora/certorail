@@ -85,6 +85,10 @@ POLICY = Policy.allow(
 Without `--policy`, the built-in default applies: read, write and list anywhere within the root,
 and no subprocesses.
 
+A set of worked policies ported from nono's profile language, each with a program it accepts and
+one it rejects, and a comparison of the two languages, lives in
+[`examples/policies/from-nono/`](examples/policies/from-nono/README.md).
+
 ## The subset
 
 The full rules — what is banned, what proves a location, what a guard establishes — are in

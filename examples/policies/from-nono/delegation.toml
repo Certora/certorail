@@ -1,0 +1,70 @@
+# Ported from nono: the git -> ssh chained-tool delegation.
+#
+# The nono fragment (nono/docs/cli/features/tool-sandbox.mdx, "Chained Tools", plus the argv
+# gate from tool-sandbox-examples/git-ssh/git-ssh-profile-macos.json):
+#
+#     {
+#       "command_policies": {
+#         "commands": {
+#           "git": {
+#             "can_use": ["ssh"],
+#             "sandbox": { "fs_read": ["."], "fs_write": ["."] },
+#             "from": { "session": { "invocation_policy": {
+#               "default": "deny",
+#               "allow": [
+#                 { "argv": { "prefix": ["clone"] },     "reason": "cloning a repo is read-only" },
+#                 { "argv": { "prefix": ["fetch"] },     "reason": "fetching is read-only" },
+#                 { "argv": { "prefix": ["pull"] },      "reason": "pulling is read-only" },
+#                 { "argv": { "prefix": ["ls-remote"] }, "reason": "listing remote refs is read-only" }
+#               ],
+#               "deny": [ { "argv": { "prefix": ["push"] }, "reason": "pushing is not part of the read-only demo" } ]
+#             } } }
+#           },
+#           "ssh": { "from": { "git": { "fs_read_file": ["$HOME/.ssh/known_hosts"] }, "session": "deny" } }
+#         }
+#       }
+#     }
+#
+# What carries over: the subcommand allow-list, and the fact that `ssh` is not a program the
+# program may run. Both are the same mechanism here. Once any rule for a program names a
+# subcommand that program fails closed, so `git push` is denied by the absence of a rule --
+# nono needs an explicit deny entry beside its allow entries; certorail needs none, and cannot
+# express one.
+#
+# What becomes a static proof: nono decides at the moment of the exec, from the argv it
+# observes. certorail decides before the program starts: the program name must be a string
+# literal, the subcommand words must be literals, and the cwd must be a proven location, or
+# the call site is rejected. There is no argv the analysis has not already seen.
+#
+# What certorail cannot say at all: delegation. There is no caller in the model -- no `can_use`,
+# no `from`, no per-caller sandbox, and no policy for a child process. A permitted `[[program]]`
+# is spawned by the broker OUTSIDE the jail, with the invoking user's environment and authority,
+# and nothing it does afterwards is analysed or confined. So "git may reach ssh, the session may
+# not" has no counterpart: granting `git` grants whatever git chooses to run, ssh included. nono
+# is straightforwardly stronger here, and this is the sharpest edge in the whole comparison.
+policy-version = 1
+
+[filesystem]
+read  = ["checkout/**"]
+write = ["checkout/**"]
+list  = ["checkout/**"]
+
+[[program]]
+name       = "git"
+subcommand = "clone"
+cwd        = "checkout"
+
+[[program]]
+name       = "git"
+subcommand = "fetch"
+cwd        = "checkout/**"
+
+[[program]]
+name       = "git"
+subcommand = "pull"
+cwd        = "checkout/**"
+
+[[program]]
+name       = "git"
+subcommand = "ls-remote"
+cwd        = "checkout/**"

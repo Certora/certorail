@@ -1,0 +1,62 @@
+# Ported from nono: the L7 endpoint policy -- method plus path, default-deny.
+#
+# The nono fragment (nono/docs/cli/features/*, the `endpoint_policy` spelling, which is the
+# only one of nono's three that carries deny and reason):
+#
+#     {
+#       "endpoint_policy": {
+#         "default": "deny",
+#         "allow": [
+#           { "method": "GET",  "path": "/repos/<owner>/<repo>/issues" },
+#           { "method": "GET",  "path": "/repos/<owner>/<repo>/issues/*" },
+#           { "method": "POST", "path": "/repos/<owner>/<repo>/issues/*/comments" }
+#         ],
+#         "deny": [
+#           { "method": "DELETE", "path": "/**", "reason": "destructive GitHub API calls are denied" }
+#         ]
+#       }
+#     }
+#
+# What carries over: host, scheme, port and method. `methods = ["GET"]` is the whole of the
+# DELETE deny -- an unlisted method matches no rule, and there is no rule to write.
+#
+# What becomes a static proof: nono terminates TLS in its proxy and matches the path of each
+# request as it goes out. A `[[network]]` rule has no path field at all; the path is constrained
+# by `requires`, naming an atom the URL VALUE must carry at the call site. A literal URL carries
+# a regex-defined atom because its text does, decided during analysis with no request made. So
+# the second and third calls below are settled before the program starts.
+#
+# The cost of that is real, and the last two cases show it. A URL the program builds at runtime
+# has no text the analysis can read -- and once a value is read as a URL, through
+# `urllib.parse.urlsplit` guards, it gives up its text reading entirely, so those guards prove
+# the scheme and the netloc and can never prove the path. The route left open is the runtime
+# half: `certora.check` runs a trusted checker, and the atom rides the value from there. That
+# checker is a host program the policy names by absolute path; ship one with the policy
+# (`checks/issues-endpoint` here) or the example only type-checks.
+#
+# What certorail cannot say at all: a path pattern as such -- `path: "/repos/*/issues"` has no
+# spelling, and the regex in the atom has to cover the whole URL, scheme and host included;
+# query strings, headers and bodies, none of which any rule can mention; per-rule `reason`
+# strings; and `approve` as a third answer beside allow and deny.
+#
+# Redirects are the one place both tools agree: nono re-checks policy on every hop, and a
+# textual atom here defaults to `on-redirect = "recheck"`, so the broker re-establishes it from
+# each hop's URL.
+policy-version = 1
+
+[atoms]
+# The path constraint, spelled as a property of the whole URL text.
+issues-endpoint = { matches = 'https://api\.github\.com/repos/[\w.-]+/[\w.-]+/issues(/[\w./-]*)?' }
+
+[[validation]]
+# The runtime half, for a URL whose text the analysis never sees. The checker is trusted: it
+# is a host program, outside the sandbox, and saying exit 0 establishes the atom.
+name        = "issues-endpoint-check"
+params      = ["url"]
+argv        = ["/usr/local/lib/certorail-examples/issues-endpoint", "${url}"]
+establishes = { url = ["issues-endpoint"] }
+
+[[network]]
+host     = "api.github.com"
+methods  = ["GET"]
+requires = ["issues-endpoint"]

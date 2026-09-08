@@ -1,0 +1,73 @@
+# Ported from nono: the gh argv gate, and the approval gate beside it.
+#
+# The nono fragments (tool-sandbox-examples/github-cli/ghcli-profile-macos.json, and
+# tool-sandbox-examples/kubernetes-with-approval/staging-admin.json for the approval half):
+#
+#     "invocation_policy": {
+#       "default": "deny",
+#       "deny": [
+#         { "argv": { "prefix": ["api", "graphql"] },                  "reason": "..." },
+#         { "argv": { "prefix": ["api", "-X", "POST", "graphql"] },    "reason": "..." },
+#         { "argv": { "prefix": ["api", "--method", "POST", "graphql"] }, "reason": "..." },
+#         { "argv": { "prefix": ["issue", "comment"] }, "reason": "agents may read issues but not comment on them" },
+#         { "argv": { "prefix": ["issue", "create"] },  "reason": "agents may read issues but not create them" },
+#         { "argv": { "prefix": ["issue", "close"] },   "reason": "agents may read issues but not close them" }
+#       ],
+#       "allow": [
+#         { "argv": { "exact":  ["auth", "token"] },  "reason": "..." },
+#         { "argv": { "prefix": ["issue", "list"] },  "reason": "agents may list GitHub issues" },
+#         { "argv": { "prefix": ["issue", "view"] },  "reason": "agents may view GitHub issues" },
+#         { "argv": { "prefix": ["api"] },            "reason": "gh api is constrained by the L7 endpoint policy" }
+#       ]
+#     }
+#
+#     "approve": [
+#       { "argv": { "prefix": ["rollout", "restart"] }, "backend": "local-webhook",
+#         "reason": "rollout restart changes running workloads" }
+#     ]
+#
+# What carries over: the subcommand allow-list, as `[[program]]` rules that fail closed.
+#
+# What becomes a static proof instead of a pattern match: the three `api ... graphql` deny
+# entries exist only because nono's matcher is literal -- its own docs say it does "no
+# command-specific semantic normalization such as `--flag=value` versus `--flag value`, short
+# versus long aliases, repeated or duplicate flag folding, flag-order canonicalization", so
+# each spelling needs its own rule, and `-XPOST` still slips past all three. certorail states
+# the property once, as an atom every argument must carry, and the analysis discharges it from
+# each argument's known text: `-X POST`, `-XPOST`, `--method=POST` and `--method post` are all
+# denied by the one rule. The property is crude on purpose -- it rejects any token containing
+# those letters, so an argument like "postgres" is rejected too. That is the trade: a property
+# of every argument, checked exhaustively, in place of an enumeration of spellings.
+#
+# What certorail cannot say at all: approval. There is no `approve` decision, no backend, no
+# human in the loop. Analysis happens before the program starts and produces one verdict; a
+# call site is permitted or the program is rejected, and nothing can be escalated to a person
+# at the moment it happens. `default: "approve"` -- nono's best idea in this file, since an
+# unrecognised subcommand raises a human rather than failing either way -- has no counterpart.
+# There is also no reason string: a denial is rendered from the rule that failed, and the
+# policy cannot attach its own words to it.
+policy-version = 1
+
+[filesystem]
+list = ["."]
+
+[atoms]
+# The one property, in place of nono's per-spelling deny entries: a token that does not name
+# a mutating HTTP method, in any casing, glued to any flag.
+read-only-token = { matches = '(?i)(?!.*(post|put|patch|delete)).*' }
+
+[[program]]
+name       = "gh"
+subcommand = "issue list"
+cwd        = "."
+
+[[program]]
+name       = "gh"
+subcommand = "issue view"
+cwd        = "."
+
+[[program]]
+name           = "gh"
+subcommand     = "api"
+cwd            = "."
+argument-atoms = ["read-only-token"]

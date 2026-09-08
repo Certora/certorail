@@ -1,0 +1,57 @@
+# Ported from nono: the protective groups -- unlink_protection, deny_credentials,
+# dangerous_commands.
+#
+# The nono fragments (nono/crates/nono-cli/data/policy.json):
+#
+#     "unlink_protection": {
+#       "description": "Block file deletion globally, override for user-writable paths",
+#       "deny": { "unlink": true, "unlink_override_for_user_writable": true }
+#     }
+#
+#     "deny_credentials": {
+#       "description": "Block access to cryptographic keys, tokens, and cloud credentials",
+#       "required": true,
+#       "deny": { "access": ["~/.ssh", "~/.gnupg", "~/.aws", "~/.git-credentials", "~/.netrc", "..."] }
+#     }
+#
+#     "dangerous_commands": {
+#       "deny": { "commands": ["rm", "rmdir", "dd", "chmod", "chown", "mv", "cp", "sudo", "..."] }
+#     }
+#
+# All three are deny lists over an otherwise permissive baseline. certorail has no deny of any
+# kind: `Policy.allow` is the only constructor, listing more rules can only widen, and every one
+# of these three is already the default.
+#
+# unlink_protection has no policy counterpart because deletion is not a policy question here.
+# `unlink`, `rmdir`, `rename`, `symlink_to`, `hardlink_to` are forbidden attributes and `shutil`
+# is a forbidden module, so a program that deletes anything is rejected by the subset itself.
+# See protection_deleted.py: that rejection is a *violation*, not a denial -- no policy grants
+# deletion, and none can. nono's second flag, reopening deletion for paths the profile made
+# writable, has no counterpart either: there is no dial.
+#
+# deny_credentials becomes the absence of a grant. Nothing is readable unless `[filesystem]`
+# says so, so `~/.ssh` and the rest are dark by default and need no list. What has no clean
+# counterpart is nono's carve-out: excluding one name from inside a granted tree. The nearest
+# thing is a negative lookahead in a single component, below -- a regex trick, not a feature,
+# and it only holds for exactly-known text. Note also what it does NOT do: `list` still covers
+# the directory, so the file's existence is visible even though its content is not. nono draws
+# the same line deliberately (`deny.access` blocks content and leaves `stat` alone).
+#
+# The trick is also fragile in a way a real deny is not, and the fragility is worth stating:
+# there is nothing to backstop it. Add `read = ["workspace/**"]` beside the line below and
+# `.env` is readable again, with no error and no warning. In nono the same overlap is a hard
+# error on Linux, because Landlock cannot carve a deny out of an allow.
+#
+# dangerous_commands becomes the empty program list. Nothing is executable unless a
+# `[[program]]` rule names it -- `name` is matched by string equality, there is no wildcard,
+# and this policy declares none, so every exec is denied. nono is denying from a baseline where
+# the shell is otherwise reachable, and its own docs are candid that the block is best-effort:
+# "A process can bypass this by calling the equivalent syscall from within an allowed
+# interpreter." Here the interpreter is the confined program, and the syscall is not reachable
+# from it at all.
+policy-version = 1
+
+[filesystem]
+read  = ['workspace/<(?!\.env).*>']
+write = ["workspace/reports/**"]
+list  = ["workspace/**"]

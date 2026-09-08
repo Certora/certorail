@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""Establishes the ``issues-endpoint`` atom: exit 0 iff the single argument is a GitHub
+issues URL, non-zero otherwise.
+
+The pattern is the one ``endpoints.toml`` gives the atom. The atom's ``matches`` is what the
+analysis discharges from text it can read; this program is what establishes the same property
+on text it cannot. Keeping the two in step is the policy author's job -- nothing checks it.
+
+The broker runs this with the caller's URL as argv[1], on the host, outside the jail, with the
+invoking user's environment. Keep it fast, idempotent and free of side effects.
+"""
+import re
+import sys
+
+PATTERN = r"https://api\.github\.com/repos/[\w.-]+/[\w.-]+/issues(/[\w./-]*)?"
+
+if len(sys.argv) != 2:
+    print("usage: issues-endpoint URL", file=sys.stderr)
+    raise SystemExit(2)
+
+raise SystemExit(0 if re.fullmatch(PATTERN, sys.argv[1]) else 1)
