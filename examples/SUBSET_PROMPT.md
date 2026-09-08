@@ -215,9 +215,13 @@ slugs: list[typing.Annotated[str, certora.no_slash, certora.not_dot_dot]] = []
 
 - Only `certora.exec(program, *args, cwd=<located path>)`. `program` is a string literal (or a name bound to
   one); arguments are separate strings, no `*`/`**` splats; the only keyword is `cwd`, and it is required and
-  must be a proven location. No shell; output is captured. Returns a `CompletedProcess` with `.returncode`,
-  `.stdout` and `.stderr` (bytes). A subprocess that exits non-zero is a normal return; a call the host
-  refuses raises.
+  must be a proven location. No shell; output is captured. A call the host refuses raises.
+- The result is a `CompletedProcess` with `.returncode`, `.stdout` and `.stderr` (bytes), plus decoded views:
+  `.stdout_string()`, `.stdout_lines()`, `.stderr_string()`, `.stderr_lines()` (UTF-8, lines split like
+  `str.splitlines`). **The views raise `certora.CalledProcessError` when the command exited non-zero**, so
+  `for line in certora.exec("git", "log", "--oneline", cwd=repo).stdout_lines()[:10]:` is the whole
+  pipeline and fails loudly if `git` did. To handle failure yourself, test `.returncode` and read the bytes.
+  There is no shell: do filtering (`head`, `tail`, `grep`, `wc`) in Python on the lines.
 - The policy may pin subcommands: if it declares `git log` and `git push origin`, any other `git`
   invocation — including one whose subcommand is not a literal — is rejected.
 - The policy may refuse arguments it cannot vouch for: anything other than a string literal, a module-level

@@ -272,7 +272,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=pathlib.Path,
         default=None,
         help="a policy: a .toml/.json document, or a Python file defining POLICY "
-        "(default: the nearest ambient policy under ~/.certorail for this root, "
+        "(default: the nearest ambient policy under ~/.certorail/policy for this root, "
         "else the built-in policy)",
     )
     parser.add_argument("--check", action="store_true", help="analyse and evaluate only; do not run")

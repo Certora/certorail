@@ -60,7 +60,8 @@ certorail -c SOURCE  [--root DIR] [--policy POLICY] [--check] [-- ARG ...]
 
 The policy is **trusted**. It is normally a TOML document ([`examples/policy.toml`](examples/policy.toml);
 the schema is documented in [`certorail/policyfile.py`](certorail/policyfile.py)), passed with
-`--policy` or discovered ambiently under `~/.certorail/` for the sandbox root. The
+`--policy` or discovered ambiently under `~/.certorail/policy/` for the sandbox root, with the
+checker programs its validations run kept beside it under `~/.certorail/checkers/`. The
 [`certorail-policy`](.claude/skills/certorail-policy/SKILL.md) skill walks a Claude Code session
 through deriving one from what your scripts need to do, including the checker programs its
 runtime validations run. A policy may also be Python defining `POLICY`, written in the same

@@ -18,11 +18,15 @@ program in the confined subset.
 ## What you deliver
 
 1. `policy.toml` — data, default-deny, every grant commented with the need it serves.
-2. One executable per validation that is not a plain regex, in a `checks/` directory beside the
-   policy, referenced from `argv` by **absolute path**.
+2. One executable per validation that is not a plain regex, installed in
+   `~/.certorail/checkers/<name>` and referenced from `argv` by **absolute path**. The config
+   directory is the one auditable place for everything the analysis trusts: the policies under
+   `~/.certorail/policy/`, the checkers they run under `~/.certorail/checkers/`. Do not scatter
+   checkers into repositories or `PATH`.
 3. Evidence: the policy loads; each checker accepts and refuses sample inputs; a probe program
    exercising each grant is accepted with `--check`; a probe that oversteps is denied.
-4. Installation: `--policy path/to/policy.toml`, or ambient under the config directory.
+4. Installation: ambient under `~/.certorail/policy/` (the default), or `--policy path` for a
+   one-off.
 5. A program-author note: the validation names, parameters, atoms and regexes programs must use.
    Whoever writes the confined programs (usually a model prompted with `SUBSET_PROMPT.md`) needs
    this vocabulary appended to their prompt.
@@ -130,8 +134,11 @@ Rules:
   interpolate them into a shell string or pass them to `eval`.
 - Fail closed: `set -euo pipefail`; check the argument count; any unexpected condition exits
   non-zero with a one-line reason on stderr.
-- Reference checkers by absolute path (`~` is not expanded). Make them executable.
-- Checkers are trusted code with the host's authority. Review them like the policy.
+- Install checkers in `~/.certorail/checkers/<name>`, mode `0755`, and reference them by
+  absolute path with the home directory spelled out (`/home/alice/.certorail/checkers/org-checkout`):
+  `~` is not expanded and `PATH` is not consulted for a bare name you did not intend.
+- Checkers are trusted code with the host's authority. Review them like the policy; the whole
+  of `~/.certorail/` is the review unit.
 
 Templates:
 
@@ -190,11 +197,13 @@ A trivial text predicate can be a `test` one-liner with no script at all:
    sink with its proven location: read it. Then write one probe that oversteps each grant and
    confirm the `denied:` line. Literal checkers run during `--check` under `--root`, so the root
    and any directory a cwd-slot checker names must exist.
-4. **Install.** For `--policy`, done. For ambient use: the config directory is
-   `$CERTORAIL_CONFIG_DIR`, else `$XDG_CONFIG_HOME/certorail`, else `~/.certorail`; inside it a
-   directory named by the root with `/` turned into `-` (`/srv/work/repo` → `-srv-work-repo`)
-   holds `*.toml` files, each of which must carry `root = "/srv/work/repo"`. A run then prints
-   `certorail: policy from …`. Two files claiming the same root is an error.
+4. **Install.** The config directory is `$CERTORAIL_CONFIG_DIR`, else
+   `$XDG_CONFIG_HOME/certorail`, else `~/.certorail`. Checkers go in `checkers/` under it.
+   Policies go in `policy/<munged root>/`, the root with `/` turned into `-`
+   (`/srv/work/repo` → `policy/-srv-work-repo/`), as `*.toml` files each carrying
+   `root = "/srv/work/repo"`. A run rooted there, or below, then prints
+   `certorail: policy from …`. Two files claiming the same root is an error. `--policy path`
+   bypasses discovery for a one-off.
 5. **Hand over.** The commented TOML, the checkers, the run commands, the program-author note,
    and an explicit list of what is *not* granted.
 
@@ -220,10 +229,13 @@ A trivial text predicate can be a `test` one-liner with no script at all:
 
 Need: scripts clone repositories under `repos/`, inspect them, write reports, push to branches
 whose names come from the command line, but only to certora-org checkouts and never with a
-flag-shaped branch argument; they read the GitHub API.
+flag-shaped branch argument; they read the GitHub API. Sandbox root `/srv/work/audit`, so the
+file is `~/.certorail/policy/-srv-work-audit/audit.toml` and the checker is
+`~/.certorail/checkers/org-checkout`.
 
 ```toml
 policy-version = 1
+root = "/srv/work/audit"
 
 [filesystem]
 read  = ["repos/**", "reports/**"]           # inspect clones, re-read earlier reports
@@ -236,7 +248,7 @@ no-flag      = { matches = '[^-].*' }        # A: a branch argument is not an op
 
 [[validation]]
 name        = "org-repo"
-argv        = ["/srv/policies/checks/org-checkout"]
+argv        = ["/home/alice/.certorail/checkers/org-checkout"]
 cwd         = "repos/**"
 effect-free = true
 establishes = { cwd = ["org-checkout"] }

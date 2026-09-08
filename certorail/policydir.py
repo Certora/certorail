@@ -1,6 +1,11 @@
 """Ambient policy discovery: per-root policies in the user's config directory.
 
-    ~/.certorail/<munged-prefix>/*.toml
+    ~/.certorail/policy/<munged-prefix>/*.toml     the policies
+    ~/.certorail/checkers/<name>                   the programs their validations run
+
+The config directory is the one auditable place for everything a policy trusts: the
+policies themselves under ``policy/``, and under ``checkers/`` the executables their
+``[[validation]]`` entries name (by absolute path -- nothing here rewrites ``argv``).
 
 When ``--policy`` is not supplied, the sandbox root's ancestors are probed, nearest first:
 for a run rooted at ``/srv/work/repo``, first ``munge(/srv/work/repo)``, then
@@ -36,6 +41,9 @@ def config_dir() -> pathlib.Path:
         return pathlib.Path(xdg) / "certorail"
     return pathlib.Path.home() / ".certorail"
 
+def policy_dir() -> pathlib.Path:
+    return config_dir() / "policy"
+
 
 def munge(path: pathlib.PurePath) -> str:
     """A path as a single component: ``/srv/work/x`` -> ``-srv-work-x``, ``/`` -> ``-``.
@@ -63,7 +71,7 @@ def find_policy(root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path] | None:
     """The nearest ancestor's self-identified policy for a run rooted at *root*:
     ``(policy file, governed prefix)``, or None. Ambiguity -- two files claiming the same
     prefix -- raises ``AmbientPolicyError``."""
-    base = config_dir()
+    base = policy_dir()
     if not base.is_dir():
         return None
     prefix = root.resolve()

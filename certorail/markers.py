@@ -44,16 +44,47 @@ class ContractViolation(Exception):
 class ExecFailed(RuntimeError):
     """A brokered exec failed before completing: denied by the broker's re-check, over a
     cap, or transport trouble. (A child that ran and exited non-zero is NOT this: that is a
-    normal ``CompletedProcess`` with its returncode.)"""
+    normal ``ExecResult`` with its returncode.)"""
 
 
-def exec(*cmd: str, cwd: pathlib.Path | str) -> subprocess.CompletedProcess[bytes]:
+class ExecResult(subprocess.CompletedProcess[bytes]):
+    """What ``certora.exec`` returns: a ``CompletedProcess`` (``args``, ``returncode``, the raw
+    ``stdout``/``stderr`` bytes) plus the decoded views a program reaches for where it would
+    otherwise pipe into ``head``/``tail``/``wc``. ``stdout_string()``, ``stdout_lines()`` and
+    their stderr twins **raise ``CalledProcessError`` when the child exited non-zero**, so a
+    pipeline over a failed command fails loudly instead of quietly processing empty output;
+    a program that means to handle failure inspects ``returncode`` and the raw bytes instead.
+    Text is UTF-8 with undecodable bytes replaced; lines are split as ``str.splitlines`` does
+    (``\\r\\n`` handled, no trailing empty line)."""
+
+    def stdout_string(self) -> str:
+        self.check_returncode()
+        return self.stdout.decode("utf-8", errors="replace")
+
+    def stdout_lines(self) -> list[str]:
+        return self.stdout_string().splitlines()
+
+    def stderr_string(self) -> str:
+        self.check_returncode()
+        return self.stderr.decode("utf-8", errors="replace")
+
+    def stderr_lines(self) -> list[str]:
+        return self.stderr_string().splitlines()
+
+
+# The exception the decoded views raise, re-exported so the subset -- which cannot import
+# subprocess -- can spell it: ``except certora.CalledProcessError as e: e.returncode``.
+CalledProcessError = subprocess.CalledProcessError
+
+
+def exec(*cmd: str, cwd: pathlib.Path | str) -> ExecResult:
     """The only way to run a subprocess: tunneled to the host's broker, which re-checks the
     decidable half of the exec rules (program, fail-closed subcommand, cwd containment --
     defense in depth; the full rules were enforced statically), spawns the child outside the
     sandbox, drains its output, and returns it wholesale. No shell, output always captured,
     ``cwd`` mandatory: exactly the ``subprocess.run(..., capture_output=True)`` this once
-    was, one socket away.
+    was, one socket away -- returned as an ``ExecResult``, whose decoded views raise on a
+    non-zero exit.
 
     This is the runtime half. The static half (``walker``) additionally requires the program to
     be a string literal, refuses ``*args``/``**kwargs`` and any keyword but ``cwd``, and treats
@@ -78,7 +109,7 @@ def exec(*cmd: str, cwd: pathlib.Path | str) -> subprocess.CompletedProcess[byte
         raise ExecFailed(f"broker transport failure: {exc}")
     if not reply.get("ok"):
         raise ExecFailed(f"{reply.get('error', 'error')}: {reply.get('detail', '')}")
-    return subprocess.CompletedProcess(
+    return ExecResult(
         args=list(cmd),
         returncode=int(reply["returncode"]),
         stdout=base64.b64decode(reply.get("stdout_b64", "")),

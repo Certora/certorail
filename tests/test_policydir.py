@@ -30,12 +30,23 @@ class TestFindPolicy(unittest.TestCase):
         self.tree = pathlib.Path(tempfile.mkdtemp())
         (self.tree / "a" / "b" / "c").mkdir(parents=True)
 
+    def _bucket(self, prefix: pathlib.Path) -> pathlib.Path:
+        bucket = self.base / "policy" / munge(prefix)
+        bucket.mkdir(parents=True, exist_ok=True)
+        return bucket
+
     def _put(self, prefix: pathlib.Path, name: str, declared: str) -> pathlib.Path:
-        bucket = self.base / munge(prefix)
-        bucket.mkdir(exist_ok=True)
-        file = bucket / name
+        file = self._bucket(prefix) / name
         file.write_text(f'root = "{declared}"\n', encoding="utf-8")
         return file
+
+    def test_the_policy_subdirectory_is_the_layout(self) -> None:
+        # a bucket directly under the config dir (the pre-``policy/`` layout) is not consulted
+        deep = self.tree / "a" / "b" / "c"
+        stray = self.base / munge(deep)
+        stray.mkdir()
+        (stray / "old.toml").write_text(f'root = "{deep}"\n', encoding="utf-8")
+        self.assertIsNone(find_policy(deep))
 
     def test_the_nearest_ancestor_wins(self) -> None:
         deep = self.tree / "a" / "b" / "c"
@@ -63,8 +74,7 @@ class TestFindPolicy(unittest.TestCase):
 
     def test_a_file_without_root_fails_closed(self) -> None:
         deep = self.tree / "a" / "b" / "c"
-        bucket = self.base / munge(deep)
-        bucket.mkdir()
+        bucket = self._bucket(deep)
         (bucket / "anon.toml").write_text("policy-version = 1\n", encoding="utf-8")
         with self.assertRaises(AmbientPolicyError):
             find_policy(deep)
@@ -74,8 +84,7 @@ class TestFindPolicy(unittest.TestCase):
 
     def test_load_policy_goes_through_the_strict_loader(self) -> None:
         deep = self.tree / "a" / "b" / "c"
-        bucket = self.base / munge(deep)
-        bucket.mkdir()
+        bucket = self._bucket(deep)
         (bucket / "here.toml").write_text(
             f'policy-version = 1\nroot = "{deep}"\n\n[[network]]\nhost = "api.github.com"\n',
             encoding="utf-8",

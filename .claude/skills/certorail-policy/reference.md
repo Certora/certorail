@@ -143,7 +143,8 @@ What a validation's program experiences when a confined program calls `certora.c
 
 - **Command.** `argv` with each `${param}` piece replaced by the program's string for that
   parameter, as one token. No shell. `argv[0]` is resolved like `subprocess` does: an absolute
-  path, or a name on the host's `PATH`. `~` is not expanded.
+  path, or a name on the host's `PATH`. `~` is not expanded. Checkers belong in
+  `~/.certorail/checkers/` and are named by absolute path.
 - **Working directory.** The validation's `cwd` argument, resolved under the sandbox root
   (an absolute one as is); the sandbox root itself for a cwd-free validation. The broker has
   already verified it lies within the declared `cwd` location.
@@ -166,7 +167,8 @@ What a validation's program experiences when a confined program calls `certora.c
 Full rules in `examples/SUBSET_PROMPT.md`. The parts a policy author needs:
 
 - `certora.exec(program, *args, cwd=<proven path>)`: literal program name, string arguments,
-  no splats, `cwd` mandatory.
+  no splats, `cwd` mandatory. Returns a `CompletedProcess` whose `.stdout_lines()` /
+  `.stdout_string()` (and stderr twins) raise `certora.CalledProcessError` on a non-zero exit.
 - `certora.check(name, key=var, …, cwd=var)`: bare statement; establishes on the variables
   passed; `cwd=` present iff the validation declares one.
 - `branch = certora.check_single(name, value)`: expression form for one-parameter validations;
@@ -189,11 +191,14 @@ nearest ambient policy for the root applies, else the built-in default (read, wr
 anywhere within the root; no programs, no network). Exit status: the program's own when it ran;
 1 when rejected; 2 when it does not parse.
 
-Ambient discovery: `$CERTORAIL_CONFIG_DIR`, else `$XDG_CONFIG_HOME/certorail`, else
-`~/.certorail`; inside, a directory named by the root with `/` turned into `-`
-(`/srv/work/repo` → `-srv-work-repo`, `/` → `-`), containing `*.toml` files that each carry
+Ambient discovery: the config directory is `$CERTORAIL_CONFIG_DIR`, else
+`$XDG_CONFIG_HOME/certorail`, else `~/.certorail`. Under its `policy/` subdirectory, a
+directory named by the root with `/` turned into `-` (`/srv/work/repo` →
+`policy/-srv-work-repo/`, `/` → `policy/-/`) holds `*.toml` files that each carry
 `root = "/abs/path"`. The root's ancestors are probed nearest first; only the file whose `root`
-equals the probed prefix applies; two such files is an error. Only TOML is discovered ambiently.
+equals the probed prefix applies; two such files is an error. Only TOML is discovered
+ambiently. The `checkers/` subdirectory beside `policy/` is where validations' programs live,
+so the config directory is the single place to audit.
 
 ## Python API equivalents
 
