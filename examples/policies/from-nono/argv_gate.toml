@@ -28,16 +28,24 @@
 #
 # What carries over: the subcommand allow-list, as `[[program]]` rules that fail closed.
 #
-# What becomes a static proof instead of a pattern match: the three `api ... graphql` deny
-# entries exist only because nono's matcher is literal -- its own docs say it does "no
-# command-specific semantic normalization such as `--flag=value` versus `--flag value`, short
-# versus long aliases, repeated or duplicate flag folding, flag-order canonicalization", so
-# each spelling needs its own rule, and `-XPOST` still slips past all three. certorail states
-# the property once, as an atom every argument must carry, and the analysis discharges it from
-# each argument's known text: `-X POST`, `-XPOST`, `--method=POST` and `--method post` are all
-# denied by the one rule. The property is crude on purpose -- it rejects any token containing
-# those letters, so an argument like "postgres" is rejected too. That is the trade: a property
-# of every argument, checked exhaustively, in place of an enumeration of spellings.
+# What becomes a static proof instead of a pattern match: the last two `api ... graphql` deny
+# entries are one property written twice. nono's matcher is literal -- its own docs say it does
+# "no command-specific semantic normalization such as `--flag=value` versus `--flag value`,
+# short versus long aliases, repeated or duplicate flag folding, flag-order canonicalization" --
+# so each spelling of the POST flag needs its own rule, and `-XPOST` still slips past both.
+# certorail states the property once, as an atom every argument must carry, and the analysis
+# discharges it from each argument's known text: `-X POST`, `-XPOST`, `--method=POST` and
+# `--method post` are all denied by the one rule.
+#
+# The first deny entry is a different thing, and it is the awkward one. It denies the graphql
+# endpoint however it is reached, and `graphql` is a word in `gh api`'s argument list rather
+# than a subcommand of its own. certorail has no way to exclude one word from an otherwise-
+# granted subcommand -- there is no negative rule anywhere in the language -- so the exclusion
+# has to ride on the same argument atom, which leaves the atom carrying two properties under
+# one name. It is crude in the other direction too: it rejects any argument containing that
+# text anywhere, so "postgres" and a repository named "graphql-tools" go with it. That is the
+# trade -- a property of every argument, checked exhaustively, in place of an enumeration of
+# spellings, and no way to say "this subcommand, except that word".
 #
 # What certorail cannot say at all: approval. There is no `approve` decision, no backend, no
 # human in the loop. Analysis happens before the program starts and produces one verdict; a
@@ -48,13 +56,10 @@
 # policy cannot attach its own words to it.
 policy-version = 1
 
-[filesystem]
-list = ["."]
-
 [atoms]
-# The one property, in place of nono's per-spelling deny entries: a token that does not name
-# a mutating HTTP method, in any casing, glued to any flag.
-read-only-token = { matches = '(?i)(?!.*(post|put|patch|delete)).*' }
+# In place of nono's deny entries: an argument that names no mutating HTTP method, in any
+# casing and glued to any flag, and does not reach the graphql endpoint.
+read-only-token = { matches = '(?i)(?!.*(post|put|patch|delete|graphql)).*' }
 
 [[program]]
 name       = "gh"

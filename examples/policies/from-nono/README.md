@@ -17,8 +17,8 @@ and which have no spelling here at all.
 |---|---|---|
 | `paths.toml`, `paths_ok.py`, `paths_denied.py` | `groups.include` with `when` predicates, and the `filesystem` block beside it | Path grants carry over; groups, `extends`, `when` and `$HOME` do not |
 | `delegation.toml`, `delegation_ok.py`, `delegation_denied.py` | the `git` → `ssh` chained-tool grant with an `invocation_policy` | Subcommands carry over; delegation has no counterpart at all |
-| `argv_gate.toml`, `argv_gate_ok.py`, `argv_gate_denied.py` | the `gh` argv gate, and the `kubectl` approval gate | One atom replaces the enumerated flag spellings, and catches the one they miss; approval has no counterpart |
-| `endpoints.toml`, `endpoints_ok.py`, `endpoints_denied.py`, `checks/issues-endpoint` | `endpoint_policy` with a method-and-path allow list | Method and host carry over; the path becomes a property of the URL value |
+| `argv_gate.toml`, `argv_gate_ok.py`, `argv_gate_denied.py` | the `gh` argv gate, and the `kubectl` approval gate | One atom replaces the enumerated flag spellings and catches the one they miss, but has to carry the denied endpoint too; approval has no counterpart |
+| `endpoints.toml`, `endpoints_ok.py`, `endpoints_denied.py`, `checks/issues-endpoint` | `endpoint_policy` with a method-and-path allow list | Method and host carry over; the path becomes a property of the URL value, dot segments and all; the POST allow is dropped |
 | `protection.toml`, `protection_ok.py`, `protection_denied.py`, `protection_deleted.py` | `unlink_protection`, `deny_credentials`, `dangerous_commands` | All three are already the default; none of the three is expressible as a rule |
 
 ## Running them
@@ -43,10 +43,30 @@ stops behaving as its header claims fails the suite:
 python3 -m unittest discover -s tests -t .
 ```
 
-`sandbox/` is a tree for the programs to talk about. `--check` never touches the filesystem, so
-it is only needed for a real run — drop `--check` and add `--no-jail`, and `paths_ok.py` and
-`protection_ok.py` run end to end. The other three additionally want `git`, `gh`, network access,
-and the checker in `checks/` installed at the absolute path `endpoints.toml` names.
+`sandbox/` is a tree for the programs to talk about. `--check` does not run the program and does
+not touch that tree — a `--root` naming a directory that does not exist is fine — but it is not
+inert: it reads the program and the policy, and it runs any validation checker the policy marks
+`effect-free`, as a host program, to discharge pure atoms on text the analysis can already read.
+So the policy is trusted at check time as much as at run time. None of the validations here is
+`effect-free`, so nothing in this directory runs a checker under `--check`.
+
+Two of the five run for real. Drop `--check`, add `--no-jail`, and `paths_ok.py` and
+`protection_ok.py` go end to end against `sandbox/`. The other three are `--check` examples only:
+their coordinates are placeholders — `example-org/example-repo` is not a repository — so a real
+run fails at the network even with `git`, `gh` and connectivity present. Substitute a repository
+you own before dropping `--check`, and install the checker `endpoints.toml` names, which needs a
+writable directory:
+
+```
+sudo install -d /usr/local/lib/certorail-examples
+sudo install -m 755 examples/policies/from-nono/checks/issues-endpoint \
+    /usr/local/lib/certorail-examples/
+```
+
+A per-user location works as well — put the checker wherever you like and edit `argv` in
+`endpoints.toml` to match. It has to be an absolute path spelled out in full: certorail
+locations have no variable expansion, and a relative `argv[0]` resolves under the sandbox root,
+where `checks/` deliberately does not live.
 
 ## nono says / certorail says / neither says
 
@@ -70,8 +90,12 @@ rule constrains arguments by *property* — `argument-atoms` names atoms every a
 discharged from each argument's known text. `argv_gate.toml` states one such property and it
 catches `-X POST`, `-XPOST`, `--method=post` and `POST` together, including the spelling that
 slips past all three of nono's rules. The property is coarser than a parser: it rejects any token
-containing those letters, "postgres" included. Neither says: anything about what the command will
-do with the arguments. Both are looking at text.
+containing those letters, "postgres" included. It is also carrying more than one idea, because
+it has to. Two of nono's three entries deny a method spelling, but the first denies the `graphql`
+endpoint outright, and `graphql` is an argument word rather than a subcommand — certorail has no
+way to except one word from a subcommand it has granted, so that exclusion goes into the same
+atom. Neither says: anything about what the command will do with the arguments. Both are looking
+at text.
 
 **Network and L7 constraints.** nono says: `allow_domain` and `deny_domain` with a hostname
 wildcard grammar, and, where a rule carries `endpoints`/`endpoint_rules`/`endpoint_policy`, TLS
@@ -80,9 +104,13 @@ and a `reason` on each. certorail says: host, scheme, port and method per `[[net
 evaluated at every call site before the program runs and again by the broker on every redirect
 hop; the path has no field, and is constrained only by `requires`, naming an atom the URL value
 must carry — which a literal URL discharges from its own text. A URL whose scheme and netloc are
-not proven is refused outright. Neither says: anything about a query string, a header, or a body.
-And neither reaches an exec'd child's traffic: nono's child gets its own sandbox, certorail's
-child runs outside the jail entirely.
+not proven is refused outright. A rule's `methods` and its `requires` are independent, so one
+rule cannot pair a method with a path the way an `endpoint_policy` entry does. Neither says:
+anything about a query string, a header, or a body. Neither applies the *caller's* endpoint rules
+to an exec'd child, but they are not level here: nono's child is governed, under a profile of its
+own, while certorail's child is spawned outside the jail with the user's whole authority and is
+neither analysed nor confined at all. A path constraint smuggled into an atom also has to do its
+own normalising — nothing between the atom and the origin server resolves `..`.
 
 **Credentials.** nono says a great deal: keyring and 1Password and file and env `credential_key`
 URIs, phantom tokens the sandbox sees in place of real ones, header/query/basic injection modes
@@ -119,16 +147,21 @@ so in its header rather than pretending otherwise.
 `deny.unlink`, `deny.commands`, `bypass_protection` to punch back through a deny group — and
 refuses to start on Linux when a `deny` overlaps an `allow`, because Landlock has no deny
 primitive to express the carve-out. certorail says: nothing, and needs less. `Policy.allow` is the
-only constructor; there is no deny list, no negative rule, no key that removes an earlier grant,
-and rules for one program are read disjunctively so listing more can only widen. Default-deny
+only constructor; there is no deny list, no negative rule, and no key that removes an earlier
+grant, so no rule subtracts from another. That is not the same as "more rules is always more
+authority": `Policy.allow` rejects two rules for one program whose subcommands overlap, and
+rejects a bare rule sitting beside subcommand rules for the same name, because the applicable
+rule has to be unique. Filesystem and network grants do accumulate. Default-deny
 makes most deny lists unnecessary: `deny_credentials` is the absence of a grant, and
 `dangerous_commands` is the empty program list. The one thing genuinely missing is the carve-out —
 excluding one name from inside a granted tree. The nearest approximation is a negative lookahead
 inside a single location component, which `protection.toml` uses and its header flags as a regex
 trick rather than a feature: nothing backstops it, and a wider grant beside it silently reopens
-what it excluded. Neither says: how to remove an *operation*. certorail forbids deletion in the
-subset, where no policy can grant it back; nono's `unlink_protection` is a group, so a profile can
-exclude it.
+what it excluded. Neither says: how to remove an *operation*. certorail takes deletion out of the
+subset, so a confined program has no sink to delete through and no policy can hand one back —
+but a granted `[[program]]` deletes as freely as it likes, since the grant is coarse and the child
+is unconfined, so deletion by a subprocess stays an ordinary policy question. nono's
+`unlink_protection` covers the child too, and being a group, a profile can exclude it.
 
 **The enforcement model.** nono says: the profile becomes kernel rules before the process starts,
 and the kernel stops the operation. That works on any binary — a Rust agent, a shell script, a
@@ -183,7 +216,11 @@ Every nono rule in this directory's quoted fragments carries a `reason`, and tho
 what a person actually reads. Closing it means a field on the rule dataclasses and a back-pointer
 from `Denial` to the candidate rule.
 
-**Path patterns for URLs, and carve-outs for paths.** A `[[network]]` rule has no path field, so a
-path constraint has to be smuggled into an atom's regex over the whole URL; and a location has no
-exclusion, so removing one name from a granted tree has to be smuggled into a negative lookahead
-in one component. Both work, both are the wrong shape, and both are flagged where they are used.
+**Path patterns for URLs, and carve-outs generally.** A `[[network]]` rule has no path field, so a
+path constraint has to be smuggled into an atom's regex over the whole URL — and that regex is
+then the only thing normalising the URL, since nothing downstream resolves dot segments. A
+location has no exclusion, so removing one name from a granted tree has to be smuggled into a
+negative lookahead in one component. A subcommand has no exclusion either, so denying one
+argument word of a granted subcommand has to ride on an `argument-atoms` regex that then applies
+to every argument. All three work, all three are the wrong shape, and all three are flagged where
+they are used.

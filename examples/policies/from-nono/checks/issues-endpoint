@@ -12,7 +12,7 @@ invoking user's environment. Keep it fast, idempotent and free of side effects.
 import re
 import sys
 
-PATTERN = r"https://api\.github\.com/repos/[\w.-]+/[\w.-]+/issues(/[\w./-]*)?"
+PATTERN = r"(?!.*\.\.)https://api\.github\.com/repos/[\w.-]+/[\w.-]+/issues(/[\w.-]+)*"
 
 if len(sys.argv) != 2:
     print("usage: issues-endpoint URL", file=sys.stderr)

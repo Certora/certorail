@@ -20,6 +20,12 @@
 # What carries over: host, scheme, port and method. `methods = ["GET"]` is the whole of the
 # DELETE deny -- an unlisted method matches no rule, and there is no rule to write.
 #
+# What the port drops: the POST allow on `issues/*/comments`. A `[[network]]` rule's `methods`
+# and its `requires` are independent, so one rule cannot pair a method with a path; expressing
+# the POST allow means a second rule with `methods = ["POST"]` and a second atom scoped to the
+# comments path. That is writable, and it is left out to keep the example to one rule -- which
+# makes this port narrower than the fragment it comes from, not just differently shaped.
+#
 # What becomes a static proof: nono terminates TLS in its proxy and matches the path of each
 # request as it goes out. A `[[network]]` rule has no path field at all; the path is constrained
 # by `requires`, naming an atom the URL VALUE must carry at the call site. A literal URL carries
@@ -34,6 +40,14 @@
 # checker is a host program the policy names by absolute path; ship one with the policy
 # (`checks/issues-endpoint` here) or the example only type-checks.
 #
+# A regex over raw URL text has to do its own normalising, and this is the trap in the shape.
+# The atom matches the URL as written, and neither the analysis nor the broker resolves dot
+# segments before the request goes out -- the broker sends `urlsplit(url).path` verbatim -- so
+# a tail class admitting `.` and `/` puts `issues/../../../user` inside the atom's language and
+# the request lands on `/user`. The atom below excludes `..` explicitly and keeps `/` out of the
+# segment class, which is work nono's path matcher does not have to do because it matches a path
+# the proxy has already parsed.
+#
 # What certorail cannot say at all: a path pattern as such -- `path: "/repos/*/issues"` has no
 # spelling, and the regex in the atom has to cover the whole URL, scheme and host included;
 # query strings, headers and bodies, none of which any rule can mention; per-rule `reason`
@@ -45,8 +59,9 @@
 policy-version = 1
 
 [atoms]
-# The path constraint, spelled as a property of the whole URL text.
-issues-endpoint = { matches = 'https://api\.github\.com/repos/[\w.-]+/[\w.-]+/issues(/[\w./-]*)?' }
+# The path constraint, spelled as a property of the whole URL text. The leading lookahead is
+# load-bearing: nothing downstream resolves `..`, so the atom has to reject it.
+issues-endpoint = { matches = '(?!.*\.\.)https://api\.github\.com/repos/[\w.-]+/[\w.-]+/issues(/[\w.-]+)*' }
 
 [[validation]]
 # The runtime half, for a URL whose text the analysis never sees. The checker is trusted: it
