@@ -16,8 +16,13 @@ set -u
 revision="$1"
 
 # A pin is a full commit id. A branch or tag name is a moving target, so it is not one.
+# The digits are spelled out rather than given as `0-9a-f`: a range in a case pattern is
+# collation-dependent, and matches uppercase under a UTF-8 locale.
 case "$revision" in
-    "" | *[!0-9a-f]*) echo "'$revision' is not a full hexadecimal commit id" >&2; exit 1 ;;
+    "" | *[!0123456789abcdef]*)
+        echo "'$revision' is not a full lowercase hexadecimal commit id" >&2
+        exit 1
+        ;;
 esac
 [ "${#revision}" -eq 40 ] || { echo "'$revision' is not 40 hex digits" >&2; exit 1; }
 

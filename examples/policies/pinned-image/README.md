@@ -37,8 +37,9 @@ list-membership atom is missing, and the message says exactly that.
 
 ## Forgetting `--root`
 
-Without a root there is nowhere to run the literal checker, so `approved-image` is never
-discharged and the conforming program is rejected:
+`--root` defaults to the current directory, so the literal checker still runs -- in the wrong
+place, where there is no `approved-images.txt`. It exits non-zero, `approved-image` is never
+discharged, and the conforming program is rejected:
 
 ```
 $ certorail examples/policies/pinned-image/run_report.py --check \

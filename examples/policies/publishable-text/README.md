@@ -18,6 +18,13 @@ The file route is the point of the example. A scan that inspects command argumen
 at all in `probes/write_then_publish.py`: the text is written to a file and the file is handed
 over by name, and every string in that `execve` is innocuous.
 
+The published path is confined twice over, and it takes both. `argument-locations` holds the
+arguments the analysis tracked as located paths inside `outbox/**`, but a hard-coded string is
+known text rather than a path, so that test skips it — and `scan-file` scans whatever path it
+is handed, including one outside the root. The `outbox-path` atom closes that: a regex is a
+claim about the text, so a literal has to satisfy it too, and a program asking to publish
+`../../etc/passwd` is refused with `argument 2 is not validated by: outbox-path`.
+
 ## The denylist is a placeholder
 
 `denylist.txt` holds three obviously fake terms. **It is not a starting point.** A real
@@ -58,9 +65,11 @@ certora.exec("post-note", "publish-text", "XXX-DO-NOT-SHIP-XXX: internal build",
 ## The checkers
 
 `checkers/scan-text.sh` takes the text as an argument; `checkers/scan-file.sh` takes a path and
-reads it. Both are case-insensitive and both run with the sandbox root as their working
-directory, so `denylist.txt` and the path the confined program spelled resolve the way the
-program meant them.
+reads it. Both are case-insensitive, and both validations declare `cwd = "."`, so both run at
+the sandbox root. That declaration is load-bearing on the text scanner too: a validation that
+declares no `cwd` lets the confined program choose the directory the checker runs in, and
+`denylist.txt` is resolved relative to that directory — so the program would be picking the
+list it is scanned against.
 
 ```
 $ sh checkers/scan-text.sh "we ship project-bluebottle soon"
@@ -69,7 +78,9 @@ $ sh checkers/scan-file.sh outbox/nope.md
 no such file: .../outbox/nope.md
 ```
 
-A file the scanner cannot read is exit 2, never a pass.
+Neither scanner passes on a failure to look. `grep` exits 0 for a match, 1 for no match and 2
+for an error, and both scripts read the status rather than branching on truthiness, so an
+unreadable target file or an unreadable denylist is exit 2 and never a pass.
 
 ## What a syscall-level sandbox cannot express
 

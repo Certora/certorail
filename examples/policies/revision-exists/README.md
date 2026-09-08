@@ -20,6 +20,14 @@ certorail examples/policies/revision-exists/pin_dependency.py --check \
   --root   examples/policies/revision-exists
 ```
 
+**Use `--check`.** `deps/widget` holds a placeholder file, not a repository, and `git` is the
+one program in these examples that actually exists. git looks for a repository by walking up
+from its working directory, so a run without `--check` reaches whichever checkout the examples
+are sitting in — the certorail clone itself, if you are running them from there — and
+`checkout --detach` detaches its HEAD. `cwd = "deps/*"` in the policy does not prevent this:
+certorail decides where the child is spawned, and git walks up from there on its own. Point
+`deps/widget` at a real clone before running this one for real.
+
 ## The probes
 
 | Probe | Denial |
@@ -41,14 +49,16 @@ upstream
 $ sh checkers/revision-exists.sh ffffffffffffffffffffffffffffffffffffffff
 'ffffffffffffffffffffffffffffffffffffffff' is not on the upstream default branch
 $ sh checkers/revision-exists.sh main
-'main' is not a full hexadecimal commit id
+'main' is not a full lowercase hexadecimal commit id
 ```
 
 **Mirror mode** takes `EXAMPLE_UPSTREAM_MIRROR` pointing at a local clone of the upstream
 project, kept fresh out of band, and asks git whether the revision is an ancestor of that
-clone's `origin/HEAD`. It never fetches: a literal checker runs during analysis, possibly more
-than once, so it must not touch the network and must not mutate anything. Keeping the mirror
-current is the deployment's job, not the checker's. In this mode a revision git has never heard
+clone's `origin/HEAD`. That mirror is a read-only copy of the dependency's history and is a
+different repository from the checkout `deps/widget` stands in for. It never fetches: a
+literal checker runs during analysis, possibly more than once, so it must not touch the
+network and must not mutate anything. Keeping the mirror current is the deployment's job,
+not the checker's. In this mode a revision git has never heard
 of comes back as git's own exit code rather than the checker's `1`; anything non-zero refuses.
 
 ## What a syscall-level sandbox cannot express

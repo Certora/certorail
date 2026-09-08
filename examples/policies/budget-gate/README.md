@@ -8,8 +8,13 @@ boundary, so the gate has to be re-established for each job. That is not a limit
 worked around; it is the only reading of "under budget" that is still true when the money is
 spent.
 
-The job specs are passed as proven paths confined to `jobs/**` by `argument-locations`, and
-`unknown-arguments = false` refuses anything the analysis cannot vouch for.
+The job specs are proven paths, and `argument-locations` keeps them inside `jobs/**`. Read
+that as the narrow claim it is: `argument-locations` tests the arguments the analysis tracked
+as located paths, and a hard-coded string is known text rather than a path, so it is not
+tested. `unknown-arguments = false` rules out the computed strings -- an f-string, a `.strip()`
+-- but a literal `"../../elsewhere"` reaches `submit-job` unconstrained. Containment of
+*located* arguments is what this rule buys. Pinning the spelling as well takes a regex-defined
+atom in `argument-atoms`, the way `publishable-text` does it for its outbox paths.
 
 ## Run it
 

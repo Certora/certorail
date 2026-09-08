@@ -8,9 +8,10 @@ def main() -> None:
     if len(sys.argv[1:]) != 1:
         print("usage: deploy.py <environment>")
         return
-    # `sys.argv[1]` is known to be a string, so a check has a value to attach its fact to.
-    # `sys.argv[1:][0]` is not: the analysis knows nothing about it, and a check on it
-    # establishes nothing.
+    # Indexing `sys.argv` gives a value the analysis knows is a string, so a check has
+    # something to attach its fact to. Binding the slice to a name first --
+    # `args = sys.argv[1:]` and then `args[0]` -- does not: the element is unknown, the
+    # check establishes nothing, and the exec is denied.
     environment = sys.argv[1]
     workdir = pathlib.Path(".")
 

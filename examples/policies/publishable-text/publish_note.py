@@ -16,7 +16,7 @@ def main() -> None:
     body = (DRAFTS / "release-note.md").read_text()
 
     # A pure fact: it is about this exact string, so it survives the calls that follow.
-    scanned = certora.check_single("scan-text", body)
+    scanned = certora.check_single("scan-text", body, cwd=workdir)
     certora.exec("post-note", "publish-text", scanned, cwd=workdir)
 
     note = OUTBOX / "release-note.md"

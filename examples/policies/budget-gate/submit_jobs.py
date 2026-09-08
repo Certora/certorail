@@ -9,7 +9,7 @@ def main() -> None:
     workdir = pathlib.Path(".")
     for spec in sorted(JOBS.glob("*.json")):
         certora.check("budget-gate", cwd=workdir)
-        result = certora.exec("submit-job", "submit", spec, cwd=workdir)
+        result = certora.exec("submit-job", "submit", str(spec), cwd=workdir)
         print(f"{spec}: exit {result.returncode}")
 
 

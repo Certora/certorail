@@ -8,7 +8,9 @@
 #
 # Two modes:
 #   stub  -- EXAMPLE_CLOUD_ACCOUNT is set: its value is taken as the account the credentials
-#            resolve to. This is what the offline tests use.
+#            resolve to. This is what the offline tests use. DELETE THAT BRANCH when you
+#            adapt this checker: it lets anything that can set one variable in the broker's
+#            environment answer the question for you.
 #   live  -- otherwise: ask the provider CLI who it is. Substitute your own provider's
 #            "who am I" command for the `cloudctl account show` line below.
 #
@@ -16,6 +18,18 @@
 set -u
 [ "$#" -eq 1 ] || { echo "usage: cloud-account.sh ENVIRONMENT" >&2; exit 2; }
 environment="$1"
+
+# The name comes from the confined program, and it is about to become a path component.
+# A checker validates everything it is handed; without this, a name containing `..` reads a
+# file outside accounts/ while a different string is what goes on to the provider.
+# The characters are spelled out rather than given as `a-z0-9`: a range in a case pattern
+# is collation-dependent, and matches uppercase under a UTF-8 locale.
+case "$environment" in
+    "" | *[!abcdefghijklmnopqrstuvwxyz0123456789_-]*)
+        echo "not an environment name: '$environment' (expected [a-z0-9_-])" >&2
+        exit 2
+        ;;
+esac
 
 expected_file="accounts/$environment.account"
 if [ ! -f "$expected_file" ]; then
@@ -26,6 +40,7 @@ expected=$(cat "$expected_file")
 [ -n "$expected" ] || { echo "$expected_file is empty" >&2; exit 3; }
 
 if [ -n "${EXAMPLE_CLOUD_ACCOUNT-}" ]; then
+    # Test stub. Delete this branch when adapting the checker -- see the header.
     actual="$EXAMPLE_CLOUD_ACCOUNT"
 else
     command -v cloudctl >/dev/null 2>&1 || {
