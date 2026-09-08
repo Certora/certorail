@@ -53,10 +53,30 @@ Exit status: the program's own when it ran; 1 when rejected; 2 when it does not 
 uv tool install .
 certorail program.py [--root DIR] [--policy POLICY] [--check] [-- ARG ...]
 certorail -c SOURCE  [--root DIR] [--policy POLICY] [--check] [-- ARG ...]
+certorail explain program.py [--root DIR] [--policy POLICY] [--json]
 ```
 
 `--check` analyses and evaluates without running. `--root` defaults to the current directory.
 `-c` takes the program inline, for agents that generate and run in one step.
+
+## Explaining a rejection
+
+`certorail explain` runs the same pipeline `--check` runs and reports it instead of summarising
+it. Per problem: the site with its source line, the operation, the reason -- which subset rule
+fired, which location is unproven, which policy rule refused, which atom obligation is
+undischarged -- and two remedies, one written in the policy's own vocabulary and one in the
+program's. `--json` emits the same content machine-readably; the exit status is the one `--check`
+gives (0 accepted, 1 rejected, 2 unparsable), and the report goes to stdout in both verdicts.
+
+It never runs the program, and it weakens nothing to have more to say: the verdict is the verdict
+`--check` gives. It reports policy content only where a site in the program asked for it, so it
+cannot become a way to read an ambient policy the program's author was not handed. A file
+literally named `explain` is shadowed by the subcommand; pass `./explain`.
+
+[`examples/claude-code-pack/`](examples/claude-code-pack/README.md) puts it in front of an agent
+at the moment of the refusal: a hook that runs `certorail explain` on a certorail rejection and
+returns it with the two legitimate remedies named, and a declarative installer that merges into
+`~/.claude/settings.json` rather than overwriting it.
 
 The policy is **trusted**. It is normally a TOML document ([`examples/policy.toml`](examples/policy.toml);
 the schema is documented in [`certorail/policyfile.py`](certorail/policyfile.py)), passed with

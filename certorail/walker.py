@@ -294,6 +294,10 @@ class Vocabulary:
 class Report:
     violations: list[tuple[ast.AST, str]] = field(default_factory=list)
     sinks: list[Site] = field(default_factory=list)
+    # which pass found the violations. ``analyze`` runs the passes in order and returns at the
+    # first one with anything to say, so the pass is otherwise implicit in the control flow --
+    # and it is the only structure a violation has (the rest is a node and a sentence).
+    phase: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -1567,17 +1571,17 @@ def analyze(
     imports = ImportAnalysis()
     imports.visit(tree)
     if imports.violations:
-        return Report(violations=list(imports.violations))
+        return Report(violations=list(imports.violations), phase="imports")
 
     classes = ClassAnalysis()
     classes.visit(tree)
     if classes.violations:
-        return Report(violations=list(classes.violations))
+        return Report(violations=list(classes.violations), phase="classes")
 
     functions = FunctionAnalysis()
     functions.visit(tree)
     if functions.violations:
-        return Report(violations=list(functions.violations))
+        return Report(violations=list(functions.violations), phase="functions")
 
     # the injected namespace is a module root like any import: its members may only be applied
     module_roots = imports.import_roots | {NAMESPACE}
@@ -1585,7 +1589,7 @@ def analyze(
     inheritance = InheritanceAnalysis(known_classes=classes.known_classes, module_roots=module_roots)
     inheritance.visit(tree)
     if inheritance.violations:
-        return Report(violations=list(inheritance.violations))
+        return Report(violations=list(inheritance.violations), phase="inheritance")
 
     lexical = ValidationAnalysis(
         known_classes=classes.known_classes,
@@ -1594,14 +1598,22 @@ def analyze(
     )
     lexical.visit(tree)
     if lexical.violations:
-        return Report(violations=list(lexical.violations))
+        return Report(violations=list(lexical.violations), phase="lexical")
 
     walker = ValidationWalker(imports.imports, functions.contracts, vocabulary, discharge)
     try:
         walker.visit(tree)
     except InvalidProgram as e:
-        return Report(violations=[*walker.violations, (e.node, str(e))], sinks=walker.sinks)
-    return Report(violations=walker.violations, sinks=walker.sinks)
+        return Report(
+            violations=[*walker.violations, (e.node, str(e))],
+            sinks=walker.sinks,
+            phase="dataflow",
+        )
+    return Report(
+        violations=walker.violations,
+        sinks=walker.sinks,
+        phase="dataflow" if walker.violations else None,
+    )
 
 
 def where(filename: str, node: ast.AST) -> str:
