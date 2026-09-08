@@ -11,7 +11,8 @@ argument or an environment variable with a documented default.
 ## Install
 
 ```
-python3 examples/claude-code-pack/install.py
+./install.sh --with-claude-pack          # certorail and the pack together
+python3 examples/claude-code-pack/install.py   # the pack on its own
 ```
 
 | Argument | Default | Meaning |

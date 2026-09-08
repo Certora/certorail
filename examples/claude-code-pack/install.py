@@ -160,9 +160,10 @@ class Installer:
         self.records: list[dict] = []
         self.changed = 0
 
-    def say(self, verb: str, what: str) -> None:
+    def say(self, done: str, planned: str, what: str) -> None:
+        """Two spellings of the same step: what a real run did, and what a dry run would do."""
         if not self.quiet:
-            print(f"{'would ' if self.dry_run else ''}{verb} {what}")
+            print(f"would {planned} {what}" if self.dry_run else f"{done} {what}")
 
     def previous(self, kind: str, key: str, value: str) -> dict | None:
         return next(
@@ -182,7 +183,7 @@ class Installer:
                 )
             if dest.read_bytes() == content:
                 self.records.append({"type": "write_file", "path": str(dest), "sha256": sha256(dest)})
-                self.say("unchanged", str(dest))
+                self.say("unchanged", "leave unchanged", str(dest))
                 return
             if sha256(dest) != record["sha256"]:
                 raise InstallError(
@@ -197,7 +198,7 @@ class Installer:
                 dest.chmod(int(mode, 8))
         self.records.append({"type": "write_file", "path": str(dest), "sha256": digest})
         self.changed += 1
-        self.say("wrote", str(dest))
+        self.say("wrote", "write", str(dest))
 
     # -- symlink ------------------------------------------------------------
 
@@ -208,7 +209,7 @@ class Installer:
         if link.is_symlink():
             if pathlib.Path(os.readlink(link)) == target:
                 self.records.append(record)
-                self.say("unchanged", str(link))
+                self.say("unchanged", "leave unchanged", str(link))
                 return
             if not self.dry_run:
                 link.unlink()
@@ -222,7 +223,7 @@ class Installer:
             link.symlink_to(target)
         self.records.append(record)
         self.changed += 1
-        self.say("linked", f"{link} -> {target}")
+        self.say("linked", "link", f"{link} -> {target}")
 
     # -- json_merge ---------------------------------------------------------
 
@@ -241,14 +242,14 @@ class Installer:
                     "additions": [] if earlier is None else earlier["additions"],
                 }
             )
-            self.say("unchanged", str(file))
+            self.say("unchanged", "leave unchanged", str(file))
             return
         if not self.dry_run:
             file.parent.mkdir(parents=True, exist_ok=True)
             file.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
         self.records.append({"type": "json_merge", "file": str(file), "additions": additions})
         self.changed += 1
-        self.say("merged", f"{file} ({len(additions)} added)")
+        self.say("merged", "merge into", f"{file} ({len(additions)} added)")
 
 
 # ---------------------------------------------------------------------------
@@ -289,19 +290,19 @@ def uninstall(records: list[dict], installer: Installer) -> None:
                 if not path.exists():
                     continue
                 if sha256(path) != record["sha256"]:
-                    installer.say("left in place", f"{path} (edited since install)")
+                    installer.say("left in place", "leave in place", f"{path} (edited since install)")
                     continue
                 if not installer.dry_run:
                     path.unlink()
                 installer.changed += 1
-                installer.say("removed", str(path))
+                installer.say("removed", "remove", str(path))
             case "symlink":
                 link = pathlib.Path(record["link"])
                 if link.is_symlink() and os.readlink(link) == record["target"]:
                     if not installer.dry_run:
                         link.unlink()
                     installer.changed += 1
-                    installer.say("removed", str(link))
+                    installer.say("removed", "remove", str(link))
             case "json_merge":
                 file = pathlib.Path(record["file"])
                 if not file.is_file() or not record["additions"]:
@@ -311,7 +312,7 @@ def uninstall(records: list[dict], installer: Installer) -> None:
                 if not installer.dry_run:
                     file.write_text(json.dumps(restored, indent=2) + "\n", encoding="utf-8")
                 installer.changed += 1
-                installer.say("unmerged", str(file))
+                installer.say("unmerged", "unmerge from", str(file))
 
 
 def write_record(record_file: pathlib.Path, manifest: dict, records: list[dict]) -> None:
@@ -372,7 +373,7 @@ def main(argv: list[str] | None = None) -> int:
             uninstall(previous_records, installer)
             if record_file.is_file() and not ns.dry_run:
                 record_file.unlink()
-                installer.say("removed", str(record_file))
+                installer.say("removed", "remove", str(record_file))
         else:
             manifest = load_manifest(pack_dir)
             apply(manifest, pack_dir, env, installer)
@@ -392,7 +393,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if not ns.quiet:
         verb = "removed" if ns.uninstall else "installed"
-        print(f"{verb}: {installer.changed} step(s) changed, into {claude_dir}")
+        if ns.dry_run:
+            print(f"dry run: {installer.changed} step(s) would change, in {claude_dir}")
+        else:
+            print(f"{verb}: {installer.changed} step(s) changed, into {claude_dir}")
     return 0
 
 

@@ -47,10 +47,21 @@ denylists.
 
 Exit status: the program's own when it ran; 1 when rejected; 2 when it does not parse.
 
+## Install
+
+```
+./install.sh                     # uv, pipx or a plain venv, whichever is available
+./install.sh --with-claude-pack  # and the Claude Code pack in examples/
+./install.sh --uninstall
+```
+
+`--dry-run` prints the plan without touching anything. There is no `curl ... | sh` form: nothing
+is published to download, so the script installs the checkout it sits in. `uv tool install .` by
+hand does the same job when you want no help.
+
 ## Usage
 
 ```
-uv tool install .
 certorail program.py [--root DIR] [--policy POLICY] [--check] [-- ARG ...]
 certorail -c SOURCE  [--root DIR] [--policy POLICY] [--check] [-- ARG ...]
 certorail explain program.py [--root DIR] [--policy POLICY] [--json]
