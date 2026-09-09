@@ -67,7 +67,14 @@ import urllib.parse
 from collections.abc import Callable, Sequence
 
 from .analysis import _literal_location, location_le
-from .policy import NetworkRule, Policy, Refusal, matches_endpoint, pretty_locations
+from .policy import (
+    NetworkRule,
+    Policy,
+    Refusal,
+    matches_endpoint,
+    path_permitted,
+    pretty_locations,
+)
 
 log = logging.getLogger("certorail.broker")
 
@@ -173,8 +180,16 @@ def _check(
         raise PolicyDenied(f"invalid port in URL {url!r}")
     port = port or (443 if scheme == "https" else 80)
     refusal: str | None = None
+    # the path as the origin will most plausibly read it: percent-decoded, then placed. A ".."
+    # that appears after decoding has no location and satisfies no path-restricted rule.
+    url_path = _literal_location(urllib.parse.unquote(parts.path) or "/")
     for rule in policy.network:
         if not matches_endpoint(rule, scheme, host, port, method):
+            continue
+        if not path_permitted(rule, url_path):
+            refusal = refusal or (
+                f"path {parts.path!r} is outside the permitted {pretty_locations(rule.paths)}"
+            )
             continue
         why = _rule_refusal(policy, rule, url, initial, discharge)
         if why is None:

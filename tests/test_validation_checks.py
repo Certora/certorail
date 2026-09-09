@@ -289,6 +289,7 @@ SUB_POLICY = Policy.allow(
             subcommand="push origin",
             cwd=markers.within("repos"),
             argument_atoms=["not-force"],
+            unknown_arguments=True,  # branch names are checked values, not literals: the opt-in
         ),
         program("git", subcommand="log", cwd=markers.within("repos")),
     ],
@@ -414,6 +415,7 @@ CWD_FREE_POLICY = Policy.allow(
             subcommand="push origin",
             cwd=markers.within("repos"),
             argument_atoms=["not-force"],
+            unknown_arguments=True,  # branch names are checked values, not literals: the opt-in
         )
     ],
 )

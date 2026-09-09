@@ -64,7 +64,10 @@ a Claude Code `SessionStart` hook running it puts the policy into the agent's co
 Command *templates* let a rule state the shape of a permitted command line — literal words,
 typed holes, a flag vocabulary — so `find`, `grep` and friends can be granted without granting
 `-exec` or `-r /etc`; *rulesets* bundle such templates for reuse, applied to a policy with a
-location. Both are specified in [`TEMPLATES.md`](TEMPLATES.md).
+location. Both are specified in [`TEMPLATES.md`](TEMPLATES.md). A rule may also be a *source*:
+values extracted unmodified from its result (`certora.extract` and friends) carry a provenance
+fact a hole can demand, so a program acts only on what a trusted query returned; that is
+[`PROVENANCE.md`](PROVENANCE.md).
 
 The policy is **trusted**. It is normally a TOML document ([`examples/policy.toml`](examples/policy.toml);
 the schema is documented in [`certorail/policyfile.py`](certorail/policyfile.py)), passed with
@@ -72,27 +75,29 @@ the schema is documented in [`certorail/policyfile.py`](certorail/policyfile.py)
 checker programs its validations run kept beside it under `~/.certorail/checkers/`. The
 [`certorail-policy`](.claude/skills/certorail-policy/SKILL.md) skill walks a Claude Code session
 through deriving one from what your scripts need to do, including the checker programs its
-runtime validations run. A policy may also be Python defining `POLICY`, written in the same
-location vocabulary as the annotations (so "the policy permits reads within `data`" and "this
-function relies on a path within `data`" mean the same thing):
+runtime validations run. Locations are spelled the same way in the policy and in the program's
+annotations, so "the policy permits reads within `data`" and "this function relies on a path
+within `data`" mean the same thing:
 
-```python
-from certorail import markers
-from certorail.policy import Policy, program
+```toml
+policy-version = 1
 
-POLICY = Policy.allow(
-    read=[markers.within("data"), markers.within("repos")],
-    write=[markers.within("repos")],
-    listing=[markers.within("repos")],
-    programs=[
-        program("git", cwd=markers.within("repos")),
-        program("gh", cwd="."),
-    ],
-)
+[filesystem]
+read  = ["data/**", "repos/**"]
+write = ["repos/**"]
+list  = ["repos/**"]
+
+[[program]]
+name = "git"
+cwd  = "repos/**"
+
+[[program]]
+name = "gh"
+cwd  = "."
 ```
 
-Without `--policy`, the built-in default applies: read, write and list anywhere within the root,
-and no subprocesses.
+There is no Python policy API; a policy is data. Without `--policy` or an ambient policy, the
+built-in default applies: read, write and list anywhere within the root, and no subprocesses.
 
 ## The subset
 

@@ -19,17 +19,16 @@
    is where anything it missed goes to die. Without srt the run proceeds with a loud
    warning (or quietly with ``--no-jail``).
 
-The policy file is trusted Python defining ``POLICY`` (a ``certorail.policy.Policy``); without one,
-``policy.DEFAULT_POLICY`` applies: read, write and list anywhere within the root, and ``git``/``gh``
-with a cwd within the root. Exit status: the program's own when it ran; 1 when rejected; 2 when the
-program does not parse.
+The policy is a TOML (or JSON) document (``policyfile``), given with ``--policy`` or discovered
+ambiently for the root (``policydir``); without one, ``policy.DEFAULT_POLICY`` applies: read,
+write and list anywhere within the root, and no programs. Exit status: the program's own when it
+ran; 1 when rejected; 2 when the program does not parse.
 """
 import argparse
 import ast
 import json
 import os
 import pathlib
-import runpy
 import shlex
 import shutil
 import subprocess
@@ -241,16 +240,12 @@ def load_policy(path: pathlib.Path | None, root: pathlib.Path | None = None) -> 
                 except PolicyFileError as e:
                     raise SystemExit(str(e))
         return DEFAULT_POLICY
-    if path.suffix in (".toml", ".json"):
-        try:
-            return load_policy_file(path)
-        except PolicyFileError as e:
-            raise SystemExit(str(e))
-    namespace = runpy.run_path(str(path))
-    policy = namespace.get("POLICY")
-    if not isinstance(policy, Policy):
-        raise SystemExit(f"{path}: expected POLICY to be a certorail.policy.Policy")
-    return policy
+    if path.suffix not in (".toml", ".json"):
+        raise SystemExit(f"{path}: a policy is a .toml or .json document")
+    try:
+        return load_policy_file(path)
+    except PolicyFileError as e:
+        raise SystemExit(str(e))
 
 
 def _policy_origin(path: pathlib.Path | None, root: pathlib.Path) -> tuple[str, str | None]:
@@ -286,7 +281,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--policy",
         type=pathlib.Path,
         default=None,
-        help="a policy: a .toml/.json document, or a Python file defining POLICY "
+        help="a policy: a .toml or .json document "
         "(default: the nearest ambient policy under ~/.certorail/policy for this root, "
         "else the built-in policy)",
     )

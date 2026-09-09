@@ -415,7 +415,22 @@ NON_KILLING_CALLEES: frozenset[tuple[str, ...]] = frozenset({
     ("pathlib", "PosixPath"), ("pathlib", "PurePosixPath"),
     ("re", "fullmatch"), ("re", "match"), ("re", "search"), ("re", "compile"),
     ("json", "dumps"), ("json", "loads"),
+    # the extractors (PROVENANCE.md): pure functions over text the program already holds
+    (NAMESPACE, "extract"), (NAMESPACE, "extract_all"), (NAMESPACE, "lines"), (NAMESPACE, "field"),
+    # the location guard: a pure predicate
+    (NAMESPACE, "pathmatch"),
 })
+
+# certora.pathmatch(text, "<location>"): the policy's location spelling as a guard (guards.py
+# establishes the location; the walker checks the shape: two positional arguments, a literal
+# spelling that parses).
+PATHMATCH_CALLEE: tuple[str, ...] = (NAMESPACE, "pathmatch")
+
+# The extractors, for the walker's audit: the only constructors of a source atom.
+EXTRACT_CALLEE: tuple[str, ...] = (NAMESPACE, "extract")
+EXTRACT_ALL_CALLEE: tuple[str, ...] = (NAMESPACE, "extract_all")
+LINES_CALLEE: tuple[str, ...] = (NAMESPACE, "lines")
+FIELD_CALLEE: tuple[str, ...] = (NAMESPACE, "field")
 
 
 # ---------------------------------------------------------------------------

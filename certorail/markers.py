@@ -296,6 +296,120 @@ class _Network:
 network = _Network()
 
 
+# ---------------------------------------------------------------------------
+# extractors: how data gets out of a source with its provenance intact (PROVENANCE.md)
+#
+# The static half binds a *source atom* to what these return: a value extracted from the result
+# of a source-bearing rule is something that source produced, unmodified. Any string operation
+# on it yields a fresh value with no provenance -- the identity semantics -- so these four are
+# the only constructors. Runtime-wise they are plain functions in the child.
+# ---------------------------------------------------------------------------
+
+
+class ExtractError(Exception):
+    """The path misses, selects null or a non-scalar, the text is not JSON, or the source is not
+    something extractable (a failed response, an object with no text)."""
+
+
+def _source_text(x: object) -> str:
+    match x:
+        case ExecResult():
+            return x.stdout_string()  # a failed child raises CalledProcessError here
+        case NetworkResponse():
+            if not 200 <= x.status < 300:
+                raise ExtractError(f"response status {x.status} {x.reason}".rstrip())
+            return x.body.decode("utf-8", errors="replace")
+        case str():
+            return x
+        case bytes():
+            return x.decode("utf-8", errors="replace")
+        case _ if callable(getattr(x, "read", None)):
+            data = getattr(x, "read")()
+            return data.decode("utf-8", errors="replace") if isinstance(data, bytes) else str(data)
+        case _:
+            raise ExtractError(f"not a source: {type(x).__name__}")
+
+
+def _scalar(value: object, path: str) -> str:
+    match value:
+        case bool():
+            return "true" if value else "false"
+        case int() | float():
+            return str(value)
+        case str():
+            return value
+        case None:
+            raise ExtractError(f"{path}: null")
+        case _:
+            raise ExtractError(f"{path}: not a scalar ({type(value).__name__})")
+
+
+def _select(x: object, path: str, want_plural: bool) -> object:
+    from . import jqpath  # stdlib-only; imported lazily to keep the namespace's import light
+
+    try:
+        steps = jqpath.parse(path)
+    except ValueError as exc:
+        raise ExtractError(str(exc)) from None
+    if jqpath.plural(steps) != want_plural:
+        raise ExtractError(
+            f"{path}: a plural path ([]) needs extract_all" if not want_plural
+            else f"{path}: extract_all needs a plural path (one [])"
+        )
+    try:
+        document = json.loads(_source_text(x))
+    except json.JSONDecodeError as exc:
+        raise ExtractError(f"not JSON: {exc}") from None
+    try:
+        return jqpath.walk(steps, document)
+    except ValueError as exc:
+        raise ExtractError(str(exc)) from None
+
+
+def extract(x: object, path: str) -> str:
+    """The scalar *path* selects in the JSON text of *x* -- an exec result (stdout), a response
+    (body), a file object, or text -- as a string. Numbers and booleans are stringified; null,
+    a missing path and a non-scalar are ``ExtractError``."""
+    return _scalar(_select(x, path, want_plural=False), path)
+
+
+def extract_all(x: object, path: str) -> list[str]:
+    """The scalars a plural *path* (one ``[]``) selects, each as a string."""
+    found = _select(x, path, want_plural=True)
+    assert isinstance(found, list)
+    return [_scalar(v, path) for v in found]
+
+
+def lines(x: object) -> list[str]:
+    """The lines of a source's text, newline stripped."""
+    return _source_text(x).splitlines()
+
+
+def field(line: str, index: int, sep: str | None = None) -> str:
+    """One field of a line (``str.split`` semantics); ``ExtractError`` when there is none."""
+    parts = line.split(sep)
+    try:
+        return parts[index]
+    except IndexError:
+        raise ExtractError(f"field {index} of {len(parts)}") from None
+
+
+def pathmatch(text: str, location: str) -> bool:
+    """Is *text* -- a filesystem path (relative to the sandbox root, or absolute) or a URL path
+    -- at the *location*, spelled the way the policy spells locations: ``repos/**``,
+    ``repos/*/foundry.toml``, ``/repos/*/*/issues/<\\d+>/comments``, ``{a,b}/x``?
+
+    As the condition of a guard (``assert certora.pathmatch(p, "repos/*/foundry.toml")``, or
+    ``if ... and certora.pathmatch(urllib.parse.urlsplit(u).path, "/repos/**"):``) it
+    establishes exactly that location on the variable statically; at runtime it is the same
+    matcher on the concrete text. A ``..`` anywhere is within nothing."""
+    if not isinstance(text, str):
+        raise TypeError("pathmatch: the path must be a str (use str(p) for a pathlib path)")
+    from . import locspec  # stdlib-only
+
+    return locspec.matches(locspec.parse(location), text)
+
+
 @dataclass(frozen=True)
 class Atom:
     name: str

@@ -53,7 +53,10 @@ Components separated by `/`. Each component is a literal name, `*` (any one name
 | `/srv/data/**` | anchored at the *filesystem* root |
 
 `**` appears at most once, as the last component or followed by exactly one leaf. No `..`, no
-empty components. A relative location is under the sandbox root (`--root`, the program's working
+empty components. Programs use the same spelling to prove a dynamic path is at a location:
+`assert certora.pathmatch(p, "repos/*/foundry.toml")`, and for a URL
+`certora.pathmatch(urllib.parse.urlsplit(u).path, "/repos/**")`; the description hands them the
+text to quote. A relative location is under the sandbox root (`--root`, the program's working
 directory). Absolute and relative locations never relate: an absolute grant says nothing about
 relative paths and vice versa. A program's literal beginning with `/` is an absolute path.
 
@@ -160,10 +163,21 @@ holes.FLAGS = { kind = "flags", flagset = "find-ro" }
 ```
 | `subcommand` | string | leading literal words this rule governs (`"push origin"`). Once any rule for a program names a subcommand, that program **fails closed**: an exec matching no declared subcommand (unlisted, or not literal) is denied. Subcommands of one program must be prefix-free and cannot mix with a bare rule |
 Vouched-for means exactly-known text or a proven path; an f-string, a `.strip()` result or a
-runtime-checked value is *not*, even when it carries atoms. The Python API's `program()`
-defaults `unknown_arguments` to `True`; the data format deliberately does not. Prefer a template
+runtime-checked value is *not*, even when it carries atoms. Prefer a template
 over `unknown-arguments = true` whenever the program takes flags or paths: a template grants
 exactly the flags and positions listed and nothing else.
+
+## Sources: `source = "…"` and `[[source]]`
+
+A rule may name a **source atom** its results yield: `source = "gh-api"` on a `[[program]]` or
+`[[network]]` rule, or a `[[source]] name = "manifest" location = "dist/manifest.json"` for a
+readable location (which grants nothing: the read must still be permitted). The atom is declared
+in `[atoms]` with `pure = true`, and only extraction establishes it: `certora.extract(...)`,
+`extract_all`, `lines`, `field`, or `for line in f` over a handle. Consume it like any atom:
+`holes.BRANCH = { atoms = ["gh-api"] }` means "a value the GitHub API returned, unmodified" --
+never a literal, never something read elsewhere and massaged. This is the dual of `literal`:
+`literal` for what the agent chose, a source atom for what a trusted query produced. See
+`PROVENANCE.md`.
 
 ## `[[apply]]` and rulesets
 
@@ -203,6 +217,7 @@ network use is not governed here; it is folded into their `[[program]]` grant.
 | `ports` | list of ints, default empty | empty means the scheme's default port only |
 | `methods` | list, default empty | empty means any method |
 | `allow-nonpublic` | bool, default false | permit loopback, RFC1918, link-local and metadata addresses |
+| `path` | location or list, server-absolute | the URL's path must be proven within one of them (a literal URL, or `urlsplit(u).path` guards); checked again on every redirect hop, percent-decoded. Absent: any path |
 | `requires` | list | atoms the URL value must carry at the call site: `"atom"`, or `{ atom = "…", on-redirect = "recheck" \| "stop" \| "waive" }` |
 | `read-timeout`, `total-timeout` | number (s) | per-destination overrides of the broker caps (600 s silence, 900 s total) |
 | `max-response-bytes` | int | per-destination override of the 16 MiB cap |
@@ -265,7 +280,7 @@ certorail --describe [--root DIR] [--policy FILE]
 ```
 
 `--check` analyses and evaluates without running and prints every sink with its proven
-location. `--describe` prints the policy's interface for the program author, rendered from the
+location. `--policy` takes a `.toml` or `.json` document. `--describe` prints the policy's interface for the program author, rendered from the
 loaded policy: filesystem grants, every program form as a signature with its holes and flags,
 validations, atoms, network rules. Put it in the agent's context with a Claude Code hook in the
 project's `.claude/settings.json`:
@@ -287,11 +302,8 @@ equals the probed prefix applies; two such files is an error. Only TOML is disco
 ambiently. The `checkers/` subdirectory beside `policy/` is where validations' programs live,
 so the config directory is the single place to audit.
 
-## Python API equivalents
+## No Python policy API
 
-For a `.py` policy: `Policy.allow(read=[…], write=[…], listing=[…], programs=[program(…)],
-validations=[validation(…)], atoms=[atom(name, markers.matches(r))], network=[network(…)])`
-from `certorail.policy`, with locations spelled as `markers.within("repos")`,
-`markers.exactly("a", "b")` or literal strings; `pure("atom")` in `establishes` marks purity
-(the TOML declares it centrally instead); `param("name")` in `argv`. Prefer TOML: it is data,
-reviewable, and the only form discovered ambiently.
+A policy is a TOML or JSON document, nothing else: `--policy` refuses any other suffix, and only
+TOML is discovered ambiently. The constructors in `certorail/policy.py` are the object model the
+loader builds, not a second language.

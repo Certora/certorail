@@ -890,10 +890,22 @@ class Container:
     elem: ValidationFact
     param: bool = False
 
+@dataclass(frozen=True)
+class Data:
+    """A *source handle* (PROVENANCE.md): the result of a ``certora.exec``, a ``certora.network``
+    request, or a file read, bound to a name. Like ``Container``, deliberately NOT a
+    ValidationFact: ``interpret_expr`` yields None for a handle-valued name, and the two domains
+    meet only at the extractors (``certora.extract`` & co.) and at iteration (``for line in f``).
+
+    ``sources`` is the *source atoms* the handle yields -- the pure atoms the policy attached to
+    the rule that produced it. Empty for a handle from a rule that names no source: still
+    extractable, vouching for nothing."""
+    sources: frozenset[str] = frozenset()
+
 # what the expression semantics read facts from: the walker's state. A Mapping, not a dict,
 # both because these functions only ever read it and because covariance then lets a plain
 # dict[str, ValidationFact] (tests, sub-states) flow in despite dict's invariance.
-type StateMap = Mapping[str, ValidationFact | Container]
+type StateMap = Mapping[str, ValidationFact | Container | Data]
 
 def is_path_typed(fact: ValidationFact | None) -> bool:
     return isinstance(fact, PathFact) or (isinstance(fact, Located) and fact.repr == "path")
@@ -1473,9 +1485,9 @@ def interpret_expr(e: ast.expr, st: StateMap) -> ValidationFact | None:
     match e:
         case ast.Name(id=name):
             found = st.get(name)
-            # a container-valued name has no scalar reading: the container domain is the
-            # walker's, and only the roster touchpoints below reach into it
-            return None if isinstance(found, Container) else found
+            # a container- or handle-valued name has no scalar reading: those domains are the
+            # walker's, and only their touchpoints reach into them
+            return None if isinstance(found, (Container, Data)) else found
         case ast.Constant(value=str() as s):
             return StrFact(regex=Exact(s))
         case ast.Call(func=ast.Attribute(value=ast.Name(id=rname), attr="pop"), args=pargs) if (
@@ -1605,6 +1617,12 @@ def element_fact(iterable: ast.expr, st: StateMap) -> ValidationFact | None:
             container = st[name]
             assert isinstance(container, Container)
             return container.elem  # iterating a tracked container: its current element fact
+        case ast.Name(id=name) if isinstance(st.get(name), Data):
+            handle = st[name]
+            assert isinstance(handle, Data)
+            # ``for line in f`` over a source handle: each line is something the source
+            # produced, unmodified (PROVENANCE.md) -- ``certora.lines`` spelled the stdlib way
+            return StrFact(checks=handle.sources)
         case _:
             return None
 

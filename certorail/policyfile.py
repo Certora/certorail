@@ -59,9 +59,10 @@ defaults to recheck when the atom is textual, stop otherwise. Network rules say 
 exec'd programs, whose network access is folded into their ``[[program]]`` grant.
 
 The schema is strict and fails closed: unknown keys, undeclared atoms, malformed locations and
-mistyped values are all errors, and all of them are reported, not just the first. One default
-deliberately diverges from the Python API: ``unknown-arguments`` is *false* here -- the reviewed
-artifact opts into looseness explicitly.
+mistyped values are all errors, and all of them are reported, not just the first.
+``unknown-arguments`` is *false* by default: the reviewed artifact opts into looseness
+explicitly. This is the only policy language; the constructors in ``policy`` are the object
+model it builds.
 """
 import hashlib
 import json
@@ -74,6 +75,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from . import markers
+from .locations import parse_location
 from .policydir import config_dir
 from .analysis import (
     ANY_NAME,
@@ -96,6 +98,7 @@ from .policy import (
     Policy,
     Program,
     RequiredAtom,
+    Source,
     Validation,
     atom,
     network,
@@ -110,78 +113,10 @@ class PolicyFileError(Exception):
     """The policy document does not conform; every problem found, one per line."""
 
 
-# ---------------------------------------------------------------------------
-# the location micro-syntax
-# ---------------------------------------------------------------------------
-
-
-def _split_components(text: str) -> list[str]:
-    """Split on "/", except inside a ``<...>`` component, whose regex may contain "/": the
-    component runs to the ">" that precedes a "/" or the end of the string."""
-    out: list[str] = []
-    start = 0
-    in_regex = False
-    for i, c in enumerate(text):
-        if in_regex:
-            if c == ">" and (i + 1 == len(text) or text[i + 1] == "/"):
-                in_regex = False
-        elif c == "<" and i == start:
-            in_regex = True
-        elif c == "/":
-            out.append(text[start:i])
-            start = i + 1
-    out.append(text[start:])
-    return out
-
-
-def _parse_component(piece: str) -> Component:
-    if piece == "*":
-        return ANY_NAME
-    if piece.startswith("<"):
-        if not piece.endswith(">") or len(piece) < 3:
-            raise ValueError(f"malformed regex component {piece!r}")
-        regex = piece[1:-1]
-        try:
-            re.compile(regex)
-        except re.error as e:
-            raise ValueError(f"bad regex in {piece!r}: {e}")
-        return Matching(RegexLit(regex))
-    if piece.startswith("{"):
-        if not piece.endswith("}") or len(piece) < 3:
-            raise ValueError(f"malformed choice component {piece!r}")
-        names = [n.strip() for n in piece[1:-1].split(",")]
-        if not names or not all(is_safe_name(n) for n in names):
-            raise ValueError(f"choice components must be plain names: {piece!r}")
-        return OneOf(frozenset(names))
-    if not is_safe_name(piece):
-        raise ValueError(f"not a path component: {piece!r}")
-    return Named(piece)
-
-
-def parse_location(text: str) -> LocationFact:
-    """The location a compact spelling names; raises ``ValueError`` for a malformed one. A
-    leading "/" anchors the location at the filesystem root instead of the sandbox root."""
-    if text in (".", ""):
-        return StaticPath(())
-    absolute = text.startswith("/")
-    if absolute:
-        text = text[1:]
-        if not text:
-            return StaticPath((), absolute=True)  # "/": the filesystem root itself
-    pieces = _split_components(text)
-    if "" in pieces:
-        raise ValueError(f"empty path component in {text!r}")
-    splat_at = [i for i, p in enumerate(pieces) if p == "**"]
-    if not splat_at:
-        return StaticPath(tuple(_parse_component(p) for p in pieces), absolute)
-    if len(splat_at) > 1 or splat_at[0] < len(pieces) - 2:
-        raise ValueError(
-            f"'**' may appear once, as the last component or followed by one leaf: {text!r}"
-        )
-    at = splat_at[0]
-    prefix = tuple(_parse_component(p) for p in pieces[:at])
-    leaf = ANY_NAME if at == len(pieces) - 1 else _parse_component(pieces[at + 1])
-    return DirSplat(prefix, leaf, absolute)
+# the location micro-syntax lives in ``locspec`` (the grammar, stdlib-only, shared with the
+# runtime's ``certora.pathmatch``) and ``locations`` (the conversion to LocationFact, shared with
+# the analysis' pathmatch guard); ``parse_location`` is re-exported here for its callers
+__all__ = ["PolicyFileError", "from_data", "load_policy_file", "parse_location", "rulesets_dir"]
 
 
 _PARAM_REF = re.compile(r"\$\{(\w+)\}")
@@ -386,13 +321,15 @@ class _Loader:
         return value
 
 
-_TOP_KEYS = frozenset(
-    {"policy-version", "root", "filesystem", "atoms", "flagset", "validation", "program", "network", "apply"}
-)
+_TOP_KEYS = frozenset({
+    "policy-version", "root", "filesystem", "atoms", "flagset", "validation", "program",
+    "network", "apply", "source",
+})
 # a ruleset (TEMPLATES.md): exec-side vocabulary only -- no filesystem grants, no network, no root
 _RULESET_TOP_KEYS = frozenset(
-    {"ruleset-version", "params", "atoms", "flagset", "validation", "program", "apply"}
+    {"ruleset-version", "params", "atoms", "flagset", "validation", "program", "apply", "source"}
 )
+_SOURCE_KEYS = frozenset({"name", "location"})
 _PARAM_KINDS = ("directory", "atom")
 # where a ruleset's parameters may be substituted: location slots (a directory parameter heads
 # the spelling) and atom lists (an atom parameter is the whole entry)
@@ -407,12 +344,12 @@ _ATOM_KEYS = frozenset({"pure", "matches"})
 _VALIDATION_KEYS = frozenset({"name", "params", "argv", "cwd", "establishes", "effect-free"})
 _NETWORK_KEYS = frozenset({
     "host", "schemes", "ports", "methods", "allow-nonpublic", "requires",
-    "read-timeout", "total-timeout", "max-response-bytes",
+    "read-timeout", "total-timeout", "max-response-bytes", "source", "path",
 })
 _LEGACY_PROGRAM_KEYS = frozenset(
     {"subcommand", "argument-atoms", "unknown-arguments", "argument-locations"}
 )
-_PROGRAM_KEYS = frozenset({"name", "cwd", "requires", "argv", "holes"}) | _LEGACY_PROGRAM_KEYS
+_PROGRAM_KEYS = frozenset({"name", "cwd", "requires", "argv", "holes", "source"}) | _LEGACY_PROGRAM_KEYS
 # a constraint table: a token hole, an each hole's elements, a valued flag (TEMPLATES.md)
 _CONSTRAINT_KEYS = frozenset({"location", "matches", "one-of", "atoms", "literal", "any"})
 _HOLE_KEYS = _CONSTRAINT_KEYS | {"kind", "min", "flagset", "bare"}
@@ -439,30 +376,31 @@ def _open_table(loader: "_Loader", path: str, value: Any, known: frozenset[str])
     return value if ok else None
 
 
-def _constraint_locations(
-    loader: "_Loader", path: str, table: dict[str, Any]
+def _location_list(
+    loader: "_Loader", path: str, table: dict[str, Any], key: str
 ) -> tuple[LocationFact, ...] | None:
-    """A constraint's optional ``location``: one spelling or a list (any-of)."""
-    value = table.get("location")
+    """An optional location slot under *key* (a constraint's ``location``, a network rule's
+    ``path``): one spelling or a list (any-of); empty when absent, None when malformed."""
+    value = table.get(key)
     if value is None:
         return ()
     texts = value if isinstance(value, list) else [value]
     if not texts or not all(isinstance(v, str) for v in texts):
-        loader.error(f"{path}.location", "expected a location or a non-empty list of locations")
+        loader.error(f"{path}.{key}", "expected a location or a non-empty list of locations")
         return None
     out: list[LocationFact] = []
     for i, text in enumerate(texts):
         try:
             out.append(parse_location(text))
         except ValueError as e:
-            loader.error(f"{path}.location[{i}]", str(e))
+            loader.error(f"{path}.{key}[{i}]", str(e))
     return tuple(out) if len(out) == len(texts) else None
 
 
 def _constraint(
     loader: "_Loader", path: str, table: dict[str, Any], declared: frozenset[str]
 ) -> Constraint | None:
-    locations = _constraint_locations(loader, path, table)
+    locations = _location_list(loader, path, table, "location")
     matches = loader.field(path, table, "matches", str)
     one_of = loader.str_list(path, table, "one-of")
     atoms = loader.atom_names(path, table, "atoms", declared)
@@ -574,6 +512,46 @@ def _hole(
         return Token(c)
     minimum = loader.field(path, table, "min", int)
     return Each(c, 0 if minimum is None else minimum)
+
+
+def _source_atom(
+    loader: "_Loader",
+    path: str,
+    table: dict[str, Any],
+    key: str,
+    declared: frozenset[str],
+    pure_names: frozenset[str],
+) -> str | None:
+    """A source atom (PROVENANCE.md) named under *key*: declared, and *pure*."""
+    name = loader.field(path, table, key, str)
+    if name is None:
+        return None
+    if name not in declared:
+        loader.error(f"{path}.{key}", f"atom {name!r} is not declared in [atoms]")
+        return None
+    if name not in pure_names:
+        loader.error(f"{path}.{key}", f"a source atom is pure: declare {name!r} with pure = true")
+        return None
+    return name
+
+
+def _sources(
+    loader: "_Loader", top: dict[str, Any], declared: frozenset[str], pure_names: frozenset[str]
+) -> list[Source]:
+    """``[[source]]``: read locations whose contents yield an atom."""
+    out: list[Source] = []
+    for i, entry in enumerate(loader.entries("source", top)):
+        path = f"source[{i}]"
+        t = loader.table(path, entry, _SOURCE_KEYS)
+        if "name" not in t:
+            loader.error(path, "name is required")
+            continue
+        name = _source_atom(loader, path, t, "name", declared, pure_names)
+        locations = loader.location_slot(path, t, "location")
+        if name is None or locations is None:
+            continue
+        out.append(Source(name, locations))
+    return out
 
 
 def _pieces(loader: "_Loader", path: str, words: list[str]) -> tuple[Piece, ...] | None:
@@ -774,7 +752,7 @@ def _instantiate(
         return out
 
     result = dict(top)
-    for section in ("program", "validation", "flagset"):
+    for section in ("program", "validation", "flagset", "source"):
         if section in top:
             result[section] = walk(top[section], section, section)
     applies = top.get("apply")
@@ -984,6 +962,7 @@ def _programs(
     loader: "_Loader",
     top: dict[str, Any],
     declared: frozenset[str],
+    pure_names: frozenset[str],
     flagsets: Mapping[str, Flagset],
     origin: str | None,
 ) -> list[Program]:
@@ -993,6 +972,7 @@ def _programs(
         t = loader.table(path, entry, _PROGRAM_KEYS)
         name = loader.required_str(path, t, "name")
         cwd = loader.location_slot(path, t, "cwd")
+        yields = _source_atom(loader, path, t, "source", declared, pure_names)
         if "argv" in t:
             # a templated form (TEMPLATES.md): the shape is argv + holes, and the flat rule's
             # keys have no place on it
@@ -1030,6 +1010,7 @@ def _programs(
                         argv=pieces,
                         holes=holes,
                         origin=origin,
+                        source=yields,
                     )
                 )
             except ValueError as e:
@@ -1051,6 +1032,7 @@ def _programs(
                     requires=loader.atom_names(path, t, "requires", declared),
                     argument_atoms=loader.atom_names(path, t, "argument-atoms", declared),
                     origin=origin,
+                    source=yields,
                 )
             )
         except ValueError as e:
@@ -1091,23 +1073,27 @@ def from_data(data: object, where: str = "<policy>") -> Policy:
     # pass 3: each document's vocabulary; flagsets stay private to their document
     validations: list[Validation] = []
     programs: list[Program] = []
+    sources: list[Source] = []
     for doc in documents:
         dl = loader if doc.origin is None else _Loader(doc.label, loader.errors)
         flagsets = _flagsets(dl, doc.top, declared)
         validations += _validations(dl, doc.top, declared, pure_names, doc.restricted)
-        programs += _programs(dl, doc.top, declared, flagsets, doc.origin)
+        programs += _programs(dl, doc.top, declared, pure_names, flagsets, doc.origin)
+        sources += _sources(dl, doc.top, declared, pure_names)
 
     net_rules: list[NetworkRule] = []
     for i, entry in enumerate(loader.entries("network", top)):
         path = f"network[{i}]"
         t = loader.table(path, entry, _NETWORK_KEYS)
         host = loader.required_str(path, t, "host")
-        if host is None:
+        paths = _location_list(loader, path, t, "path")
+        if host is None or paths is None:
             continue
         try:
             net_rules.append(
                 network(
                     host,
+                    path=paths,
                     schemes=loader.str_list(path, t, "schemes") or ("https",),
                     ports=loader.int_list(path, t, "ports"),
                     methods=loader.str_list(path, t, "methods"),
@@ -1116,6 +1102,7 @@ def from_data(data: object, where: str = "<policy>") -> Policy:
                     read_timeout=loader.number(path, t, "read-timeout"),
                     total_timeout=loader.number(path, t, "total-timeout"),
                     max_response_bytes=loader.field(path, t, "max-response-bytes", int),
+                    source=_source_atom(loader, path, t, "source", declared, pure_names),
                 )
             )
         except ValueError as e:
@@ -1127,7 +1114,7 @@ def from_data(data: object, where: str = "<policy>") -> Policy:
         return Policy.allow(
             read=read, write=write, listing=listing,
             programs=programs, validations=validations, atoms=atom_defs,
-            network=net_rules,
+            network=net_rules, sources=sources,
         )
     except ValueError as e:
         raise PolicyFileError(f"{where}: {e}")

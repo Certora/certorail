@@ -23,6 +23,7 @@ from .dangerous import (
     CLASS_FACTORIES,
     DANGEROUS_MEMBERS,
     FORBIDDEN_ATTRIBUTES,
+    NAMESPACE,
     FORBIDDEN_CLASS_KEYWORDS,
     FORBIDDEN_MODULES,
     PATH_SINK_METHODS,
@@ -297,8 +298,12 @@ class ValidationAnalysis(_LexicalAnalysis):
             self._violation(dunder_attr, "dunder attribute")
             return
         # receiver-independent bans: frame/code internals, link creation, archive extraction, ...
+        # -- except the direct members of the ``certora`` namespace, whose names are the host's
+        # own API (``certora.extract`` is the JSON extractor, not TarFile.extract): the namespace
+        # is unrebindable, so nothing else can hide behind that receiver
+        own_api = attr.is_var_base and attr.base_name == NAMESPACE and len(fields) == 1
         forbidden_attr = next((n for (fld, n) in fields if fld in FORBIDDEN_ATTRIBUTES), None)
-        if forbidden_attr is not None:
+        if forbidden_attr is not None and not own_api:
             self._violation(forbidden_attr, f"forbidden attribute {forbidden_attr.attr}")
             return
         # sink methods get the module-symbol treatment: fully applied or not at all, so that

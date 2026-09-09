@@ -77,6 +77,7 @@ from .analysis import (
     url_of,
     ValidationFact
 )
+from .locations import parse_location
 from .templates import (
     BindError,
     Constraint,
@@ -103,7 +104,9 @@ from .walker import (
     Report,
     SinkSite,
     Site,
+    SourceTable,
     Vocabulary,
+    host_matches,
 )
 
 # ---------------------------------------------------------------------------
@@ -150,19 +153,16 @@ def _absolute_prefix(s: str) -> StaticPath:
 
 
 def location_of(where: Where) -> LocationFact:
-    """``within(...)``/``exactly(...)``/a literal path as a location; ``"."`` is the root, and a
-    leading "/" anchors the location at the filesystem root instead (the two anchors never
-    relate -- see ``location_le``). A LocationFact passes through: the data-policy loader
-    (``policyfile``) hands those in."""
+    """A location: a ``LocationFact`` passes through (the loader hands those in); a string is the
+    policy's own spelling (``repos/**``, ``repos/*/x``, ``<re>``, ``{a,b}``, a leading "/" for
+    the filesystem root), parsed exactly as ``policyfile`` parses it -- there is one location
+    language, and a plain string never means a directory literally named ``**``. The marker
+    forms remain for the annotation side."""
     match where:
         case StaticPath() | DirSplat():
             return where
         case str():
-            if where in (".", ""):
-                return StaticPath(())
-            if where.startswith("/"):
-                return _absolute_prefix(where)
-            return StaticPath(_components_of(where))
+            return parse_location(where)
         case markers.Exactly(components=components):
             if not components:
                 raise ValueError("exactly() needs at least one component")
@@ -357,6 +357,9 @@ class Program:
     # provenance for reports: the ruleset (and bindings) this rule came from, None for a rule
     # the root policy wrote itself
     origin: str | None = None
+    # the source atom this rule's results yield (PROVENANCE.md): a value extracted from the
+    # exec's output is something this program produced, unmodified
+    source: str | None = None
 
     @property
     def leading_words(self) -> tuple[str, ...]:
@@ -372,13 +375,15 @@ def program(
     *,
     cwd: Where | Iterable[Where],
     subcommand: str | Iterable[str] = (),
-    unknown_arguments: bool = True,
+    # None: not given, meaning False -- as in the data format, looseness is opted into explicitly
+    unknown_arguments: bool | None = None,
     argument_locations: Iterable[Where] = (),
     requires: Iterable[str] = (),
     argument_atoms: Iterable[str] = (),
     argv: Iterable[Piece] | None = None,
     holes: Mapping[str, Hole] | None = None,
     origin: str | None = None,
+    source: str | None = None,
 ) -> Program:
     words = tuple(subcommand.split()) if isinstance(subcommand, str) else tuple(subcommand)
     if not all(isinstance(w, str) and w for w in words):
@@ -387,7 +392,12 @@ def program(
     if argv is not None or holes is not None:
         if argv is None or holes is None:
             raise ValueError(f"program {name!r}: argv and holes go together")
-        if words or not unknown_arguments or tuple(argument_locations) or tuple(argument_atoms):
+        if (
+            words
+            or unknown_arguments is not None
+            or tuple(argument_locations)
+            or tuple(argument_atoms)
+        ):
             raise ValueError(
                 f"program {name!r}: a templated rule carries no subcommand or argument keys; "
                 "constrain the holes instead"
@@ -398,13 +408,14 @@ def program(
     return Program(
         name,
         _one_or_many(cwd),
-        unknown_arguments,
+        bool(unknown_arguments),
         _locations(argument_locations),
         frozenset(requires),
         words,
         frozenset(argument_atoms),
         template,
         origin,
+        source,
     )
 
 
@@ -509,6 +520,11 @@ class NetworkRule:
     read_timeout: float | None = None
     total_timeout: float | None = None
     max_response_bytes: int | None = None
+    # the source atom responses from this rule yield (PROVENANCE.md)
+    source: str | None = None
+    # the URL paths this rule admits, server-absolute (a leading "/"), any-of; empty: any path.
+    # Checked statically on the proven URL path, and by the broker on every hop, percent-decoded
+    paths: tuple[LocationFact, ...] = ()
 
 
 def network(
@@ -522,6 +538,8 @@ def network(
     read_timeout: float | None = None,
     total_timeout: float | None = None,
     max_response_bytes: int | None = None,
+    source: str | None = None,
+    path: Where | Iterable[Where] = (),
 ) -> NetworkRule:
     normalized = host.lower().rstrip(".")
     if not normalized:
@@ -529,6 +547,13 @@ def network(
     schemes_f = frozenset(s.lower() for s in schemes)
     if not schemes_f or not schemes_f <= {"http", "https"}:
         raise ValueError(f"network rule {host!r}: schemes must be among http, https")
+    path_locs = _one_or_many(path) if path else ()
+    for loc in path_locs:
+        if not loc.absolute:
+            raise ValueError(
+                f"network rule {host!r}: a URL path is server-absolute, spell it with a leading '/': "
+                f"{pretty_location(loc)!r}"
+            )
     return NetworkRule(
         normalized,
         schemes_f,
@@ -539,14 +564,34 @@ def network(
         None if read_timeout is None else float(read_timeout),
         None if total_timeout is None else float(total_timeout),
         None if max_response_bytes is None else int(max_response_bytes),
+        source,
+        path_locs,
     )
 
 
-def _host_matches(pattern: str, host: str) -> bool:
-    if pattern.startswith("*."):
-        suffix = pattern[1:]              # ".example.com"
-        return host.endswith(suffix) and len(host) > len(suffix)
-    return host == pattern
+def path_permitted(rule: NetworkRule, url_path: LocationFact | None) -> bool:
+    """Does *rule* admit a URL whose path is *url_path* (None: not proven / not placeable)? A rule
+    with no ``paths`` admits any path; one with paths needs a proven path within one of them.
+    The one definition: ``Policy.evaluate`` asks it of the lifted URL, the broker of every hop."""
+    if not rule.paths:
+        return True
+    return url_path is not None and any(location_le(url_path, p) for p in rule.paths)
+
+
+@dataclass(frozen=True)
+class Source:
+    """A read location whose contents are a source (PROVENANCE.md): ``read_text()``, ``open()``
+    and friends on a proven path within one of *locations* yield a handle carrying *name*.
+    Grants nothing -- the read must still be permitted by the filesystem grants."""
+
+    name: str
+    locations: tuple[LocationFact, ...]
+
+
+def source(name: str, location: Where | Iterable[Where]) -> Source:
+    if not name:
+        raise ValueError("source: the atom name must be non-empty")
+    return Source(name, _one_or_many(location))
 
 
 def default_port(scheme: str) -> int:
@@ -557,7 +602,7 @@ def matches_endpoint(rule: NetworkRule, scheme: str, host: str, port: int, metho
     """Does *rule* permit *method* against ``scheme://host:port``? The one definition of the
     rule semantics: the broker asks it per redirect hop at runtime, ``Policy.evaluate`` per
     statically-proven endpoint."""
-    if not _host_matches(rule.host, host):
+    if not host_matches(rule.host, host):
         return False
     if scheme not in rule.schemes:
         return False
@@ -658,6 +703,7 @@ class Policy:
     validations: tuple[Validation, ...] = ()
     atoms: tuple[AtomDef, ...] = ()
     network: tuple[NetworkRule, ...] = ()
+    sources: tuple[Source, ...] = ()
 
     @classmethod
     def allow(
@@ -670,6 +716,7 @@ class Policy:
         validations: Iterable[Validation] = (),
         atoms: Iterable[AtomDef] = (),
         network: Iterable[NetworkRule] = (),
+        sources: Iterable[Source] = (),
     ) -> "Policy":
         vals = tuple(validations)
         names = [v.name for v in vals]
@@ -680,6 +727,26 @@ class Policy:
         if len(defined_names) != len(atoms_t):
             raise ValueError("defined atom names must be unique")
         progs = tuple(programs)
+        srcs = tuple(sources)
+        net_in = tuple(network)
+        # source atoms (PROVENANCE.md) are established by extraction alone: not by a checker,
+        # and never with a regex definition (a literal must not satisfy them)
+        source_atoms = frozenset(
+            [p.source for p in progs if p.source is not None]
+            + [r.source for r in net_in if r.source is not None]
+            + [s.name for s in srcs]
+        )
+        if source_atoms & defined_names:
+            raise ValueError(
+                f"source atoms cannot be defined atoms: {sorted(source_atoms & defined_names)}"
+            )
+        for v in vals:
+            established = frozenset(a for atoms_ in v.establishes.values() for a in atoms_)
+            if established & source_atoms:
+                raise ValueError(
+                    f"validation {v.name!r} establishes source atom(s) "
+                    f"{sorted(established & source_atoms)}; only extraction establishes those"
+                )
         by_name: dict[str, list[Program]] = {}
         for p in progs:
             by_name.setdefault(p.name, []).append(p)
@@ -720,7 +787,7 @@ class Policy:
             if _literal_slot(v, a) is not None
         }
         net_rules = []
-        for r in network:
+        for r in net_in:
             resolved = set()
             for ra in r.requires:
                 if ra.on_redirect is None:
@@ -739,11 +806,20 @@ class Policy:
             net_rules.append(replace(r, requires=frozenset(resolved)))
         return cls(
             _locations(read), _locations(write), _locations(listing), progs, vals, atoms_t,
-            tuple(net_rules),
+            tuple(net_rules), srcs,
+        )
+
+    @property
+    def source_atoms(self) -> frozenset[str]:
+        """The atoms extraction establishes (PROVENANCE.md): pure, never re-checkable from text."""
+        return frozenset(
+            [p.source for p in self.programs if p.source is not None]
+            + [r.source for r in self.network if r.source is not None]
+            + [s.name for s in self.sources]
         )
 
     def vocabulary(self) -> Vocabulary:
-        """The analysis-side half of the validations and defined atoms, for ``analyze``."""
+        """The analysis-side half of the validations, defined atoms and sources, for ``analyze``."""
         return Vocabulary(
             signatures={
                 v.name: CheckSignature(
@@ -753,8 +829,20 @@ class Policy:
                 for v in self.validations
             },
             pure_atoms=frozenset(a for v in self.validations for a in v.pure_atoms)
-            | frozenset(a.name for a in self.atoms),
+            | frozenset(a.name for a in self.atoms)
+            | self.source_atoms,
             defined={a.name: a.regex for a in self.atoms},
+            sources=SourceTable(
+                exec=tuple(
+                    (p.name, p.leading_words[1:], p.source)
+                    for p in self.programs
+                    if p.source is not None
+                ),
+                network=tuple(
+                    (r.host, r.paths, r.source) for r in self.network if r.source is not None
+                ),
+                read=tuple((loc, s.name) for s in self.sources for loc in s.locations),
+            ),
         )
 
     @property
@@ -803,9 +891,9 @@ class Policy:
         )
         if isinstance(bound, BindError):
             return Refusal("; ".join(bound.reasons))
-        # only textual atoms can be re-established from a string; the environmental ones were
-        # the static check's to demand
-        textual = self.vocabulary().pure_atoms
+        # only textual atoms can be re-established from a string; the environmental ones, and
+        # the source atoms (provenance is not a property of text), were the static check's
+        textual = self.vocabulary().pure_atoms - self.source_atoms
         failures = hole_failures(
             bound, lambda value, atoms: self._missing_atoms(value, atoms & textual, discharge)
         )
@@ -915,6 +1003,23 @@ class Policy:
                                 "network rule",
                             )
                         ]
+                    within_path = [rule for rule in candidates if path_permitted(rule, lifted.path)]
+                    if not within_path:
+                        restricted = ", ".join(
+                            pretty_locations(rule.paths) for rule in candidates if rule.paths
+                        )
+                        if lifted.path is None:
+                            reason = (
+                                "the URL's path is not proven (a literal URL, or urlsplit(u).path "
+                                f"guards), and the rules for {host} permit only {restricted}"
+                            )
+                        else:
+                            reason = (
+                                f"the URL's path {pretty_location(lifted.path)} is outside the "
+                                f"permitted {restricted}"
+                            )
+                        return [Denial(site, reason)]
+                    candidates = within_path
                     # whatever their redirect treatment, every required atom is demanded of
                     # the original URL here
                     missing = min(

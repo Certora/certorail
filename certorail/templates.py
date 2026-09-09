@@ -12,8 +12,10 @@ Shared by the analysis (values are facts) and the broker (values are the concret
 the runtime re-check is the same check: ``bind`` and the constraint, flag and dash-guard
 functions below take either.
 """
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 from .analysis import (
     Alternation,
@@ -321,6 +323,88 @@ def constraint_failure(c: Constraint, value: Value, atoms_missing: AtomsMissing)
     return None
 
 
+# The regex parser behind ``re.compile`` (``sre_parse`` of old). Private, so reached by name and
+# typed Any; it is the one parser whose reading of a pattern is the reading that will be enforced.
+_RE_PARSER: Any = getattr(re, "_parser")
+_RE_CONSTANTS: Any = getattr(re, "_constants")
+_DASH = ord("-")
+
+
+def _charset_has_dash(items: Any) -> bool:
+    """Does a bracket class (the ``IN`` operand) admit ``-``? Literals, ranges and the ``\\d``,
+    ``\\w``, ``\\s`` categories (their negations admit it), under an optional ``NEGATE``."""
+    negate = False
+    hit = False
+    for op, av in items:
+        if op is _RE_CONSTANTS.NEGATE:
+            negate = True
+        elif op is _RE_CONSTANTS.LITERAL:
+            hit = hit or av == _DASH
+        elif op is _RE_CONSTANTS.RANGE:
+            lo, hi = av
+            hit = hit or lo <= _DASH <= hi
+        elif op is _RE_CONSTANTS.CATEGORY:
+            hit = hit or "NOT" in str(av)  # \D \W \S match "-"; \d \w \s do not
+        else:
+            return True  # anything unforeseen: may
+    return hit != negate
+
+
+def _first(sub: Any) -> tuple[bool, bool]:
+    """Of a parsed (sub)pattern: (may its first matched character be ``-``, can it match the
+    empty string). A sequence's first character comes from its first non-nullable item and
+    everything nullable before it."""
+    may = False
+    for op, av in sub:
+        item_may, item_nullable = _first_item(op, av)
+        may = may or item_may
+        if not item_nullable:
+            return may, False
+    return may, True
+
+
+def _first_item(op: Any, av: Any) -> tuple[bool, bool]:
+    c = _RE_CONSTANTS
+    if op is c.LITERAL:
+        return av == _DASH, False
+    if op is c.NOT_LITERAL:
+        return av != _DASH, False
+    if op is c.ANY:
+        return True, False
+    if op is c.IN:
+        return _charset_has_dash(av), False
+    if op is c.AT or op is c.ASSERT or op is c.ASSERT_NOT:
+        return False, True  # zero-width; ignoring a lookaround only widens "may": sound
+    if op is c.SUBPATTERN:
+        return _first(av[3])
+    if op is c.ATOMIC_GROUP:
+        return _first(av)
+    if op is c.BRANCH:
+        results = [_first(b) for b in av[1]]
+        return any(m for m, _ in results), any(n for _, n in results)
+    if op in (c.MAX_REPEAT, c.MIN_REPEAT, c.POSSESSIVE_REPEAT):
+        lo, _, body = av
+        body_may, body_nullable = _first(body)
+        return body_may, lo == 0 or body_nullable
+    if op is c.GROUPREF_EXISTS:
+        _, yes, no = av
+        yes_may, yes_nullable = _first(yes)
+        no_may, no_nullable = _first(no) if no is not None else (False, True)
+        return yes_may or no_may, yes_nullable or no_nullable
+    return True, True  # GROUPREF and anything unforeseen: may, and may be empty
+
+
+def _literal_regex_may_start_with_dash(reg: str) -> bool:
+    """Could a string this regex fullmatches begin with ``-``? Decided on the parse tree the
+    ``re`` module itself builds; an unparsable pattern is "may"."""
+    try:
+        parsed = _RE_PARSER.parse(reg)
+    except re.error:
+        return True
+    may, _ = _first(parsed)
+    return may
+
+
 def _regex_may_start_with_dash(r: PseudoRegex) -> bool:
     match r:
         case Exact(exact_str=s):
@@ -334,7 +418,9 @@ def _regex_may_start_with_dash(r: PseudoRegex) -> bool:
             return _regex_may_start_with_dash(head)
         case Both(all_of=parts):
             return all(_regex_may_start_with_dash(p) for p in parts)
-        case RegexLit() | AnyStr():
+        case RegexLit(reg=reg):
+            return _literal_regex_may_start_with_dash(reg)
+        case AnyStr():
             return True
 
 

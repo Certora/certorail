@@ -77,6 +77,7 @@ interrogating further:
 | program takes opaque arguments (`gh api -f q=...`) | `unknown-arguments = true` on that flat rule only, or `any = true` on that one hole |
 | program takes runtime-checked values (a checked branch name) | a hole with `atoms = [...]`; on a flat rule `argument-atoms` **and** `unknown-arguments = true`, since vouched-for means literal text or a proven path |
 | a destructive action the agent must have chosen itself (drop a database, delete a branch) | a hole with `literal = true` plus the shape (`matches`/`one-of`/`location`): the value must appear in the program text, never come from a file, argv or an API |
+| an action only on what a trusted query returned (terminate the runners the inventory listed, push to branches the API listed, email the on-call roster) | mark the query's rule `source = "atom"` (or a `[[source]]` location) and put `atoms = ["atom"]` on the hole: only a value extracted unmodified from that result satisfies it. Identifiers all look alike; which query said so is the whole property |
 | talk to an API | one `[[network]]` per host: `methods`, default `https`, default port; `allow-nonpublic` only for loopback/private targets |
 | gate an action on a property | atoms + validations (step 3), consumed by `requires` / `argument-atoms` / `[[network]].requires` |
 
@@ -218,8 +219,8 @@ A trivial text predicate can be a `test` one-liner with no script at all:
 
 ## Pitfalls
 
-- `unknown-arguments` defaults to **false** in TOML (true in the Python API): a computed
-  argument — an f-string, `.strip()`, a checked value — is denied unless the rule opts in.
+- `unknown-arguments` defaults to **false**: a computed argument — an f-string, `.strip()`, a
+  checked value — is denied unless the rule opts in.
 - Atoms are declared once in `[atoms]`; a name used in `establishes`, `requires`,
   `argument-atoms` or `[[network]].requires` without a declaration is an error.
 - A cwd-free validation cannot establish atoms on `cwd`; a validation with `cwd` requires the

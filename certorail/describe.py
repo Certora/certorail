@@ -26,7 +26,10 @@ NOTATION = (
     "<any> anything, unknown values included; <... validated X> also carries the validation "
     "fact X. Claims combine: </dev-\\w+/ literal> is a named database of that shape. NAME... "
     "takes a list. A flags list is flag names in order, each valued flag followed by its value; "
-    "only the flags listed exist."
+    "only the flags listed exist. Locations are spelled repos/** (at or below), repos/*/x (one "
+    "arbitrary component), <re> (a component matching re), {a,b} (one of), a leading / for the "
+    "filesystem root; a program proves a dynamic path is at a location with "
+    'assert certora.pathmatch(p, "<that spelling>") -- for a URL, on urllib.parse.urlsplit(u).path.'
 )
 
 
@@ -73,6 +76,8 @@ def _program(p: Program) -> list[str]:
         out.append(f"    cwd within {pretty_locations(p.cwd)}")
         if p.requires:
             out.append(f"    cwd validated by {', '.join(sorted(p.requires))} (check right before)")
+        if p.source:
+            out.append(f"    yields {p.source}: extract values from the result with certora.extract / extract_all / lines")
         parts = ["any" if p.unknown_arguments else "literal"]
         if p.argument_locations:
             parts.append(
@@ -86,6 +91,8 @@ def _program(p: Program) -> list[str]:
     out.append(f"    cwd within {pretty_locations(p.cwd)}")
     if p.requires:
         out.append(f"    cwd validated by {', '.join(sorted(p.requires))} (check right before)")
+    if p.source:
+        out.append(f"    yields {p.source}: extract values from the result with certora.extract / extract_all / lines")
     keyword_only = t.keyword_only
     if keyword_only:
         out.append(f"    bind by keyword: {', '.join(keyword_only)}")
@@ -147,7 +154,20 @@ def _atoms(policy: Policy) -> list[str]:
             f"- {name}: a property of the environment, established by a check; dies at any "
             "effectful call, so check immediately before the use"
         )
+    for name in sorted(policy.source_atoms):
+        out.append(
+            f"- {name}: provenance -- a value extracted, unmodified, from the source that yields "
+            "it (certora.extract / extract_all / lines / field, or `for line in f`); any string "
+            "operation drops it; no literal has it"
+        )
     return out
+
+
+def _sources(policy: Policy) -> list[str]:
+    return [
+        f"- reading under {pretty_locations(s.locations)} (read_text, open, f.read, for line in f) yields {s.name}"
+        for s in policy.sources
+    ]
 
 
 def _network(r: NetworkRule) -> str:
@@ -155,8 +175,12 @@ def _network(r: NetworkRule) -> str:
     schemes = "/".join(sorted(r.schemes))
     ports = (":" + ",".join(str(p) for p in sorted(r.ports))) if r.ports else ""
     line = f"- {methods} {schemes}://{r.host}{ports}"
+    if r.paths:
+        line += f"; path within {pretty_locations(r.paths)}"
     if r.requires:
         line += "; the URL must be validated by " + ", ".join(sorted(ra.name for ra in r.requires))
+    if r.source:
+        line += f"; yields {r.source}"
     return line
 
 
@@ -195,4 +219,5 @@ def describe(policy: Policy, origin: str, governs: str | None = None) -> str:
         + _section("Validations", validations)
         + _section("Atoms", _atoms(policy))
         + _section("Network: certora.network.<method>(url)", (_network(r) for r in policy.network))
+        + (_section("Sources: file reads that yield provenance", _sources(policy)) if policy.sources else [])
     ).rstrip() + "\n"

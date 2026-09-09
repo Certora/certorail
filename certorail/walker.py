@@ -22,18 +22,23 @@ import argparse
 import ast
 import pathlib
 import sys
+import urllib.parse
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from . import jqpath
 from .analysis import (
     ANY_STR,
+    Alternation,
     Container,
+    Data,
     Exact,
     InvalidConstantForm,
     InvalidProgram,
     Located,
+    LocationFact,
     NameAccess,
     PathFact,
     PseudoRegex,
@@ -45,6 +50,7 @@ from .analysis import (
     as_const_or_default,
     as_const_or_null,
     bind_call_args,
+    checks_of,
     drop_checks,
     entails,
     interpret_expr,
@@ -52,6 +58,7 @@ from .analysis import (
     iteration_bindings,
     known_text,
     locate,
+    location_le,
     operand_value,
     pretty_location,
     pretty_regex,
@@ -64,6 +71,11 @@ from .dangerous import (
     CHECK_SINGLE_CALLEE,
     EXEC_CALLEE,
     EXEC_REQUIRED_KEYWORDS,
+    EXTRACT_ALL_CALLEE,
+    EXTRACT_CALLEE,
+    FIELD_CALLEE,
+    LINES_CALLEE,
+    PATHMATCH_CALLEE,
     NETWORK_BODY_METHODS,
     NETWORK_METHODS,
     NETWORK_NAMESPACE,
@@ -74,6 +86,7 @@ from .dangerous import (
 )
 from .annotations import Contract, bind_arguments, default_of, is_plain_type, parse_annotation
 from .guards import apply, recognize
+from .locations import parse_location
 from .markers import NAMESPACE
 from .safepy import (
     ClassAnalysis,
@@ -82,10 +95,10 @@ from .safepy import (
     InheritanceAnalysis,
     ValidationAnalysis,
 )
-from .templates import Binding, Elements, Many
+from .templates import Binding, Elements, Many, matches_leading
 from .terms import Call, Method, lower
 
-type State = dict[str, ValidationFact | Container]
+type State = dict[str, ValidationFact | Container | Data]
 
 # the container roster (CONTAINERS.md): the method surface that keeps a tracked list/set
 # tracked. Writes carry an entailment obligation; "sequence" -- the borrowed view a
@@ -284,6 +297,32 @@ class CheckSignature:
     needs_cwd: bool = True  # False: the check does not care where it runs; cwd= may be omitted
 
 
+def host_matches(pattern: str, host: str) -> bool:
+    """A network rule's host: an exact name, or ``*.suffix`` (subdomains, not the suffix)."""
+    if pattern.startswith("*."):
+        suffix = pattern[1:]  # ".example.com"
+        return host.endswith(suffix) and len(host) > len(suffix)
+    return host == pattern
+
+
+@dataclass(frozen=True)
+class SourceTable:
+    """Which rules yield which *source atom* (PROVENANCE.md), as the walker needs them to bind a
+    handle: an exec by program and leading words, a network request by host pattern, a file
+    read by location."""
+
+    exec: tuple[tuple[str, tuple[str, ...], str], ...] = ()
+    # (host pattern, permitted URL paths -- empty: any, atom)
+    network: tuple[tuple[str, tuple[LocationFact, ...], str], ...] = ()
+    read: tuple[tuple[LocationFact, str], ...] = ()
+
+    @property
+    def atoms(self) -> frozenset[str]:
+        return frozenset(
+            [a for _, _, a in self.exec] + [a for _, _, a in self.network] + [a for _, a in self.read]
+        )
+
+
 @dataclass(frozen=True)
 class Vocabulary:
     """The policy's validations as the analysis sees them: the check signatures, plus which atoms
@@ -297,6 +336,8 @@ class Vocabulary:
     # one directly (``saturate``) on any value whose known text entails it -- a literal needs no
     # runtime check -- and it is pure by construction (a subset of ``pure_atoms``).
     defined: dict[str, PseudoRegex] = field(default_factory=dict)
+    # source atoms and the rules that yield them (also a subset of ``pure_atoms``)
+    sources: SourceTable = field(default_factory=SourceTable)
 
 
 @dataclass
@@ -390,6 +431,7 @@ def _without_env_checks(st: State, pure: frozenset[str]) -> State:
         k: (
             replace(v, elem=drop_checks(v.elem, keep=pure))
             if isinstance(v, Container)
+            else v if isinstance(v, Data)  # a handle carries only source atoms: pure
             else drop_checks(v, keep=pure)
         )
         for k, v in st.items()
@@ -513,8 +555,8 @@ class ValidationWalker(ast.NodeVisitor):
         out = dict(st)
         for g in recognize(lower(cond, self.modules), out):
             current = out.get(g.subject)
-            if isinstance(current, Container):
-                continue  # guards speak about scalars; the container domain has its own rules
+            if isinstance(current, (Container, Data)):
+                continue  # guards speak about scalars; containers and handles have their own rules
             refined = apply(current, g.refinement)
             if refined is not None:
                 out[g.subject] = refined
@@ -564,7 +606,13 @@ class ValidationWalker(ast.NodeVisitor):
     def _assign(self, target: ast.expr, value: ast.expr) -> None:
         self.visit(value)  # for sinks inside the value, e.g. ``x = open(...)``
         if isinstance(target, ast.Name):
-            fact = interpret_expr(value, self.state)
+            # a source handle or an extraction first (PROVENANCE.md): those right-hand sides
+            # have no scalar reading worth keeping, and must not be shadowed by one
+            fact: ValidationFact | Container | Data | None = self._handle(value)
+            if fact is None:
+                fact = self._extract_fact(value)
+            if fact is None:
+                fact = interpret_expr(value, self.state)
             if fact is None:
                 fact = self._guaranteed(value)
             if fact is None:
@@ -675,14 +723,43 @@ class ValidationWalker(ast.NodeVisitor):
                 declared.kind == "set" and not gen.is_async
             ):
                 return self._comprehension_conforms(value, elt, gen, declared)
+            # the extractors (PROVENANCE.md): every element is something the source produced
+            case ast.Call(func=func, args=[source_expr, _], keywords=[]) if (
+                declared.kind == "list"
+                and (callee := resolve_callee(func)) is not None
+                and callee.matches(*EXTRACT_ALL_CALLEE)
+            ):
+                return self._extracted_conforms(value, self._handle_sources(source_expr), declared)
+            case ast.Call(func=func, args=[source_expr], keywords=[]) if (
+                declared.kind == "list"
+                and (callee := resolve_callee(func)) is not None
+                and callee.matches(*LINES_CALLEE)
+            ):
+                return self._extracted_conforms(value, self._handle_sources(source_expr), declared)
+            case ast.Call(
+                func=ast.Attribute(value=ast.Name(id=handle_name), attr="readlines"), args=[], keywords=[]
+            ) if declared.kind == "list" and isinstance((handle := self.state.get(handle_name)), Data):
+                return self._extracted_conforms(value, handle.sources, declared)  # certora.lines, stdlib-spelled
             case _:
                 self._violation(
                     value,
                     f"container: not a recognized {declared.kind} constructor "
-                    f"(a display, a comprehension, {declared.kind}(), or "
-                    f"{declared.kind}(tracked))",
+                    f"(a display, a comprehension, {declared.kind}(), {declared.kind}(tracked), "
+                    "or an extractor)",
                 )
                 return False
+
+    def _extracted_conforms(
+        self, node: ast.expr, sources: frozenset[str] | None, declared: Container
+    ) -> bool:
+        if sources is None:
+            return False  # the extractor's audit reported the non-source
+        if not self._establishes(StrFact(checks=sources), declared.elem):
+            self._violation(
+                node, f"the extracted elements do not establish {_describe_value(declared.elem)}"
+            )
+            return False
+        return True
 
     def _comprehension_conforms(
         self, comp: ast.expr, elt: ast.expr, gen: ast.comprehension, declared: Container
@@ -821,7 +898,7 @@ class ValidationWalker(ast.NodeVisitor):
             len(full) == 2
             and full[1] != "open"  # Path.open("w") writes; the mode is the audit's business
             and PATH_SINK_METHODS.get(full[1]) in ("read", "list")
-            and not isinstance(receiver, Container)
+            and not isinstance(receiver, (Container, Data))
             and is_path_typed(receiver)
         ):
             return True  # p.read_text() / p.exists() / p.iterdir() on a proven path
@@ -1053,7 +1130,7 @@ class ValidationWalker(ast.NodeVisitor):
             expr = cwd_expr if target == "cwd" else keywords.get(target)
             if isinstance(expr, ast.Name):
                 fact = self.state.get(expr.id)
-                if fact is not None and not isinstance(fact, Container):
+                if fact is not None and not isinstance(fact, (Container, Data)):
                     self.state[expr.id] = replace(fact, checks=fact.checks | atoms)
 
     def _audit_check_single(self, node: ast.Call) -> None:
@@ -1133,6 +1210,191 @@ class ValidationWalker(ast.NodeVisitor):
         elif base is None:
             base = StrFact()
         return replace(base, checks=base.checks | atoms)
+
+    # -- sources and extractors (PROVENANCE.md) -----------------------------------------------
+
+    def _exec_source(self, program: str, arguments: Sequence[str | ValidationFact | None]) -> frozenset[str]:
+        for name, words, atom in self.vocabulary.sources.exec:
+            if name == program and matches_leading(words, arguments):
+                return frozenset({atom})
+        return frozenset()
+
+    def _network_source(self, url: ValidationFact | None) -> frozenset[str]:
+        """The source atoms of the rule(s) a proven URL's host falls under: every host the netloc
+        may denote must match, or the response vouches for nothing."""
+        lifted = url_of(url)
+        if lifted is None or lifted.netloc is None:
+            return frozenset()
+        match lifted.netloc:
+            case Exact(exact_str=text):
+                texts = [text]
+            case Alternation(any_of=branches) if all(isinstance(b, Exact) for b in branches):
+                texts = [b.exact_str for b in branches if isinstance(b, Exact)]
+            case _:
+                return frozenset()
+        hosts: list[str] = []
+        for text in texts:
+            host = urllib.parse.urlsplit(f"//{text}").hostname
+            if host is None:
+                return frozenset()
+            hosts.append(host.lower().rstrip("."))
+        path = lifted.path
+        return frozenset(
+            atom
+            for pattern, paths, atom in self.vocabulary.sources.network
+            if all(host_matches(pattern, h) for h in hosts)
+            and (not paths or (path is not None and any(location_le(path, p) for p in paths)))
+        )
+
+    def _read_source(self, path: ValidationFact | None) -> frozenset[str] | None:
+        """The source atoms of the ``[[source]]`` locations a proven path lies within; None when
+        the path is not proven at all (then there is no handle, and the read is unconfined
+        anyway)."""
+        located = locate(path)
+        if located is None:
+            return None
+        return frozenset(
+            atom
+            for loc, atom in self.vocabulary.sources.read
+            if location_le(located.location, loc)
+        )
+
+    def _handle(self, value: ast.expr) -> Data | None:
+        """The source handle a right-hand side binds, or None when it is not a source at all:
+        the result of ``certora.exec`` / ``certora.network.<m>``, ``p.read_text()`` /
+        ``read_bytes()`` on a proven path, or ``f.read()`` on a handle."""
+        match value:
+            case ast.Call(func=func, args=[prog, *rest]) if (
+                (callee := resolve_callee(func)) is not None and callee.matches(*EXEC_CALLEE)
+            ):
+                match interpret_expr(prog, self.state):
+                    case StrFact(regex=Exact(exact_str=program)):
+                        arguments = tuple(operand_value(a, self.state) for a in rest)
+                        return Data(self._exec_source(program, arguments))
+                    case _:
+                        return Data()
+            case ast.Call(func=func, args=[url, *_]) if (
+                (callee := resolve_callee(func)) is not None
+                and any(callee.matches(*NETWORK_NAMESPACE, m) for m in NETWORK_METHODS)
+            ):
+                return Data(self._network_source(interpret_expr(url, self.state)))
+            case ast.Call(func=ast.Attribute(value=recv, attr=("read_text" | "read_bytes")), args=[]):
+                sources = self._read_source(interpret_expr(recv, self.state))
+                return None if sources is None else Data(sources)
+            case ast.Call(func=ast.Attribute(value=ast.Name(id=name), attr="read"), args=[]) if (
+                isinstance((handle := self.state.get(name)), Data)
+            ):
+                return handle  # text = f.read(): the text is the handle's
+            case _:
+                return None
+
+    def _with_handle(self, context_expr: ast.expr) -> Data | None:
+        """``with open(p) as f`` / ``with p.open() as f`` for reading, on a proven path."""
+        match lower(context_expr, self.modules):
+            case Call(("open",), (path_term, *rest), kws):
+                mode_term = next((v for k, v in kws if k == "mode"), rest[0] if rest else None)
+                path_fact = interpret_expr(path_term.node, self.state)
+            case Method(recv, "open", args, kws):
+                mode_term = next((v for k, v in kws if k == "mode"), args[0] if args else None)
+                path_fact = interpret_expr(recv.node, self.state)
+            case _:
+                return None
+        if _open_kind("r" if mode_term is None else mode_term.as_str()) != "read":
+            return None
+        sources = self._read_source(path_fact)
+        return None if sources is None else Data(sources)
+
+    def _handle_sources(self, expr: ast.expr) -> frozenset[str] | None:
+        """The sources behind an extractor's first argument: a name bound to a handle, or a
+        source call inline. None: not a source."""
+        if isinstance(expr, ast.Name) and isinstance((bound := self.state.get(expr.id)), Data):
+            return bound.sources
+        handle = self._handle(expr)
+        return None if handle is None else handle.sources
+
+    def _extract_fact(self, value: ast.expr) -> ValidationFact | None:
+        """The result fact of ``certora.extract(h, path)`` (the source atoms, on text of unknown
+        shape) or of ``certora.field(line, i)`` (a projection: the line's source atoms survive,
+        nothing else does)."""
+        match value:
+            case ast.Call(func=func, args=[source_expr, _], keywords=[]) if (
+                (callee := resolve_callee(func)) is not None and callee.matches(*EXTRACT_CALLEE)
+            ):
+                sources = self._handle_sources(source_expr)
+                return None if sources is None else StrFact(checks=sources)
+            case ast.Call(func=func, args=[line, _, *rest], keywords=kws) if (
+                (callee := resolve_callee(func)) is not None
+                and callee.matches(*FIELD_CALLEE)
+                and len(rest) <= 1
+                and all(k.arg == "sep" for k in kws)
+            ):
+                fact = interpret_expr(line, self.state)
+                if fact is None:
+                    return StrFact()
+                return StrFact(checks=checks_of(fact) & self.vocabulary.sources.atoms)
+            case _:
+                return None
+
+    def _audit_extract(self, node: ast.Call, plural: bool) -> None:
+        """``certora.extract(source, path)`` / ``extract_all``: a source handle (or a source call
+        inline) and a literal path in the jq subset, of the function's plurality."""
+        what = "extract_all" if plural else "extract"
+        if node.keywords or any(isinstance(a, ast.Starred) for a in node.args) or len(node.args) != 2:
+            self._violation(node, f"{what}: exactly two positional arguments, the source and the path")
+            return
+        path = as_const_or_null(str, node.args[1])
+        if path is None:
+            self._violation(node.args[1], f"{what}: the path must be a string literal")
+        else:
+            try:
+                steps = jqpath.parse(path)
+            except ValueError as e:
+                self._violation(node.args[1], f"{what}: {e}")
+            else:
+                if jqpath.plural(steps) != plural:
+                    self._violation(
+                        node.args[1],
+                        "extract: a plural path ([]) needs extract_all"
+                        if not plural
+                        else "extract_all: the path needs one []",
+                    )
+        if self._handle_sources(node.args[0]) is None:
+            self._violation(
+                node.args[0],
+                f"{what}: the first argument must be a source -- the result of certora.exec or "
+                "certora.network, a file read, or one of those inline",
+            )
+
+    def _audit_lines(self, node: ast.Call) -> None:
+        if node.keywords or any(isinstance(a, ast.Starred) for a in node.args) or len(node.args) != 1:
+            self._violation(node, "lines: exactly one positional argument, the source")
+            return
+        if self._handle_sources(node.args[0]) is None:
+            self._violation(node.args[0], "lines: the argument must be a source")
+
+    def _audit_field(self, node: ast.Call) -> None:
+        if (
+            any(isinstance(a, ast.Starred) for a in node.args)
+            or not 2 <= len(node.args) <= 3
+            or any(k.arg != "sep" for k in node.keywords)
+        ):
+            self._violation(node, "field: field(line, index, sep=None)")
+
+    def _audit_pathmatch(self, node: ast.Call) -> None:
+        """``certora.pathmatch(text, "<location>")``: the guard's shape. What it establishes is
+        ``guards``' business; a spelling that does not parse establishes nothing, and is said so
+        here rather than discovered at the sink."""
+        if node.keywords or any(isinstance(a, ast.Starred) for a in node.args) or len(node.args) != 2:
+            self._violation(node, "pathmatch: exactly two positional arguments, the path and the location")
+            return
+        spelling = as_const_or_null(str, node.args[1])
+        if spelling is None:
+            self._violation(node.args[1], "pathmatch: the location must be a string literal")
+            return
+        try:
+            parse_location(spelling)
+        except ValueError as e:
+            self._violation(node.args[1], f"pathmatch: {e}")
 
     def _audit_exec(self, node: ast.Call) -> None:
         """``certora.exec(program, *args, cwd=..., HOLE=...)``: the shape is checked here
@@ -1214,6 +1476,21 @@ class ValidationWalker(ast.NodeVisitor):
             return
         if callee is not None and callee.matches(*CHECK_SINGLE_CALLEE):
             self._audit_check_single(node)
+            return
+        if callee is not None and callee.matches(*EXTRACT_CALLEE):
+            self._audit_extract(node, plural=False)
+            return
+        if callee is not None and callee.matches(*EXTRACT_ALL_CALLEE):
+            self._audit_extract(node, plural=True)
+            return
+        if callee is not None and callee.matches(*LINES_CALLEE):
+            self._audit_lines(node)
+            return
+        if callee is not None and callee.matches(*FIELD_CALLEE):
+            self._audit_field(node)
+            return
+        if callee is not None and callee.matches(*PATHMATCH_CALLEE):
+            self._audit_pathmatch(node)
             return
         if callee is not None:
             method = next(
@@ -1351,6 +1628,11 @@ class ValidationWalker(ast.NodeVisitor):
             for item in node.items:
                 if item.optional_vars is not None:
                     self.visit(item.optional_vars)  # kills the bound names
+                    if isinstance(item.optional_vars, ast.Name):
+                        # ``with open(p) as f`` on a proven path: f is a source handle
+                        handle = self._with_handle(item.context_expr)
+                        if handle is not None:
+                            self.state[item.optional_vars.id] = handle
             self._block(node.body)
 
         if straight_line:
