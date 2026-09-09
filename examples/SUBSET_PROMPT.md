@@ -224,6 +224,19 @@ slugs: list[typing.Annotated[str, certora.no_slash, certora.not_dot_dot]] = []
   There is no shell: do filtering (`head`, `tail`, `grep`, `wc`) in Python on the lines.
 - The policy may pin subcommands: if it declares `git log` and `git push origin`, any other `git`
   invocation — including one whose subcommand is not a literal — is rejected.
+- The policy may declare a command's *shape* (a template): literal words, then typed *holes*. A
+  template binds like a function call: spell the literal words positionally, then fill the holes
+  positionally in order — `certora.exec("git", "push", "origin", branch, cwd=repo)`,
+  `certora.exec("find", where, "-mindepth", "1", "-name", "*.py", cwd=here)` — or by keyword
+  (`BRANCH=branch`). Some holes are keyword-only (the description says which):
+  `certora.exec("tar", FLAGS=["-c", "-z"], ARCHIVE=out, FILES=[a, b], cwd=here)`. A list hole takes a
+  list display (or a typed container); a flags hole takes a list of flag names with their values
+  following, and only the flags the policy lists. Never spell the words the host inserts (`--`,
+  `-f`). Every hole is checked like a parameter annotation (a proven path within a location, text
+  matching a regex, a validation fact). A value that may begin with `-` where the tool could read
+  it as an option is rejected: use a path under a named directory, or a literal.
+- Run `certorail --describe` (or read the description in your context) for the exact shapes,
+  hole names, flags and validations this policy permits.
 - The policy may refuse arguments it cannot vouch for: anything other than a string literal, a module-level
   constant, or a proven path (an f-string or `.strip()` result is not vouched for). It may confine path
   arguments to locations. Spell arguments out as literals where you can; pass paths as located values.

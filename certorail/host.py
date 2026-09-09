@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 
 from .analysis import Named, StaticPath
 from .broker import build_server
+from .describe import describe
 from .policy import DEFAULT_POLICY, Denial, Policy
 from .policydir import AmbientPolicyError, find_policy
 from .policyfile import PolicyFileError, load_policy_file
@@ -252,6 +253,20 @@ def load_policy(path: pathlib.Path | None, root: pathlib.Path | None = None) -> 
     return policy
 
 
+def _policy_origin(path: pathlib.Path | None, root: pathlib.Path) -> tuple[str, str | None]:
+    """Where the policy for this run comes from, and the prefix it governs (ambient only)."""
+    if path is not None:
+        return str(path), None
+    try:
+        found = find_policy(root)
+    except AmbientPolicyError as e:
+        raise SystemExit(str(e))
+    if found is not None:
+        policy_file, prefix = found
+        return str(policy_file), str(prefix)
+    return "the built-in default policy", None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="certorail", description="Analyse a program, check it against a policy, and run it."
@@ -277,6 +292,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--check", action="store_true", help="analyse and evaluate only; do not run")
     parser.add_argument(
+        "--describe",
+        action="store_true",
+        help="print what the policy for --root permits, for the program author (no program)",
+    )
+    parser.add_argument(
         "--no-jail",
         action="store_true",
         help="run without the srt OS jail (the static analysis and the broker still apply)",
@@ -288,6 +308,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("args", nargs="*", help="arguments for the program (after --)")
     ns = parser.parse_args(argv)
 
+    if ns.describe:
+        if ns.program is not None or ns.command is not None or ns.args:
+            parser.error("--describe takes no program")
+        root = ns.root.resolve()
+        print(describe(load_policy(ns.policy, root), *_policy_origin(ns.policy, root)))
+        return 0
     if (ns.program is None) == (ns.command is None):
         parser.error("exactly one of PROGRAM or -c SOURCE is required")
     if ns.command is not None:

@@ -87,8 +87,8 @@ Every fact name used anywhere is declared here, once. A name maps to a table:
 |---|---|---|
 | `name` | string, required, unique | what programs name in `certora.check(name, …)` |
 | `params` | list of strings | the keyword parameters programs pass; unique; `cwd` is not allowed as a name |
-| `argv` | list of strings, required | the checker command; the first piece is a literal program (absolute path or on `PATH`); a piece that is exactly `${param}` is replaced by that argument; `${…}` inside a larger piece is an error |
-| `cwd` | location | where the check may run; programs must pass a proven `cwd=` within it. **Omit** for a check that does not care where it runs: programs then omit `cwd=` and the check cannot establish on `cwd` |
+| `argv` | list of strings, required | the checker command; the first piece is a literal program: `${checkers}/<name>` (the executable `<name>` in the config directory's `checkers/`, resolved at load, which must exist), an absolute path, or a name on `PATH`; a piece that is exactly `${param}` is replaced by that argument; `${…}` inside a larger piece is an error |
+| `cwd` | location or list | where the check may run (any of them); programs must pass a proven `cwd=` within one. **Omit** for a check that does not care where it runs: programs then omit `cwd=` and the check cannot establish on `cwd` |
 | `effect-free` | bool, default false | the checker mutates nothing: its run kills no environmental atoms |
 | `establishes` | table: param name or `cwd` → list of atom names | what success establishes on which argument |
 
@@ -99,18 +99,96 @@ program (cached per atom and text; for the `cwd` slot the directory `root/<text>
 
 ## `[[program]]`
 
+Two forms. The **flat** form governs a program (or one subcommand of it) by rules over its
+arguments as a whole; the **templated** form (`argv` + `holes`) states the shape of the command
+line. A program's rules, of either form, must be prefix-free in their leading literal words, so
+an exec selects exactly one and an unlisted form fails closed. `cwd` is a location *slot* on
+both: one location or a list meaning any-of.
+
 | Key | Type | Meaning |
 |---|---|---|
 | `name` | string, required | the executable, as programs spell it in `certora.exec(name, …)` |
-| `cwd` | location, required | the exec's `cwd=` must be proven within it |
-| `subcommand` | string | leading literal words this rule governs (`"push origin"`). Once any rule for a program names a subcommand, that program **fails closed**: an exec matching no declared subcommand (unlisted, or not literal) is denied. Subcommands of one program must be prefix-free and cannot mix with a bare rule |
+| `cwd` | location or list, required | the exec's `cwd=` must be proven within one of them |
 | `requires` | list of atoms | the cwd must carry these, live, at the exec |
-| `argument-atoms` | list of atoms | every argument after the subcommand must carry these (a live check, or — for a textual atom — its known text) |
-| `argument-locations` | list of locations | every argument that is a proven path must lie within one |
-| `unknown-arguments` | bool, default **false** | may arguments include values the analysis cannot vouch for? Vouched-for means exactly-known text or a proven path; an f-string, a `.strip()` result or a runtime-checked value is *not*, even when it carries atoms |
+| `argv` | list of words | templated form: literal words, `${X}` (one token), `${X...}` (a splice); the first is the program |
+| `holes` | table | templated form: one table per hole named in `argv` (below) |
 
-The Python API's `program()` defaults `unknown_arguments` to `True`; the data format deliberately
-does not.
+Flat-form keys (not allowed together with `argv`):
+
+| Key | Type | Meaning |
+|---|---|---|
+| `subcommand` | string | leading literal words this rule governs (`"push origin"`) |
+| `argument-atoms` | list of atoms | every argument after the subcommand must carry these |
+| `argument-locations` | list of locations | every argument that is a proven path must lie within one |
+| `unknown-arguments` | bool, default **false** | may arguments include values the analysis cannot vouch for? |
+
+**Holes** (`holes.X = { ... }`, or `holes.X.key = ...` dotted). `kind` is `token` (default,
+`${X}`), `each` (`${X...}`, every element checked; optional `min`) or `flags` (`${X...}`, a flag
+vocabulary: `flagset = "name"` referencing a `[[flagset]]`, or inline `bare = [...]` plus
+`"-x" = { constraint }` keys). A token hole, an each hole and a valued flag carry a
+**constraint**: `location` (one or a list: a proven path within one of them), `matches`
+(a regex the text is known to fullmatch), `one-of` (a list of strings), `atoms` (validation
+facts the value must carry), `literal = true` (statically known text: the program *named* the
+value, it did not read it from a file, argv or an API), `any = true` (anything). Shape
+(`location`/`matches`/`one-of`), provenance (`literal`) and facts (`atoms`) combine freely
+except that `location` excludes `matches`/`one-of` and `any` stands alone; an empty constraint
+is an error. `{ matches = 'dev-\w+', literal = true }` is the intent gate for a destructive
+command: only a database the program itself named, of the dev shape.
+
+**`[[flagset]]`**: `name`, `bare = [...]` (flags taking no value), and `"-x" = { constraint }`
+for each valued flag. `{}` is not a bare flag.
+
+**Binding.** A template binds like a Python call: the leading literal words select it,
+positionals fill holes in order, a trailing splice takes the rest, a splice that is not last and
+every hole after it are keyword-only. Interior literal words (`--`, `-f`) are emitted by the host,
+never spelled. A token or each value must be shown not to begin with `-` unless a literal `--`
+precedes its hole. The broker re-binds the concrete call and composes the argv itself.
+
+```toml
+[[flagset]]
+name = "find-ro"
+bare = ["-print"]
+"-mindepth" = { matches = '\d+' }
+"-newer"    = { location = "repos/**" }
+
+[[program]]
+name = "find"
+cwd  = "."
+argv = ["find", "${WHERE}", "${FLAGS...}"]
+holes.WHERE = { location = "repos/**" }
+holes.FLAGS = { kind = "flags", flagset = "find-ro" }
+```
+| `subcommand` | string | leading literal words this rule governs (`"push origin"`). Once any rule for a program names a subcommand, that program **fails closed**: an exec matching no declared subcommand (unlisted, or not literal) is denied. Subcommands of one program must be prefix-free and cannot mix with a bare rule |
+Vouched-for means exactly-known text or a proven path; an f-string, a `.strip()` result or a
+runtime-checked value is *not*, even when it carries atoms. The Python API's `program()`
+defaults `unknown_arguments` to `True`; the data format deliberately does not. Prefer a template
+over `unknown-arguments = true` whenever the program takes flags or paths: a template grants
+exactly the flags and positions listed and nothing else.
+
+## `[[apply]]` and rulesets
+
+A **ruleset** is a reusable, parameterised bundle of exec-side vocabulary in
+`~/.certorail/rulesets/<name>.toml`: `ruleset-version = 1`, `[params]`, `[atoms]`,
+`[[flagset]]`, `[[program]]`, `[[validation]]`, `[[apply]]`. No `[filesystem]`, no
+`[[network]]`, no `root`; no absolute locations. The root policy applies it:
+
+```toml
+[[apply]]
+ruleset = "unix.toml"
+where   = ["repos", "/srv/data"]      # a directory parameter is set-valued
+org     = "org-checkout"              # an atom parameter names an atom the root declares
+```
+
+`[params] where = { kind = "directory" }` binds one directory or a list (plain paths, no `**`);
+the ruleset writes `${where}` for the directory and `${where}/**` for its subtree, and every
+location slot so written becomes a one-of list over the bound directories. `kind = "atom"`
+parameters are substituted whole into atom lists (`requires`, `argument-atoms`, `atoms`,
+`establishes`). A ruleset is applied at most once; two applications with different bindings is
+an error (apply it once with the union), the same application reached twice through nested
+rulesets is one document. Atom and validation names are unique across the whole composition
+(namespace by convention: `unix.no-flag`); flagsets are private to their file. A ruleset's
+validation may run only `${checkers}/<name>` or `test`. Denials name the ruleset and bindings a
+rule came from.
 
 ## `[[network]]`
 
@@ -183,10 +261,19 @@ Full rules in `examples/SUBSET_PROMPT.md`. The parts a policy author needs:
 ```
 certorail [--root DIR] [--policy FILE] [--check] [--no-jail] PROGRAM [-- ARG ...]
 certorail -c SOURCE [--root DIR] [--policy FILE] [--check] [--no-jail] [-- ARG ...]
+certorail --describe [--root DIR] [--policy FILE]
 ```
 
 `--check` analyses and evaluates without running and prints every sink with its proven
-location. `--policy` takes `.toml`, `.json`, or a Python file defining `POLICY`. Without it the
+location. `--describe` prints the policy's interface for the program author, rendered from the
+loaded policy: filesystem grants, every program form as a signature with its holes and flags,
+validations, atoms, network rules. Put it in the agent's context with a Claude Code hook in the
+project's `.claude/settings.json`:
+
+```json
+{"hooks": {"SessionStart": [{"matcher": "startup|resume|clear|compact",
+  "hooks": [{"type": "command", "command": "certorail --describe"}]}]}}
+``` `--policy` takes `.toml`, `.json`, or a Python file defining `POLICY`. Without it the
 nearest ambient policy for the root applies, else the built-in default (read, write and list
 anywhere within the root; no programs, no network). Exit status: the program's own when it ran;
 1 when rejected; 2 when it does not parse.

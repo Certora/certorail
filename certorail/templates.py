@@ -1,0 +1,456 @@
+"""Command templates: the shape of a permitted command line (TEMPLATES.md).
+
+A template is a sequence of *pieces* -- literal words and *holes*, ``${X}`` for one token and
+``${X...}`` for a splice -- and it binds like a Python call: the leading literal words select
+it, positionals fill holes in template order (a trailing variadic hole takes the rest; a
+variadic hole that is not last, and every hole after it, is keyword-only), keywords fill holes
+by name. **Holes are relies**: a ``Constraint`` says of one token what a parameter annotation
+says of a value, and is checked the same way. The program never composes the argv; the broker
+does, from the template's words and the checked values (``instantiate``).
+
+Shared by the analysis (values are facts) and the broker (values are the concrete strings), so
+the runtime re-check is the same check: ``bind`` and the constraint, flag and dash-guard
+functions below take either.
+"""
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+
+from .analysis import (
+    Alternation,
+    Both,
+    Concat,
+    DirSplat,
+    Exact,
+    Located,
+    LocationFact,
+    Named,
+    OneOf,
+    PathFact,
+    PseudoRegex,
+    RegexLit,
+    AnyStr,
+    StaticPath,
+    StrFact,
+    UrlString,
+    ValidationFact,
+    concat,
+    entails,
+    known_text,
+    locate,
+    location_le,
+    pretty_location,
+    pretty_regex,
+)
+
+# ---------------------------------------------------------------------------
+# the vocabulary
+# ---------------------------------------------------------------------------
+
+type Value = str | ValidationFact | None  # one token as the analysis sees it (a str: known text)
+
+
+@dataclass(frozen=True)
+class HoleRef:
+    """``${name}`` (one token) or ``${name...}`` (a splice) in a template's pieces."""
+
+    name: str
+    variadic: bool = False
+
+
+type Piece = str | HoleRef
+
+
+@dataclass(frozen=True)
+class Constraint:
+    """What one token must be: a rely, in the annotation vocabulary. Three orthogonal kinds of
+    claim: *shape* -- ``locations`` (a proven path within one of them) or ``regex`` (text known
+    to match); *provenance* -- ``literal``: the text is statically known, so the program named
+    it (a literal, a constant, a join of literals) rather than read it from a file, argv or an
+    API -- the intent gate for destructive actions; *facts* -- ``atoms``, live validation facts.
+    ``any`` admits anything, the local successor of ``unknown-arguments``, and combines with
+    nothing. A located value is textless, so ``locations`` excludes ``regex``; everything else
+    combines (``locations`` + ``literal`` is a constant path within). Empty says nothing."""
+
+    locations: tuple[LocationFact, ...] = ()
+    regex: PseudoRegex | None = None
+    atoms: frozenset[str] = frozenset()
+    literal: bool = False
+    any: bool = False
+
+    def __post_init__(self) -> None:
+        if self.any and (self.locations or self.regex is not None or self.literal or self.atoms):
+            raise ValueError("a constraint with any=True combines with nothing")
+        if self.locations and self.regex is not None:
+            raise ValueError("a located value is textless: location does not combine with matches/one-of")
+        if not (self.any or self.locations or self.regex is not None or self.literal or self.atoms):
+            raise ValueError("an empty constraint says nothing; use any = true to mean that")
+
+
+@dataclass(frozen=True)
+class Token:
+    constraint: Constraint
+
+
+@dataclass(frozen=True)
+class Each:
+    constraint: Constraint
+    min: int = 0
+
+
+@dataclass(frozen=True)
+class Flagset:
+    """A flag vocabulary: the bare flags, and the valued ones with the constraint on their
+    value. Every flag name begins with ``-``."""
+
+    bare: frozenset[str] = frozenset()
+    valued: Mapping[str, Constraint] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        names = set(self.bare) | set(self.valued)
+        if not names:
+            raise ValueError("a flag vocabulary needs at least one flag")
+        for n in names:
+            if not n.startswith("-"):
+                raise ValueError(f"flag names begin with '-': {n!r}")
+        both = self.bare & self.valued.keys()
+        if both:
+            raise ValueError(f"flags both bare and valued: {sorted(both)}")
+
+
+@dataclass(frozen=True)
+class Flags:
+    flagset: Flagset
+
+
+type Hole = Token | Each | Flags
+
+CWD = "cwd"  # reserved: never a hole name
+
+
+@dataclass(frozen=True)
+class Template:
+    """One permitted command-line shape. ``pieces[0]`` is the program, a literal."""
+
+    pieces: tuple[Piece, ...]
+    holes: Mapping[str, Hole]
+
+    def __post_init__(self) -> None:
+        if not self.pieces or not isinstance(self.pieces[0], str):
+            raise ValueError("a template begins with the program, a literal word")
+        refs = [p for p in self.pieces if isinstance(p, HoleRef)]
+        names = [r.name for r in refs]
+        if len(set(names)) != len(names):
+            raise ValueError("a hole appears once in a template")
+        if CWD in self.holes:
+            raise ValueError(f"{CWD!r} is reserved and cannot be a hole")
+        for r in refs:
+            hole = self.holes.get(r.name)
+            if hole is None:
+                raise ValueError(f"hole {r.name!r} is used but not declared")
+            variadic_kind = isinstance(hole, (Each, Flags))
+            if r.variadic != variadic_kind:
+                spelled = "${" + r.name + ("...}" if r.variadic else "}")
+                raise ValueError(f"{spelled} disagrees with its kind ({type(hole).__name__.lower()})")
+        for name in self.holes:
+            if name not in names:
+                raise ValueError(f"hole {name!r} is declared but not used")
+
+    @property
+    def program(self) -> str:
+        first = self.pieces[0]
+        assert isinstance(first, str)
+        return first
+
+    @property
+    def leading_words(self) -> tuple[str, ...]:
+        """The maximal literal prefix, program included: what selects the template."""
+        out: list[str] = []
+        for p in self.pieces:
+            if not isinstance(p, str):
+                break
+            out.append(p)
+        return tuple(out)
+
+    def variadic(self, name: str) -> bool:
+        return isinstance(self.holes[name], (Each, Flags))
+
+    @property
+    def keyword_only(self) -> tuple[str, ...]:
+        """The holes from the first non-last variadic hole onward: nothing marks where such a
+        splice would end, so they are bound by name."""
+        refs = [p for p in self.pieces if isinstance(p, HoleRef)]
+        for i, r in enumerate(refs):
+            if r.variadic and r is not self.pieces[-1]:
+                return tuple(x.name for x in refs[i:])
+        return ()
+
+    def dash_exempt(self, name: str) -> bool:
+        """A literal ``--`` earlier in the template makes a later hole safe from being read as
+        an option, for tools that honour it."""
+        for p in self.pieces:
+            if p == "--":
+                return True
+            if isinstance(p, HoleRef) and p.name == name:
+                return False
+        return False
+
+
+# ---------------------------------------------------------------------------
+# binding: a template is a signature
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Many:
+    """A variadic hole's value as a sequence of tokens: a display, or the positional tail."""
+
+    elements: tuple[Value, ...]
+
+
+@dataclass(frozen=True)
+class Elements:
+    """A variadic hole's value as a typed container: every element has this fact, the count is
+    unknown (CONTAINERS.md: the splat, landing where it was always going to)."""
+
+    elem: ValidationFact
+
+
+type Binding = Value | Many | Elements
+
+
+@dataclass(frozen=True)
+class Bound:
+    template: Template
+    bindings: Mapping[str, Binding]
+
+
+@dataclass(frozen=True)
+class BindError:
+    reasons: tuple[str, ...]
+
+
+def matches_leading(words: Sequence[str], arguments: Sequence[Value]) -> bool:
+    """Do *arguments* (the positionals after the program) begin with the literal *words*?"""
+    if len(arguments) < len(words):
+        return False
+    return all(known_text(arguments[i]) == w for i, w in enumerate(words))
+
+
+def bind(
+    template: Template, arguments: Sequence[Value], keywords: Mapping[str, Binding]
+) -> Bound | BindError:
+    """*arguments* are the positionals after the program, leading words included (the caller
+    selected the template by them). Positionals fill holes in template order; a trailing
+    variadic takes the rest; a non-last variadic and everything after it is keyword-only;
+    keywords fill by name. Interior literal words are never spelled by the program."""
+    reasons: list[str] = []
+    bindings: dict[str, Binding] = {}
+    lead = len(template.leading_words) - 1
+    positionals = list(arguments[lead:])
+    keyword_only = set(template.keyword_only)
+    for piece in template.pieces[len(template.leading_words):]:
+        if isinstance(piece, str) or piece.name in keyword_only:
+            continue
+        if piece.variadic:  # necessarily the last piece: it takes whatever positionals remain
+            if positionals:
+                bindings[piece.name] = Many(tuple(positionals))
+                positionals = []
+        elif positionals:
+            bindings[piece.name] = positionals.pop(0)
+    if positionals:
+        reasons.append(
+            f"{len(positionals)} positional argument(s) too many"
+            + (
+                f"; the holes {', '.join(template.keyword_only)} are keyword-only"
+                if keyword_only
+                else ""
+            )
+        )
+    for name, value in keywords.items():
+        if name not in template.holes:
+            reasons.append(f"{name!r} is not a hole of this form")
+        elif name in bindings:
+            reasons.append(f"hole {name!r} is bound twice")
+        elif template.variadic(name) and not isinstance(value, (Many, Elements)):
+            reasons.append(f"hole {name!r} takes a list (a display, or a typed container)")
+        elif not template.variadic(name) and isinstance(value, (Many, Elements)):
+            reasons.append(f"hole {name!r} takes one value, not a list")
+        else:
+            bindings[name] = value
+    for name in template.holes:
+        if name not in bindings:
+            if template.variadic(name):
+                bindings[name] = Many(())
+            else:
+                reasons.append(f"hole {name!r} is unbound")
+    return BindError(tuple(reasons)) if reasons else Bound(template, bindings)
+
+
+# ---------------------------------------------------------------------------
+# checking a bound template
+# ---------------------------------------------------------------------------
+
+# atoms of *required* that *value* does not carry (the policy supplies this: saturation and
+# literal checkers live there)
+type AtomsMissing = Callable[[Value, frozenset[str]], frozenset[str]]
+
+
+def _as_fact(value: str | ValidationFact) -> ValidationFact:
+    return StrFact(regex=Exact(value)) if isinstance(value, str) else value
+
+
+def constraint_failure(c: Constraint, value: Value, atoms_missing: AtomsMissing) -> str | None:
+    """Why *value* does not satisfy *c*, or None."""
+    if c.any:
+        return None
+    if value is None:
+        return "is of unknown provenance"
+    if c.locations:
+        located = locate(_as_fact(value))
+        if located is None or not any(location_le(located.location, loc) for loc in c.locations):
+            names = ", ".join(pretty_location(loc) for loc in c.locations)
+            return f"is not a proven path within {names}"
+    if c.regex is not None and not entails(value, StrFact(regex=c.regex)):
+        return f"is not known to match {pretty_regex(c.regex)}"
+    if c.literal and known_text(value) is None:
+        return "is not statically known text (the program must name it: a literal or a constant)"
+    if c.atoms:
+        missing = atoms_missing(value, c.atoms)
+        if missing:
+            return f"is not validated by: {', '.join(sorted(missing))}"
+    return None
+
+
+def _regex_may_start_with_dash(r: PseudoRegex) -> bool:
+    match r:
+        case Exact(exact_str=s):
+            return s.startswith("-")
+        case Alternation(any_of=branches):
+            return any(_regex_may_start_with_dash(b) for b in branches)
+        case Concat(seq=pieces):
+            head = pieces[0]
+            if head == Exact(""):
+                return _regex_may_start_with_dash(concat(*pieces[1:])) if len(pieces) > 1 else False
+            return _regex_may_start_with_dash(head)
+        case Both(all_of=parts):
+            return all(_regex_may_start_with_dash(p) for p in parts)
+        case RegexLit() | AnyStr():
+            return True
+
+
+def may_start_with_dash(value: Value) -> bool:
+    """Could this token's text begin with ``-``, and so be read by a tool as an option? True
+    unless the value's known text, regex head, or location's first component rules it out."""
+    match value:
+        case str():
+            return value.startswith("-")
+        case None | PathFact() | UrlString():
+            return True
+        case Located(location=loc):
+            if loc.absolute:
+                return False  # begins with "/"
+            components = loc.path_components if isinstance(loc, StaticPath) else loc.static_prefix
+            if not components:
+                # "." itself for a StaticPath; for a DirSplat the first component is unknown
+                return isinstance(loc, DirSplat)
+            match components[0]:
+                case Named(name=n):
+                    return n.startswith("-")
+                case OneOf(names=ns):
+                    return any(n.startswith("-") for n in ns)
+                case _:
+                    return True
+        case StrFact(regex=regex):
+            return _regex_may_start_with_dash(regex)
+
+
+DASH_REASON = "may begin with '-' and be read as an option; confine it under a named directory or guard its text"
+
+
+def flags_failure(fs: Flagset, elements: Sequence[Value], atoms_missing: AtomsMissing) -> str | None:
+    """Parse *elements* against the vocabulary, left to right."""
+    i = 0
+    while i < len(elements):
+        name = known_text(elements[i])
+        if name is None:
+            return f"element {i + 1} is in flag position but is not statically known text"
+        if name in fs.bare:
+            i += 1
+            continue
+        c = fs.valued.get(name)
+        if c is None:
+            return f"{name!r} is not a declared flag"
+        if i + 1 >= len(elements):
+            return f"flag {name!r} needs a value"
+        reason = constraint_failure(c, elements[i + 1], atoms_missing)
+        if reason is not None:
+            return f"the value of {name!r} {reason}"
+        i += 2
+    return None
+
+
+def hole_failures(bound: Bound, atoms_missing: AtomsMissing) -> list[str]:
+    """Every way the bound values fall short of their holes, each naming the hole."""
+    out: list[str] = []
+    template = bound.template
+    for name, hole in template.holes.items():
+        value = bound.bindings[name]
+        guard = not template.dash_exempt(name)
+        match hole:
+            case Token(constraint=c):
+                assert not isinstance(value, (Many, Elements))
+                reason = constraint_failure(c, value, atoms_missing)
+                if reason is None and guard and may_start_with_dash(value):
+                    reason = DASH_REASON
+                if reason is not None:
+                    out.append(f"{name} {reason}")
+            case Each(constraint=c, min=minimum):
+                match value:
+                    case Many(elements=elements):
+                        if len(elements) < minimum:
+                            out.append(f"{name} needs at least {minimum} element(s)")
+                        for i, e in enumerate(elements):
+                            reason = constraint_failure(c, e, atoms_missing)
+                            if reason is None and guard and may_start_with_dash(e):
+                                reason = DASH_REASON
+                            if reason is not None:
+                                out.append(f"{name}[{i}] {reason}")
+                    case Elements(elem=elem):
+                        reason = constraint_failure(c, elem, atoms_missing)
+                        if reason is None and guard and may_start_with_dash(elem):
+                            reason = DASH_REASON
+                        if reason is not None:
+                            out.append(f"the elements of {name} {reason}")
+                    case _:
+                        out.append(f"{name} takes a list")
+            case Flags(flagset=fs):
+                match value:
+                    case Many(elements=elements):
+                        reason = flags_failure(fs, elements, atoms_missing)
+                        if reason is not None:
+                            out.append(f"{name}: {reason}")
+                    case _:
+                        out.append(f"{name} takes a display of flags, not a container")
+    return out
+
+
+def instantiate(bound: Bound) -> list[str]:
+    """The argv: literal words as themselves, a token hole as its string, a variadic hole
+    spliced. Every binding must be concrete text (the broker's side)."""
+    argv: list[str] = []
+    for piece in bound.template.pieces:
+        if isinstance(piece, str):
+            argv.append(piece)
+            continue
+        value = bound.bindings[piece.name]
+        match value:
+            case str():
+                argv.append(value)
+            case Many(elements=elements):
+                for e in elements:
+                    if not isinstance(e, str):
+                        raise ValueError(f"hole {piece.name!r}: not concrete text")
+                    argv.append(e)
+            case _:
+                raise ValueError(f"hole {piece.name!r}: not concrete text")
+    return argv

@@ -25,7 +25,7 @@ import socket
 import struct
 import subprocess
 import typing
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -77,7 +77,7 @@ class ExecResult(subprocess.CompletedProcess[bytes]):
 CalledProcessError = subprocess.CalledProcessError
 
 
-def exec(*cmd: str, cwd: pathlib.Path | str) -> ExecResult:
+def exec(*cmd: str, cwd: pathlib.Path | str, **holes: str | Sequence[str]) -> ExecResult:
     """The only way to run a subprocess: tunneled to the host's broker, which re-checks the
     decidable half of the exec rules (program, fail-closed subcommand, cwd containment --
     defense in depth; the full rules were enforced statically), spawns the child outside the
@@ -86,14 +86,26 @@ def exec(*cmd: str, cwd: pathlib.Path | str) -> ExecResult:
     was, one socket away -- returned as an ``ExecResult``, whose decoded views raise on a
     non-zero exit.
 
+    Keywords other than ``cwd`` bind the *holes* of the policy's command template for the
+    program (TEMPLATES.md): a string for a token hole, a list of strings for a splice. The
+    broker binds the call like a signature and composes the argv itself.
+
     This is the runtime half. The static half (``walker``) additionally requires the program to
-    be a string literal, refuses ``*args``/``**kwargs`` and any keyword but ``cwd``, and treats
-    ``cwd`` as a sink whose location must be proven.
+    be a string literal, refuses ``*args``/``**kwargs``, and treats ``cwd`` as a sink whose
+    location must be proven.
     """
     if not cmd:
         raise ValueError("exec: no program given")
     if not all(isinstance(part, str) for part in cmd):
         raise TypeError("exec: every part of the command must be a str")
+    bindings: dict[str, str | list[str]] = {}
+    for name, value in holes.items():
+        if isinstance(value, str):
+            bindings[name] = value
+        elif isinstance(value, (list, tuple)) and all(isinstance(v, str) for v in value):
+            bindings[name] = list(value)
+        else:
+            raise TypeError(f"exec: {name}= must be a str or a list of str")
     socket_path = os.environ.get("CERTORAIL_BROKER_SOCKET")
     if socket_path is None:
         raise ExecFailed("no broker: the policy permits no programs")
@@ -102,7 +114,7 @@ def exec(*cmd: str, cwd: pathlib.Path | str) -> ExecResult:
         reply = _broker_roundtrip(
             socket_path,
             {"kind": "exec", "program": program, "arguments": arguments,
-             "cwd": os.fspath(cwd)},
+             "kwargs": bindings, "cwd": os.fspath(cwd)},
             timeout=None,
         )
     except OSError as exc:

@@ -62,7 +62,6 @@ from .analysis import (
 from .dangerous import (
     CHECK_CALLEE,
     CHECK_SINGLE_CALLEE,
-    EXEC_ALLOWED_KEYWORDS,
     EXEC_CALLEE,
     EXEC_REQUIRED_KEYWORDS,
     NETWORK_BODY_METHODS,
@@ -83,6 +82,7 @@ from .safepy import (
     InheritanceAnalysis,
     ValidationAnalysis,
 )
+from .templates import Binding, Elements, Many
 from .terms import Call, Method, lower
 
 type State = dict[str, ValidationFact | Container]
@@ -125,11 +125,17 @@ def _roster_blessings(
 
     for n in ast.walk(root):
         match n:
-            case ast.Call(func=ast.Attribute(value=recv, attr=method), args=args):
+            case ast.Call(func=ast.Attribute(value=recv, attr=method), args=args, keywords=kws):
                 if method in _CONTAINER_METHODS:
                     bless(recv)
                 if method == "extend" and args:
                     bless(args[0])
+                if method == EXEC_CALLEE[1] and isinstance(recv, ast.Name) and recv.id == EXEC_CALLEE[0]:
+                    # a container bound to a hole of certora.exec is a roster read (the splat of
+                    # TEMPLATES.md); _audit_exec records its element fact for the policy
+                    for k in kws:
+                        if k.arg is not None and k.arg != "cwd":
+                            bless(k.value)
             case ast.Call(func=ast.Name(id=f), args=args):
                 if f in _CONTAINER_READ_CALLS:
                     for a in args:
@@ -207,6 +213,9 @@ class ExecSite:
     program: str
     arguments: tuple[str | ValidationFact | None, ...]
     cwd: ValidationFact | None
+    # hole bindings by keyword (TEMPLATES.md): a value, a display (Many), or a typed container
+    # (Elements); which holes exist is the policy's business
+    keywords: Mapping[str, Binding] = field(default_factory=dict)
 
     @property
     def what(self) -> str:
@@ -1126,14 +1135,13 @@ class ValidationWalker(ast.NodeVisitor):
         return replace(base, checks=base.checks | atoms)
 
     def _audit_exec(self, node: ast.Call) -> None:
-        """``certora.exec(program, *args, cwd=...)``: the shape is checked here (violations), the
-        cwd's provenance is a sink question (``confined``), and the arguments are reported."""
+        """``certora.exec(program, *args, cwd=..., HOLE=...)``: the shape is checked here
+        (violations), the cwd's provenance is a sink question (``confined``), and the arguments
+        and hole bindings are recorded for the policy, which alone knows the program's forms."""
         if any(isinstance(a, ast.Starred) for a in node.args) or any(k.arg is None for k in node.keywords):
             self._violation(node, "exec: *args / **kwargs are not admissible; spell the command out")
             return
         keywords = {k.arg: k.value for k in node.keywords if k.arg is not None}
-        for name in sorted(keywords.keys() - EXEC_ALLOWED_KEYWORDS):
-            self._violation(node, f"exec: keyword {name!r} is not part of the API")
         for name in sorted(EXEC_REQUIRED_KEYWORDS - keywords.keys()):
             self._violation(node, f"exec: {name}= is required")
         if not node.args:
@@ -1154,8 +1162,22 @@ class ValidationWalker(ast.NodeVisitor):
                 program,
                 tuple(operand_value(a, self.state) for a in node.args[1:]),
                 None if cwd_expr is None else _at_sink(interpret_expr(cwd_expr, self.state)),
+                {name: self._hole_binding(expr) for name, expr in keywords.items() if name != "cwd"},
             )
         )
+
+    def _hole_binding(self, expr: ast.expr) -> Binding:
+        """A keyword argument of ``certora.exec`` as the policy will bind it: a display is the
+        sequence of its elements, a tracked container its element fact, anything else a value."""
+        match expr:
+            case ast.List(elts=elts) | ast.Tuple(elts=elts):
+                return Many(tuple(operand_value(e, self.state) for e in elts))
+            case ast.Name(id=name) if isinstance(self.state.get(name), Container):
+                container = self.state[name]
+                assert isinstance(container, Container)
+                return Elements(container.elem)
+            case _:
+                return operand_value(expr, self.state)
 
     def _audit_network(self, node: ast.Call, method: str) -> None:
         """``certora.network.<method>(url, *, headers=..., body=..., timeout=...)``: one
@@ -1648,6 +1670,16 @@ def _describe_value(v: str | ValidationFact | Container | None) -> str:
             return f"url ({claims or 'nothing known'})" + _checks_suffix(checks)
 
 
+def _describe_binding(value: Binding) -> str:
+    match value:
+        case Many(elements=elements):
+            return "[" + ", ".join(_describe_value(e) for e in elements) + "]"
+        case Elements(elem=elem):
+            return f"elements of {_describe_value(elem)}"
+        case _:
+            return _describe_value(value)
+
+
 def describe_sink(site: Site) -> str:
     match site:
         case SinkSite(fact=None):
@@ -1658,9 +1690,12 @@ def describe_sink(site: Site) -> str:
             return "the path is read as text; it is not confined"
         case NetworkSite(method=method, url=url):
             return f"{method} {_describe_value(url)}"
-        case ExecSite(arguments=arguments, cwd=cwd):
+        case ExecSite(arguments=arguments, cwd=cwd, keywords=keywords):
             args = ", ".join(_describe_value(a) for a in arguments) or "none"
-            return f"cwd {_describe_value(cwd)}; arguments: {args}"
+            holes = "".join(
+                f"; {name}={_describe_binding(value)}" for name, value in sorted(keywords.items())
+            )
+            return f"cwd {_describe_value(cwd)}; arguments: {args}{holes}"
         case CheckSite(arguments=arguments, cwd=cwd):
             args = ", ".join(f"{k}={_describe_value(v)}" for k, v in sorted(arguments.items())) or "none"
             return f"cwd {_describe_value(cwd)}; arguments: {args}"

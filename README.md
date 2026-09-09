@@ -53,10 +53,18 @@ Exit status: the program's own when it ran; 1 when rejected; 2 when it does not 
 uv tool install .
 certorail program.py [--root DIR] [--policy POLICY] [--check] [-- ARG ...]
 certorail -c SOURCE  [--root DIR] [--policy POLICY] [--check] [-- ARG ...]
+certorail --describe [--root DIR] [--policy POLICY]
 ```
 
 `--check` analyses and evaluates without running. `--root` defaults to the current directory.
-`-c` takes the program inline, for agents that generate and run in one step.
+`-c` takes the program inline, for agents that generate and run in one step. `--describe` prints
+what the policy for the root permits, rendered from the loaded policy for the program author;
+a Claude Code `SessionStart` hook running it puts the policy into the agent's context.
+
+Command *templates* let a rule state the shape of a permitted command line — literal words,
+typed holes, a flag vocabulary — so `find`, `grep` and friends can be granted without granting
+`-exec` or `-r /etc`; *rulesets* bundle such templates for reuse, applied to a policy with a
+location. Both are specified in [`TEMPLATES.md`](TEMPLATES.md).
 
 The policy is **trusted**. It is normally a TOML document ([`examples/policy.toml`](examples/policy.toml);
 the schema is documented in [`certorail/policyfile.py`](certorail/policyfile.py)), passed with

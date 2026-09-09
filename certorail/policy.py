@@ -46,7 +46,7 @@ import subprocess
 import urllib.parse
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Literal
+from typing import Any, Literal, cast
 
 from . import markers
 from .analysis import (
@@ -76,6 +76,24 @@ from .analysis import (
     saturate,
     url_of,
     ValidationFact
+)
+from .templates import (
+    BindError,
+    Constraint,
+    Each,
+    Flags,
+    Flagset,
+    Hole,
+    HoleRef,
+    Many,
+    Piece,
+    Template,
+    Token,
+    Value,
+    bind,
+    hole_failures,
+    instantiate,
+    matches_leading,
 )
 from .walker import (
     CheckSignature,
@@ -170,6 +188,22 @@ def _locations(wheres: Iterable[Where]) -> tuple[LocationFact, ...]:
     return tuple(location_of(w) for w in wheres)
 
 
+def _one_or_many(where: Where | Iterable[Where]) -> tuple[LocationFact, ...]:
+    """A location *slot* (``Program.cwd``, ``Validation.cwd``): one spelling, or several meaning
+    any-of -- the same reading filesystem grants and ``argument_locations`` have always had."""
+    if isinstance(where, (str, markers.Within, markers.Exactly, StaticPath, DirSplat)):
+        return (location_of(where),)
+    out = tuple(location_of(w) for w in where)
+    if not out:
+        raise ValueError("a location slot needs at least one location")
+    return out
+
+
+def pretty_locations(locations: Iterable[LocationFact]) -> str:
+    names = [pretty_location(loc) for loc in locations]
+    return names[0] if len(names) == 1 else "one of " + ", ".join(names)
+
+
 # ---------------------------------------------------------------------------
 # validations: policy-declared runtime predicates (certora.check)
 # ---------------------------------------------------------------------------
@@ -228,9 +262,10 @@ class Validation:
     name: str
     params: tuple[str, ...]
     argv: tuple[str | Param, ...]
-    # None: the check does not care where it runs -- callers may omit cwd=, and no location
-    # is required or proven. Such a check cannot establish atoms on cwd.
-    cwd: LocationFact | None
+    # where the check may run: any of these. None: the check does not care where it runs --
+    # callers may omit cwd=, and no location is required or proven. Such a check cannot
+    # establish atoms on cwd.
+    cwd: tuple[LocationFact, ...] | None
     establishes: dict[str, frozenset[str]]  # param name or CWD -> atoms
     pure_atoms: frozenset[str] = frozenset()  # the established atoms wrapped in pure()
     effect_free: bool = False  # the evaluator mutates nothing: its run kills no atoms
@@ -240,7 +275,7 @@ def validation(
     name: str,
     *,
     argv: Iterable[str | Param],
-    cwd: Where | None = None,
+    cwd: Where | Iterable[Where] | None = None,
     params: Iterable[str] = (),
     establishes: Mapping[str, Iterable[str | Pure]],
     effect_free: bool = False,
@@ -283,7 +318,7 @@ def validation(
             "atoms on cwd"
         )
     return Validation(
-        name, params_t, argv_t, None if cwd is None else location_of(cwd), est,
+        name, params_t, argv_t, None if cwd is None else _one_or_many(cwd), est,
         frozenset(pure_set), effect_free,
     )
 
@@ -298,7 +333,7 @@ class Program:
     """A permitted ``certora.exec`` program."""
 
     name: str
-    cwd: LocationFact
+    cwd: tuple[LocationFact, ...]  # the exec's cwd must lie within one of these
     # may the arguments include values the analysis cannot vouch for (URLs, JSON fields)?
     # Vouched-for means exactly-known text or a proven path; a computed str is unknown even
     # when it is tracked as a fact
@@ -315,30 +350,99 @@ class Program:
     # atoms every argument after the subcommand must satisfy: by a live check, or -- for a
     # defined atom -- by its known text (saturate)
     argument_atoms: frozenset[str] = frozenset()
+    # the command-line shape (TEMPLATES.md). None for the flat rule above, which is the template
+    # [name, *subcommand, ${REST...}] in disguise: a trailing each hole taking any statically
+    # known text (or anything, with unknown_arguments)
+    template: Template | None = None
+    # provenance for reports: the ruleset (and bindings) this rule came from, None for a rule
+    # the root policy wrote itself
+    origin: str | None = None
+
+    @property
+    def leading_words(self) -> tuple[str, ...]:
+        """What selects this rule: the program and the literal words that follow it. A
+        program's rules are prefix-free in these, so an exec selects exactly one."""
+        if self.template is not None:
+            return self.template.leading_words
+        return (self.name, *self.subcommand)
 
 
 def program(
     name: str,
     *,
-    cwd: Where,
+    cwd: Where | Iterable[Where],
     subcommand: str | Iterable[str] = (),
     unknown_arguments: bool = True,
     argument_locations: Iterable[Where] = (),
     requires: Iterable[str] = (),
     argument_atoms: Iterable[str] = (),
+    argv: Iterable[Piece] | None = None,
+    holes: Mapping[str, Hole] | None = None,
+    origin: str | None = None,
 ) -> Program:
     words = tuple(subcommand.split()) if isinstance(subcommand, str) else tuple(subcommand)
     if not all(isinstance(w, str) and w for w in words):
         raise ValueError(f"program {name!r}: subcommand words must be non-empty strings")
+    template = None
+    if argv is not None or holes is not None:
+        if argv is None or holes is None:
+            raise ValueError(f"program {name!r}: argv and holes go together")
+        if words or not unknown_arguments or tuple(argument_locations) or tuple(argument_atoms):
+            raise ValueError(
+                f"program {name!r}: a templated rule carries no subcommand or argument keys; "
+                "constrain the holes instead"
+            )
+        template = Template(tuple(argv), dict(holes))
+        if template.program != name:
+            raise ValueError(f"program {name!r}: its template begins with {template.program!r}")
     return Program(
         name,
-        location_of(cwd),
+        _one_or_many(cwd),
         unknown_arguments,
         _locations(argument_locations),
         frozenset(requires),
         words,
         frozenset(argument_atoms),
+        template,
+        origin,
     )
+
+
+def hole(name: str) -> HoleRef:
+    """``${name}``: one token."""
+    return HoleRef(name)
+
+
+def splice(name: str) -> HoleRef:
+    """``${name...}``: a splice of zero or more tokens."""
+    return HoleRef(name, variadic=True)
+
+
+def constraint(
+    *,
+    location: Where | Iterable[Where] = (),
+    matches: str | None = None,
+    one_of: Iterable[str] = (),
+    atoms: Iterable[str] = (),
+    literal: bool = False,
+    any: bool = False,
+) -> Constraint:
+    """A hole's rely, in the marker vocabulary (see ``templates.Constraint`` for the rules)."""
+    regex: PseudoRegex | None = None
+    if matches is not None:
+        regex = RegexLit(matches)
+    names = tuple(one_of)
+    if names:
+        if regex is not None:
+            raise ValueError("matches and one_of exclude each other")
+        regex = alternation(*(Exact(n) for n in names))
+    return Constraint(
+        _one_or_many(location) if location else (), regex, frozenset(atoms), literal, any
+    )
+
+
+def flagset(bare: Iterable[str] = (), valued: Mapping[str, Constraint] | None = None) -> Flagset:
+    return Flagset(frozenset(bare), dict(valued or {}))
 
 
 @dataclass(frozen=True)
@@ -492,10 +596,17 @@ def _netloc_endpoints(netloc: PseudoRegex) -> list[tuple[str, int | None]] | Non
     return out
 
 
-def _prefix_matches(prefix: tuple[str, ...], arguments: tuple) -> bool:
-    if len(arguments) < len(prefix):
-        return False
-    return all(known_text(arguments[i]) == word for i, word in enumerate(prefix))
+def _select(rules: Sequence[Program], arguments: Sequence[Value]) -> Program | None:
+    """The rule whose leading words (after the program) begin *arguments*: unique, by the
+    prefix-freedom ``Policy.allow`` enforces; None when no form matches (fail closed)."""
+    return next((r for r in rules if matches_leading(r.leading_words[1:], arguments)), None)
+
+
+@dataclass(frozen=True)
+class Refusal:
+    """Why the broker will not spawn this exec."""
+
+    reason: str
 
 
 # ---------------------------------------------------------------------------
@@ -573,15 +684,17 @@ class Policy:
         for p in progs:
             by_name.setdefault(p.name, []).append(p)
         for pname, rs in by_name.items():
-            subbed = [r for r in rs if r.subcommand]
-            if subbed and len(subbed) != len(rs):
-                raise ValueError(f"program {pname!r}: subcommand rules cannot mix with a bare rule")
-            for i, a in enumerate(subbed):
-                for b in subbed[i + 1 :]:
-                    if is_prefix(a.subcommand, b.subcommand) or is_prefix(b.subcommand, a.subcommand):
+            # one shape per prefix: a program's rules are prefix-free in their leading words (a
+            # bare rule is the empty prefix), so an exec selects exactly one rule and an
+            # unlisted form fails closed
+            for i, a in enumerate(rs):
+                for b in rs[i + 1 :]:
+                    if is_prefix(a.leading_words, b.leading_words) or is_prefix(
+                        b.leading_words, a.leading_words
+                    ):
                         raise ValueError(
-                            f"program {pname!r}: subcommands {' '.join(a.subcommand)!r} and "
-                            f"{' '.join(b.subcommand)!r} overlap; the applicable rule must be unique"
+                            f"program {pname!r}: forms {' '.join(a.leading_words)!r} and "
+                            f"{' '.join(b.leading_words)!r} overlap; the applicable rule must be unique"
                         )
         # an atom means one thing: pure in one declaration and environmental in another is a bug.
         # A defined atom is pure by construction, however it is established.
@@ -648,39 +761,62 @@ class Policy:
     def _defined(self) -> dict[str, PseudoRegex]:
         return {a.name: a.regex for a in self.atoms}
 
-    def exec_refusal(
-        self, program_name: str, arguments: Sequence[str], cwd: str
-    ) -> str | None:
-        """The broker's defense-in-depth re-check of one concrete exec invocation.
+    def exec_command(
+        self,
+        program_name: str,
+        arguments: Sequence[str],
+        keywords: Mapping[str, str | Sequence[str]],
+        cwd: str,
+        discharge: Callable[[str, str], bool] | None = None,
+    ) -> list[str] | Refusal:
+        """The broker's re-check of one concrete exec, and the argv to spawn for it.
 
         Necessarily incomplete against the full rules -- runtime strings carry no provenance,
-        checks or facts, so ``unknown_arguments``, ``argument_locations``, ``argument_atoms``
-        and ``requires`` are the static analysis' alone. What IS decidable on concrete values
-        is decided: the program must be permitted, a subcommand-bearing program must match a
-        declared subcommand exactly (fail closed), and the cwd must lie (lexically) within an
-        applicable rule's location."""
+        so environmental atoms and the flat rule's ``unknown_arguments``/``argument_*`` are the
+        static analysis' alone. What IS decidable on concrete values is decided: the program is
+        permitted, its leading words select a declared form (fail closed), the cwd lies within
+        the rule's locations, and for a templated form the same ``bind`` and hole checks the
+        analysis ran -- flag vocabulary and arity, regexes, lexical locations, the leading-dash
+        guard, textual atoms -- run again on the strings. The template, not the program,
+        then composes the argv."""
         rules = [p for p in self.programs if p.name == program_name]
         if not rules:
-            return f"program {program_name!r} is not permitted"
+            return Refusal(f"program {program_name!r} is not permitted")
         cwd_loc = _literal_location(cwd)
         if cwd_loc is None:
-            return f"cwd {cwd!r} has no safe location"
-        if any(r.subcommand for r in rules):
-            rule = next(
-                (r for r in rules if _prefix_matches(r.subcommand, tuple(arguments))), None
+            return Refusal(f"cwd {cwd!r} has no safe location")
+        rule = _select(rules, arguments)
+        if rule is None:
+            return Refusal(
+                f"arguments match no declared subcommand of {program_name!r} (subcommands fail closed)"
             )
-            if rule is None:
-                return (
-                    f"arguments match no declared subcommand of {program_name!r} "
-                    "(subcommands fail closed)"
-                )
-            rules = [rule]
-        reasons = []
-        for rule in rules:
-            if location_le(cwd_loc, rule.cwd):
-                return None
-            reasons.append(f"cwd {cwd!r} is not within {pretty_location(rule.cwd)}")
-        return "; ".join(reasons)
+        if not any(location_le(cwd_loc, allowed) for allowed in rule.cwd):
+            return Refusal(f"cwd {cwd!r} is not within {pretty_locations(rule.cwd)}")
+        if rule.template is None:
+            if keywords:
+                return Refusal(f"the rule for {program_name!r} takes no keyword arguments")
+            return [program_name, *arguments]
+        bound = bind(
+            rule.template,
+            list(arguments),
+            {k: v if isinstance(v, str) else Many(tuple(v)) for k, v in keywords.items()},
+        )
+        if isinstance(bound, BindError):
+            return Refusal("; ".join(bound.reasons))
+        # only textual atoms can be re-established from a string; the environmental ones were
+        # the static check's to demand
+        textual = self.vocabulary().pure_atoms
+        failures = hole_failures(
+            bound, lambda value, atoms: self._missing_atoms(value, atoms & textual, discharge)
+        )
+        if failures:
+            return Refusal("; ".join(failures))
+        return instantiate(bound)
+
+    def exec_refusal(self, program_name: str, arguments: Sequence[str], cwd: str) -> str | None:
+        """``exec_command`` for the flat form: the refusal's reason, or None when permitted."""
+        outcome = self.exec_command(program_name, arguments, {}, cwd)
+        return outcome.reason if isinstance(outcome, Refusal) else None
 
     def discharger(self, root: PathLike[str] | str) -> Callable[[str, str], bool]:
         """A runner for literal checkers: ``discharge(atom, text)`` is True when some effect-free
@@ -718,35 +854,39 @@ class Policy:
                 return [Denial(site, f"{kind} of {pretty_location(loc)} is not permitted")]
             case SinkSite():
                 return [Denial(site, "the location of the path is not proven")]
-            case ExecSite(program=name, cwd=cwd, arguments=arguments):
+            case ExecSite(program=name, cwd=cwd, arguments=arguments, keywords=keywords):
                 rules = [p for p in self.programs if p.name == name]
                 if not rules:
                     return [Denial(site, f"program {name!r} is not permitted")]
                 if not isinstance(cwd, Located):
                     return [Denial(site, "the cwd is not proven")]
-                if any(r.subcommand for r in rules):
-                    # subcommands fail closed: at most one rule matches (prefix-freedom); an
-                    # unlisted or computed subcommand matches nothing and is denied
-                    rule = next((r for r in rules if _prefix_matches(r.subcommand, arguments)), None)
-                    if rule is None:
-                        return [
-                            Denial(
-                                site,
-                                f"arguments match no declared subcommand of {name!r} "
-                                "(subcommands fail closed)",
-                            )
-                        ]
+                # forms fail closed: the leading words select exactly one rule
+                # (prefix-freedom); an unlisted or computed form matches nothing
+                rule = _select(rules, arguments)
+                if rule is None:
+                    return [
+                        Denial(
+                            site,
+                            f"arguments match no declared subcommand of {name!r} "
+                            "(subcommands fail closed)",
+                        )
+                    ]
+                if rule.template is None:
+                    if keywords:
+                        return [Denial(site, f"the rule for {name!r} takes no keyword arguments")]
                     reason = self._exec_mismatch(
-                        rule, cwd, arguments[len(rule.subcommand):], discharge
+                        rule, cwd, arguments[len(rule.leading_words) - 1:], discharge
                     )
-                    return [] if reason is None else [Denial(site, reason)]
-                reasons: list[str] = []
-                for rule in rules:
-                    reason = self._exec_mismatch(rule, cwd, arguments, discharge)
-                    if reason is None:
-                        return []
-                    reasons.append(reason)
-                return [Denial(site, "; ".join(reasons))]
+                else:
+                    reason = self._template_mismatch(
+                        rule, rule.template, cwd, arguments, keywords, discharge
+                    )
+                if reason is None:
+                    return []
+                # provenance: which ruleset's rule spoke
+                if rule.origin is not None:
+                    reason = f"{rule.origin}: {reason}"
+                return [Denial(site, reason)]
             case NetworkSite(method=method, url=url):
                 lifted = url_of(url)
                 if lifted is None or lifted.scheme is None or lifted.netloc is None:
@@ -802,12 +942,12 @@ class Policy:
                     return []  # the check declared no interest in where it runs
                 if not isinstance(cwd, Located):
                     return [Denial(site, "the cwd is not proven")]
-                if not location_le(cwd.location, declared.cwd):
+                if not any(location_le(cwd.location, allowed) for allowed in declared.cwd):
                     return [
                         Denial(
                             site,
                             f"check {name!r} may not run at {pretty_location(cwd.location)} "
-                            f"(permitted: {pretty_location(declared.cwd)})",
+                            f"(permitted: {pretty_locations(declared.cwd)})",
                         )
                     ]
                 return []
@@ -829,6 +969,37 @@ class Policy:
             missing = frozenset(a for a in missing if not discharge(a, text))
         return missing
 
+    def _cwd_mismatch(
+        self, rule: Program, cwd: Located, discharge: Callable[[str, str], bool] | None
+    ) -> str | None:
+        if not any(location_le(cwd.location, allowed) for allowed in rule.cwd):
+            return f"cwd {pretty_location(cwd.location)} is not within {pretty_locations(rule.cwd)}"
+        missing = self._missing_atoms(cwd, rule.requires, discharge)
+        if missing:
+            return f"cwd is not validated by: {', '.join(sorted(missing))}"
+        return None
+
+    def _template_mismatch(
+        self,
+        rule: Program,
+        template: Template,
+        cwd: Located,
+        arguments: Sequence[Value],
+        keywords: Mapping[str, object],
+        discharge: Callable[[str, str], bool] | None,
+    ) -> str | None:
+        """The templated form: bind the call like a signature, then every hole is a rely."""
+        reason = self._cwd_mismatch(rule, cwd, discharge)
+        if reason is not None:
+            return reason
+        bound = bind(template, arguments, cast(Mapping[str, Any], keywords))
+        if isinstance(bound, BindError):
+            return "; ".join(bound.reasons)
+        failures = hole_failures(
+            bound, lambda value, atoms: self._missing_atoms(value, atoms, discharge)
+        )
+        return "; ".join(failures) if failures else None
+
     def _exec_mismatch(
         self,
         rule: Program,
@@ -836,12 +1007,10 @@ class Policy:
         arguments: tuple,
         discharge: Callable[[str, str], bool] | None = None,
     ) -> str | None:
-        """*arguments* excludes the matched subcommand words, if the rule has any."""
-        if not location_le(cwd.location, rule.cwd):
-            return f"cwd {pretty_location(cwd.location)} is not within {pretty_location(rule.cwd)}"
-        missing = self._missing_atoms(cwd, rule.requires, discharge)
-        if missing:
-            return f"cwd is not validated by: {', '.join(sorted(missing))}"
+        """The flat form. *arguments* excludes the matched subcommand words, if any."""
+        reason = self._cwd_mismatch(rule, cwd, discharge)
+        if reason is not None:
+            return reason
         if not rule.unknown_arguments:
             for i, a in enumerate(arguments):
                 # vouched-for means exactly-known text or a proven path: a computed str

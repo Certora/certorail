@@ -361,10 +361,12 @@ PATH_SINK_METHODS: dict[str, AccessKind] = {
 # Controlled APIs: the sandbox's replacements for forbidden surface, reached
 # through the injected `certora` namespace (markers.py holds the runtime half).
 #
-# certora.exec(program, *args, cwd=...) is the only way to run a subprocess:
-# no shell, output always captured, cwd mandatory. Statically (walker):
+# certora.exec(program, *args, cwd=..., HOLE=...) is the only way to run a
+# subprocess: no shell, output always captured, cwd mandatory. Statically (walker):
 #   * no *args / **kwargs -- a command that cannot be read cannot be reported;
-#   * exactly the keywords below, with the required ones present;
+#   * the required keywords are present; any other keyword binds a hole of the
+#     policy's command template for the program (TEMPLATES.md) -- which holes
+#     exist is the policy's business, so the walker records and the policy denies;
 #   * the program is a string literal (or a name bound to exactly one): it is
 #     the thing a reviewer needs to see;
 #   * cwd is a sink like open(): legal iff its location is proven;
@@ -374,7 +376,6 @@ PATH_SINK_METHODS: dict[str, AccessKind] = {
 # ---------------------------------------------------------------------------
 
 EXEC_CALLEE: tuple[str, ...] = (NAMESPACE, "exec")
-EXEC_ALLOWED_KEYWORDS: frozenset[str] = frozenset({"cwd"})
 EXEC_REQUIRED_KEYWORDS: frozenset[str] = frozenset({"cwd"})
 
 # certora.check(name, key=value, ..., cwd=...) runs a policy-declared runtime validation (a
