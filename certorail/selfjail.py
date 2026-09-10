@@ -102,7 +102,7 @@ def deny_process_creation() -> str | None:
     denial could not be installed, None on success -- except on Windows, which is handled
     with the gravity it deserves (WSL and --no-jail both exist)."""
     if sys.platform == "win32":
-        print("here's a quarter, buy yourself a real OS kid")
+        print("here's a nickel kid, get yourself a better computer")
         sys.exit(1)
     if sys.platform == "linux":
         return _linux_seccomp()

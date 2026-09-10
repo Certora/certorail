@@ -67,6 +67,7 @@ import urllib.parse
 from collections.abc import Callable, Sequence
 
 from .analysis import _literal_location, location_le
+from .enforcement import Discharge
 from .policy import (
     NetworkRule,
     Policy,
@@ -135,7 +136,7 @@ def _rule_refusal(
     rule: NetworkRule,
     url: str,
     initial: bool,
-    discharge: Callable[[str, str], bool] | None,
+    discharge: Discharge | None,
 ) -> str | None:
     """Why an endpoint-matching *rule* refuses this *url*, or None. The initial request's
     ``requires`` were proven statically; the broker's own obligations are the redirect hops:
@@ -160,7 +161,7 @@ def _check(
     method: str,
     url: str,
     initial: bool,
-    discharge: Callable[[str, str], bool] | None,
+    discharge: Discharge | None,
 ) -> tuple[str, str, int, NetworkRule]:
     """The (scheme, host, port, rule) permitting *method* on *url*, or ``PolicyDenied``.
     Applied to every redirect hop, so a redirect cannot escape the allowlist. The endpoint
@@ -376,7 +377,7 @@ def _hop(
 def _execute(
     policy: Policy,
     tls: ssl.SSLContext,
-    discharge: Callable[[str, str], bool] | None,
+    discharge: Discharge | None,
     client: socket.socket,
     method: str,
     url: str,
@@ -502,7 +503,7 @@ def _run_exec(
     arguments: list[str],
     keywords: dict[str, str | list[str]],
     cwd: str,
-    discharge: Callable[[str, str], bool] | None,
+    discharge: Discharge | None,
 ) -> dict:
     """One brokered ``certora.exec``: re-check the decidable half of the exec rules
     (``Policy.exec_command`` -- defense in depth; the full rules were enforced statically),
@@ -684,7 +685,7 @@ class _Server(socketserver.ThreadingUnixStreamServer):
         self,
         socket_path: str,
         policy: Policy,
-        discharge: Callable[[str, str], bool] | None,
+        discharge: Discharge | None,
         root: pathlib.Path | None,
     ):
         self.policy = policy

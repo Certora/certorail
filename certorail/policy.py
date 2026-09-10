@@ -53,7 +53,7 @@ from os import PathLike
 import pathlib
 import subprocess
 import urllib.parse
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, cast
 
@@ -107,12 +107,12 @@ from .templates import (
     instantiate,
     matches_leading,
 )
-from .walker import (
+from .enforcement import (
     CheckSignature,
     CheckSite,
+    Discharge,
     ExecSite,
     NetworkSite,
-    Report,
     SinkSite,
     Site,
     SourceTable,
@@ -120,6 +120,7 @@ from .walker import (
     WriteTable,
     host_matches,
 )
+from .walker import Report
 
 # ---------------------------------------------------------------------------
 # the marker vocabulary -> the location domain (the runtime-object twin of annotations.py)
@@ -1077,7 +1078,7 @@ class Policy:
         arguments: Sequence[str],
         keywords: Mapping[str, str | Sequence[str]],
         cwd: str,
-        discharge: Callable[[str, str], bool] | None = None,
+        discharge: Discharge | None = None,
     ) -> list[str] | Refusal:
         """The broker's re-check of one concrete exec, and the argv to spawn for it.
 
@@ -1128,33 +1129,33 @@ class Policy:
         outcome = self.exec_command(program_name, arguments, {}, cwd)
         return outcome.reason if isinstance(outcome, Refusal) else None
 
-    def discharger(self, root: PathLike[str] | str) -> Callable[[str, str], bool]:
+    def discharger(self, root: PathLike[str] | str) -> Discharge:
         """A runner for literal checkers: ``discharge(atom, text)`` is True when some effect-free
         validation establishing the pure *atom* through a single slot accepts the exact *text*,
         run right now under *root*. Cached per (atom, text); handed to ``evaluate`` and to
         ``analyze`` so constants need neither a ``certora.check`` nor a regex definition."""
         rootpath = pathlib.Path(root)
-        cache: dict[tuple[str, str], bool] = {}
+        cache: dict[tuple[AtomId, str], bool] = {}
 
-        def discharge(atom_name: str, text: str) -> bool:
-            key = (atom_name, text)
+        def discharge(atom: AtomId, text: str) -> bool:
+            key = (atom, text)
             if key not in cache:
                 cache[key] = any(
                     _run_literal_checker(v, slot, text, rootpath)
                     for v in self.validations
-                    if (slot := _literal_slot(v, AtomId(atom_name))) is not None
+                    if (slot := _literal_slot(v, atom)) is not None
                 )
             return cache[key]
 
         return discharge
 
     def evaluate(
-        self, report: Report, discharge: Callable[[str, str], bool] | None = None
+        self, report: Report, discharge: Discharge | None = None
     ) -> list[Denial]:
         return [d for site in report.sinks for d in self._evaluate(site, discharge)]
 
     def _evaluate(
-        self, site: Site, discharge: Callable[[str, str], bool] | None = None
+        self, site: Site, discharge: Discharge | None = None
     ) -> list[Denial]:
         match site:
             case SinkSite(kind=kind, fact=Located(location=loc)):
@@ -1283,7 +1284,7 @@ class Policy:
         self,
         value: str | ValidationFact | None,
         required: frozenset[AtomId],
-        discharge: Callable[[str, str], bool] | None,
+        discharge: Discharge | None,
     ) -> frozenset[AtomId]:
         """The required atoms *value* does not carry, after saturation (regex-defined atoms on
         known text) and after running literal checkers on exactly-known text."""
@@ -1297,7 +1298,7 @@ class Policy:
         return missing
 
     def _cwd_mismatch(
-        self, rule: Program, cwd: Located, discharge: Callable[[str, str], bool] | None
+        self, rule: Program, cwd: Located, discharge: Discharge | None
     ) -> str | None:
         if not any(location_le(cwd.location, allowed) for allowed in rule.cwd):
             return f"cwd {pretty_location(cwd.location)} is not within {pretty_locations(rule.cwd)}"
@@ -1313,7 +1314,7 @@ class Policy:
         cwd: Located,
         arguments: Sequence[Value],
         keywords: Mapping[str, object],
-        discharge: Callable[[str, str], bool] | None,
+        discharge: Discharge | None,
     ) -> str | None:
         """The templated form: bind the call like a signature, then every hole is a rely."""
         reason = self._cwd_mismatch(rule, cwd, discharge)
@@ -1332,7 +1333,7 @@ class Policy:
         rule: Program,
         cwd: Located,
         arguments: tuple,
-        discharge: Callable[[str, str], bool] | None = None,
+        discharge: Discharge | None = None,
     ) -> str | None:
         """The flat form. *arguments* excludes the matched subcommand words, if any."""
         reason = self._cwd_mismatch(rule, cwd, discharge)

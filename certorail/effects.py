@@ -41,6 +41,10 @@ class Effects:
     def empty(self) -> bool:
         return not self.regions and not self.media
 
+    def __or__(self, other: "Effects") -> "Effects":
+        """The union: what two effects together may write."""
+        return Effects(self.regions | other.regions, self.media | other.media)
+
     def meets(self, other: "Effects", medium_of: Mapping[RegionId, Medium]) -> bool:
         """Do the two sets share state? A region meets itself and the whole medium it belongs
         to; a whole medium meets the same whole medium. *medium_of* is the policy's region

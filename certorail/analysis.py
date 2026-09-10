@@ -186,38 +186,33 @@ def as_const_or_null[T](t: type[T], elem: ast.expr) -> T | None:
         return None
     return elem.value
 
-@dataclass
-class PyOpenCall:
-    file: ast.expr
-    mode: ast.expr | str = "r"
-    encoding: ast.expr | None = None
-    errors : ast.expr | None = None
-    newline: ast.expr | None = None
-    closefd: ast.expr | bool = True
-    opener: ast.expr | None = None
+def bind_values[T](spec: type[T], args: Sequence[object], kwargs: Mapping[str, object]) -> T | None:
+    """Match positional *args* and keyword *kwargs* -- AST nodes, facts, strings, whatever a
+    caller has for the arguments of a call -- against the dataclass type *spec*, whose generated
+    ``__init__`` is the signature. On success returns ``spec(...)`` built from them. Returns None
+    when the call can't be statically bound:
 
-def bind_call_args[T](call: ast.Call, spec: type[T]) -> T | None:
-    """Match the arguments of *call* against the dataclass type *spec*.
- 
-    On success returns ``spec(...)`` built from the call's argument
-    expressions. Returns None when the call can't be statically bound:
- 
-      - *args / **kwargs splats anywhere in the call
       - too many positional arguments
       - unknown or duplicate keyword arguments
       - a required (no-default) field isn't supplied
       - a kw_only field passed positionally
       - an argument supplied both positionally and by keyword
- 
-    Only *binding* failures become None. The instance is constructed after
-    binding succeeds, so exceptions from your own __post_init__ (a natural
-    place for validation) propagate instead of masquerading as parse
-    failures.
+
+    Only *binding* failures become None. The instance is constructed after binding succeeds, so
+    exceptions from your own __post_init__ (a natural place for validation) propagate instead of
+    masquerading as parse failures.
     """
     if not (isinstance(spec, type) and is_dataclass(spec)):
         raise TypeError(f"spec must be a dataclass type, got {spec!r}")
- 
-    # Splats defeat static binding.
+    try:
+        bound = inspect.signature(spec).bind(*args, **kwargs)
+    except TypeError:  # any way the binding can fail at runtime
+        return None
+    return spec(*bound.args, **bound.kwargs)
+
+
+def bind_call_args[T](call: ast.Call, spec: type[T]) -> T | None:
+    """``bind_values`` over a call's argument expressions. Splats defeat static binding."""
     if any(isinstance(arg, ast.Starred) for arg in call.args):
         return None
     kwargs: dict[str, ast.expr] = {}
@@ -227,13 +222,7 @@ def bind_call_args[T](call: ast.Call, spec: type[T]) -> T | None:
         if kw.arg in kwargs:  # impossible in parsed source; hand-built ASTs only
             return None
         kwargs[kw.arg] = kw.value
- 
-    # The dataclass's generated __init__ is the signature; bind against it.
-    try:
-        bound = inspect.signature(spec).bind(*call.args, **kwargs)
-    except TypeError:  # any way the binding can fail at runtime
-        return None
-    return spec(*bound.args, **bound.kwargs)
+    return bind_values(spec, call.args, kwargs)
 
 def is_prefix[T](s: Sequence[T], r: Sequence[T]) -> bool:
     if len(s) > len(r):
@@ -941,7 +930,7 @@ def known_text(value: "str | ValidationFact | None") -> str | None:
             return None
 
 def saturate(
-    value: "str | ValidationFact | None", defined: Mapping[AtomId, PseudoRegex]
+    value: str | ValidationFact | None, defined: Mapping[AtomId, PseudoRegex]
 ) -> "str | ValidationFact | None":
     """The value with every *defined* atom its known text entails added to ``checks``. A defined
     atom is a pure text property (the policy's ``atom()``), so establishing it from the text is

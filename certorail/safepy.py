@@ -94,6 +94,10 @@ class ImportAnalysis(_LexicalAnalysis):
                 self._violation(node, "private (underscore-prefixed) module import")
             elif _forbidden_module(a.name):
                 self._violation(node, "forbidden module import")
+            elif a.name.split(".")[0] in dir(builtins):
+                # ``import tuple`` would bind a builtin's name to a module: the analysis reads
+                # builtin names by their meaning, so nothing may rebind one
+                self._violation(node, "import shadows a builtin")
             self._imports.add(tuple(a.name.split(".")))
         return self.generic_visit(node)
 
@@ -326,7 +330,9 @@ class ValidationAnalysis(_LexicalAnalysis):
     def _visit_binding(self, nm: str, ctxt: ast.AST):
         if nm in self._module_roots:
             self._violation(ctxt, "rebind import name")
-        if nm in self._known_classes:
+        # the definition itself is the one permitted binding of a class name (a second
+        # definition is ClassAnalysis' report)
+        if nm in self._known_classes and not (isinstance(ctxt, ast.ClassDef) and ctxt.name == nm):
             self._violation(ctxt, "rebind class name")
         # the definition itself is the one permitted binding of a module-level function's name
         if nm in self._known_functions and self._known_functions[nm] is not ctxt:
@@ -423,8 +429,25 @@ class ValidationAnalysis(_LexicalAnalysis):
             self.visit(kw.value)
         for tp in node.type_params:
             self.visit(tp)
+        # a class statement binds its name like a def does: ``class tuple:`` with an __init__
+        # that keeps its argument would launder a typed container through a roster read
+        self._visit_binding(node.name, node)
         for s in node.body:
             self.visit(s)
+
+    # PEP 695 type parameters bind names in an annotation scope the body can see; a TypeVar is
+    # not callable, but a bound builtin name is a bound builtin name
+    def visit_TypeVar(self, node: ast.TypeVar) -> Any:
+        self._visit_binding(node.name, node)
+        return self.generic_visit(node)
+
+    def visit_ParamSpec(self, node: ast.ParamSpec) -> Any:
+        self._visit_binding(node.name, node)
+        return self.generic_visit(node)
+
+    def visit_TypeVarTuple(self, node: ast.TypeVarTuple) -> Any:
+        self._visit_binding(node.name, node)
+        return self.generic_visit(node)
 
     def visit_MatchAs(self, node: ast.MatchAs) -> Any:
         if node.name is not None:
