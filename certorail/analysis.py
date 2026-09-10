@@ -7,6 +7,8 @@ import urllib.parse
 from typing import Any, cast, Callable, Literal, Mapping, Sequence
 from dataclasses import dataclass, is_dataclass, replace
 
+from .ids import AtomId
+
 sensitive_builtins = (
     "getattr",
     "setattr",
@@ -939,7 +941,7 @@ def known_text(value: "str | ValidationFact | None") -> str | None:
             return None
 
 def saturate(
-    value: "str | ValidationFact | None", defined: Mapping[str, PseudoRegex]
+    value: "str | ValidationFact | None", defined: Mapping[AtomId, PseudoRegex]
 ) -> "str | ValidationFact | None":
     """The value with every *defined* atom its known text entails added to ``checks``. A defined
     atom is a pure text property (the policy's ``atom()``), so establishing it from the text is

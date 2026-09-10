@@ -10,6 +10,7 @@ import unittest
 from certorail import markers
 from certorail.host import Accepted, Rejected
 from certorail.host import check as host_check
+from certorail.ids import HoleName
 from certorail.policy import Policy
 from certorail.policyfile import PolicyFileError, from_data
 from certorail.templates import Flags, Token
@@ -99,11 +100,11 @@ class TestApply(RulesetCase):
         grep, ls = policy.programs
         self.assertEqual(len(grep.cwd), 2)  # cwd = "${where}" -> two directories
         assert grep.template is not None and ls.template is not None
-        files = grep.template.holes["FILES"]
+        files = grep.template.holes[HoleName("FILES")]
         self.assertEqual(
             [str(loc.absolute) for loc in getattr(files, "constraint").locations], ["False", "True"]
         )
-        where = ls.template.holes["WHERE"]
+        where = ls.template.holes[HoleName("WHERE")]
         assert isinstance(where, Token)
         self.assertEqual(len(where.constraint.locations), 3)  # two mapped + shared/**
         self.assertEqual(grep.origin, "unix.toml (where=repos,/srv/data)")

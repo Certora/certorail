@@ -43,6 +43,7 @@ from .analysis import (
     pretty_location,
     pretty_regex,
 )
+from .ids import AtomId, FlagName, HoleName
 
 # ---------------------------------------------------------------------------
 # the vocabulary
@@ -55,7 +56,7 @@ type Value = str | ValidationFact | None  # one token as the analysis sees it (a
 class HoleRef:
     """``${name}`` (one token) or ``${name...}`` (a splice) in a template's pieces."""
 
-    name: str
+    name: HoleName
     variadic: bool = False
 
 
@@ -75,7 +76,7 @@ class Constraint:
 
     locations: tuple[LocationFact, ...] = ()
     regex: PseudoRegex | None = None
-    atoms: frozenset[str] = frozenset()
+    atoms: frozenset[AtomId] = frozenset()
     literal: bool = False
     any: bool = False
 
@@ -104,8 +105,8 @@ class Flagset:
     """A flag vocabulary: the bare flags, and the valued ones with the constraint on their
     value. Every flag name begins with ``-``."""
 
-    bare: frozenset[str] = frozenset()
-    valued: Mapping[str, Constraint] = field(default_factory=dict)
+    bare: frozenset[FlagName] = frozenset()
+    valued: Mapping[FlagName, Constraint] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         names = set(self.bare) | set(self.valued)
@@ -134,7 +135,7 @@ class Template:
     """One permitted command-line shape. ``pieces[0]`` is the program, a literal."""
 
     pieces: tuple[Piece, ...]
-    holes: Mapping[str, Hole]
+    holes: Mapping[HoleName, Hole]
 
     def __post_init__(self) -> None:
         if not self.pieces or not isinstance(self.pieces[0], str):
@@ -173,11 +174,11 @@ class Template:
             out.append(p)
         return tuple(out)
 
-    def variadic(self, name: str) -> bool:
+    def variadic(self, name: HoleName) -> bool:
         return isinstance(self.holes[name], (Each, Flags))
 
     @property
-    def keyword_only(self) -> tuple[str, ...]:
+    def keyword_only(self) -> tuple[HoleName, ...]:
         """The holes from the first non-last variadic hole onward: nothing marks where such a
         splice would end, so they are bound by name."""
         refs = [p for p in self.pieces if isinstance(p, HoleRef)]
@@ -186,7 +187,7 @@ class Template:
                 return tuple(x.name for x in refs[i:])
         return ()
 
-    def dash_exempt(self, name: str) -> bool:
+    def dash_exempt(self, name: HoleName) -> bool:
         """A literal ``--`` earlier in the template makes a later hole safe from being read as
         an option, for tools that honour it."""
         for p in self.pieces:
@@ -223,7 +224,7 @@ type Binding = Value | Many | Elements
 @dataclass(frozen=True)
 class Bound:
     template: Template
-    bindings: Mapping[str, Binding]
+    bindings: Mapping[HoleName, Binding]
 
 
 @dataclass(frozen=True)
@@ -246,7 +247,7 @@ def bind(
     variadic takes the rest; a non-last variadic and everything after it is keyword-only;
     keywords fill by name. Interior literal words are never spelled by the program."""
     reasons: list[str] = []
-    bindings: dict[str, Binding] = {}
+    bindings: dict[HoleName, Binding] = {}
     lead = len(template.leading_words) - 1
     positionals = list(arguments[lead:])
     keyword_only = set(template.keyword_only)
@@ -268,7 +269,8 @@ def bind(
                 else ""
             )
         )
-    for name, value in keywords.items():
+    for spelled, value in keywords.items():
+        name = HoleName(spelled)  # the program's keyword, entering the template's domain
         if name not in template.holes:
             reasons.append(f"{name!r} is not a hole of this form")
         elif name in bindings:
@@ -294,7 +296,7 @@ def bind(
 
 # atoms of *required* that *value* does not carry (the policy supplies this: saturation and
 # literal checkers live there)
-type AtomsMissing = Callable[[Value, frozenset[str]], frozenset[str]]
+type AtomsMissing = Callable[[Value, frozenset[AtomId]], frozenset[AtomId]]
 
 
 def _as_fact(value: str | ValidationFact) -> ValidationFact:
@@ -457,9 +459,10 @@ def flags_failure(fs: Flagset, elements: Sequence[Value], atoms_missing: AtomsMi
     """Parse *elements* against the vocabulary, left to right."""
     i = 0
     while i < len(elements):
-        name = known_text(elements[i])
-        if name is None:
+        text = known_text(elements[i])
+        if text is None:
             return f"element {i + 1} is in flag position but is not statically known text"
+        name = FlagName(text)
         if name in fs.bare:
             i += 1
             continue

@@ -15,6 +15,8 @@ Values the program supplies are written in one compact notation, explained once 
 from collections.abc import Iterable
 
 from .analysis import pretty_location, pretty_regex
+from .effects import EVERYTHING, Effects
+from .ids import AtomId
 from .policy import NetworkRule, Policy, Program, Validation, pretty_locations
 from .templates import Constraint, Each, Flags, Flagset, Template, Token
 
@@ -67,7 +69,91 @@ def _signature(t: Template) -> str:
     return " ".join(words)
 
 
-def _program(p: Program) -> list[str]:
+# -- effects (EFFECTS.md) -------------------------------------------------------------------
+
+
+def _writes(e: Effects) -> str:
+    """A write set as a phrase: the regions, and a whole medium as "anything ..."."""
+    if e.empty:
+        return "none"
+    parts : list[str] = sorted(e.regions)
+    if "fs" in e.media:
+        parts.append("anything on the filesystem")
+    if "network" in e.media:
+        parts.append("anything remote")
+    return "writes " + ", ".join(parts)
+
+
+def _depends(e: Effects) -> str:
+    if e == EVERYTHING:
+        return "everything"
+    parts : list[str] = sorted(e.regions)
+    if "fs" in e.media:
+        parts.append("any filesystem state")
+    if "network" in e.media:
+        parts.append("any remote state")
+    return ", ".join(parts)
+
+
+def _effects_line(policy: Policy, rule: Program | Validation) -> str:
+    """What a grant does to the state atoms depend on, with the media it forgoes."""
+    if rule.effect_free:
+        return "effects: none (effect-free: kills no facts)"
+    notes = []
+    if not rule.network:
+        notes.append("no network")
+    if not rule.write:
+        notes.append("no filesystem writes")
+    text = f"effects: {_writes(policy.write_set(rule))}"
+    return text + (f" ({'; '.join(notes)})" if notes else "")
+
+
+def _dies_on(policy: Policy, atom_name: AtomId) -> str:
+    """Every declared operation whose write set meets the atom's read set, computed."""
+    hits: list[str] = []
+    for p in policy.programs:
+        if policy.kills(p, atom_name):
+            hits.append(" ".join(p.leading_words))
+    for r in policy.network:
+        if policy.kills(r, atom_name):
+            methods = "/".join(sorted(r.methods)) if r.methods else "any method"
+            hits.append(f"{methods} {r.host}")
+    for v in policy.validations:
+        if policy.kills(v, atom_name):
+            hits.append(f"check {v.name}")
+    state = policy.read_set(atom_name)
+    if "fs" in state.media:
+        hits.append("any file write")
+    else:
+        under = [
+            pretty_location(loc)
+            for r in policy.regions
+            if r.medium == "fs" and r.name in state.regions
+            for loc in r.footprint
+        ]
+        if under:
+            hits.append(f"file writes under {', '.join(under)} (below the check's cwd)")
+    return "; ".join(hits) if hits else "nothing this policy permits"
+
+
+def _regions(policy: Policy) -> list[str]:
+    out: list[str] = []
+    for r in policy.regions:
+        if r.medium == "network":
+            where = "remote"
+        else:
+            where = (
+                "on disk at " + ", ".join(pretty_location(loc) for loc in r.footprint)
+                + " below the check's cwd, and everything under it"
+            )
+        out.append(f"- {r.name} ({where})" + (f": {r.about}" if r.about else ""))
+    return out
+
+
+# -- the sections -------------------------------------------------------------------------
+
+
+def _program(p: Program, policy: Policy) -> list[str]:
     out: list[str] = []
     origin = f"    [from {p.origin}]" if p.origin else ""
     t = p.template
@@ -78,6 +164,7 @@ def _program(p: Program) -> list[str]:
             out.append(f"    cwd validated by {', '.join(sorted(p.requires))} (check right before)")
         if p.source:
             out.append(f"    yields {p.source}: extract values from the result with certora.extract / extract_all / lines")
+        out.append(f"    {_effects_line(policy, p)}")
         parts = ["any" if p.unknown_arguments else "literal"]
         if p.argument_locations:
             parts.append(
@@ -93,6 +180,7 @@ def _program(p: Program) -> list[str]:
         out.append(f"    cwd validated by {', '.join(sorted(p.requires))} (check right before)")
     if p.source:
         out.append(f"    yields {p.source}: extract values from the result with certora.extract / extract_all / lines")
+    out.append(f"    {_effects_line(policy, p)}")
     keyword_only = t.keyword_only
     if keyword_only:
         out.append(f"    bind by keyword: {', '.join(keyword_only)}")
@@ -112,7 +200,7 @@ def _program(p: Program) -> list[str]:
     return out
 
 
-def _validation(v: Validation, defined: frozenset[str]) -> list[str]:
+def _validation(v: Validation, policy: Policy, defined: frozenset[AtomId]) -> list[str]:
     params = ", ".join(f"{p}=<str>" for p in v.params)
     cwd = "" if v.cwd is None else f"cwd=<path within {', '.join(pretty_location(l) for l in v.cwd)}>"
     call = ", ".join(x for x in (f'"{v.name}"', params, cwd) if x)
@@ -123,20 +211,16 @@ def _validation(v: Validation, defined: frozenset[str]) -> list[str]:
             for a in sorted(atoms)
         )
         out.append(f"    establishes on {key}: {kinds}")
-    notes = []
-    if v.effect_free:
-        notes.append("effect-free: kills no other facts")
+    out.append(f"    {_effects_line(policy, v)}")
     if len(v.params) == 1:
-        notes.append(f'also as an expression: certora.check_single("{v.name}", value)')
-    if notes:
-        out.append("    " + "; ".join(notes))
+        out.append(f'    also as an expression: certora.check_single("{v.name}", value)')
     return out
 
 
 def _atoms(policy: Policy) -> list[str]:
     defined = {a.name: a.regex for a in policy.atoms}
-    pure: set[str] = set()
-    environmental: set[str] = set()
+    pure: set[AtomId] = set()
+    environmental: set[AtomId] = set()
     for v in policy.validations:
         for atoms in v.establishes.values():
             for a in atoms:
@@ -150,10 +234,17 @@ def _atoms(policy: Policy) -> list[str]:
     for name in sorted(pure):
         out.append(f"- {name}: a property of the value's text, established by a check; survives calls")
     for name in sorted(environmental):
-        out.append(
-            f"- {name}: a property of the environment, established by a check; dies at any "
-            "effectful call, so check immediately before the use"
-        )
+        state = policy.read_set(name)
+        if state == EVERYTHING:
+            out.append(
+                f"- {name}: a property of the environment, established by a check; dies at any "
+                "effectful call, so check immediately before the use"
+            )
+        else:
+            out.append(
+                f"- {name}: a property of the environment, established by a check; depends on "
+                f"{_depends(state)}; dies on: {_dies_on(policy, name)}"
+            )
     for name in sorted(policy.source_atoms):
         out.append(
             f"- {name}: provenance -- a value extracted, unmodified, from the source that yields "
@@ -170,7 +261,7 @@ def _sources(policy: Policy) -> list[str]:
     ]
 
 
-def _network(r: NetworkRule) -> str:
+def _network(r: NetworkRule, policy: Policy) -> str:
     methods = ", ".join(sorted(r.methods)) if r.methods else "any method"
     schemes = "/".join(sorted(r.schemes))
     ports = (":" + ",".join(str(p) for p in sorted(r.ports))) if r.ports else ""
@@ -181,6 +272,9 @@ def _network(r: NetworkRule) -> str:
         line += "; the URL must be validated by " + ", ".join(sorted(ra.name for ra in r.requires))
     if r.source:
         line += f"; yields {r.source}"
+    ws = policy.write_set(r)
+    if not ws.empty:
+        line += f"; {_writes(ws)}"
     return line
 
 
@@ -210,14 +304,19 @@ def describe(policy: Policy, origin: str, governs: str | None = None) -> str:
         for kind, locs in (("read", policy.read), ("write", policy.write), ("list", policy.listing))
     ]
     defined = frozenset(a.name for a in policy.atoms)
-    programs = [line for p in policy.programs for line in _program(p)]
-    validations = [line for v in policy.validations for line in _validation(v, defined)]
+    programs = [line for p in policy.programs for line in _program(p, policy)]
+    validations = [line for v in policy.validations for line in _validation(v, policy, defined)]
     return "\n".join(
         head
         + _section("Filesystem", fs)
         + _section("Programs: certora.exec(<words>, <holes>, cwd=<proven path>)", programs)
         + _section("Validations", validations)
+        + (
+            _section("Regions: the state checks depend on and commands change", _regions(policy))
+            if policy.regions
+            else []
+        )
         + _section("Atoms", _atoms(policy))
-        + _section("Network: certora.network.<method>(url)", (_network(r) for r in policy.network))
+        + _section("Network: certora.network.<method>(url)", (_network(r, policy) for r in policy.network))
         + (_section("Sources: file reads that yield provenance", _sources(policy)) if policy.sources else [])
     ).rstrip() + "\n"

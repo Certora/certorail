@@ -11,6 +11,7 @@ from certorail.analysis import ANY_NAME, DirSplat, Exact, Located, Named, Static
 from certorail.broker import build_server, exec_request
 from certorail.host import Accepted, Rejected
 from certorail.host import check as host_check
+from certorail.ids import HoleName
 from certorail.policy import Policy, Refusal, atom, constraint, flagset, hole, program, splice
 from certorail.policyfile import PolicyFileError, from_data
 from certorail.templates import (
@@ -337,17 +338,17 @@ class TestTemplateWellFormedness(unittest.TestCase):
     def test_template_errors(self) -> None:
         good = Token(constraint(any=True))
         with self.assertRaises(ValueError):
-            Template(("x", HoleRef("A")), {})  # used, not declared
+            Template(("x", HoleRef(HoleName("A"))), {})  # used, not declared
         with self.assertRaises(ValueError):
-            Template(("x",), {"A": good})  # declared, not used
+            Template(("x",), {HoleName("A"): good})  # declared, not used
         with self.assertRaises(ValueError):
-            Template(("x", HoleRef("A", variadic=True)), {"A": good})  # ${A...} on a token
+            Template(("x", HoleRef(HoleName("A"), variadic=True)), {HoleName("A"): good})  # ${A...} on a token
         with self.assertRaises(ValueError):
-            Template(("x", HoleRef("A")), {"A": Each(constraint(any=True))})  # ${A} on an each
+            Template(("x", HoleRef(HoleName("A"))), {HoleName("A"): Each(constraint(any=True))})  # ${A} on an each
         with self.assertRaises(ValueError):
-            Template(("x", HoleRef("cwd")), {"cwd": good})
+            Template(("x", HoleRef(HoleName("cwd"))), {HoleName("cwd"): good})
         with self.assertRaises(ValueError):
-            Template((HoleRef("A"),), {"A": good})
+            Template((HoleRef(HoleName("A")),), {HoleName("A"): good})
 
     def test_constraint_errors(self) -> None:
         with self.assertRaises(ValueError):
@@ -410,7 +411,7 @@ class TestBind(unittest.TestCase):
     def test_an_omitted_splice_is_empty(self) -> None:
         bound = bind(GREP, [], {"PATTERN": "x", "FILES": Many(("repos/a",))})
         assert isinstance(bound, Bound)
-        self.assertEqual(bound.bindings["FLAGS"], Many(()))
+        self.assertEqual(bound.bindings[HoleName("FLAGS")], Many(()))
 
     def test_positionals_reaching_keyword_only_holes(self) -> None:
         result = bind(GREP, ["-r"], {})
@@ -527,13 +528,13 @@ class TestDataFormat(unittest.TestCase):
         self.assertEqual(find.leading_words, ("find",))
         self.assertEqual(git.leading_words, ("git", "push", "origin"))
         self.assertEqual(tar.template.keyword_only, ("FLAGS", "ARCHIVE", "FILES"))
-        flags = find.template.holes["FLAGS"]
+        flags = find.template.holes[HoleName("FLAGS")]
         assert isinstance(flags, Flags)
         self.assertEqual(flags.flagset.bare, frozenset({"-print"}))
-        inline = tar.template.holes["FLAGS"]
+        inline = tar.template.holes[HoleName("FLAGS")]
         assert isinstance(inline, Flags)
         self.assertIn("-C", inline.flagset.valued)
-        files = tar.template.holes["FILES"]
+        files = tar.template.holes[HoleName("FILES")]
         assert isinstance(files, Each)
         self.assertEqual(files.min, 1)
         self.assertEqual(len(files.constraint.locations), 2)

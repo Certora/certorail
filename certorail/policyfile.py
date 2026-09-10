@@ -7,8 +7,12 @@
     write = ["repos/**"]
     list  = ["repos/**"]
 
+    [regions]
+    git.config = { footprint = ".git/config", about = "remotes and everything else git reads from config" }
+    git.remote = { network = true, about = "the remote repository" }
+
     [atoms]
-    org-checkout = {}                          # environmental, opaque
+    org-checkout = { reads = ["git.config"] }  # environmental: dies when git.config is written
     not-force    = { pure = true }             # pure, established by a checker
     no-flag      = { matches = '[^-].*' }      # defined: the regex is its meaning (pure)
 
@@ -26,6 +30,7 @@
     cwd            = "repos/**"
     requires       = ["org-checkout"]
     argument-atoms = ["not-force"]
+    writes         = ["git.remote"]
 
     [[network]]
     host    = "api.github.com"
@@ -57,6 +62,14 @@ re-establishes it from the hop URL's text; textual atoms only), ``stop`` (the ru
 authorize hops), or ``waive`` (the atom speaks about the original request only). A bare name
 defaults to recheck when the atom is textual, stop otherwise. Network rules say nothing about
 exec'd programs, whose network access is folded into their ``[[program]]`` grant.
+``[regions]`` (EFFECTS.md) names the state checks depend on and commands change, each with one
+medium: a ``footprint`` -- locations relative to the cwd of the check whose atom depends on it,
+or absolute, each meaning that path and everything below -- or ``network = true``. A rule or a
+validation may claim the media it reaches (``network = false``, ``write = false``;
+``effect-free = true`` is neither) and what it ``writes`` within them, region names or a medium
+name for the whole medium; an environmental atom may say what it ``reads``. Undeclared means
+everything, so a policy that says nothing keeps the crude kill. A rule with ``unknown-arguments``
+or an ``any`` hole the tool could read as an option cannot say what it writes.
 
 The schema is strict and fails closed: unknown keys, undeclared atoms, malformed locations and
 mistyped values are all errors, and all of them are reported, not just the first.
@@ -75,6 +88,8 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from . import markers
+from .effects import Medium, as_medium
+from .ids import AtomId, FlagName, FlagsetId, HoleName, ParamName, RegionId
 from .locations import parse_location
 from .policydir import config_dir
 from .analysis import (
@@ -97,6 +112,7 @@ from .policy import (
     Param,
     Policy,
     Program,
+    Region,
     RequiredAtom,
     Source,
     Validation,
@@ -104,6 +120,7 @@ from .policy import (
     network,
     program,
     pure,
+    region,
     validation,
 )
 from .templates import Constraint, Each, Flags, Flagset, Hole, HoleRef, Piece, Token
@@ -148,7 +165,7 @@ def _resolve_checker(loader: "_Loader", where: str, piece: str, index: int) -> s
 def _parse_argv_piece(piece: str) -> str | Param:
     m = _PARAM_REF.fullmatch(piece)
     if m is not None:
-        return Param(m.group(1))
+        return Param(ParamName(m.group(1)))
     if "${" in piece:
         raise ValueError(f"parameter references must be whole arguments: {piece!r}")
     return piece
@@ -267,16 +284,16 @@ class _Loader:
         return out
 
     def atom_names(
-        self, path: str, table: dict[str, Any], key: str, declared: frozenset[str]
-    ) -> list[str]:
+        self, path: str, table: dict[str, Any], key: str, declared: frozenset[AtomId]
+    ) -> list[AtomId]:
         names = self.str_list(path, table, key)
         for n in names:
             if n not in declared:
                 self.error(f"{path}.{key}", f"atom {n!r} is not declared in [atoms]")
-        return names
+        return [AtomId(n) for n in names]
 
     def required_atoms(
-        self, path: str, table: dict[str, Any], key: str, declared: frozenset[str]
+        self, path: str, table: dict[str, Any], key: str, declared: frozenset[AtomId]
     ) -> list[str | RequiredAtom]:
         """A network rule's ``requires``: each entry an atom name (redirect treatment decided
         by the atom's textuality), or ``{ atom = "...", on-redirect = "..." }``."""
@@ -308,8 +325,24 @@ class _Loader:
                 continue
             if name not in declared:
                 self.error(where, f"atom {name!r} is not declared in [atoms]")
-            out.append(name if mode is None else RequiredAtom(name, mode))
+            out.append(name if mode is None else RequiredAtom(AtomId(name), mode))
         return out
+
+    def region_names(
+        self, path: str, table: dict[str, Any], key: str, regions: Mapping[RegionId, Medium]
+    ) -> list[str] | None:
+        """A list of regions under *key* (``writes``, ``reads``): declared region names, or a
+        medium name (``fs``, ``network``) for the whole medium. None when absent -- undeclared --
+        or malformed (reported); an empty list is a declaration of nothing."""
+        if key not in table:
+            return None
+        names = self.str_list(path, table, key)
+        ok = isinstance(table.get(key), list)
+        for n in names:
+            if RegionId(n) not in regions and as_medium(n) is None:
+                self.error(f"{path}.{key}", f"region {n!r} is not declared in [regions]")
+                ok = False
+        return names if ok else None
 
     def entries(self, key: str, data: dict[str, Any]) -> list[Any]:
         value = data.get(key)
@@ -322,13 +355,18 @@ class _Loader:
 
 
 _TOP_KEYS = frozenset({
-    "policy-version", "root", "filesystem", "atoms", "flagset", "validation", "program",
-    "network", "apply", "source",
+    "policy-version", "root", "filesystem", "regions", "atoms", "flagset", "validation",
+    "program", "network", "apply", "source",
 })
 # a ruleset (TEMPLATES.md): exec-side vocabulary only -- no filesystem grants, no network, no root
-_RULESET_TOP_KEYS = frozenset(
-    {"ruleset-version", "params", "atoms", "flagset", "validation", "program", "apply", "source"}
-)
+_RULESET_TOP_KEYS = frozenset({
+    "ruleset-version", "params", "regions", "atoms", "flagset", "validation", "program", "apply",
+    "source",
+})
+# a region (EFFECTS.md): one medium -- a footprint (fs) or network = true
+_REGION_KEYS = frozenset({"footprint", "network", "about"})
+# the media a grant claims to reach, and what it writes within them
+_MEDIA_KEYS = frozenset({"network", "write", "writes"})
 _SOURCE_KEYS = frozenset({"name", "location"})
 _PARAM_KINDS = ("directory", "atom")
 # where a ruleset's parameters may be substituted: location slots (a directory parameter heads
@@ -340,16 +378,22 @@ _WHOLE_PARAM = re.compile(r"\$\{(\w+)\}")
 # stock, config-free, non-spawning predicates a ruleset's validation may run besides
 # ${checkers}/<name>: the whole executable surface a shared file can reach
 RULESET_STOCK_CHECKERS: frozenset[str] = frozenset({"test"})
-_ATOM_KEYS = frozenset({"pure", "matches"})
-_VALIDATION_KEYS = frozenset({"name", "params", "argv", "cwd", "establishes", "effect-free"})
+_ATOM_KEYS = frozenset({"pure", "matches", "reads"})
+_VALIDATION_KEYS = (
+    frozenset({"name", "params", "argv", "cwd", "establishes", "effect-free"}) | _MEDIA_KEYS
+)
 _NETWORK_KEYS = frozenset({
     "host", "schemes", "ports", "methods", "allow-nonpublic", "requires",
-    "read-timeout", "total-timeout", "max-response-bytes", "source", "path",
+    "read-timeout", "total-timeout", "max-response-bytes", "source", "path", "writes",
 })
 _LEGACY_PROGRAM_KEYS = frozenset(
     {"subcommand", "argument-atoms", "unknown-arguments", "argument-locations"}
 )
-_PROGRAM_KEYS = frozenset({"name", "cwd", "requires", "argv", "holes", "source"}) | _LEGACY_PROGRAM_KEYS
+_PROGRAM_KEYS = (
+    frozenset({"name", "cwd", "requires", "argv", "holes", "source", "effect-free"})
+    | _MEDIA_KEYS
+    | _LEGACY_PROGRAM_KEYS
+)
 # a constraint table: a token hole, an each hole's elements, a valued flag (TEMPLATES.md)
 _CONSTRAINT_KEYS = frozenset({"location", "matches", "one-of", "atoms", "literal", "any"})
 _HOLE_KEYS = _CONSTRAINT_KEYS | {"kind", "min", "flagset", "bare"}
@@ -363,7 +407,7 @@ _HOLE_REF = re.compile(r"\$\{(\w+)(\.\.\.)?\}")
 # ---------------------------------------------------------------------------
 
 
-def _open_table(loader: "_Loader", path: str, value: Any, known: frozenset[str]) -> dict[str, Any] | None:
+def _open_table(loader: _Loader, path: str, value: Any, known: frozenset[str]) -> dict[str, Any] | None:
     """A table whose keys are *known* or flag names (``-``-prefixed): hole tables and flagsets."""
     if not isinstance(value, dict):
         loader.error(path, "expected a table")
@@ -377,7 +421,7 @@ def _open_table(loader: "_Loader", path: str, value: Any, known: frozenset[str])
 
 
 def _location_list(
-    loader: "_Loader", path: str, table: dict[str, Any], key: str
+    loader: _Loader, path: str, table: dict[str, Any], key: str
 ) -> tuple[LocationFact, ...] | None:
     """An optional location slot under *key* (a constraint's ``location``, a network rule's
     ``path``): one spelling or a list (any-of); empty when absent, None when malformed."""
@@ -398,7 +442,7 @@ def _location_list(
 
 
 def _constraint(
-    loader: "_Loader", path: str, table: dict[str, Any], declared: frozenset[str]
+    loader: _Loader, path: str, table: dict[str, Any], declared: frozenset[AtomId]
 ) -> Constraint | None:
     locations = _location_list(loader, path, table, "location")
     matches = loader.field(path, table, "matches", str)
@@ -429,15 +473,15 @@ def _constraint(
 
 
 def _flag_vocabulary(
-    loader: "_Loader",
+    loader: _Loader,
     path: str,
     table: dict[str, Any],
-    declared: frozenset[str],
+    declared: frozenset[AtomId],
     reserved: frozenset[str],
 ) -> Flagset | None:
     """``bare`` plus every ``-``-keyed valued flag; *reserved* are the table's own keys."""
     bare = loader.str_list(path, table, "bare")
-    valued: dict[str, Constraint] = {}
+    valued: dict[FlagName, Constraint] = {}
     ok = True
     for key, spec in table.items():
         if key in reserved:
@@ -458,22 +502,22 @@ def _flag_vocabulary(
         if c is None:
             ok = False
         else:
-            valued[key] = c
+            valued[FlagName(key)] = c
     if not ok:
         return None
     try:
-        return Flagset(frozenset(bare), valued)
+        return Flagset(frozenset(FlagName(b) for b in bare), valued)
     except ValueError as e:
         loader.error(path, str(e))
         return None
 
 
 def _hole(
-    loader: "_Loader",
+    loader: _Loader,
     path: str,
     table: dict[str, Any],
-    flagsets: Mapping[str, Flagset],
-    declared: frozenset[str],
+    flagsets: Mapping[FlagsetId, Flagset],
+    declared: frozenset[AtomId],
 ) -> Hole | None:
     kind = loader.field(path, table, "kind", str) or "token"
     if kind not in _HOLE_KINDS:
@@ -489,7 +533,7 @@ def _hole(
             loader.error(path, "flagset and an inline vocabulary exclude each other")
             return None
         if ref is not None:
-            fs = flagsets.get(ref)
+            fs = flagsets.get(FlagsetId(ref))
             if fs is None:
                 loader.error(f"{path}.flagset", f"flagset {ref!r} is not declared")
                 return None
@@ -515,13 +559,13 @@ def _hole(
 
 
 def _source_atom(
-    loader: "_Loader",
+    loader: _Loader,
     path: str,
     table: dict[str, Any],
     key: str,
-    declared: frozenset[str],
-    pure_names: frozenset[str],
-) -> str | None:
+    declared: frozenset[AtomId],
+    pure_names: frozenset[AtomId],
+) -> AtomId | None:
     """A source atom (PROVENANCE.md) named under *key*: declared, and *pure*."""
     name = loader.field(path, table, key, str)
     if name is None:
@@ -532,11 +576,11 @@ def _source_atom(
     if name not in pure_names:
         loader.error(f"{path}.{key}", f"a source atom is pure: declare {name!r} with pure = true")
         return None
-    return name
+    return AtomId(name)
 
 
 def _sources(
-    loader: "_Loader", top: dict[str, Any], declared: frozenset[str], pure_names: frozenset[str]
+    loader: _Loader, top: dict[str, Any], declared: frozenset[AtomId], pure_names: frozenset[AtomId]
 ) -> list[Source]:
     """``[[source]]``: read locations whose contents yield an atom."""
     out: list[Source] = []
@@ -554,13 +598,13 @@ def _sources(
     return out
 
 
-def _pieces(loader: "_Loader", path: str, words: list[str]) -> tuple[Piece, ...] | None:
+def _pieces(loader: _Loader, path: str, words: list[str]) -> tuple[Piece, ...] | None:
     out: list[Piece] = []
     ok = True
     for i, word in enumerate(words):
         m = _HOLE_REF.fullmatch(word)
         if m is not None:
-            out.append(HoleRef(m.group(1), m.group(2) is not None))
+            out.append(HoleRef(HoleName(m.group(1)), m.group(2) is not None))
         elif "${" in word:
             loader.error(f"{path}.argv[{i}]", f"hole references are whole words: {word!r}")
             ok = False
@@ -588,7 +632,7 @@ class _Document:
     restricted: bool      # a ruleset: restricted validation argv
 
 
-def _ruleset_params(loader: "_Loader", top: dict[str, Any]) -> dict[str, str]:
+def _ruleset_params(loader: _Loader, top: dict[str, Any]) -> dict[str, str]:
     """``[params]``: name -> kind."""
     table = top.get("params", {})
     if not isinstance(table, dict):
@@ -607,7 +651,7 @@ def _ruleset_params(loader: "_Loader", top: dict[str, Any]) -> dict[str, str]:
 
 
 def _bindings(
-    loader: "_Loader", path: str, table: dict[str, Any], params: Mapping[str, str]
+    loader: _Loader, path: str, table: dict[str, Any], params: Mapping[str, str]
 ) -> dict[str, Any] | None:
     """The ``[[apply]]`` entry's bindings, checked against the ruleset's parameters: a directory
     parameter takes one directory or a non-empty list of them (a StaticPath: no splat, no regex);
@@ -658,7 +702,7 @@ def _join_dir(base: str, rest: str | None) -> str:
 
 
 def _instantiate(
-    loader: "_Loader", top: dict[str, Any], params: Mapping[str, str], bindings: Mapping[str, Any]
+    loader: _Loader, top: dict[str, Any], params: Mapping[str, str], bindings: Mapping[str, Any]
 ) -> dict[str, Any]:
     """Substitute the parameters into a ruleset's rules. A directory parameter heads a location
     spelling and maps over its bound directories (``${where}/**`` with two directories is two
@@ -762,7 +806,7 @@ def _instantiate(
 
 
 def _apply_all(
-    loader: "_Loader",
+    loader: _Loader,
     top: dict[str, Any],
     chain: tuple[str, ...],
     seen: dict[tuple[str, str], tuple[str, str]],
@@ -836,15 +880,61 @@ def _apply_all(
 # ---------------------------------------------------------------------------
 
 
+def _declare_regions(
+    loader: _Loader, documents: Sequence[_Document]
+) -> tuple[list[Region], dict[RegionId, Medium]]:
+    """``[regions]`` across the composition (EFFECTS.md): the state vocabulary. Two files
+    declaring the same name mean the same region -- the vocabulary is the shared thing -- so
+    identical declarations merge and differing ones are an error. A footprint is relative (to
+    the cwd of the check whose atom depends on the region) or absolute; a ruleset's footprints
+    are relative only, like its other locations."""
+    out: dict[RegionId, Region] = {}
+    declared_by: dict[RegionId, str] = {}
+    for doc in documents:
+        dl = _Loader(doc.label, loader.errors)
+        table = doc.top.get("regions", {})
+        if not isinstance(table, dict):
+            dl.error("regions", "expected a table")
+            continue
+        for name, spec_data in table.items():
+            path = f"regions.{name}"
+            spec = dl.table(path, spec_data, _REGION_KEYS)
+            is_network = dl.field(path, spec, "network", bool) or False
+            about = dl.field(path, spec, "about", str) or ""
+            footprint = _location_list(dl, path, spec, "footprint") if "footprint" in spec else None
+            if "footprint" in spec and not footprint:
+                continue  # malformed or empty: reported by _location_list
+            if doc.restricted and footprint and any(loc.absolute for loc in footprint):
+                dl.error(f"{path}.footprint", "a ruleset names no absolute locations")
+                continue
+            try:
+                r = region(name, footprint=footprint, network=is_network, about=about)
+            except ValueError as e:
+                dl.error(path, str(e))
+                continue
+            previous = out.get(r.name)
+            if previous is None:
+                out[r.name] = r
+                declared_by[r.name] = doc.label
+            elif (previous.medium, previous.footprint) != (r.medium, r.footprint):
+                dl.error(
+                    path,
+                    f"region {name!r} is declared differently by {declared_by[r.name]}; one name, one region",
+                )
+    return list(out.values()), {r.name: r.medium for r in out.values()}
+
+
 def _declare_atoms(
-    loader: "_Loader", documents: Sequence[_Document]
-) -> tuple[list[AtomDef], frozenset[str], frozenset[str]]:
-    """``[atoms]`` across the composition: defined atoms, pure names, all declared names. A name
-    is declared once, whatever file declares it; two files declaring the same name is an error
-    even when the definitions agree (namespace by convention: ``unix.no-arg``)."""
+    loader: _Loader, documents: Sequence[_Document], regions: Mapping[RegionId, Medium]
+) -> tuple[list[AtomDef], frozenset[AtomId], frozenset[AtomId], dict[str, list[str]]]:
+    """``[atoms]`` across the composition: defined atoms, pure names, all declared names, and
+    what each environmental atom depends on (``reads``, by atom name, as spelled). A name is
+    declared once, whatever file declares it; two files declaring the same name is an error even
+    when the definitions agree (namespace by convention: ``unix.no-arg``)."""
     atom_defs: list[AtomDef] = []
-    pure_names: set[str] = set()
-    declared_by: dict[str, str] = {}
+    pure_names: set[AtomId] = set()
+    declared_by: dict[AtomId, str] = {}
+    reads_map: dict[str, list[str]] = {}
     for doc in documents:
         dl = _Loader(doc.label, loader.errors)
         atoms_table = doc.top.get("atoms", {})
@@ -853,13 +943,15 @@ def _declare_atoms(
             continue
         for name, spec_data in atoms_table.items():
             path = f"atoms.{name}"
-            if name in declared_by:
-                dl.error(path, f"atom {name!r} is also declared by {declared_by[name]}; atom names are unique")
+            aid = AtomId(name)
+            if aid in declared_by:
+                dl.error(path, f"atom {name!r} is also declared by {declared_by[aid]}; atom names are unique")
                 continue
-            declared_by[name] = doc.label
+            declared_by[aid] = doc.label
             spec = dl.table(path, spec_data, _ATOM_KEYS)
             meaning = dl.field(path, spec, "matches", str)
             pure_flag = dl.field(path, spec, "pure", bool)
+            depends = dl.region_names(path, spec, "reads", regions)
             if meaning is not None:
                 if pure_flag is False:
                     dl.error(path, "a defined atom is pure by construction")
@@ -869,15 +961,36 @@ def _declare_atoms(
                     dl.error(f"{path}.matches", f"bad regex: {e}")
                     continue
                 atom_defs.append(atom(name, markers.matches(meaning)))
-                pure_names.add(name)
+                pure_names.add(aid)
             elif pure_flag:
-                pure_names.add(name)
-    return atom_defs, frozenset(pure_names), frozenset(declared_by)
+                pure_names.add(aid)
+            if "reads" in spec:
+                if aid in pure_names:
+                    dl.error(f"{path}.reads", "a pure atom depends on no state; reads applies to environmental atoms")
+                elif depends is not None and not depends:
+                    dl.error(f"{path}.reads", "an atom that depends on nothing is pure; say pure = true")
+                elif depends is not None:
+                    reads_map[name] = depends
+    return atom_defs, frozenset(pure_names), frozenset(declared_by), reads_map
 
 
-def _flagsets(loader: "_Loader", top: dict[str, Any], declared: frozenset[str]) -> dict[str, Flagset]:
+def _media_keys(
+    loader: _Loader, path: str, t: dict[str, Any], regions: Mapping[RegionId, Medium]
+) -> tuple[bool, bool | None, bool | None, list[str] | None]:
+    """A grant's ``effect-free``, ``network``, ``write`` and ``writes`` (EFFECTS.md)."""
+    return (
+        loader.field(path, t, "effect-free", bool) or False,
+        loader.field(path, t, "network", bool),
+        loader.field(path, t, "write", bool),
+        loader.region_names(path, t, "writes", regions),
+    )
+
+
+def _flagsets(
+    loader: _Loader, top: dict[str, Any], declared: frozenset[AtomId]
+) -> dict[FlagsetId, Flagset]:
     """``[[flagset]]``: private to the document that declares them."""
-    flagsets: dict[str, Flagset] = {}
+    flagsets: dict[FlagsetId, Flagset] = {}
     for i, entry in enumerate(loader.entries("flagset", top)):
         path = f"flagset[{i}]"
         t = _open_table(loader, path, entry, _FLAGSET_KEYS)
@@ -887,19 +1000,21 @@ def _flagsets(loader: "_Loader", top: dict[str, Any], declared: frozenset[str]) 
         fs = _flag_vocabulary(loader, path, t, declared, _FLAGSET_KEYS)
         if fname is None or fs is None:
             continue
-        if fname in flagsets:
+        fid = FlagsetId(fname)
+        if fid in flagsets:
             loader.error(path, f"flagset {fname!r} is declared twice")
             continue
-        flagsets[fname] = fs
+        flagsets[fid] = fs
     return flagsets
 
 
 def _validations(
-    loader: "_Loader",
+    loader: _Loader,
     top: dict[str, Any],
-    declared: frozenset[str],
-    pure_names: frozenset[str],
+    declared: frozenset[AtomId],
+    pure_names: frozenset[AtomId],
     restricted: bool,
+    regions: Mapping[RegionId, Medium],
 ) -> list[Validation]:
     validations: list[Validation] = []
     for i, entry in enumerate(loader.entries("validation", top)):
@@ -933,7 +1048,7 @@ def _validations(
         # may be called without cwd=
         cwd_given = "cwd" in t
         cwd = loader.location_slot(path, t, "cwd") if cwd_given else None
-        effect_free = loader.field(path, t, "effect-free", bool) or False
+        effect_free, net_flag, write_flag, writes = _media_keys(loader, path, t, regions)
         est_table = loader.table(
             f"{path}.establishes", t.get("establishes", {}), frozenset(params) | {"cwd"}
         )
@@ -951,6 +1066,7 @@ def _validations(
                 validation(
                     name, argv=argv, cwd=cwd, params=params,
                     establishes=establishes, effect_free=effect_free,
+                    network=net_flag, write=write_flag, writes=writes,
                 )
             )
         except ValueError as e:
@@ -959,12 +1075,13 @@ def _validations(
 
 
 def _programs(
-    loader: "_Loader",
+    loader: _Loader,
     top: dict[str, Any],
-    declared: frozenset[str],
-    pure_names: frozenset[str],
-    flagsets: Mapping[str, Flagset],
+    declared: frozenset[AtomId],
+    pure_names: frozenset[AtomId],
+    flagsets: Mapping[FlagsetId, Flagset],
     origin: str | None,
+    regions: Mapping[RegionId, Medium],
 ) -> list[Program]:
     programs: list[Program] = []
     for i, entry in enumerate(loader.entries("program", top)):
@@ -973,6 +1090,7 @@ def _programs(
         name = loader.required_str(path, t, "name")
         cwd = loader.location_slot(path, t, "cwd")
         yields = _source_atom(loader, path, t, "source", declared, pure_names)
+        effect_free, net_flag, write_flag, writes = _media_keys(loader, path, t, regions)
         if "argv" in t:
             # a templated form (TEMPLATES.md): the shape is argv + holes, and the flat rule's
             # keys have no place on it
@@ -1011,6 +1129,10 @@ def _programs(
                         holes=holes,
                         origin=origin,
                         source=yields,
+                        effect_free=effect_free,
+                        network=net_flag,
+                        write=write_flag,
+                        writes=writes,
                     )
                 )
             except ValueError as e:
@@ -1033,6 +1155,10 @@ def _programs(
                     argument_atoms=loader.atom_names(path, t, "argument-atoms", declared),
                     origin=origin,
                     source=yields,
+                    effect_free=effect_free,
+                    network=net_flag,
+                    write=write_flag,
+                    writes=writes,
                 )
             )
         except ValueError as e:
@@ -1068,8 +1194,10 @@ def from_data(data: object, where: str = "<policy>") -> Policy:
     # pass 1: the composition -- the root and every ruleset it applies, instantiated
     documents = [_Document(top, where, None, False)]
     _apply_all(loader, top, (), {}, documents)
-    # pass 2: atoms across the composition, so any document may reference any other's
-    atom_defs, pure_names, declared = _declare_atoms(loader, documents)
+    # pass 2: regions, then atoms, across the composition, so any document may reference any
+    # other's
+    region_list, regions = _declare_regions(loader, documents)
+    atom_defs, pure_names, declared, reads_map = _declare_atoms(loader, documents, regions)
     # pass 3: each document's vocabulary; flagsets stay private to their document
     validations: list[Validation] = []
     programs: list[Program] = []
@@ -1077,8 +1205,8 @@ def from_data(data: object, where: str = "<policy>") -> Policy:
     for doc in documents:
         dl = loader if doc.origin is None else _Loader(doc.label, loader.errors)
         flagsets = _flagsets(dl, doc.top, declared)
-        validations += _validations(dl, doc.top, declared, pure_names, doc.restricted)
-        programs += _programs(dl, doc.top, declared, pure_names, flagsets, doc.origin)
+        validations += _validations(dl, doc.top, declared, pure_names, doc.restricted, regions)
+        programs += _programs(dl, doc.top, declared, pure_names, flagsets, doc.origin, regions)
         sources += _sources(dl, doc.top, declared, pure_names)
 
     net_rules: list[NetworkRule] = []
@@ -1103,6 +1231,7 @@ def from_data(data: object, where: str = "<policy>") -> Policy:
                     total_timeout=loader.number(path, t, "total-timeout"),
                     max_response_bytes=loader.field(path, t, "max-response-bytes", int),
                     source=_source_atom(loader, path, t, "source", declared, pure_names),
+                    writes=loader.region_names(path, t, "writes", regions),
                 )
             )
         except ValueError as e:
@@ -1114,7 +1243,7 @@ def from_data(data: object, where: str = "<policy>") -> Policy:
         return Policy.allow(
             read=read, write=write, listing=listing,
             programs=programs, validations=validations, atoms=atom_defs,
-            network=net_rules, sources=sources,
+            network=net_rules, sources=sources, regions=region_list, reads=reads_map,
         )
     except ValueError as e:
         raise PolicyFileError(f"{where}: {e}")

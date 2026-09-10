@@ -80,13 +80,16 @@ from .dangerous import (
     NETWORK_METHODS,
     NETWORK_NAMESPACE,
     NON_KILLING_CALLEES,
+    NON_KILLING_KEYWORDS,
     PATH_SINK_FUNCTIONS,
     PATH_SINK_METHOD_TARGETS,
     PATH_SINK_METHODS,
     AccessKind,
 )
 from .annotations import Contract, bind_arguments, default_of, is_plain_type, parse_annotation
+from .effects import EVERYTHING, Effects, Medium
 from .guards import apply, recognize
+from .ids import AtomId, ParamName, ProgramName, RegionId, ValidationName
 from .locations import parse_location
 from .markers import NAMESPACE
 from .safepy import (
@@ -291,11 +294,18 @@ class CheckSignature:
     handed to ``analyze`` -- the atom vocabulary is part of the language the program is written
     against, the way user-defined types are; the evaluator itself stays policy-side."""
 
-    name: str
-    params: tuple[str, ...]
-    establishes: dict[str, frozenset[str]]  # parameter name, or "cwd" -> validation atoms
-    effect_free: bool = False  # the evaluator mutates nothing: its own run kills no atoms
+    name: ValidationName
+    params: tuple[ParamName, ...]
+    establishes: dict[ParamName, frozenset[AtomId]]  # parameter name, or "cwd" -> validation atoms
+    # what the evaluator's own run writes (EFFECTS.md): NOTHING for an effect-free check, the
+    # whole media it reaches when the policy declared no regions
+    writes: Effects = EVERYTHING
     needs_cwd: bool = True  # False: the check does not care where it runs; cwd= may be omitted
+
+    @property
+    def effect_free(self) -> bool:
+        """The evaluator mutates nothing, so its run kills no atoms."""
+        return self.writes.empty
 
 
 def host_matches(pattern: str, host: str) -> bool:
@@ -307,18 +317,28 @@ def host_matches(pattern: str, host: str) -> bool:
 
 
 @dataclass(frozen=True)
+class WriteTable:
+    """What the policy's exec and network rules write (EFFECTS.md), keyed as the walker resolves
+    sites: an exec by program and the leading words after it, a network request by host and
+    methods. A check's write set rides its ``CheckSignature``."""
+
+    exec: tuple[tuple[ProgramName, tuple[str, ...], Effects], ...] = ()
+    network: tuple[tuple[str, frozenset[str], Effects], ...] = ()
+
+
+@dataclass(frozen=True)
 class SourceTable:
     """Which rules yield which *source atom* (PROVENANCE.md), as the walker needs them to bind a
     handle: an exec by program and leading words, a network request by host pattern, a file
     read by location."""
 
-    exec: tuple[tuple[str, tuple[str, ...], str], ...] = ()
+    exec: tuple[tuple[ProgramName, tuple[str, ...], AtomId], ...] = ()
     # (host pattern, permitted URL paths -- empty: any, atom)
-    network: tuple[tuple[str, tuple[LocationFact, ...], str], ...] = ()
-    read: tuple[tuple[LocationFact, str], ...] = ()
+    network: tuple[tuple[str, tuple[LocationFact, ...], AtomId], ...] = ()
+    read: tuple[tuple[LocationFact, AtomId], ...] = ()
 
     @property
-    def atoms(self) -> frozenset[str]:
+    def atoms(self) -> frozenset[AtomId]:
         return frozenset(
             [a for _, _, a in self.exec] + [a for _, _, a in self.network] + [a for _, a in self.read]
         )
@@ -331,14 +351,20 @@ class Vocabulary:
     it dies only with the value. An environment atom is about the world at a location, and dies
     at every potentially-effectful call."""
 
-    signatures: dict[str, CheckSignature] = field(default_factory=dict)
-    pure_atoms: frozenset[str] = frozenset()
+    signatures: dict[ValidationName, CheckSignature] = field(default_factory=dict)
+    pure_atoms: frozenset[AtomId] = frozenset()
     # *defined* atoms: name -> the text property that is its meaning. The analysis establishes
     # one directly (``saturate``) on any value whose known text entails it -- a literal needs no
     # runtime check -- and it is pure by construction (a subset of ``pure_atoms``).
-    defined: dict[str, PseudoRegex] = field(default_factory=dict)
+    defined: dict[AtomId, PseudoRegex] = field(default_factory=dict)
     # source atoms and the rules that yield them (also a subset of ``pure_atoms``)
     sources: SourceTable = field(default_factory=SourceTable)
+    # EFFECTS.md, for the kill by intersection: per environmental atom the state it depends on
+    # (an atom absent here depends on everything), per rule what it writes, and each declared
+    # region's medium
+    reads: Mapping[AtomId, Effects] = field(default_factory=dict)
+    writes: WriteTable = field(default_factory=WriteTable)
+    medium_of: Mapping[RegionId, Medium] = field(default_factory=dict)
 
 
 @dataclass
@@ -481,6 +507,20 @@ def _open_kind(mode: str | None) -> AccessKind:
     if mode is None:
         return "write"
     return "write" if any(c in mode for c in "wax+") else "read"
+
+
+def _non_killing(call: ast.Call, callee: tuple[str, ...]) -> bool:
+    """Is *call*, to the dotted *callee*, on the effect-free allowlist AND spelled so that it runs
+    no program code through its arguments? A keyword outside the callee's admitted set is a hook
+    or a duck-typed object (``json.loads(object_hook=f)``, ``print(file=obj)``); a ``**`` splat
+    hides its keys; a ``*`` splat consumes an iterable that may be a generator. Each makes the
+    call an ordinary, killing one."""
+    if callee not in NON_KILLING_CALLEES:
+        return False
+    if any(isinstance(a, ast.Starred) for a in call.args):
+        return False
+    admitted = NON_KILLING_KEYWORDS.get(callee, frozenset())
+    return all(k.arg is not None and k.arg in admitted for k in call.keywords)
 
 
 def _at_sink(fact: ValidationFact | None) -> ValidationFact | None:
@@ -890,7 +930,7 @@ class ValidationWalker(ast.NodeVisitor):
         if callee.matches(*CHECK_CALLEE) or callee.matches(*CHECK_SINGLE_CALLEE):
             return self._effect_free_check(node)
         full = callee.full_path
-        if full in NON_KILLING_CALLEES or (len(full) == 3 and full[:2] == ("os", "path")):
+        if _non_killing(node, full) or (len(full) == 3 and full[:2] == ("os", "path")):
             return True
         if full in (("os", "listdir"), ("os", "walk")):
             return True  # read sinks: audited, and they mutate nothing
@@ -961,7 +1001,7 @@ class ValidationWalker(ast.NodeVisitor):
         if not call.args:
             return False
         name = as_const_or_null(str, call.args[0])
-        signature = None if name is None else self.vocabulary.signatures.get(name)
+        signature = None if name is None else self.vocabulary.signatures.get(ValidationName(name))
         return signature is not None and signature.effect_free
 
     def _may_effect(self, nodes: Iterable[ast.AST]) -> bool:
@@ -982,7 +1022,7 @@ class ValidationWalker(ast.NodeVisitor):
                         continue
                     return True
                 full = callee.full_path
-                if full in NON_KILLING_CALLEES or (len(full) == 3 and full[:2] == ("os", "path")):
+                if _non_killing(n, full) or (len(full) == 3 and full[:2] == ("os", "path")):
                     continue
                 if full in (("os", "listdir"), ("os", "walk")):
                     continue
@@ -1096,7 +1136,7 @@ class ValidationWalker(ast.NodeVisitor):
                     node.args[0],
                     "check: the validation name must be a string literal (or a name bound to one)",
                 )
-        signature = self.vocabulary.signatures.get(name)
+        signature = self.vocabulary.signatures.get(ValidationName(name))
         if signature is None and name != "?":
             self._violation(node, f"check: the policy declares no validation named {name!r}")
         cwd_expr = keywords.get("cwd")
@@ -1161,7 +1201,7 @@ class ValidationWalker(ast.NodeVisitor):
                     node.args[0],
                     "check_single: the validation name must be a string literal",
                 )
-        signature = self.vocabulary.signatures.get(name)
+        signature = self.vocabulary.signatures.get(ValidationName(name))
         if signature is None and name != "?":
             self._violation(node, f"check_single: the policy declares no validation named {name!r}")
         if signature is not None and len(signature.params) != 1:
@@ -1201,7 +1241,7 @@ class ValidationWalker(ast.NodeVisitor):
             case _:
                 return None
         name = as_const_or_null(str, name_expr)
-        signature = None if name is None else self.vocabulary.signatures.get(name)
+        signature = None if name is None else self.vocabulary.signatures.get(ValidationName(name))
         if signature is None or len(signature.params) != 1:
             return None  # the audit reported the shape problem; the result stays unknown
         atoms = signature.establishes.get(signature.params[0], frozenset())

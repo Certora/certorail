@@ -20,6 +20,7 @@ from certorail.analysis import (
     pretty_location,
 )
 from certorail.host import load_policy
+from certorail.ids import ValidationName
 from certorail.policy import (
     Policy,
     RequiredAtom,
@@ -294,7 +295,7 @@ class TestCwdFreeValidations(unittest.TestCase):
         """)
         (v,) = pol.validations
         self.assertIsNone(v.cwd)
-        self.assertFalse(pol.vocabulary().signatures["not-force-check"].needs_cwd)
+        self.assertFalse(pol.vocabulary().signatures[ValidationName("not-force-check")].needs_cwd)
 
 
 if __name__ == "__main__":

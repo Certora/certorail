@@ -431,6 +431,27 @@ NON_KILLING_CALLEES: frozenset[tuple[str, ...]] = frozenset({
     (NAMESPACE, "pathmatch"),
 })
 
+# The keywords a NON_KILLING callee may be given and stay non-killing. Any other keyword runs
+# program code inside the call -- a hook (``json.loads(object_hook=f)``), a callable
+# (``json.dumps(default=f)``, ``cls=``), a duck-typed object (``print(file=obj)`` calls
+# ``obj.write``) -- so the call kills like any other. A callee absent here admits no keyword. A
+# ``**`` splat is never admitted (its keys are unknown), nor a ``*`` splat (it consumes an
+# iterable, which may be a generator whose body is program code).
+NON_KILLING_KEYWORDS: dict[tuple[str, ...], frozenset[str]] = {
+    ("print",): frozenset({"sep", "end", "flush"}),
+    ("int",): frozenset({"base"}),
+    ("str",): frozenset({"encoding", "errors"}),
+    ("re", "compile"): frozenset({"flags"}),
+    ("re", "fullmatch"): frozenset({"flags"}),
+    ("re", "match"): frozenset({"flags"}),
+    ("re", "search"): frozenset({"flags"}),
+    ("json", "dumps"): frozenset({
+        "skipkeys", "ensure_ascii", "check_circular", "allow_nan", "indent", "separators",
+        "sort_keys",
+    }),
+    (NAMESPACE, "field"): frozenset({"sep"}),
+}
+
 # certora.pathmatch(text, "<location>"): the policy's location spelling as a guard (guards.py
 # establishes the location; the walker checks the shape: two positional arguments, a literal
 # spelling that parses).

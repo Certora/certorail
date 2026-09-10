@@ -14,24 +14,34 @@ import unittest
 from certorail import markers
 from certorail.broker import build_server
 from certorail.analysis import RegexLit, checks_of
+from certorail.effects import NOTHING
 from certorail.host import Accepted, Rejected
 from certorail.host import check as host_check
 from certorail.markers import CheckFailed
 from certorail.policy import Policy, atom, param, program, pure, validation
+from certorail.ids import AtomId, ParamName, ValidationName
 from certorail.walker import CheckSignature, CheckSite, ExecSite, Report, Vocabulary, analyze
 
+CWD = ParamName("cwd")
 VOCAB = Vocabulary(
     signatures={
         # environmental atom, effectful evaluator (the conservative default)
-        "org-repo": CheckSignature("org-repo", (), {"cwd": frozenset({"org-checkout"})}),
+        ValidationName("org-repo"): CheckSignature(
+            ValidationName("org-repo"), (), {CWD: frozenset({AtomId("org-checkout")})}
+        ),
         # environmental atom, effect-free evaluator: kills nothing, so checkers stack
-        "clean-tree": CheckSignature("clean-tree", (), {"cwd": frozenset({"clean"})}, effect_free=True),
+        ValidationName("clean-tree"): CheckSignature(
+            ValidationName("clean-tree"), (), {CWD: frozenset({AtomId("clean")})}, writes=NOTHING
+        ),
         # pure atom on a string parameter
-        "repo-url": CheckSignature("repo-url", ("url",), {"url": frozenset({"good-url"})}, effect_free=True),
+        ValidationName("repo-url"): CheckSignature(
+            ValidationName("repo-url"), (ParamName("url"),),
+            {ParamName("url"): frozenset({AtomId("good-url")})}, writes=NOTHING,
+        ),
     },
-    pure_atoms=frozenset({"good-url", "no-flag"}),
+    pure_atoms=frozenset({AtomId("good-url"), AtomId("no-flag")}),
     # a regex-defined atom: its meaning is a text property, established by saturation
-    defined={"no-flag": RegexLit(r"[^-].*")},
+    defined={AtomId("no-flag"): RegexLit(r"[^-].*")},
 )
 
 HEADER = "import pathlib\nimport typing\n"
@@ -231,7 +241,9 @@ class TestPolicy(unittest.TestCase):
             ORG_POLICY.vocabulary(),
             Vocabulary(
                 signatures={
-                    "org-repo": CheckSignature("org-repo", (), {"cwd": frozenset({"org-checkout"})})
+                    ValidationName("org-repo"): CheckSignature(
+                        ValidationName("org-repo"), (), {CWD: frozenset({AtomId("org-checkout")})}
+                    )
                 },
                 pure_atoms=frozenset(),
             ),
@@ -435,8 +447,10 @@ class TestCwdFreeChecks(unittest.TestCase):
             self.fail("\n".join(outcome.describe("<t>")))
 
     def test_the_vocabulary_marks_cwd_free_checks(self) -> None:
-        self.assertFalse(CWD_FREE_POLICY.vocabulary().signatures["not-force-check"].needs_cwd)
-        self.assertTrue(ORG_POLICY.vocabulary().signatures["org-repo"].needs_cwd)
+        self.assertFalse(
+            CWD_FREE_POLICY.vocabulary().signatures[ValidationName("not-force-check")].needs_cwd
+        )
+        self.assertTrue(ORG_POLICY.vocabulary().signatures[ValidationName("org-repo")].needs_cwd)
 
     def test_a_cwd_free_check_cannot_establish_on_cwd(self) -> None:
         with self.assertRaises(ValueError):
