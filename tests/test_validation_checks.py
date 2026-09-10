@@ -95,13 +95,13 @@ class TestGen(unittest.TestCase):
 
 
 class TestKill(unittest.TestCase):
-    def test_any_call_kills_environment_atoms(self) -> None:
-        report = run(REPO + CHECK + "xs = sorted([3, 1])\n" + EXEC)
+    def test_a_program_call_kills_environment_atoms(self) -> None:
+        report = run("def helper():\n    return 1\n" + REPO + CHECK + "helper()\n" + EXEC)
         (site,) = exec_sites(report)
         self.assertEqual(checks_of(site.cwd), frozenset())
 
     def test_effect_free_calls_do_not_kill(self) -> None:
-        report = run(REPO + CHECK + "msg = str(repo)\nprint(msg)\n" + EXEC)
+        report = run(REPO + CHECK + "msg = str(repo)\nprint(msg)\nxs = sorted([3, 1])\n" + EXEC)
         (site,) = exec_sites(report)
         self.assertEqual(checks_of(site.cwd), frozenset({"org-checkout"}))
 

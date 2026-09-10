@@ -71,8 +71,8 @@ class TestExecWriteSets(unittest.TestCase):
         self.assertIn("cwd is not validated by: org-checkout, unprotected", reason)
 
     def test_a_loop_boundary_uses_the_same_write_sets(self) -> None:
-        # the state-free scan of the body reads the literal program and words, so a commit in a
-        # loop kills what a commit kills and no more
+        # the boundary rehearses one iteration, so a commit in a loop kills what a commit kills
+        # and no more
         self.assertIsInstance(between("for i in [1]:\n    " + COMMIT), Accepted)
         reason = denied_atoms(between('for i in [1]:\n    certora.exec("cargo", "build", cwd=repo)\n'))
         self.assertIn("org-checkout", reason)
@@ -98,9 +98,10 @@ class TestEverythingElse(unittest.TestCase):
         self.assertIn("org-checkout", reason)
         self.assertIn("unprotected", reason)
 
-    def test_an_unknown_call_still_kills_everything(self) -> None:
-        reason = denied_atoms(between("xs = sorted([3, 1])\n"))
+    def test_a_program_call_still_kills_everything(self) -> None:
+        reason = denied_atoms(between("def helper():\n    return 1\nhelper()\n"))
         self.assertIn("org-checkout", reason)
+        self.assertIn("unprotected", reason)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
-"""The effect-free allowlist is conditional on how the call is spelled: a keyword outside the
-callee's admitted set (``json.loads(object_hook=f)``, ``json.dumps(default=f)``,
-``print(file=obj)``) or a ``*``/``**`` splat runs program code inside the call, so the call kills
-environmental atoms like any other. Plain spellings keep their exemption."""
+"""The roster's exemption is conditional on the arguments: a hook -- a keyword, a ``*`` or ``**``
+splat -- that is not inert (``json.loads(object_hook=f)``, ``json.dumps(default=f)``,
+``print(file=obj)``, ``print(*gen)``) runs program code inside the call, so the call kills
+environmental atoms like any other. Inert spellings keep their exemption."""
 import unittest
 
 from certorail.analysis import checks_of
@@ -56,10 +56,18 @@ class TestKeywordsKill(unittest.TestCase):
             with self.subTest(call=call):
                 self.assertEqual(atoms_at_exec(call), DEAD)
 
-    def test_splats_kill(self) -> None:
-        for call in ('print(*xs)\n', 'opts = {"indent": 2}\njson.dumps({"a": 1}, **opts)\n'):
+    def test_splats_of_program_values_kill(self) -> None:
+        for call in (
+            'print(*(x for x in xs))\n',
+            'opts = hook({"indent": 2})\njson.dumps({"a": 1}, **opts)\n',
+        ):
             with self.subTest(call=call):
                 self.assertEqual(atoms_at_exec(call), DEAD)
+
+    def test_splats_of_inert_values_do_not(self) -> None:
+        for call in ('print(*xs)\n', 'opts = {"indent": 2}\njson.dumps({"a": 1}, **opts)\n'):
+            with self.subTest(call=call):
+                self.assertEqual(atoms_at_exec(call), LIVE)
 
     def test_admitted_keywords_do_not_kill(self) -> None:
         for call in (
@@ -72,7 +80,7 @@ class TestKeywordsKill(unittest.TestCase):
                 self.assertEqual(atoms_at_exec(call), LIVE)
 
     def test_the_loop_boundary_agrees(self) -> None:
-        # _may_effect scans the body without a state: the same spelling rule applies there
+        # the boundary rehearses one iteration: the same argument rule applies there
         self.assertEqual(atoms_at_exec('for i in xs:\n    json.loads("{}")\n'), LIVE)
         self.assertEqual(atoms_at_exec('for i in xs:\n    json.loads("{}", object_hook=hook)\n'), DEAD)
 

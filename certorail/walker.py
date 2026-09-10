@@ -39,23 +39,31 @@ from .analysis import (
     InvalidProgram,
     Located,
     PathFact,
+    Std,
     StrFact,
     UrlString,
     ValidationFact,
-    as_const_or_null,
+    destructure,
+    entry_of,
+    inert,
     interpret_expr,
+    is_inert,
     is_path_typed,
     iteration_bindings,
     operand_value,
     resolve_callee,
+    std_of,
 )
 from .annotations import Contract, bind_arguments, default_of, is_plain_type, parse_annotation
 from .dangerous import CHECK_CALLEE, EXEC_CALLEE, EXTRACT_ALL_CALLEE, LINES_CALLEE
-from .effects import EVERYTHING, NOTHING, Effects
+from .effects import EVERYTHING
 from .enforcement import (
     CONTAINER_METHODS,
     CONTAINER_READ_CALLS,
     METHOD_KINDS,
+    NO_KILL,
+    OPAQUE,
+    OPENING,
     Argument,
     Audit,
     Callsite,
@@ -64,6 +72,7 @@ from .enforcement import (
     Discharge,
     Enforcement,
     ExecSite,
+    Kill,
     NetworkSite,
     SinkSite,
     Site,
@@ -93,7 +102,7 @@ __all__ = [
     "where",
 ]
 
-type State = dict[str, ValidationFact | Container | Data]
+type State = dict[str, ValidationFact | Container | Data | Std]
 
 
 def _roster_blessings(
@@ -259,9 +268,24 @@ def _kill(st: State, names: set[str]) -> State:
 
 
 def _join(a: State, b: State) -> State:
-    """Facts that hold on both paths. Equality for now; the lattice join (``join_loc`` &c.) slots
-    in here once it lands."""
-    return {k: v for k, v in a.items() if b.get(k) == v}
+    """Facts that hold on both paths: equal entries as they are; two standard values as one of
+    the common kind, closed when both are; two inert scalars that differ -- text on one path, a
+    number on the other -- as a standard value of unknown kind. Equality otherwise; the lattice
+    join for facts (``join_loc`` &c.) slots in here once it lands."""
+    out: State = {}
+    for k, v in a.items():
+        other = b.get(k)
+        if other is None:
+            continue
+        if other == v:
+            out[k] = v
+        elif isinstance(v, Std) and isinstance(other, Std):
+            out[k] = Std(v.kind if v.kind == other.kind else None, v.closed and other.closed)
+        elif isinstance(v, Data) and isinstance(other, Data) and v.sources == other.sources:
+            out[k] = Data(v.sources, v.closed and other.closed)
+        elif not isinstance(v, (Container, Data)) and not isinstance(other, (Container, Data)):
+            out[k] = Std(None, inert(v) and inert(other))
+    return out
 
 
 def _join_all(states: Sequence[State]) -> State:
@@ -335,11 +359,16 @@ class ValidationWalker(ast.NodeVisitor):
             vocabulary if vocabulary is not None else Vocabulary(), discharge, self.modules
         )
         # facts for module-level constants, computed by visit_Module and seeded into function
-        # bodies. Scalars only: containers are never module constants.
-        self.module_constants: dict[str, ValidationFact] = {}
+        # bodies. Scalars only: containers are never module constants, and a standard value only
+        # when nothing can open it.
+        self.module_constants: dict[str, ValidationFact | Std] = {}
         # ast.Name occurrences (by id) in container-roster positions; any other Load of a
         # tracked container is its escape. Filled once per module by visit_Module.
         self._blessed: set[int] = set()
+        # what the walk has done to the state since the innermost ``_measure`` began: the kills
+        # of one loop iteration, one comprehension, one try body -- the boundaries the walk does
+        # not pass through are computed from it (see ``_iteration_kill``)
+        self._seen: Kill = NO_KILL
 
     def _violation(self, node: ast.AST, what: str) -> None:
         self.violations.append((node, what))
@@ -363,7 +392,9 @@ class ValidationWalker(ast.NodeVisitor):
             current = out.get(g.subject)
             if isinstance(current, (Container, Data)):
                 continue  # guards speak about scalars; containers and handles have their own rules
-            refined = apply(current, g.refinement)
+            # a standard value refined by a guard (``isinstance(x, str)``) becomes the fact the
+            # guard establishes, from nothing; otherwise it stays what it was
+            refined = apply(None if isinstance(current, Std) else current, g.refinement)
             if refined is not None:
                 out[g.subject] = refined
         return out
@@ -378,29 +409,28 @@ class ValidationWalker(ast.NodeVisitor):
             return f(e)
         return None
 
-    def _digest(self, call: ast.Call, st: State, *, interpret: bool = True) -> Callsite:
-        """*call* as the enforcement sees it, against *st*. Without *interpret* only literals are
-        read -- the state-free digest for code the walk does not pass through (a loop's other
-        iterations, a handler's entry), where every exemption that needs a fact is unavailable
-        and the answer is conservative by construction."""
+    def _digest(self, call: ast.Call, st: State) -> Callsite:
+        """*call* as the enforcement sees it, against *st*."""
         callee = resolve_callee(call.func)
         assert callee is not None, "visit_Call refuses computed callees before digesting"
 
         def value(e: ast.expr) -> Binding:
-            if isinstance(e, ast.Starred):
-                return None
-            if not interpret:
-                return as_const_or_null(str, e)
-            return self._binding(e, st)
+            return None if isinstance(e, ast.Starred) else self._binding(e, st)
 
-        receiver: ValidationFact | Container | Data | None = None
-        if interpret and isinstance(call.func, ast.Attribute):
-            recv = call.func.value
-            receiver = st.get(recv.id) if isinstance(recv, ast.Name) else interpret_expr(recv, st)
+        receiver: ValidationFact | Container | Data | Std | None = None
+        if isinstance(call.func, ast.Attribute):
+            receiver = entry_of(call.func.value, st, self.modules)
+
+        # the argument conditions of the callee analysis: plain positionals, ``*xs`` (the
+        # inertness of xs), ``name=value``, ``**m`` (the inertness of m)
+        plain = [is_inert(a, st, self.modules) for a in call.args if not isinstance(a, ast.Starred)]
+        starred = [is_inert(a, st, self.modules) for a in call.args if isinstance(a, ast.Starred)]
+        named = [is_inert(k.value, st, self.modules) for k in call.keywords if k.arg is not None]
+        double = [is_inert(k.value, st, self.modules) for k in call.keywords if k.arg is None]
+        inert_keywords = all(named)
+        inert_splats = all(starred) and all(double)
 
         def handle_of(which: int | str) -> Data | None:
-            if not interpret:
-                return None
             if isinstance(which, int):
                 if which >= len(call.args):
                     return None
@@ -413,11 +443,8 @@ class ValidationWalker(ast.NodeVisitor):
             if isinstance(e, ast.Name):
                 bound = st.get(e.id)
                 return bound if isinstance(bound, Data) else None
-            # a source call inline: its handle needs the state, so this is only reached when
-            # interpreting, and the nested record interprets as well
-            return self._maybe_call(
-                e, lambda c: self.enforcement.handle(self._digest(c, st, interpret=True))
-            )
+            # a source call inline
+            return self._maybe_call(e, lambda c: self.enforcement.handle(self._digest(c, st)))
 
         keywords = {k.arg: value(k.value) for k in call.keywords if k.arg is not None}
         return Callsite(
@@ -439,6 +466,9 @@ class ValidationWalker(ast.NodeVisitor):
             or any(k.arg is None for k in call.keywords),
             receiver=receiver,
             handle_of=handle_of,
+            inert_arguments=all(plain) and inert_keywords and inert_splats,
+            inert_keywords=inert_keywords,
+            inert_splats=inert_splats,
         )
 
     def _binding(self, expr: ast.expr, st: State) -> Binding:
@@ -471,42 +501,72 @@ class ValidationWalker(ast.NodeVisitor):
         """A check's success, on the variables it named: a fact needs a variable to live on."""
         for name, atoms in atoms_by_name.items():
             fact = self.state.get(name)
-            if fact is not None and not isinstance(fact, (Container, Data)):
+            if fact is not None and not isinstance(fact, (Container, Data, Std)):
                 self.state[name] = replace(fact, checks=fact.checks | atoms)
 
-    def _killed(self, st: State, writes: Effects) -> State:
-        """*st* after an effect writing *writes*: every atom the write set reaches dies, on every
-        variable and on every container's element fact (the annotation is only the birth
-        invariant; reads yield the current, possibly degraded fact). A handle carries only
-        source atoms, which are pure."""
-        if writes.empty:
+    def _killed(self, st: State, kill: Kill) -> State:
+        """*st* after a call: every atom the write set reaches dies, on every variable and on
+        every container's element fact (the annotation is only the birth invariant; reads yield
+        the current, possibly degraded fact); a handle carries only source atoms, which are pure.
+        When the call opens the state -- program code may have run, or a program object was
+        stored -- every standard value and handle that can hold one is opened."""
+        if kill.writes.empty and not kill.opens:
             return st
         forget = self.enforcement.forget
-        return {
-            k: (
-                replace(v, elem=forget(v.elem, writes))
-                if isinstance(v, Container)
-                else v if isinstance(v, Data)
-                else forget(v, writes)
-            )
-            for k, v in st.items()
-        }
+        out: State = {}
+        for k, v in st.items():
+            match v:
+                case Container(elem=elem):
+                    out[k] = replace(v, elem=forget(elem, kill.writes))
+                case Data() | Std():
+                    out[k] = v.opened() if kill.opens else v
+                case _:
+                    out[k] = forget(v, kill.writes)
+        return out
 
-    def _writes_in(self, nodes: Iterable[ast.AST]) -> Effects:
-        """What the calls inside *nodes* may write, for the states the walk does *not* pass
-        through -- a loop's iteration boundary, a try's handler entry, a with's escape path.
-        State-free, so over-approximate: it only costs checks, never soundness."""
-        total = NOTHING
-        for root in nodes:
-            for n in ast.walk(root):
-                if not isinstance(n, ast.Call):
-                    continue
-                if resolve_callee(n.func) is None:
-                    return EVERYTHING
-                total = total | self.enforcement.writes_of(self._digest(n, {}, interpret=False))
-                if total == EVERYTHING:
-                    return total
-        return total
+    def _kill_state(self, kill: Kill) -> None:
+        """Apply a call's or a store's kill to the state, and count it for the enclosing measure."""
+        self.state = self._killed(self.state, kill)
+        self._seen = self._seen | kill
+
+    def _measure(self, walk: Callable[[], None]) -> Kill:
+        """Run *walk* and answer what it did to the state; the enclosing measure keeps counting."""
+        outer = self._seen
+        self._seen = NO_KILL
+        try:
+            walk()
+            return self._seen
+        finally:
+            self._seen = outer | self._seen
+
+    def _rehearse(self, walk: Callable[[], None], state: State) -> Kill:
+        """Walk once from *state* for the verdicts alone -- what the calls and stores of *walk*
+        do to the state -- recording nothing and leaving the state as it was. For the states the
+        walk does not otherwise pass through: a loop's later iterations."""
+        seen = self._seen
+        sinks_prev = list(self.sinks)
+        violations_prev = list(self.violations)
+        self._seen = NO_KILL
+        try:
+            with self.state_snapshot():
+                self.state = dict(state)
+                walk()
+                return self._seen
+        finally:
+            self.sinks = sinks_prev
+            self.violations = violations_prev
+            self._seen = seen
+
+    @staticmethod
+    def _iteration_kill(once: Kill) -> Kill:
+        """What every iteration of a body may do, given what one iteration from the boundary
+        state did. A verdict depends on what the receiver and the arguments *are* -- their
+        types and closedness -- never on the atoms they carry, and the names an iteration
+        assigns are already unknown at the boundary, so a body that opens nothing has the same
+        verdicts every time round. A body that opens something may find, next time round, an
+        opened value where it found a closed one, and then any of its calls may run program
+        code: it is taken as doing anything."""
+        return OPAQUE if once.opens else once
 
     # -- simple statements --------------------------------------------------------------------
 
@@ -555,7 +615,7 @@ class ValidationWalker(ast.NodeVisitor):
             # a source handle or an extraction first (PROVENANCE.md): those right-hand sides
             # have no scalar reading worth keeping, and must not be shadowed by one
             site = self._maybe_call(value, lambda c: self._digest(c, self.state))
-            fact: ValidationFact | Container | Data | None = None
+            fact: ValidationFact | Container | Data | Std | None = None
             if site is not None:
                 fact = self.enforcement.handle(site)
                 if fact is None:
@@ -567,6 +627,8 @@ class ValidationWalker(ast.NodeVisitor):
             if fact is None and site is not None:
                 fact = self.enforcement.check_single_fact(site)
             if fact is None:
+                fact = std_of(value, self.state, self.modules)  # coarsest last: a standard value
+            if fact is None:
                 self.state.pop(target.id, None)
             else:
                 self.state[target.id] = fact
@@ -576,9 +638,15 @@ class ValidationWalker(ast.NodeVisitor):
             and isinstance((c := self.state.get(target.value.id)), Container)
         ):
             self._container_store(target.value.id, target, value, c)
+        elif isinstance(target, ast.Subscript):
+            self.visit(target)
+            if not is_inert(value, self.state, self.modules):
+                self._kill_state(OPENING)  # ``d[k] = gen``: into some standard value
+        elif isinstance(target, (ast.Tuple, ast.List)) and is_inert(value, self.state, self.modules):
+            self.visit(target)  # the rebinding kills, then each name is an element of an inert value
+            self.state.update(destructure(target, Std()))
         else:
-            assert isinstance(target, ast.Tuple)
-            self.visit(target)  # tuple/attribute/subscript targets: kill the names involved
+            self.visit(target)  # tuple/attribute targets: kill the names involved; an attribute store opens
 
     def _container_store(
         self, name: str, target: ast.Subscript, value: ast.expr, c: Container
@@ -724,7 +792,7 @@ class ValidationWalker(ast.NodeVisitor):
             n.id for n in ast.walk(gen.target) if isinstance(n, ast.Name)
         }
         inner: State = {k: v for k, v in self.state.items() if k not in targets}
-        inner.update(iteration_bindings(gen.target, gen.iter, self.state))
+        inner.update(iteration_bindings(gen.target, gen.iter, self.state, self.modules))
         for cond in gen.ifs:
             inner = self._refine(inner, cond)
         fact = self._maybe_call(
@@ -733,7 +801,9 @@ class ValidationWalker(ast.NodeVisitor):
         if fact is None:
             fact = operand_value(elt, inner)
         if fact is not None and not isinstance(fact, str):
-            fact = self.enforcement.forget(fact, self._writes_in([comp]))
+            # what any iteration may do, rehearsed from the state after the comprehension ran
+            once = self._rehearse(lambda: self.visit(comp), self.state)
+            fact = self.enforcement.forget(fact, self._iteration_kill(once).writes)
         if not self.enforcement.establishes(fact, declared.elem):
             self._violation(
                 elt,
@@ -762,7 +832,77 @@ class ValidationWalker(ast.NodeVisitor):
             else:
                 self._escape(node, node.target.id, c)
             return
+        self.visit(node.value)
+        target = node.target
+        if isinstance(target, ast.Name):
+            # ``x op= v`` rebinds x to ``x op v``: text stays text, a standard value stays one
+            # over an inert operand
+            combined = ast.copy_location(
+                ast.BinOp(left=ast.Name(id=target.id, ctx=ast.Load()), op=node.op, right=node.value),
+                node,
+            )
+            fact = interpret_expr(combined, self.state) or std_of(combined, self.state, self.modules)
+            self.visit(target)  # the rebinding kill
+            if fact is not None:
+                self.state[target.id] = fact
+        else:
+            self.visit(target)  # a subscript or attribute target: the store lands in some value
+        if not is_inert(node.value, self.state, self.modules):
+            self._kill_state(OPENING)  # ``lst += [f]``: a program object may now sit in it
+
+    def visit_Attribute(self, node: ast.Attribute) -> Any:
         self.generic_visit(node)
+        if isinstance(node.ctx, ast.Store):
+            # a store through an attribute may register a program object with a standard value
+            # or a handle -- the receiver, or anything aliasing it -- so the state is opened
+            self._kill_state(OPENING)
+
+    # -- comprehensions: their own scope, eager --------------------------------------------------
+
+    def _comprehension(
+        self, generators: Sequence[ast.comprehension], body: Sequence[ast.expr]
+    ) -> None:
+        """Walk a comprehension in its own scope: each iterable in the state so far, then the
+        ``if`` clauses and the element expressions under the iteration bindings, so that a call
+        inside sees what its receiver is (``[x.strip() for x in lines]``). Eager for a generator
+        expression too: its body's kills are applied at creation (EFFECTS.md). The scope's names
+        return to their outer values afterwards, and the state takes what every iteration may
+        do (``_iteration_kill``)."""
+        outer = self.state
+        self.state = dict(outer)
+        bound: set[str] = set()
+
+        def iteration() -> None:
+            for gen in generators:
+                self.visit(gen.iter)
+                names = {n.id for n in ast.walk(gen.target) if isinstance(n, ast.Name)}
+                bound.update(names)
+                for name in names:
+                    self.state.pop(name, None)
+                self.state.update(iteration_bindings(gen.target, gen.iter, self.state, self.modules))
+                for cond in gen.ifs:
+                    self.visit(cond)
+                    self.state = self._refine(self.state, cond)
+            for e in body:
+                self.visit(e)
+
+        once = self._measure(iteration)
+        self.state = {k: v for k, v in self.state.items() if k not in bound} | {
+            k: v for k, v in outer.items() if k in bound
+        }
+        self._kill_state(self._iteration_kill(once))
+
+    def visit_ListComp(self, node: ast.ListComp) -> Any:
+        self._comprehension(node.generators, [node.elt])
+
+    def visit_SetComp(self, node: ast.SetComp) -> Any:
+        self._comprehension(node.generators, [node.elt])
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> Any:
+        self._comprehension(node.generators, [node.elt])
+
+    def visit_DictComp(self, node: ast.DictComp) -> Any:
+        self._comprehension(node.generators, [node.key, node.value])
 
     def _extend(self, node: ast.AST, name: str, c: Container, source: ast.expr) -> None:
         if c.kind == "sequence":
@@ -817,7 +957,7 @@ class ValidationWalker(ast.NodeVisitor):
                 audit = self.enforcement.audit(site)
                 self._record(audit)
                 # the evaluator is a subprocess like any other call: it kills first ...
-                self.state = self._killed(self.state, self.enforcement.writes_of(site))
+                self._kill_state(self.enforcement.kill_of(site))
                 # ... and its success -- the only way past this statement -- establishes
                 self._establish(audit.establishes)
             case _:
@@ -840,7 +980,7 @@ class ValidationWalker(ast.NodeVisitor):
             self._check_rely(node, node.func.id)
         # the kill: the site's facts were read above, so check-then-use survives;
         # check-call-then-use does not
-        self.state = self._killed(self.state, self.enforcement.writes_of(site))
+        self._kill_state(self.enforcement.kill_of(site))
 
     def _container_call(self, node: ast.Call) -> None:
         """The roster methods on a tracked container: obligations for the writes, kind
@@ -933,7 +1073,7 @@ class ValidationWalker(ast.NodeVisitor):
         self,
         node: ast.For | ast.While,
         test: ast.expr | None,
-        bindings: Mapping[str, ValidationFact] | None = None,
+        bindings: Mapping[str, ValidationFact | Std] | None = None,
     ) -> None:
         # names assigned in the loop are unknown at every iteration boundary; one pass over the body
         # in that state covers all iterations, and nothing the body established survives the loop.
@@ -943,13 +1083,23 @@ class ValidationWalker(ast.NodeVisitor):
         # pass itself: no escaped-set propagates to the boundary, because for any program
         # that survives, that set is empty (CONTAINERS.md)
         killed = _kill(self.state, _assigned_names([node]))
-        # some iteration (or the header itself) may run an effectful call: nothing it reaches
-        # survives an iteration boundary, so it neither enters the body nor survives the loop
-        killed = self._killed(killed, self._writes_in([node]))
-        with self.state_snapshot():
-            entry = killed if test is None else self._refine(killed, test)
-            self.state = {**entry, **(bindings or {})}
+
+        def iteration(*, header: bool) -> None:
+            if test is not None:
+                if header:
+                    self.visit(test)  # a ``while`` header re-runs every time round
+                self.state = self._refine(self.state, test)
+            self.state.update(bindings or {})
             self._block(node.body)
+
+        # some iteration (or the header itself) may run an effectful call: nothing it reaches
+        # survives an iteration boundary, so it neither enters the body nor survives the loop.
+        # One rehearsal from the boundary state says what any iteration may do.
+        once = self._rehearse(lambda: iteration(header=True), killed)
+        killed = self._killed(killed, self._iteration_kill(once))
+        with self.state_snapshot():
+            self.state = dict(killed)
+            iteration(header=False)  # the header's first run was visited by the caller
         with self.state_snapshot():
             self.state = dict(killed)
             self._block(node.orelse)  # runs only when the loop was not left by ``break``
@@ -962,7 +1112,7 @@ class ValidationWalker(ast.NodeVisitor):
         # ``for x[0] in ...`` is the container escape it deserves to be
         self.visit(node.target)
         # the iterable is evaluated once, before the loop, in the pre-loop state
-        self._loop(node, None, iteration_bindings(node.target, node.iter, self.state))
+        self._loop(node, None, iteration_bindings(node.target, node.iter, self.state, self.modules))
 
     def visit_While(self, node: ast.While) -> Any:
         self.visit(node.test)
@@ -1011,12 +1161,11 @@ class ValidationWalker(ast.NodeVisitor):
         # a manager that may swallow an exception makes the body a ``try`` with a catch-all
         # handler that falls through: whatever the body established may not have happened
         escaped = _kill(self.state, _assigned_names([node]))
-        # the body may have called before the escape
-        escaped = self._killed(escaped, self._writes_in([node]))
         with self.state_snapshot():
-            bind_and_walk()
+            body_kills = self._measure(bind_and_walk)
             body_end = self.state
-        self.state = _join(body_end, escaped)
+        # the body may have called before the escape
+        self.state = _join(body_end, self._killed(escaped, body_kills))
 
     def _try(self, node: ast.Try | ast.TryStar, *, handlers_chain: bool) -> None:
         # an exception may leave the body at any point: a handler sees the pre-state minus whatever
@@ -1027,13 +1176,19 @@ class ValidationWalker(ast.NodeVisitor):
             # loses whatever the others assign
             killed_by += [s for h in node.handlers for s in h.body]
         handler_entry = _kill(self.state, _assigned_names(killed_by))
-        # the body may have called before raising
-        handler_entry = self._killed(handler_entry, self._writes_in(killed_by))
         ends: list[State] = []
         with self.state_snapshot():
-            self._block(node.body)
+            # the body may have called before raising
+            body_kills = self._measure(lambda: self._block(node.body))
             self._block(node.orelse)  # runs only after the body completed normally
             ends.append(self.state)
+        handler_entry = self._killed(handler_entry, body_kills)
+        if handlers_chain:
+            # ... and, for ``except*``, so may the handlers that ran before this one
+            for h in node.handlers:
+                handler_entry = self._killed(
+                    handler_entry, self._rehearse(lambda h=h: self._block(h.body), handler_entry)
+                )
         for h in node.handlers:
             with self.state_snapshot():
                 self.state = dict(handler_entry)
@@ -1082,9 +1237,9 @@ class ValidationWalker(ast.NodeVisitor):
         self.module_constants = self._module_constants(node)
         self.generic_visit(node)
 
-    def _module_constants(self, module: ast.Module) -> dict[str, ValidationFact]:
+    def _module_constants(self, module: ast.Module) -> dict[str, ValidationFact | Std]:
         counts = _module_scope_binds(module.body)
-        state: dict[str, ValidationFact] = {}
+        state: dict[str, ValidationFact | Std] = {}
         for s in module.body:
             if isinstance(s, ast.Assign) and len(s.targets) == 1 and isinstance(s.targets[0], ast.Name):
                 name, value = s.targets[0].id, s.value
@@ -1095,12 +1250,19 @@ class ValidationWalker(ast.NodeVisitor):
             if counts.get(name, 0) != 1:
                 continue  # bound more than once at module scope: not a constant
             try:
+                fact: ValidationFact | Container | Std | None
                 fact = interpret_expr(value, state)  # earlier constants are in scope for later ones
+                if fact is None:
+                    fact = self._guaranteed(value)
+                if fact is None:
+                    # a number, a bytes literal, ...: immutable, so it holds everywhere; a
+                    # list or a dict does not -- some function may have opened it by the time
+                    # another runs
+                    std = std_of(value, state, self.modules)
+                    fact = std if std is not None and not std.openable else None
             except InvalidProgram:
                 continue  # a malformed value; the main walk reports it
-            if fact is None:
-                fact = self._guaranteed(value)
-            if isinstance(fact, (StrFact, PathFact, Located)):
+            if isinstance(fact, (StrFact, PathFact, Located, Std)):
                 state[name] = fact
         return state
 
@@ -1132,9 +1294,9 @@ class ValidationWalker(ast.NodeVisitor):
         local |= _assigned_names(node.body)
         # a constant's location (and any pure atom: the value is immutable) holds everywhere; an
         # environment check is anchored to a program point and does not survive into an arbitrary
-        # call of the function
+        # call of the function. A standard constant is seeded only when nothing can open it.
         seed: State = {
-            k: self.enforcement.forget(v, EVERYTHING)
+            k: v if isinstance(v, Std) else self.enforcement.forget(v, EVERYTHING)
             for k, v in self.module_constants.items()
             if k not in local
         }
@@ -1142,6 +1304,7 @@ class ValidationWalker(ast.NodeVisitor):
         guarantee = None if contract is None else contract.returns
         outer = self._guarantee
         self._guarantee = guarantee
+        seen = self._seen  # the body does not run here: what it does is not the definition's
         try:
             with self.state_snapshot():
                 self.state = seed
@@ -1150,6 +1313,7 @@ class ValidationWalker(ast.NodeVisitor):
                     self._violation(node, f"{node.name} may fall off its end without establishing its guarantee")
         finally:
             self._guarantee = outer
+            self._seen = seen
         self.state.pop(node.name, None)
 
     def visit_Return(self, node: ast.Return) -> Any:

@@ -409,48 +409,93 @@ NETWORK_NAMESPACE: tuple[str, ...] = (NAMESPACE, "network")
 NETWORK_METHODS: frozenset[str] = frozenset({"get", "head", "delete", "post", "put", "patch"})
 NETWORK_BODY_METHODS: frozenset[str] = frozenset({"post", "put", "patch"})
 
-# The crude validation-kill (walker): ANY call may run program code with effects -- a module
-# function, a lambda held in a variable, a class instantiation, a subprocess -- so every call
-# kills every live validation check, EXCEPT the enumerated effect-free path/text operations
-# below (plus the whole allowlisted ``os.path`` surface, and read/list pathlib methods on a
-# proven path receiver, both special-cased in the walker). Extending this set widens what a
-# check survives; keep everything here incapable of reaching program code or the filesystem.
-# NB: callback-taking builtins (sorted with key=, map, filter) stay OUT: a stored lambda invoked
-# through them runs program code at call time, past the definition-point audit.
-NON_KILLING_CALLEES: frozenset[tuple[str, ...]] = frozenset({
-    ("str",), ("repr",), ("len",), ("print",), ("format",),
-    ("int",), ("float",), ("bool",), ("isinstance",),
-    ("os", "fspath"),
-    ("pathlib", "Path"), ("pathlib", "PurePath"),
-    ("pathlib", "PosixPath"), ("pathlib", "PurePosixPath"),
-    ("re", "fullmatch"), ("re", "match"), ("re", "search"), ("re", "compile"),
-    ("json", "dumps"), ("json", "loads"),
-    # the extractors (PROVENANCE.md): pure functions over text the program already holds
-    (NAMESPACE, "extract"), (NAMESPACE, "extract_all"), (NAMESPACE, "lines"), (NAMESPACE, "field"),
-    # the location guard: a pure predicate
-    (NAMESPACE, "pathmatch"),
-})
+# The validation-kill (walker, enforcement.kill_of; EFFECTS.md, "The callee analysis"): a call
+# kills every live environmental atom its write set reaches, and ANY call may run program code
+# -- a module function, a lambda held in a variable, a class instantiation -- which may do
+# anything, so a call the analysis cannot place writes everything. The calls it can place are
+# the ``certora`` calls and the file sinks (effects with a known medium), a method on an inert
+# receiver with inert arguments, and the roster below: builtins and module functions that are
+# the interpreter's own code, each under the *argument condition* naming which of its arguments
+# must be inert for that to hold.
+#
+#   "keywords-and-splats" -- the plain positional arguments may be anything: every dunder the
+#       callee would dispatch to (``__str__``, ``__len__``, ``__int__``, ``__bool__``,
+#       ``__hash__``, ``__index__``, ``__fspath__``, ``__instancecheck__`` ...) is fixed, since no
+#       program class defines one, and the callee consumes no iterable and calls no callable.
+#       The keyword arguments must be inert -- the callee calls or writes to them:
+#       ``print(x, file=obj)`` calls ``obj.write``, ``json.loads(s, object_hook=f)`` calls f --
+#       and so must the splats, since splatting itself runs code: ``*gen`` consumes the
+#       generator, ``**m`` calls ``m.keys()``.
+#   "all" -- every argument must be inert, positional ones included: the callee consumes an
+#       iterable it is given (a generator's body is program code), calls a callable positionally
+#       (``re.sub``'s replacement), or reaches a method by name on a duck-typed argument
+#       (``json.dumps`` calls ``items()`` on a dict *subclass*, which ALLOWED_BASES admits; the
+#       extractors call ``read``/``split``).
+#
+# "all" is the stronger demand. What is inert is the analysis' business (``analysis.is_inert``):
+# literals, text and paths, closed standard values, source handles, builtins as values.
+# Extending the roster widens what a check survives: keep everything here incapable of reaching
+# program code other than through the arguments its condition names.
+type ArgumentCondition = Literal["all", "keywords-and-splats"]
 
-# The keywords a NON_KILLING callee may be given and stay non-killing. Any other keyword runs
-# program code inside the call -- a hook (``json.loads(object_hook=f)``), a callable
-# (``json.dumps(default=f)``, ``cls=``), a duck-typed object (``print(file=obj)`` calls
-# ``obj.write``) -- so the call kills like any other. A callee absent here admits no keyword. A
-# ``**`` splat is never admitted (its keys are unknown), nor a ``*`` splat (it consumes an
-# iterable, which may be a generator whose body is program code).
-NON_KILLING_KEYWORDS: dict[tuple[str, ...], frozenset[str]] = {
-    ("print",): frozenset({"sep", "end", "flush"}),
-    ("int",): frozenset({"base"}),
-    ("str",): frozenset({"encoding", "errors"}),
-    ("re", "compile"): frozenset({"flags"}),
-    ("re", "fullmatch"): frozenset({"flags"}),
-    ("re", "match"): frozenset({"flags"}),
-    ("re", "search"): frozenset({"flags"}),
-    ("json", "dumps"): frozenset({
-        "skipkeys", "ensure_ascii", "check_circular", "allow_nan", "indent", "separators",
-        "sort_keys",
-    }),
-    (NAMESPACE, "field"): frozenset({"sep"}),
+INERT_CALLEES: dict[tuple[str, ...], ArgumentCondition] = {
+    ("str",): "keywords-and-splats", ("repr",): "keywords-and-splats", ("format",): "keywords-and-splats", ("ascii",): "keywords-and-splats",
+    ("chr",): "keywords-and-splats", ("ord",): "keywords-and-splats", ("hex",): "keywords-and-splats", ("oct",): "keywords-and-splats", ("bin",): "keywords-and-splats",
+    ("int",): "keywords-and-splats", ("float",): "keywords-and-splats", ("complex",): "keywords-and-splats", ("bool",): "keywords-and-splats",
+    ("abs",): "keywords-and-splats", ("round",): "keywords-and-splats", ("divmod",): "keywords-and-splats", ("pow",): "keywords-and-splats",
+    ("len",): "keywords-and-splats", ("hash",): "keywords-and-splats", ("id",): "keywords-and-splats", ("callable",): "keywords-and-splats",
+    ("isinstance",): "keywords-and-splats", ("issubclass",): "keywords-and-splats", ("type",): "keywords-and-splats", ("range",): "keywords-and-splats",
+    ("print",): "keywords-and-splats",
+    ("sorted",): "all", ("reversed",): "all", ("list",): "all", ("tuple",): "all",
+    ("set",): "all", ("frozenset",): "all", ("dict",): "all", ("bytes",): "all",
+    ("min",): "all", ("max",): "all", ("sum",): "all", ("any",): "all", ("all",): "all",
+    ("enumerate",): "all", ("zip",): "all", ("map",): "all", ("filter",): "all",
+    ("iter",): "all", ("next",): "all",
+    ("os", "fspath"): "keywords-and-splats", ("os", "listdir"): "keywords-and-splats", ("os", "walk"): "keywords-and-splats",
+    ("pathlib", "Path"): "keywords-and-splats", ("pathlib", "PurePath"): "keywords-and-splats",
+    ("pathlib", "PosixPath"): "keywords-and-splats", ("pathlib", "PurePosixPath"): "keywords-and-splats",
+    ("re", "compile"): "keywords-and-splats", ("re", "match"): "keywords-and-splats", ("re", "fullmatch"): "keywords-and-splats",
+    ("re", "search"): "keywords-and-splats", ("re", "findall"): "keywords-and-splats", ("re", "finditer"): "keywords-and-splats",
+    ("re", "split"): "keywords-and-splats", ("re", "escape"): "keywords-and-splats",
+    ("re", "sub"): "all", ("re", "subn"): "all",
+    ("json", "loads"): "keywords-and-splats", ("json", "dumps"): "all",
+    # the extractors (PROVENANCE.md) and the location guard: the host's own code, over a handle
+    # or text the program already holds -- reached by name (``read``, ``split``), hence inert
+    (NAMESPACE, "extract"): "all", (NAMESPACE, "extract_all"): "all",
+    (NAMESPACE, "lines"): "all", (NAMESPACE, "field"): "all", (NAMESPACE, "pathmatch"): "all",
 }
+# whole surfaces under one condition: every allowlisted ``os.path`` member reads its positional
+# arguments through ``__fspath__``
+INERT_CALLEE_PREFIXES: dict[tuple[str, ...], ArgumentCondition] = {("os", "path"): "keywords-and-splats"}
+
+
+def inert_condition(callee: tuple[str, ...], modules: frozenset[str]) -> ArgumentCondition | None:
+    """The argument condition under which *callee* -- a bare builtin, or a member of one of
+    *modules* (the names the program imported: a variable named ``json`` is not the module) --
+    runs no program code; None when it is not on the roster."""
+    if len(callee) > 1 and callee[0] not in modules:
+        return None
+    found = INERT_CALLEES.get(callee)
+    if found is not None:
+        return found
+    return INERT_CALLEE_PREFIXES.get(callee[:-1])
+
+
+# Builtins a program may pass as values (``sorted(xs, key=len)``, ``map(str, xs)``): a roster
+# callee applies them only to values derived from its other, inert arguments, so no program code
+# runs. Never rebound (safepy), so a bare name is the builtin. ``open`` and the reflective
+# builtins are ``sensitive_builtins``: not values at all.
+INERT_BUILTIN_VALUES: frozenset[str] = frozenset({
+    "str", "repr", "format", "ascii", "chr", "ord", "hex", "oct", "bin",
+    "int", "float", "complex", "bool", "bytes", "abs", "round", "divmod", "pow",
+    "len", "hash", "id", "callable", "isinstance", "issubclass", "type", "range", "print",
+    "sorted", "reversed", "list", "tuple", "set", "frozenset", "dict",
+    "min", "max", "sum", "any", "all", "enumerate", "zip", "map", "filter", "iter", "next",
+})
+# builtin types whose methods may be taken as values (``str.lower``, ``dict.fromkeys``)
+INERT_BUILTIN_TYPES: frozenset[str] = frozenset({
+    "str", "bytes", "int", "float", "bool", "list", "tuple", "set", "frozenset", "dict",
+})
 
 # certora.pathmatch(text, "<location>"): the policy's location spelling as a guard (guards.py
 # establishes the location; the walker checks the shape: two positional arguments, a literal

@@ -6,8 +6,8 @@ says *site*, *dies*, *yields* or *does not establish*:
 
 - the shape audits, which turn a call into a ``Site`` for the policy to evaluate, or into
   violations (``audit``);
-- the kill: what a call writes (``writes_of``) and which atoms that kills (``survivors``,
-  ``forget``), EFFECTS.md;
+- the kill: what a call does to the state (``kill_of``: the regions it writes, whether it may
+  run program code) and which atoms a write set kills (``survivors``, ``forget``), EFFECTS.md;
 - provenance: the source handle a call yields, the fact an extractor produces (``handle``,
   ``with_handle``, ``extract_fact``, ``check_single_fact``), PROVENANCE.md;
 - entailment: does a value establish what a rely, a guarantee, a container element or a check
@@ -42,12 +42,14 @@ from .analysis import (
     PathFact,
     PseudoRegex,
     StaticPath,
+    Std,
     StrFact,
     UrlString,
     ValidationFact,
     bind_values,
     checks_of,
     entails,
+    inert_receiver,
     is_path_typed,
     known_text,
     locate,
@@ -70,13 +72,12 @@ from .dangerous import (
     NETWORK_BODY_METHODS,
     NETWORK_METHODS,
     NETWORK_NAMESPACE,
-    NON_KILLING_CALLEES,
-    NON_KILLING_KEYWORDS,
     PATHMATCH_CALLEE,
     PATH_SINK_FUNCTIONS,
     PATH_SINK_METHOD_TARGETS,
     PATH_SINK_METHODS,
     AccessKind,
+    inert_condition,
 )
 from .effects import EVERYTHING, NOTHING, Effects, Medium
 from .ids import AtomId, ParamName, ProgramName, RegionId, ValidationName
@@ -102,6 +103,37 @@ METHOD_KINDS: dict[str, tuple[str, ...]] = {
 CONTAINER_READ_CALLS: frozenset[str] = frozenset(
     {"len", "sorted", "list", "set", "tuple", "iter", "reversed", "enumerate"}
 )
+
+# Methods of the standard containers that reach their arguments only through ``__hash__`` and
+# ``__eq__`` -- fixed, since no program class defines a dunder -- so they run no program code
+# whatever they are given (EFFECTS.md). Storing a non-inert argument still opens the state.
+HASH_IDENTITY_METHODS: frozenset[str] = frozenset(
+    {"append", "insert", "index", "count", "remove", "get", "setdefault", "pop", "add", "discard"}
+)
+
+
+# ---------------------------------------------------------------------------
+# the kill: what one call does to the state
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Kill:
+    """What one call does to the state (EFFECTS.md): the regions it may write -- every
+    environmental atom reading one dies -- and whether it *opens* the standard values and
+    handles: program code may have run inside it, so any list, dict, set or unknown-kind value
+    may now hold a program object through an alias, or a non-inert value was stored into one."""
+
+    writes: Effects
+    opens: bool
+
+    def __or__(self, other: "Kill") -> "Kill":
+        return Kill(self.writes | other.writes, self.opens or other.opens)
+
+
+NO_KILL = Kill(NOTHING, opens=False)  # the interpreter's own code over inert values
+OPENING = Kill(NOTHING, opens=True)  # a store that may put a program object into a standard value
+OPAQUE = Kill(EVERYTHING, opens=True)  # program code may run: anything may happen
 
 
 # ---------------------------------------------------------------------------
@@ -293,10 +325,17 @@ class Discharge(Protocol):
 class Callsite:
     """One call, digested by the walker against its state. Nothing here is syntax except the
     opaque handles used to place a report: the arguments and keywords are values as the state
-    sees them (known text as a ``str``), the receiver of a method call is its state entry, and
-    ``handle_of(which)`` answers what source handle stands behind positional *which* or the
-    keyword named *which* -- a name bound to one, or a source call written inline -- without the
-    enforcement having to look."""
+    sees them (known text as a ``str``), the receiver of a method call is its state entry (or
+    the value of a computed receiver, ``line.strip().split()``), and ``handle_of(which)``
+    answers what source handle stands behind positional *which* or the keyword named *which* --
+    a name bound to one, or a source call written inline -- without the enforcement having to
+    look.
+
+    The three ``inert_*`` flags are decided by the walker over the argument expressions, for
+    the argument conditions of the callee analysis (EFFECTS.md; ``dangerous.INERT_CALLEES``):
+    ``inert_keywords`` -- every ``name=value`` is inert; ``inert_splats`` -- every ``*xs`` and
+    every ``**m`` splats an inert value; ``inert_arguments`` -- both, and every plain positional
+    argument is inert too."""
 
     node: ast.AST
     callee: NameAccess
@@ -306,8 +345,11 @@ class Callsite:
     keyword_nodes: Mapping[str, ast.AST]
     keyword_names: Mapping[str, str | None]  # the bare variable a keyword names, if it does
     splat: bool  # *args or **kwargs present
-    receiver: ValidationFact | Container | Data | None
+    receiver: ValidationFact | Container | Data | Std | None
     handle_of: Callable[[int | str], Data | None]
+    inert_arguments: bool
+    inert_keywords: bool
+    inert_splats: bool
 
     @property
     def method(self) -> str | None:
@@ -389,9 +431,9 @@ def _at_sink(value: Value) -> ValidationFact | None:
     return fact if located is None else located
 
 
-def _scalar(value: ValidationFact | Container | Data | None) -> ValidationFact | None:
-    """A state entry as a fact: containers and handles have no scalar reading."""
-    return None if isinstance(value, (Container, Data)) else value
+def _scalar(value: ValidationFact | Container | Data | Std | None) -> ValidationFact | None:
+    """A state entry as a fact: containers, handles and standard values have no scalar reading."""
+    return None if isinstance(value, (Container, Data, Std)) else value
 
 
 def _open_kind(mode: str | None) -> AccessKind:
@@ -430,19 +472,6 @@ def _hosts_of(url: ValidationFact | None) -> list[str] | None:
             return None
         hosts.append(host.lower().rstrip("."))
     return hosts
-
-
-def _non_killing(site: Callsite) -> bool:
-    """Is this call on the effect-free allowlist AND spelled so that it runs no program code
-    through its arguments? A keyword outside the callee's admitted set is a hook or a duck-typed
-    object (``json.loads(object_hook=f)``, ``print(file=obj)``); a ``**`` splat hides its keys;
-    a ``*`` splat consumes an iterable that may be a generator. Each makes the call an ordinary,
-    killing one."""
-    callee = site.callee.full_path
-    if callee not in NON_KILLING_CALLEES or site.splat:
-        return False
-    admitted = NON_KILLING_KEYWORDS.get(callee, frozenset())
-    return all(k in admitted for k in site.keywords)
 
 
 @dataclass
@@ -632,41 +661,81 @@ class Enforcement:
 
     # -- the kill (EFFECTS.md) ----------------------------------------------------------------
 
-    def writes_of(self, site: Callsite) -> Effects:
-        """What this call may change of the state atoms depend on. NOTHING for the enumerated
-        pure path/text operations (spelled without hooks), the allowlisted ``os.path`` surface,
-        reads and listings on a proven pathlib value, roster mutations of a tracked container,
-        and checks the policy declared effect-free; everything else -- program functions, lambdas
-        held in variables, instantiations, methods on unknown receivers, subprocesses -- may
-        change anything."""
+    def kill_of(self, site: Callsite) -> Kill:
+        """What this call does to the state (EFFECTS.md, the callee analysis).
+
+        The ``certora`` calls and the file sinks are effects with a known medium that run no
+        program code: a check writes what its signature declares, an exec or a request what the
+        rule it falls under writes, a file write everything (until footprints are derived), a
+        read nothing. A roster builtin or module function whose argument condition is
+        satisfied (``dangerous.INERT_CALLEES``: every argument inert, or only the keywords and
+        the splats) and a method on an inert receiver with inert arguments are the interpreter's
+        own code over inert values: no kill. The hash-and-identity methods need no inert
+        arguments, but storing a non-inert value opens the state. Anything else -- a program
+        function, a class, a lambda held in a variable, a method on an unknown receiver, a roster
+        call handed a program object -- may run program code: it writes everything and opens
+        everything."""
         callee = site.callee
-        if not callee.is_var_base:
-            return EVERYTHING  # a method on a computed receiver: nothing is known about it
-        if callee.matches(*CHECK_CALLEE) or callee.matches(*CHECK_SINGLE_CALLEE):
-            signature = self._signature(site)
-            return EVERYTHING if signature is None else signature.writes
-        if callee.matches(*EXEC_CALLEE):
-            return self._exec_writes(site)
-        method = next((m for m in NETWORK_METHODS if callee.matches(*NETWORK_NAMESPACE, m)), None)
-        if method is not None:
-            return self._network_writes(site, method)
-        full = callee.full_path
-        if _non_killing(site) or (len(full) == 3 and full[:2] == ("os", "path")):
-            return NOTHING
-        if full in (("os", "listdir"), ("os", "walk")):
-            return NOTHING  # read sinks: audited, and they mutate nothing
-        if len(full) == 2:
-            method, receiver = full[1], site.receiver
-            if (
-                method != "open"  # Path.open("w") writes; the mode is the audit's business
-                and PATH_SINK_METHODS.get(method) in ("read", "list")
-                and not isinstance(receiver, (Container, Data))
-                and is_path_typed(receiver)
-            ):
-                return NOTHING  # p.read_text() / p.exists() / p.iterdir() on a proven path
-            if method in CONTAINER_METHODS and isinstance(receiver, Container):
-                return NOTHING  # a roster mutation runs no program code; its obligation was applied
-        return EVERYTHING
+        if callee.is_var_base:
+            full = callee.full_path
+            if callee.matches(*CHECK_CALLEE) or callee.matches(*CHECK_SINGLE_CALLEE):
+                signature = self._signature(site)
+                return Kill(EVERYTHING if signature is None else signature.writes, opens=False)
+            if callee.matches(*EXEC_CALLEE):
+                return Kill(self._exec_writes(site), opens=False)
+            network = next((m for m in NETWORK_METHODS if callee.matches(*NETWORK_NAMESPACE, m)), None)
+            if network is not None:
+                return Kill(self._network_writes(site, network), opens=False)
+            if full == ("open",):
+                bound = _bind(OpenCall, site)
+                return self._open_kill(site, None if bound is None else bound.mode, bindable=bound is not None)
+            condition = inert_condition(full, self.modules)
+            if condition is not None:
+                satisfied = (
+                    site.inert_arguments
+                    if condition == "all"
+                    else site.inert_keywords and site.inert_splats
+                )
+                return NO_KILL if satisfied else OPAQUE
+            if len(full) == 1 or full[0] in self.modules:
+                return OPAQUE  # a program function or class; a module function off the roster
+        elif callee.computed_base is None:
+            return OPAQUE  # ``super().m()``: a program method
+        # a method call, on a variable or on a computed receiver: the receiver's entry decides
+        method = site.method
+        assert method is not None
+        receiver = site.receiver
+        if method in PATH_SINK_METHODS:
+            if not is_path_typed(_scalar(receiver)):
+                return OPAQUE  # a sink's name on something not proven a path: unknown code
+            if method == "open":
+                bound = _bind(PathOpenCall, site)
+                return self._open_kill(site, None if bound is None else bound.mode, bindable=bound is not None)
+            if not site.inert_arguments:
+                return OPAQUE
+            # a write is an effect on the file (everything, until footprints are derived); a
+            # read or a listing on a proven path changes nothing
+            return Kill(EVERYTHING, opens=False) if PATH_SINK_METHODS[method] == "write" else NO_KILL
+        if isinstance(receiver, Container):
+            # a roster mutation runs no program code and its obligation was applied; an
+            # off-roster method is the container's escape, reported by the walker
+            return NO_KILL if method in CONTAINER_METHODS else OPAQUE
+        if inert_receiver(receiver):
+            if method in HASH_IDENTITY_METHODS and site.inert_keywords and site.inert_splats:
+                return NO_KILL if site.inert_arguments else OPENING
+            return NO_KILL if site.inert_arguments else OPAQUE
+        return OPAQUE
+
+    def _open_kill(self, site: Callsite, mode: Value, *, bindable: bool) -> Kill:
+        """``open`` / ``Path.open``: opening for writing truncates or creates the file -- a
+        write, everything until footprints are derived -- and opening for reading changes
+        nothing. Either way the interpreter's code, unless a keyword (``opener=``) or a splat is
+        not inert; a call that does not bind, or whose mode is unknown, is taken as a write."""
+        if not (site.inert_keywords and site.inert_splats):
+            return OPAQUE
+        if not bindable or _open_kind(_mode_text(mode, "r")) == "write":
+            return Kill(EVERYTHING, opens=False)
+        return NO_KILL
 
     def survivors(self, atoms: frozenset[str], writes: Effects) -> frozenset[str]:
         """The atoms of *atoms* that outlive an effect writing *writes*: every pure atom, and
@@ -1131,12 +1200,22 @@ def _checks_suffix(checks: frozenset[str]) -> str:
     return f" (validated: {', '.join(sorted(checks))})" if checks else ""
 
 
-def describe_value(v: Value | Container) -> str:
+_STD_NOUNS: dict[str, str] = {
+    "bytes": "bytes", "number": "a number", "bool": "a bool", "none": "None", "match": "a match",
+    "pattern": "a pattern", "list": "a list", "tuple": "a tuple", "set": "a set",
+    "frozenset": "a frozenset", "dict": "a dict",
+}
+
+
+def describe_value(v: Value | Container | Std) -> str:
     match v:
         case None:
             return "unknown"
         case Container(kind=kind, elem=elem):
             return f"{kind} of {describe_value(elem)}"
+        case Std(kind=kind, closed=closed):
+            noun = _STD_NOUNS.get(kind, "a standard value") if kind is not None else "a standard value"
+            return noun + ("" if closed else " that may hold a program object")
         case str():
             return repr(v)
         case Located(location=loc, repr=rp, checks=checks):
