@@ -144,14 +144,20 @@ def _srt_settings(
     policy's write surface (``_jail_write_paths``). Reads stay default-allowed: the
     interpreter needs its stdlib from everywhere, and read confinement is the static
     analysis' stronger half anyway."""
+    # The deny lists are required by sandbox-runtime's schema even when they are empty, and it
+    # refuses the whole configuration without them rather than defaulting: leaving them out
+    # makes every jailed run die before the program starts.
     return {
         "network": {
             "allowedDomains": [],
+            "deniedDomains": [],
             "allowLocalBinding": False,
             "allowUnixSockets": [str(socket_path)] if socket_path is not None else [],
         },
         "filesystem": {
             "allowWrite": _jail_write_paths(policy, root, tmp),
+            "denyWrite": [],
+            "denyRead": [],
         },
     }
 
@@ -214,8 +220,10 @@ def run(
                     json.dumps(_srt_settings(policy, root, tmpdir, socket_path), indent=2),
                     encoding="utf-8",
                 )
-                # srt takes the confined command as one shell-quoted string
-                command = [srt, "--settings", str(settings), shlex.join(command)]
+                # srt takes the command as its own argv, not as one shell-quoted string: a
+                # joined string arrives as a single argv[0] and fails as "No such file or
+                # directory". Passing the pieces through also means no quoting to get wrong.
+                command = [srt, "--settings", str(settings), *command]
         try:
             return subprocess.run(command, cwd=root, env=env, check=False)
         finally:
