@@ -409,6 +409,29 @@ def _mode_text(value: Value, absent: str | None) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _hosts_of(url: ValidationFact | None) -> list[str] | None:
+    """Every host a proven URL's netloc may denote -- an exact netloc, or an alternation of
+    exact ones -- lower-cased, without a trailing dot; None when the URL is not proven that far.
+    A rule must admit all of them before it can be said to cover the request."""
+    lifted = url_of(url)
+    if lifted is None or lifted.netloc is None:
+        return None
+    match lifted.netloc:
+        case Exact(exact_str=text):
+            texts = [text]
+        case Alternation(any_of=branches) if all(isinstance(b, Exact) for b in branches):
+            texts = [b.exact_str for b in branches if isinstance(b, Exact)]
+        case _:
+            return None
+    hosts: list[str] = []
+    for text in texts:
+        host = urllib.parse.urlsplit(f"//{text}").hostname
+        if host is None:
+            return None
+        hosts.append(host.lower().rstrip("."))
+    return hosts
+
+
 def _non_killing(site: Callsite) -> bool:
     """Is this call on the effect-free allowlist AND spelled so that it runs no program code
     through its arguments? A keyword outside the callee's admitted set is a hook or a duck-typed
@@ -622,6 +645,11 @@ class Enforcement:
         if callee.matches(*CHECK_CALLEE) or callee.matches(*CHECK_SINGLE_CALLEE):
             signature = self._signature(site)
             return EVERYTHING if signature is None else signature.writes
+        if callee.matches(*EXEC_CALLEE):
+            return self._exec_writes(site)
+        method = next((m for m in NETWORK_METHODS if callee.matches(*NETWORK_NAMESPACE, m)), None)
+        if method is not None:
+            return self._network_writes(site, method)
         full = callee.full_path
         if _non_killing(site) or (len(full) == 3 and full[:2] == ("os", "path")):
             return NOTHING
@@ -659,6 +687,32 @@ class Enforcement:
         kept = self.survivors(fact.checks, writes)
         return fact if kept == fact.checks else replace(fact, checks=kept)
 
+    def _exec_writes(self, site: Callsite) -> Effects:
+        """What the rule this exec selects writes: by the literal program and the leading words,
+        as the policy selects it. No literal program, or no rule, is everything -- the policy
+        denies such a site anyway, and until then nothing can be said about it."""
+        program = _exact_text(site.args[0]) if site.args else None
+        if program is None:
+            return EVERYTHING
+        for name, words, writes in self.vocabulary.writes.exec:
+            if name == program and matches_leading(words, site.args[1:]):
+                return writes
+        return EVERYTHING
+
+    def _network_writes(self, site: Callsite, method: str) -> Effects:
+        """What the rules a request may fall under write: every rule whose host admits every host
+        the proven URL may denote and whose methods admit this one, unioned. An unproven URL, or
+        no admitting rule, is everything."""
+        hosts = _hosts_of(_as_fact(site.args[0])) if site.args else None
+        if hosts is None:
+            return EVERYTHING
+        wanted = method.upper()
+        total: Effects | None = None
+        for pattern, methods, writes in self.vocabulary.writes.network:
+            if all(host_matches(pattern, h) for h in hosts) and (not methods or wanted in methods):
+                total = writes if total is None else total | writes
+        return EVERYTHING if total is None else total
+
     def _signature(self, site: Callsite) -> CheckSignature | None:
         """The validation a ``certora.check``/``check_single`` names, when its first argument is
         a literal (or a name bound to one) the policy declares."""
@@ -679,21 +733,9 @@ class Enforcement:
         """The source atoms of the rule(s) a proven URL's host falls under: every host the netloc
         may denote must match, or the response vouches for nothing."""
         lifted = url_of(url)
-        if lifted is None or lifted.netloc is None:
+        hosts = _hosts_of(url)
+        if lifted is None or hosts is None:
             return frozenset()
-        match lifted.netloc:
-            case Exact(exact_str=text):
-                texts = [text]
-            case Alternation(any_of=branches) if all(isinstance(b, Exact) for b in branches):
-                texts = [b.exact_str for b in branches if isinstance(b, Exact)]
-            case _:
-                return frozenset()
-        hosts: list[str] = []
-        for text in texts:
-            host = urllib.parse.urlsplit(f"//{text}").hostname
-            if host is None:
-                return frozenset()
-            hosts.append(host.lower().rstrip("."))
         path = lifted.path
         return frozenset(
             atom
