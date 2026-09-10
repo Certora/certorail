@@ -2,6 +2,7 @@
 
     certorail program.py [--root DIR] [--policy policy.py] [--check] [--no-jail] [-- ARG ...]
     certorail -c SOURCE  [same options]     # inline source: the agentic path
+    certorail explain program.py [--root DIR] [--policy P] [--json]   # why, and what would change
 
 (``certorail`` is the ``[project.scripts]`` entry point, installed by ``uv tool install .``;
 ``python -m certorail.host`` is the same thing.)
@@ -19,10 +20,14 @@
    is where anything it missed goes to die. Without srt the run proceeds with a loud
    warning (or quietly with ``--no-jail``).
 
-The policy file is trusted Python defining ``POLICY`` (a ``certorail.policy.Policy``); without one,
-``policy.DEFAULT_POLICY`` applies: read, write and list anywhere within the root, and ``git``/``gh``
-with a cwd within the root. Exit status: the program's own when it ran; 1 when rejected; 2 when the
+The policy file is trusted Python defining ``POLICY`` (a ``certorail.policy.Policy``), or a TOML
+document; without one, ``policy.DEFAULT_POLICY`` applies: read, write and list anywhere within the
+root, and no subprocesses. Exit status: the program's own when it ran; 1 when rejected; 2 when the
 program does not parse.
+
+``explain`` (``explain.py``) is the one subcommand, dispatched by hand before the parser so a bare
+``certorail prog.py`` keeps working; a file literally named ``explain`` is shadowed by it, so pass
+``./explain``.
 """
 import argparse
 import ast
@@ -37,6 +42,7 @@ import tempfile
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import Literal
 
 from .analysis import Named, StaticPath
 from .broker import build_server
@@ -231,7 +237,19 @@ def run(
                 server.server_close()
 
 
-def load_policy(path: pathlib.Path | None, root: pathlib.Path | None = None) -> Policy:
+@dataclass(frozen=True)
+class PolicySource:
+    """Where the policy in force came from, for a report that has to say so."""
+
+    kind: Literal["explicit", "ambient", "default"]
+    path: pathlib.Path | None = None
+    governs: pathlib.Path | None = None  # the prefix an ambient policy claims
+
+
+def load_policy_described(
+    path: pathlib.Path | None, root: pathlib.Path | None = None
+) -> tuple[Policy, PolicySource]:
+    """The policy, and its provenance. ``load_policy`` is this without the provenance."""
     if path is None:
         if root is not None:
             try:
@@ -243,26 +261,31 @@ def load_policy(path: pathlib.Path | None, root: pathlib.Path | None = None) -> 
                 # a security tool picking up ambient configuration is never silent about it
                 print(f"certorail: policy from {policy_file} (root {prefix})", file=sys.stderr)
                 try:
-                    return load_policy_file(policy_file)
+                    return load_policy_file(policy_file), PolicySource(
+                        "ambient", policy_file, prefix
+                    )
                 except PolicyFileError as e:
                     raise SystemExit(str(e))
-        return DEFAULT_POLICY
+        return DEFAULT_POLICY, PolicySource("default")
     if path.suffix in (".toml", ".json"):
         try:
-            return load_policy_file(path)
+            return load_policy_file(path), PolicySource("explicit", path)
         except PolicyFileError as e:
             raise SystemExit(str(e))
     namespace = runpy.run_path(str(path))
     policy = namespace.get("POLICY")
     if not isinstance(policy, Policy):
         raise SystemExit(f"{path}: expected POLICY to be a certorail.policy.Policy")
-    return policy
+    return policy, PolicySource("explicit", path)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="certorail", description="Analyse a program, check it against a policy, and run it."
-    )
+def load_policy(path: pathlib.Path | None, root: pathlib.Path | None = None) -> Policy:
+    return load_policy_described(path, root)[0]
+
+
+def add_common_arguments(parser: argparse.ArgumentParser) -> None:
+    """The program / -c / --root / --policy quartet, shared by ``certorail`` and
+    ``certorail explain`` so the two parsers cannot drift apart."""
     parser.add_argument(
         "program", type=pathlib.Path, nargs="?", default=None, help="the Python source file"
     )
@@ -282,6 +305,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         "(default: the nearest ambient policy under ~/.certorail for this root, "
         "else the built-in policy)",
     )
+
+
+def read_source(ns: argparse.Namespace, parser: argparse.ArgumentParser) -> tuple[str, str]:
+    """The program text and the name to report it under. ``-c`` and a path are exclusive."""
+    if (ns.program is None) == (ns.command is None):
+        parser.error("exactly one of PROGRAM or -c SOURCE is required")
+    if ns.command is not None:
+        return ns.command, "<command>"
+    return ns.program.read_text(encoding="utf-8"), str(ns.program)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    # argparse cannot express "a subcommand, or else a bare path" when the first positional is
+    # itself a path, and `certorail prog.py` must keep working -- so the one subcommand is
+    # dispatched by hand. argv is normalised first: parse_args(None) would read sys.argv itself,
+    # and `python -m certorail.host explain ...` has to route here too.
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args[:1] == ["explain"]:
+        from .explain import explain_main
+
+        return explain_main(args[1:])
+    parser = argparse.ArgumentParser(
+        prog="certorail", description="Analyse a program, check it against a policy, and run it."
+    )
+    add_common_arguments(parser)
     parser.add_argument("--check", action="store_true", help="analyse and evaluate only; do not run")
     parser.add_argument(
         "--no-jail",
@@ -293,14 +341,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     # keeps parsing options anywhere, and `--` is the documented way to pass option-like
     # arguments through to the program.
     parser.add_argument("args", nargs="*", help="arguments for the program (after --)")
-    ns = parser.parse_args(argv)
+    ns = parser.parse_args(args)
 
-    if (ns.program is None) == (ns.command is None):
-        parser.error("exactly one of PROGRAM or -c SOURCE is required")
-    if ns.command is not None:
-        source, filename = ns.command, "<command>"
-    else:
-        source, filename = ns.program.read_text(encoding="utf-8"), str(ns.program)
+    source, filename = read_source(ns, parser)
     root = ns.root.resolve()
     policy = load_policy(ns.policy, root)
     args = ns.args[1:] if ns.args[:1] == ["--"] else ns.args

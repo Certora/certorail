@@ -1,0 +1,47 @@
+# A policy to run the examples against: what a script that surveys a few checkouts may do.
+#
+# Every location is relative to the sandbox root -- the directory passed as --root -- so this file
+# names no machine, no user and no absolute path, and works wherever the root is. Point a program
+# at it with:
+#
+#   certorail your_program.py --root . --policy examples/policy.toml --check
+#
+# The schema is documented in certorail/policyfile.py; the default is deny, so a kind that is not
+# listed here is not granted at all.
+
+policy-version = 1
+
+[filesystem]
+read  = ["data/**", "repos/**"]
+write = ["reports/**"]
+list  = ["data/**", "repos/**"]
+
+[atoms]
+# a defined atom: the regex IS its meaning, so any text the analysis knows carries it, and a
+# computed value carries it after an assert re.fullmatch with this exact pattern
+repo-name = { matches = '[A-Za-z0-9._-]+' }
+# an opaque, environmental atom: no regex describes it, so only a live check establishes it
+org-checkout = {}
+
+[[validation]]
+name        = "in-our-org"
+argv        = ["git", "config", "--get", "remote.origin.url"]
+cwd         = "repos/**"
+establishes = { cwd = ["org-checkout"] }
+
+[[program]]
+name       = "git"
+subcommand = "clone"
+cwd        = "repos"
+# the argument that names the checkout must be a plain name, never a path or a flag
+argument-atoms = ["repo-name"]
+
+[[program]]
+name       = "git"
+subcommand = "log"
+cwd        = "repos/**"
+requires   = ["org-checkout"]
+
+[[network]]
+host    = "api.example.com"
+methods = ["GET"]

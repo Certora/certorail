@@ -49,6 +49,7 @@ from dataclasses import dataclass, replace
 from typing import Literal
 
 from . import markers
+from .dangerous import AccessKind
 from .analysis import (
     ANY_NAME,
     Alternation,
@@ -532,10 +533,138 @@ def _run_literal_checker(v: Validation, slot: str, text: str, root: pathlib.Path
     return result.returncode == 0
 
 
+# ---------------------------------------------------------------------------
+# why a site was denied, as data
+#
+# ``Denial.reason`` stays the sentence a human reads; the cause is that same fact structured, so
+# a consumer (``certorail explain``, its ``--json``) can name the rule, the missing atoms and the
+# argument index without parsing prose back apart. Deliberately minimal: whatever is derivable
+# from the policy and the site -- which programs ARE permitted, which network rules nearly
+# matched -- is the consumer's to recompute, not this file's to carry.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class NotPermitted:
+    """A proven location that no allowance of its kind subsumes."""
+
+    kind: AccessKind
+    location: LocationFact
+
+
+@dataclass(frozen=True)
+class Unproven:
+    """A value the analysis could not pin down. No policy can permit one."""
+
+    subject: Literal["path", "cwd", "url"]
+
+
+@dataclass(frozen=True)
+class NetlocNotFinite:
+    """The URL's netloc is known only partially, so it is not a finite set of hosts."""
+
+
+@dataclass(frozen=True)
+class UnknownProgram:
+    program: str
+
+
+@dataclass(frozen=True)
+class NoSubcommand:
+    """Some rule for this program names a subcommand, so the program fails closed."""
+
+    program: str
+
+
+@dataclass(frozen=True)
+class CwdOutside:
+    location: LocationFact
+
+
+@dataclass(frozen=True)
+class CwdMissingAtoms:
+    missing: frozenset[str]
+
+
+@dataclass(frozen=True)
+class UnvouchedArgument:
+    argument: int  # 1-based, numbered as the message numbers it (subcommand words included)
+
+
+@dataclass(frozen=True)
+class ArgumentOutside:
+    argument: int
+    location: LocationFact
+
+
+@dataclass(frozen=True)
+class ArgumentMissingAtoms:
+    argument: int
+    missing: frozenset[str]
+
+
+type ExecDetail = (
+    CwdOutside | CwdMissingAtoms | UnvouchedArgument | ArgumentOutside | ArgumentMissingAtoms
+)
+
+
+@dataclass(frozen=True)
+class ExecMismatch:
+    """One candidate rule, and the first thing about the site it did not admit."""
+
+    rule_index: int  # into Policy.programs, so a remedy can name program[i]
+    rule: "Program"
+    detail: ExecDetail
+
+
+@dataclass(frozen=True)
+class ExecDenied:
+    program: str
+    mismatches: tuple[ExecMismatch, ...]  # every candidate rule, in policy order
+
+
+@dataclass(frozen=True)
+class EndpointUnmatched:
+    method: str
+    scheme: str
+    host: str
+    port: int
+
+
+@dataclass(frozen=True)
+class UrlMissingAtoms:
+    method: str
+    scheme: str
+    host: str
+    port: int
+    # every rule that matched the endpoint, with the atoms it still wants. The reason string
+    # reports the smallest of these sets; which rule it came from survives here.
+    candidates: tuple[tuple[int, "NetworkRule", frozenset[str]], ...]
+
+
+@dataclass(frozen=True)
+class UndeclaredValidation:
+    name: str
+
+
+@dataclass(frozen=True)
+class CheckCwdOutside:
+    name: str
+    location: LocationFact
+    permitted: LocationFact
+
+
+type Cause = (
+    NotPermitted | Unproven | NetlocNotFinite | UnknownProgram | NoSubcommand | ExecDenied
+    | EndpointUnmatched | UrlMissingAtoms | UndeclaredValidation | CheckCwdOutside
+)
+
+
 @dataclass(frozen=True)
 class Denial:
     site: Site
     reason: str
+    cause: Cause | None = None
 
 
 @dataclass(frozen=True)
@@ -715,38 +844,70 @@ class Policy:
                 permitted = {"read": self.read, "write": self.write, "list": self.listing}[kind]
                 if any(location_le(loc, allowed) for allowed in permitted):
                     return []
-                return [Denial(site, f"{kind} of {pretty_location(loc)} is not permitted")]
+                return [
+                    Denial(
+                        site,
+                        f"{kind} of {pretty_location(loc)} is not permitted",
+                        NotPermitted(kind, loc),
+                    )
+                ]
             case SinkSite():
-                return [Denial(site, "the location of the path is not proven")]
+                return [
+                    Denial(site, "the location of the path is not proven", Unproven("path"))
+                ]
             case ExecSite(program=name, cwd=cwd, arguments=arguments):
-                rules = [p for p in self.programs if p.name == name]
+                # the index rides along so a remedy can name the rule it would widen
+                rules = [(i, p) for i, p in enumerate(self.programs) if p.name == name]
                 if not rules:
-                    return [Denial(site, f"program {name!r} is not permitted")]
+                    return [
+                        Denial(
+                            site, f"program {name!r} is not permitted", UnknownProgram(name)
+                        )
+                    ]
                 if not isinstance(cwd, Located):
-                    return [Denial(site, "the cwd is not proven")]
-                if any(r.subcommand for r in rules):
+                    return [Denial(site, "the cwd is not proven", Unproven("cwd"))]
+                if any(r.subcommand for _, r in rules):
                     # subcommands fail closed: at most one rule matches (prefix-freedom); an
                     # unlisted or computed subcommand matches nothing and is denied
-                    rule = next((r for r in rules if _prefix_matches(r.subcommand, arguments)), None)
-                    if rule is None:
+                    matched = next(
+                        ((i, r) for i, r in rules if _prefix_matches(r.subcommand, arguments)),
+                        None,
+                    )
+                    if matched is None:
                         return [
                             Denial(
                                 site,
                                 f"arguments match no declared subcommand of {name!r} "
                                 "(subcommands fail closed)",
+                                NoSubcommand(name),
                             )
                         ]
-                    reason = self._exec_mismatch(
+                    index, rule = matched
+                    mismatch = self._exec_mismatch(
                         rule, cwd, arguments[len(rule.subcommand):], discharge
                     )
-                    return [] if reason is None else [Denial(site, reason)]
-                reasons: list[str] = []
-                for rule in rules:
-                    reason = self._exec_mismatch(rule, cwd, arguments, discharge)
-                    if reason is None:
+                    if mismatch is None:
                         return []
+                    reason, detail = mismatch
+                    return [
+                        Denial(
+                            site,
+                            reason,
+                            ExecDenied(name, (ExecMismatch(index, rule, detail),)),
+                        )
+                    ]
+                reasons: list[str] = []
+                mismatches: list[ExecMismatch] = []
+                for index, rule in rules:
+                    mismatch = self._exec_mismatch(rule, cwd, arguments, discharge)
+                    if mismatch is None:
+                        return []
+                    reason, detail = mismatch
                     reasons.append(reason)
-                return [Denial(site, "; ".join(reasons))]
+                    mismatches.append(ExecMismatch(index, rule, detail))
+                return [
+                    Denial(site, "; ".join(reasons), ExecDenied(name, tuple(mismatches)))
+                ]
             case NetworkSite(method=method, url=url):
                 lifted = url_of(url)
                 if lifted is None or lifted.scheme is None or lifted.netloc is None:
@@ -755,16 +916,23 @@ class Policy:
                             site,
                             "the URL is not proven: its scheme and netloc must be known "
                             "(a literal URL, or urllib.parse.urlsplit guards)",
+                            Unproven("url"),
                         )
                     ]
                 endpoints = _netloc_endpoints(lifted.netloc)
                 if endpoints is None:
-                    return [Denial(site, "the URL's netloc is not a known, finite set of hosts")]
+                    return [
+                        Denial(
+                            site,
+                            "the URL's netloc is not a known, finite set of hosts",
+                            NetlocNotFinite(),
+                        )
+                    ]
                 for host, port in endpoints:
                     resolved = port if port is not None else default_port(lifted.scheme)
                     candidates = [
-                        rule
-                        for rule in self.network
+                        (i, rule)
+                        for i, rule in enumerate(self.network)
                         if matches_endpoint(rule, lifted.scheme, host, resolved, method)
                     ]
                     if not candidates:
@@ -773,41 +941,58 @@ class Policy:
                                 site,
                                 f"{method} {lifted.scheme}://{host}:{resolved} matches no "
                                 "network rule",
+                                EndpointUnmatched(method, lifted.scheme, host, resolved),
                             )
                         ]
                     # whatever their redirect treatment, every required atom is demanded of
                     # the original URL here
-                    missing = min(
+                    candidate_misses = [
                         (
+                            i,
+                            rule,
                             self._missing_atoms(
                                 url, frozenset(ra.name for ra in rule.requires), discharge
-                            )
-                            for rule in candidates
-                        ),
-                        key=len,
-                    )
+                            ),
+                        )
+                        for i, rule in candidates
+                    ]
+                    missing = min((m for _, _, m in candidate_misses), key=len)
                     if missing:
                         return [
                             Denial(
                                 site,
                                 f"the URL is not validated by: {', '.join(sorted(missing))}",
+                                UrlMissingAtoms(
+                                    method,
+                                    lifted.scheme,
+                                    host,
+                                    resolved,
+                                    tuple(candidate_misses),
+                                ),
                             )
                         ]
                 return []
             case CheckSite(name=name, cwd=cwd):
                 declared = next((v for v in self.validations if v.name == name), None)
                 if declared is None:
-                    return [Denial(site, f"validation {name!r} is not declared by the policy")]
+                    return [
+                        Denial(
+                            site,
+                            f"validation {name!r} is not declared by the policy",
+                            UndeclaredValidation(name),
+                        )
+                    ]
                 if declared.cwd is None:
                     return []  # the check declared no interest in where it runs
                 if not isinstance(cwd, Located):
-                    return [Denial(site, "the cwd is not proven")]
+                    return [Denial(site, "the cwd is not proven", Unproven("cwd"))]
                 if not location_le(cwd.location, declared.cwd):
                     return [
                         Denial(
                             site,
                             f"check {name!r} may not run at {pretty_location(cwd.location)} "
                             f"(permitted: {pretty_location(declared.cwd)})",
+                            CheckCwdOutside(name, cwd.location, declared.cwd),
                         )
                     ]
                 return []
@@ -835,35 +1020,49 @@ class Policy:
         cwd: Located,
         arguments: tuple,
         discharge: Callable[[str, str], bool] | None = None,
-    ) -> str | None:
-        """*arguments* excludes the matched subcommand words, if the rule has any."""
+    ) -> tuple[str, ExecDetail] | None:
+        """The first thing about the site *rule* does not admit: the sentence, and the same fact
+        as data. *arguments* excludes the matched subcommand words, if the rule has any."""
         if not location_le(cwd.location, rule.cwd):
-            return f"cwd {pretty_location(cwd.location)} is not within {pretty_location(rule.cwd)}"
+            return (
+                f"cwd {pretty_location(cwd.location)} is not within {pretty_location(rule.cwd)}",
+                CwdOutside(cwd.location),
+            )
         missing = self._missing_atoms(cwd, rule.requires, discharge)
         if missing:
-            return f"cwd is not validated by: {', '.join(sorted(missing))}"
+            return (
+                f"cwd is not validated by: {', '.join(sorted(missing))}",
+                CwdMissingAtoms(missing),
+            )
         if not rule.unknown_arguments:
             for i, a in enumerate(arguments):
                 # vouched-for means exactly-known text or a proven path: a computed str
                 # (f-string, .strip()) is a StrFact, not None, but is still unknown
                 if known_text(a) is None and not isinstance(a, Located):
+                    numbered = i + len(rule.subcommand) + 1
                     return (
-                        f"argument {i + len(rule.subcommand) + 1} is of unknown provenance "
-                        "(neither statically known text nor a proven path)"
+                        f"argument {numbered} is of unknown provenance "
+                        "(neither statically known text nor a proven path)",
+                        UnvouchedArgument(numbered),
                     )
         if rule.argument_locations:
-            for a in arguments:
+            for i, a in enumerate(arguments):
                 if isinstance(a, Located) and not any(
                     location_le(a.location, allowed) for allowed in rule.argument_locations
                 ):
-                    return f"argument at {pretty_location(a.location)} is outside the permitted locations"
+                    return (
+                        f"argument at {pretty_location(a.location)} is outside the permitted locations",
+                        ArgumentOutside(i + len(rule.subcommand) + 1, a.location),
+                    )
         if rule.argument_atoms:
             for i, a in enumerate(arguments):
                 missing = self._missing_atoms(a, rule.argument_atoms, discharge)
                 if missing:
+                    numbered = i + len(rule.subcommand) + 1
                     return (
-                        f"argument {i + len(rule.subcommand) + 1} is not validated by: "
-                        f"{', '.join(sorted(missing))}"
+                        f"argument {numbered} is not validated by: "
+                        f"{', '.join(sorted(missing))}",
+                        ArgumentMissingAtoms(numbered, missing),
                     )
         return None
 
