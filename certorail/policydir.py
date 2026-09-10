@@ -70,12 +70,24 @@ def _declared_root(file: pathlib.Path) -> pathlib.Path:
 def find_policy(root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path] | None:
     """The nearest ancestor's self-identified policy for a run rooted at *root*:
     ``(policy file, governed prefix)``, or None. Ambiguity -- two files claiming the same
-    prefix -- raises ``AmbientPolicyError``."""
+    prefix -- raises ``AmbientPolicyError``. So does a policy in the pre-``policy/`` layout
+    (a munge bucket directly under the config directory) that claims a probed prefix: a
+    security tool must not silently fall back to the default policy because its configuration
+    moved; it says where the file now belongs."""
     base = policy_dir()
-    if not base.is_dir():
+    legacy_base = config_dir()
+    if not base.is_dir() and not legacy_base.is_dir():
         return None
     prefix = root.resolve()
     while True:
+        legacy = legacy_base / munge(prefix)
+        if legacy.is_dir():
+            stale = [f for f in sorted(legacy.glob("*.toml")) if _declared_root(f) == prefix]
+            if stale:
+                raise AmbientPolicyError(
+                    f"{stale[0]} is in the old layout: ambient policies now live under {base}; "
+                    f"move it to {base / munge(prefix) / stale[0].name}"
+                )
         bucket = base / munge(prefix)
         if bucket.is_dir():
             matches = [

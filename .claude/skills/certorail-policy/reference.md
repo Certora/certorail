@@ -68,7 +68,7 @@ The kinds, as the analysis classifies program operations:
 | Kind | Operations |
 |---|---|
 | read | `open` for reading, `Path.open` for reading, `read_text`, `read_bytes` |
-| write | `open` with a writing mode, `write_text`, `write_bytes`, `mkdir`, `touch`, `chmod` |
+| write | `open` with a writing mode, `write_text`, `write_bytes`, `mkdir`, `touch`, `chmod`, `replace` (the path *and* its target) |
 | list | `os.listdir`, `os.walk`, `os.path.exists/isfile/isdir`, `iterdir`, `glob`, `rglob`, `exists`, `is_file`, `is_dir` |
 
 Everything else on the filesystem (`unlink`, `rename`, `shutil`, archives, …) is unavailable to

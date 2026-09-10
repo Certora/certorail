@@ -74,8 +74,9 @@ Every one of these is accepted only if the location of its path is proven (below
 that kind of access there; otherwise the program is rejected: `open(path, …)`, `os.listdir(p)`, `os.walk(p)`,
 `os.path.exists/isfile/isdir(p)`, and on a `pathlib.Path`: `.open()`, `.read_text()`, `.read_bytes()`,
 `.write_text()`, `.write_bytes()`, `.iterdir()`, `.glob()`, `.rglob()`, `.exists()`, `.is_file()`, `.is_dir()`,
-`.mkdir()`, `.touch()`, `.chmod()`. These methods may only be called, never referenced (`f = p.read_text` is a
-violation). The mode of `open` decides read vs write; listing and existence probes count as `list`.
+`.mkdir()`, `.touch()`, `.chmod()`, `.replace(target)` (both the path and `target` are writes). These methods may
+only be called, never referenced (`f = p.read_text` is a violation). The mode of `open` decides read vs write;
+listing and existence probes count as `list`.
 
 Locations are relative to the sandbox root (the working directory); `"."` is the root. A literal beginning
 with `/` names a location under the *filesystem* root instead. It is accepted only where the policy grants

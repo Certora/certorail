@@ -81,6 +81,7 @@ from .dangerous import (
     NETWORK_NAMESPACE,
     NON_KILLING_CALLEES,
     PATH_SINK_FUNCTIONS,
+    PATH_SINK_METHOD_TARGETS,
     PATH_SINK_METHODS,
     AccessKind,
 )
@@ -1535,6 +1536,22 @@ class ValidationWalker(ast.NodeVisitor):
                 if name == "open":  # Path.open(mode=...) / Path.open("w")
                     mode_term = next((v for k, v in kwargs if k == "mode"), args[0] if args else None)
                     kind = _open_kind("r" if mode_term is None else mode_term.as_str())
+                if name in PATH_SINK_METHOD_TARGETS:
+                    # p.replace(target) / p.link_to(target): the target is written too, and is
+                    # audited as a sink of its own, with what is known about ITS path
+                    keyword, target_kind = PATH_SINK_METHOD_TARGETS[name]
+                    target = next((v for k, v in kwargs if k == keyword), args[0] if args else None)
+                    if target is None:
+                        self._violation(node, f"{name}(): the {keyword} argument is required")
+                    else:
+                        self.sinks.append(
+                            SinkSite(
+                                node,
+                                f"<path>.{name}({keyword})",
+                                _at_sink(interpret_expr(target.node, self.state)),
+                                target_kind,
+                            )
+                        )
             case _:
                 return
         self.sinks.append(SinkSite(node, what, _at_sink(fact), kind))

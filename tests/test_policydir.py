@@ -40,12 +40,19 @@ class TestFindPolicy(unittest.TestCase):
         file.write_text(f'root = "{declared}"\n', encoding="utf-8")
         return file
 
-    def test_the_policy_subdirectory_is_the_layout(self) -> None:
-        # a bucket directly under the config dir (the pre-``policy/`` layout) is not consulted
+    def test_the_old_layout_is_a_loud_migration_error(self) -> None:
+        # a bucket directly under the config dir (the pre-``policy/`` layout) claiming the
+        # prefix: never a silent fall-back to the default policy
         deep = self.tree / "a" / "b" / "c"
         stray = self.base / munge(deep)
         stray.mkdir()
         (stray / "old.toml").write_text(f'root = "{deep}"\n', encoding="utf-8")
+        with self.assertRaises(AmbientPolicyError) as cm:
+            find_policy(deep)
+        self.assertIn(str(self.base / "policy" / munge(deep) / "old.toml"), str(cm.exception))
+        # an old-layout bucket that claims a different path is just noise, as a colliding
+        # new-layout bucket would be
+        (stray / "old.toml").write_text(f'root = "{self.tree / "a" / "b-c"}"\n', encoding="utf-8")
         self.assertIsNone(find_policy(deep))
 
     def test_the_nearest_ancestor_wins(self) -> None:

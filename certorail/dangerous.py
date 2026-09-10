@@ -353,7 +353,17 @@ PATH_SINK_METHODS: dict[str, AccessKind] = {
     "exists": "list", "is_file": "list", "is_dir": "list", "replace": "write", "chmod": "write",
     "link_to": "write"
     # NB: Path.rename is banned outright (FORBIDDEN_ATTRIBUTES); Path.replace(target) is not,
-    # because `replace` is also str.replace -- its *target* path goes unaudited today.
+    # because `replace` is also str.replace. Its target is a second path written: see below.
+}
+
+# pathlib methods that write a SECOND path, given as their first argument (positionally or by
+# the keyword named here): ``p.replace(target)`` moves p onto target, ``p.link_to(target)``
+# creates target. The target is a write sink in its own right, audited beside the receiver;
+# a call without it is a violation (it would be a TypeError at runtime, and an unaudited path
+# statically). Enforce in walker.ValidationWalker._audit_sink.
+PATH_SINK_METHOD_TARGETS: dict[str, tuple[str, AccessKind]] = {
+    "replace": ("target", "write"),
+    "link_to": ("target", "write"),
 }
 
 
