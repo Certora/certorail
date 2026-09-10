@@ -1,0 +1,3 @@
+Stands in for a checked-out dependency. It is NOT a git repository, and git will walk up out
+of this directory to find one -- so run this example with --check, or replace this directory
+with a real clone first.

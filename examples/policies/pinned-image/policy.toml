@@ -1,0 +1,23 @@
+policy-version = 1
+
+[atoms]
+# Textual: the regex IS the meaning, so a literal image name is discharged during analysis
+# with no process at all. `sha256:` plus 64 hex digits, and no room for a `:tag` suffix.
+pinned-by-digest = { matches = '[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}' }
+# Pure, but not expressible as a regex: membership in a list this repository controls.
+# A literal checker answers it during analysis.
+approved-image = { pure = true }
+
+[[validation]]
+name        = "approved-image-check"
+params      = ["image"]
+argv        = ["/bin/sh", "checkers/approved-image.sh", "${image}"]
+effect-free = true
+establishes = { image = ["approved-image"] }
+
+[[program]]
+name              = "docker"
+subcommand        = "run --rm"
+cwd               = "."
+argument-atoms    = ["pinned-by-digest", "approved-image"]
+unknown-arguments = false

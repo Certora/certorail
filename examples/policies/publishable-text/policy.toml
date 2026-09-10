@@ -1,0 +1,50 @@
+policy-version = 1
+
+[filesystem]
+read  = ["drafts/**", "outbox/**"]
+write = ["outbox/**"]
+list  = ["drafts/**"]
+
+[atoms]
+# Pure: a property of this exact string. It survives any number of calls and dies only when
+# the value is rebuilt.
+text-scanned = { pure = true }
+# Environmental: a claim about the bytes in a file at one moment. Anything effectful may
+# have rewritten them, so it dies at every possibly-effectful call.
+file-scanned = {}
+# Textual: the shape a publishable path has. `argument-locations` below constrains the
+# arguments the analysis tracked as paths; a literal is known text, not a path, and slips
+# past it. This atom is what a literal has to satisfy as well.
+outbox-path = { matches = 'outbox/[a-zA-Z0-9._-]+' }
+
+[[validation]]
+name        = "scan-text"
+params      = ["text"]
+argv        = ["/bin/sh", "checkers/scan-text.sh", "${text}"]
+# Without this the confined program picks the directory the scanner runs in, and with it
+# the denylist the scanner reads.
+cwd         = "."
+effect-free = true
+establishes = { text = ["text-scanned"] }
+
+[[validation]]
+name        = "scan-file"
+params      = ["path"]
+argv        = ["/bin/sh", "checkers/scan-file.sh", "${path}"]
+cwd         = "."
+establishes = { path = ["file-scanned"] }
+
+[[program]]
+name              = "post-note"
+subcommand        = "publish-text"
+cwd               = "."
+argument-atoms    = ["text-scanned"]
+unknown-arguments = true
+
+[[program]]
+name               = "post-note"
+subcommand         = "publish-file"
+cwd                = "."
+argument-atoms     = ["file-scanned", "outbox-path"]
+argument-locations = ["outbox/**"]
+unknown-arguments  = false

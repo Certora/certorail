@@ -1,0 +1,23 @@
+policy-version = 1
+
+[atoms]
+# Pure: the policy is asserting that upstream history is append-only, so "this revision
+# exists upstream" is a property of the string and stays true. That assertion is what lets
+# certorail settle it during analysis, by running the checker on the literal. If your
+# upstream can be force-pushed, drop `pure` -- the fact then has to be established at
+# runtime, by a `certora.check` immediately before the pin.
+revision-exists = { pure = true }
+
+[[validation]]
+name        = "revision-exists-check"
+params      = ["revision"]
+argv        = ["/bin/sh", "checkers/revision-exists.sh", "${revision}"]
+effect-free = true
+establishes = { revision = ["revision-exists"] }
+
+[[program]]
+name              = "git"
+subcommand        = "checkout --detach"
+cwd               = "deps/*"
+argument-atoms    = ["revision-exists"]
+unknown-arguments = false

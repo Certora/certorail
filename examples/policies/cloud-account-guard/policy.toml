@@ -1,0 +1,25 @@
+policy-version = 1
+
+[atoms]
+# Environmental: a claim about the world at one moment ("the credentials in effect right now
+# resolve to the account recorded for this environment"), not about the string's text. It
+# dies at every possibly-effectful call, which is the whole point.
+credentials-verified = {}
+
+[[validation]]
+name        = "credentials-for"
+params      = ["environment"]
+argv        = ["/bin/sh", "checkers/cloud-account.sh", "${environment}"]
+cwd         = "."
+establishes = { environment = ["credentials-verified"] }
+
+[[program]]
+name       = "cloudctl"
+subcommand = "deploy --manifest manifests/service.yaml"
+cwd        = "."
+# Every argument after the subcommand words must carry the atom -- here that is exactly the
+# environment name, which is why the manifest is pinned in the subcommand instead.
+argument-atoms = ["credentials-verified"]
+# The environment name comes from argv, so it is not statically known text. The atom, not
+# the spelling, is what makes it safe.
+unknown-arguments = true
