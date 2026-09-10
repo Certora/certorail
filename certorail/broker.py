@@ -66,8 +66,15 @@ import time
 import urllib.parse
 from collections.abc import Callable, Sequence
 
-from .analysis import _literal_location, location_le, pretty_location
-from .policy import NetworkRule, Policy, matches_endpoint
+from .analysis import _literal_location, location_le
+from .policy import (
+    NetworkRule,
+    Policy,
+    Refusal,
+    matches_endpoint,
+    path_permitted,
+    pretty_locations,
+)
 
 log = logging.getLogger("certorail.broker")
 
@@ -173,8 +180,16 @@ def _check(
         raise PolicyDenied(f"invalid port in URL {url!r}")
     port = port or (443 if scheme == "https" else 80)
     refusal: str | None = None
+    # the path as the origin will most plausibly read it: percent-decoded, then placed. A ".."
+    # that appears after decoding has no location and satisfies no path-restricted rule.
+    url_path = _literal_location(urllib.parse.unquote(parts.path) or "/")
     for rule in policy.network:
         if not matches_endpoint(rule, scheme, host, port, method):
+            continue
+        if not path_permitted(rule, url_path):
+            refusal = refusal or (
+                f"path {parts.path!r} is outside the permitted {pretty_locations(rule.paths)}"
+            )
             continue
         why = _rule_refusal(policy, rule, url, initial, discharge)
         if why is None:
@@ -485,19 +500,22 @@ def _run_exec(
     client: socket.socket,
     program: str,
     arguments: list[str],
+    keywords: dict[str, str | list[str]],
     cwd: str,
+    discharge: Callable[[str, str], bool] | None,
 ) -> dict:
     """One brokered ``certora.exec``: re-check the decidable half of the exec rules
-    (``Policy.exec_refusal`` -- defense in depth; the full rules were enforced statically),
-    spawn the child host-side, and return its drained output wholesale."""
-    refusal = policy.exec_refusal(program, arguments, cwd)
-    if refusal is not None:
-        raise PolicyDenied(refusal)
+    (``Policy.exec_command`` -- defense in depth; the full rules were enforced statically),
+    let the policy's template compose the argv, spawn the child host-side, and return its
+    drained output wholesale."""
+    command = policy.exec_command(program, arguments, keywords, cwd, discharge)
+    if isinstance(command, Refusal):
+        raise PolicyDenied(command.reason)
     if root is None:
         raise BrokerError("exec: the broker was built without a root")
-    returncode, out, err = _spawn_drained(client, [program, *arguments], _resolve(root, cwd))
+    returncode, out, err = _spawn_drained(client, command, _resolve(root, cwd))
     log.info("EXEC %s (cwd=%s) -> %d (out %d bytes, err %d bytes)",
-             " ".join([program, *arguments]), cwd, returncode, len(out), len(err))
+             " ".join(command), cwd, returncode, len(out), len(err))
     return {
         "returncode": returncode,
         "stdout_b64": base64.b64encode(out).decode("ascii"),
@@ -547,10 +565,10 @@ def _run_check(
         if cwd is None:
             raise PolicyDenied(f"check {name!r}: cwd= is required")
         loc = _literal_location(cwd)
-        if loc is None or not location_le(loc, declared.cwd):
+        if loc is None or not any(location_le(loc, allowed) for allowed in declared.cwd):
             raise PolicyDenied(
                 f"check {name!r} may not run at {cwd!r} "
-                f"(permitted: {pretty_location(declared.cwd)})"
+                f"(permitted: {pretty_locations(declared.cwd)})"
             )
     workdir = root if cwd is None else _resolve(root, cwd)
     argv = [piece if isinstance(piece, str) else params[piece.name]
@@ -615,9 +633,16 @@ class _Handler(socketserver.BaseRequestHandler):
             if req.get("kind") == "exec":
                 program = str(req.get("program", "?"))
                 arguments = [str(a) for a in req.get("arguments", [])]
-                what = "exec " + " ".join([program, *arguments])
+                keywords: dict[str, str | list[str]] = {
+                    str(k): v if isinstance(v, str) else [str(x) for x in v]
+                    for k, v in (req.get("kwargs") or {}).items()
+                }
+                what = "exec " + " ".join([program, *arguments]) + "".join(
+                    f" {k}={v!r}" for k, v in keywords.items()
+                )
                 result = _run_exec(self.server.policy, self.server.root, conn,
-                                   program, arguments, str(req.get("cwd", "")))
+                                   program, arguments, keywords, str(req.get("cwd", "")),
+                                   self.server.discharge)
             elif req.get("kind") == "check":
                 name = str(req.get("name", "?"))
                 what = f"check {name}"
@@ -742,12 +767,14 @@ def exec_request(
     arguments: Sequence[str] = (),
     *,
     cwd: str,
+    kwargs: dict[str, str | list[str]] | None = None,
 ) -> dict:
     """One brokered exec: the client half of the exec tunnel, as ``certora.exec``'s runtime
-    speaks it."""
+    speaks it. *kwargs* bind the holes of a templated form."""
     return _roundtrip(socket_path, {
         "kind": "exec",
         "program": program,
         "arguments": list(arguments),
+        "kwargs": dict(kwargs or {}),
         "cwd": cwd,
     })

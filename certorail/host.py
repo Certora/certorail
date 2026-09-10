@@ -19,17 +19,17 @@
    is where anything it missed goes to die. Without srt the run proceeds with a loud
    warning (or quietly with ``--no-jail``).
 
-The policy file is trusted Python defining ``POLICY`` (a ``certorail.policy.Policy``); without one,
-``policy.DEFAULT_POLICY`` applies: read, write and list anywhere within the root, and ``git``/``gh``
-with a cwd within the root. Exit status: the program's own when it ran; 1 when rejected; 2 when the
-program does not parse.
+The policy is a TOML (or JSON) document (``policyfile``), given with ``--policy`` or discovered
+ambiently for the root (``policydir``); without one, ``policy.DEFAULT_POLICY`` applies: read,
+write and list anywhere within the root, and no programs. Exit status: the program's own when it
+ran; 1 when rejected; 2 when the program does not parse.
 """
 import argparse
 import ast
 import json
 import os
 import pathlib
-import runpy
+import shlex
 import shutil
 import subprocess
 import sys
@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 
 from .analysis import Named, StaticPath
 from .broker import build_server
+from .describe import describe
 from .policy import DEFAULT_POLICY, Denial, Policy
 from .policydir import AmbientPolicyError, find_policy
 from .policyfile import PolicyFileError, load_policy_file
@@ -247,16 +248,26 @@ def load_policy(path: pathlib.Path | None, root: pathlib.Path | None = None) -> 
                 except PolicyFileError as e:
                     raise SystemExit(str(e))
         return DEFAULT_POLICY
-    if path.suffix in (".toml", ".json"):
-        try:
-            return load_policy_file(path)
-        except PolicyFileError as e:
-            raise SystemExit(str(e))
-    namespace = runpy.run_path(str(path))
-    policy = namespace.get("POLICY")
-    if not isinstance(policy, Policy):
-        raise SystemExit(f"{path}: expected POLICY to be a certorail.policy.Policy")
-    return policy
+    if path.suffix not in (".toml", ".json"):
+        raise SystemExit(f"{path}: a policy is a .toml or .json document")
+    try:
+        return load_policy_file(path)
+    except PolicyFileError as e:
+        raise SystemExit(str(e))
+
+
+def _policy_origin(path: pathlib.Path | None, root: pathlib.Path) -> tuple[str, str | None]:
+    """Where the policy for this run comes from, and the prefix it governs (ambient only)."""
+    if path is not None:
+        return str(path), None
+    try:
+        found = find_policy(root)
+    except AmbientPolicyError as e:
+        raise SystemExit(str(e))
+    if found is not None:
+        policy_file, prefix = found
+        return str(policy_file), str(prefix)
+    return "the built-in default policy", None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -278,11 +289,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--policy",
         type=pathlib.Path,
         default=None,
-        help="a policy: a .toml/.json document, or a Python file defining POLICY "
-        "(default: the nearest ambient policy under ~/.certorail for this root, "
+        help="a policy: a .toml or .json document "
+        "(default: the nearest ambient policy under ~/.certorail/policy for this root, "
         "else the built-in policy)",
     )
     parser.add_argument("--check", action="store_true", help="analyse and evaluate only; do not run")
+    parser.add_argument(
+        "--describe",
+        action="store_true",
+        help="print what the policy for --root permits, for the program author (no program)",
+    )
     parser.add_argument(
         "--no-jail",
         action="store_true",
@@ -295,6 +311,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("args", nargs="*", help="arguments for the program (after --)")
     ns = parser.parse_args(argv)
 
+    if ns.describe:
+        if ns.program is not None or ns.command is not None or ns.args:
+            parser.error("--describe takes no program")
+        root = ns.root.resolve()
+        print(describe(load_policy(ns.policy, root), *_policy_origin(ns.policy, root)))
+        return 0
     if (ns.program is None) == (ns.command is None):
         parser.error("exactly one of PROGRAM or -c SOURCE is required")
     if ns.command is not None:

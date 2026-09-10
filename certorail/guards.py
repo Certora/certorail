@@ -47,6 +47,8 @@ from .analysis import (
     location_of,
     splat_under,
 )
+from .locations import parse_location
+from .markers import NAMESPACE
 from .terms import (
     Attr,
     BinOp,
@@ -684,10 +686,40 @@ def _call(t: Term, positive: bool, st: StateMap) -> list[Guard]:
         # not os.path.isabs(x)
         case Call(("os", "path", "isabs"), (x,), ()) if not positive:
             return _guard(subject_of(x), NOT_ABSOLUTE)
+        # certora.pathmatch(x, "<location>"): the policy's own spelling as a guard
+        case Call((ns, "pathmatch"), (x, spec), ()) if positive and ns == NAMESPACE:
+            return _pathmatch(x, spec)
+        case Method(Var(ns), "pathmatch", (x, spec), ()) if positive and ns == NAMESPACE:
+            return _pathmatch(x, spec)
         case Method(recv, name, args, ()):
             return _method(recv, name, args, positive, st)
         case _:
             return []
+
+
+def _pathmatch(x: Term, spec: Term) -> list[Guard]:
+    """``certora.pathmatch(x, "<location>")`` being true: *x* is at that location -- the very
+    ``LocationFact`` the policy loader builds from the same spelling (``locations``). On a URL
+    path view (``urlsplit(u).path``) it is a claim about the URL; on a path it is containment,
+    unconditional, because the matcher itself refuses ``..`` and anchors must agree. A
+    collapsing view (``normpath``/``abspath``) rewrote ``..`` away before the match, so it
+    establishes nothing about the variable."""
+    text = spec.as_str()
+    if text is None:
+        return []
+    try:
+        loc = parse_location(text)
+    except ValueError:
+        return []
+    if (uv := _url_view(x)) is not None:
+        inner, comp, from_split = uv
+        if comp != "path" or not from_split or not loc.absolute:
+            return []  # a URL path is server-absolute, and only urlsplit's reading is trusted
+        return _guard(subject_of(inner), Refinement(type_info="str", url=UrlString(path=loc)))
+    sub = subject_of(x)
+    if sub is None or sub.collapsing:
+        return []
+    return _guard(sub, Refinement(type_info="str", containment=loc))
 
 
 def _method(

@@ -353,7 +353,17 @@ PATH_SINK_METHODS: dict[str, AccessKind] = {
     "exists": "list", "is_file": "list", "is_dir": "list", "replace": "write", "chmod": "write",
     "link_to": "write"
     # NB: Path.rename is banned outright (FORBIDDEN_ATTRIBUTES); Path.replace(target) is not,
-    # because `replace` is also str.replace -- its *target* path goes unaudited today.
+    # because `replace` is also str.replace. Its target is a second path written: see below.
+}
+
+# pathlib methods that write a SECOND path, given as their first argument (positionally or by
+# the keyword named here): ``p.replace(target)`` moves p onto target, ``p.link_to(target)``
+# creates target. The target is a write sink in its own right, audited beside the receiver;
+# a call without it is a violation (it would be a TypeError at runtime, and an unaudited path
+# statically). Enforce in walker.ValidationWalker._audit_sink.
+PATH_SINK_METHOD_TARGETS: dict[str, tuple[str, AccessKind]] = {
+    "replace": ("target", "write"),
+    "link_to": ("target", "write"),
 }
 
 
@@ -361,10 +371,12 @@ PATH_SINK_METHODS: dict[str, AccessKind] = {
 # Controlled APIs: the sandbox's replacements for forbidden surface, reached
 # through the injected `certora` namespace (markers.py holds the runtime half).
 #
-# certora.exec(program, *args, cwd=...) is the only way to run a subprocess:
-# no shell, output always captured, cwd mandatory. Statically (walker):
+# certora.exec(program, *args, cwd=..., HOLE=...) is the only way to run a
+# subprocess: no shell, output always captured, cwd mandatory. Statically (walker):
 #   * no *args / **kwargs -- a command that cannot be read cannot be reported;
-#   * exactly the keywords below, with the required ones present;
+#   * the required keywords are present; any other keyword binds a hole of the
+#     policy's command template for the program (TEMPLATES.md) -- which holes
+#     exist is the policy's business, so the walker records and the policy denies;
 #   * the program is a string literal (or a name bound to exactly one): it is
 #     the thing a reviewer needs to see;
 #   * cwd is a sink like open(): legal iff its location is proven;
@@ -374,7 +386,6 @@ PATH_SINK_METHODS: dict[str, AccessKind] = {
 # ---------------------------------------------------------------------------
 
 EXEC_CALLEE: tuple[str, ...] = (NAMESPACE, "exec")
-EXEC_ALLOWED_KEYWORDS: frozenset[str] = frozenset({"cwd"})
 EXEC_REQUIRED_KEYWORDS: frozenset[str] = frozenset({"cwd"})
 
 # certora.check(name, key=value, ..., cwd=...) runs a policy-declared runtime validation (a
@@ -414,7 +425,22 @@ NON_KILLING_CALLEES: frozenset[tuple[str, ...]] = frozenset({
     ("pathlib", "PosixPath"), ("pathlib", "PurePosixPath"),
     ("re", "fullmatch"), ("re", "match"), ("re", "search"), ("re", "compile"),
     ("json", "dumps"), ("json", "loads"),
+    # the extractors (PROVENANCE.md): pure functions over text the program already holds
+    (NAMESPACE, "extract"), (NAMESPACE, "extract_all"), (NAMESPACE, "lines"), (NAMESPACE, "field"),
+    # the location guard: a pure predicate
+    (NAMESPACE, "pathmatch"),
 })
+
+# certora.pathmatch(text, "<location>"): the policy's location spelling as a guard (guards.py
+# establishes the location; the walker checks the shape: two positional arguments, a literal
+# spelling that parses).
+PATHMATCH_CALLEE: tuple[str, ...] = (NAMESPACE, "pathmatch")
+
+# The extractors, for the walker's audit: the only constructors of a source atom.
+EXTRACT_CALLEE: tuple[str, ...] = (NAMESPACE, "extract")
+EXTRACT_ALL_CALLEE: tuple[str, ...] = (NAMESPACE, "extract_all")
+LINES_CALLEE: tuple[str, ...] = (NAMESPACE, "lines")
+FIELD_CALLEE: tuple[str, ...] = (NAMESPACE, "field")
 
 
 # ---------------------------------------------------------------------------

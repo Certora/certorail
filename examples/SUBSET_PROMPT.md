@@ -74,8 +74,9 @@ Every one of these is accepted only if the location of its path is proven (below
 that kind of access there; otherwise the program is rejected: `open(path, …)`, `os.listdir(p)`, `os.walk(p)`,
 `os.path.exists/isfile/isdir(p)`, and on a `pathlib.Path`: `.open()`, `.read_text()`, `.read_bytes()`,
 `.write_text()`, `.write_bytes()`, `.iterdir()`, `.glob()`, `.rglob()`, `.exists()`, `.is_file()`, `.is_dir()`,
-`.mkdir()`, `.touch()`, `.chmod()`. These methods may only be called, never referenced (`f = p.read_text` is a
-violation). The mode of `open` decides read vs write; listing and existence probes count as `list`.
+`.mkdir()`, `.touch()`, `.chmod()`, `.replace(target)` (both the path and `target` are writes). These methods may
+only be called, never referenced (`f = p.read_text` is a violation). The mode of `open` decides read vs write;
+listing and existence probes count as `list`.
 
 Locations are relative to the sandbox root (the working directory); `"."` is the root. A literal beginning
 with `/` names a location under the *filesystem* root instead. It is accepted only where the policy grants
@@ -126,6 +127,11 @@ Containment, making `s`/`p` a located value under `BASE` (a literal or a located
   `p.is_relative_to(BASE)`, `p.parent == BASE`, `BASE in p.parents`, `os.path.commonpath([s, BASE]) == BASE`.
 - Resolving, needing nothing else: `p.resolve().is_relative_to(BASE)`,
   `os.path.realpath(s).startswith(str(BASE) + "/")`.
+- **The policy's own spelling**, needing nothing else: `certora.pathmatch(s, "repos/*/foundry.toml")`
+  establishes exactly that location on `s` (`repos/**` at or below, `*` one component, `<re>` a
+  component matching a regex, `{a,b}` one of, a leading `/` for the filesystem root). The
+  spelling must be a string literal; `s` must be a `str` (use `str(p)` for a path). Prefer this
+  when the policy's description names the location: guard with the same text it shows.
 
 Rules of use:
 
@@ -215,11 +221,28 @@ slugs: list[typing.Annotated[str, certora.no_slash, certora.not_dot_dot]] = []
 
 - Only `certora.exec(program, *args, cwd=<located path>)`. `program` is a string literal (or a name bound to
   one); arguments are separate strings, no `*`/`**` splats; the only keyword is `cwd`, and it is required and
-  must be a proven location. No shell; output is captured. Returns a `CompletedProcess` with `.returncode`,
-  `.stdout` and `.stderr` (bytes). A subprocess that exits non-zero is a normal return; a call the host
-  refuses raises.
+  must be a proven location. No shell; output is captured. A call the host refuses raises.
+- The result is a `CompletedProcess` with `.returncode`, `.stdout` and `.stderr` (bytes), plus decoded views:
+  `.stdout_string()`, `.stdout_lines()`, `.stderr_string()`, `.stderr_lines()` (UTF-8, lines split like
+  `str.splitlines`). **The views raise `certora.CalledProcessError` when the command exited non-zero**, so
+  `for line in certora.exec("git", "log", "--oneline", cwd=repo).stdout_lines()[:10]:` is the whole
+  pipeline and fails loudly if `git` did. To handle failure yourself, test `.returncode` and read the bytes.
+  There is no shell: do filtering (`head`, `tail`, `grep`, `wc`) in Python on the lines.
 - The policy may pin subcommands: if it declares `git log` and `git push origin`, any other `git`
   invocation — including one whose subcommand is not a literal — is rejected.
+- The policy may declare a command's *shape* (a template): literal words, then typed *holes*. A
+  template binds like a function call: spell the literal words positionally, then fill the holes
+  positionally in order — `certora.exec("git", "push", "origin", branch, cwd=repo)`,
+  `certora.exec("find", where, "-mindepth", "1", "-name", "*.py", cwd=here)` — or by keyword
+  (`BRANCH=branch`). Some holes are keyword-only (the description says which):
+  `certora.exec("tar", FLAGS=["-c", "-z"], ARCHIVE=out, FILES=[a, b], cwd=here)`. A list hole takes a
+  list display (or a typed container); a flags hole takes a list of flag names with their values
+  following, and only the flags the policy lists. Never spell the words the host inserts (`--`,
+  `-f`). Every hole is checked like a parameter annotation (a proven path within a location, text
+  matching a regex, a validation fact). A value that may begin with `-` where the tool could read
+  it as an option is rejected: use a path under a named directory, or a literal.
+- Run `certorail --describe` (or read the description in your context) for the exact shapes,
+  hole names, flags and validations this policy permits.
 - The policy may refuse arguments it cannot vouch for: anything other than a string literal, a module-level
   constant, or a proven path (an f-string or `.strip()` result is not vouched for). It may confine path
   arguments to locations. Spell arguments out as literals where you can; pass paths as located values.
@@ -239,7 +262,10 @@ slugs: list[typing.Annotated[str, certora.no_slash, certora.not_dot_dot]] = []
   guard the finished string, with `u` the variable holding it:
   `urllib.parse.urlsplit(u).scheme == "https"`, `urllib.parse.urlsplit(u).netloc == "api.github.com"` (or
   `in ("a.com", "b.com")`), `urllib.parse.urlsplit(u).path == "/v1/users"`,
-  `urllib.parse.urlsplit(u).path.startswith("/repos/")` (with `".." not in u` earlier in the condition).
+  `urllib.parse.urlsplit(u).path.startswith("/repos/")` (with `".." not in u` earlier in the condition), or
+  `certora.pathmatch(urllib.parse.urlsplit(u).path, r"/repos/*/*/issues/<\d+>/comments")` for a path shape the
+  policy spells out (a raw string when it contains a regex; this one needs no `..` guard and may come after
+  the scheme and netloc guards).
   `urlparse` is accepted for `.scheme` and `.netloc`, not for `.path`. Once a value is read as a URL no more
   text facts attach to it: put text guards first.
 - The policy may require validation facts on the URL (see validations): a literal URL that matches the
@@ -275,6 +301,24 @@ slugs: list[typing.Annotated[str, certora.no_slash, certora.not_dot_dot]] = []
   Check immediately before the operation that needs the fact; inside a loop, check inside the body. Facts about
   the value's *text* alone (as declared by the policy) survive any number of calls. In a comprehension only
   text facts accumulate: an environmental `check_single` establishes nothing on the container.
+
+## Sources and extraction
+
+- The policy may mark a program, a network host, or a readable location as a *source* yielding a
+  named fact (the description lists them: "yields gh-api"). A value carries that fact only if it
+  came out of the source's result **unmodified**, through one of four extractors:
+  `certora.extract(x, ".data.repos[0].name")` (one value), `certora.extract_all(x, ".data[].name")`
+  (a list; exactly one `[]` in the path), `certora.lines(x)` (a list of lines), and
+  `certora.field(line, i, sep=None)` (one field of an extracted line). `x` is the result of
+  `certora.exec` or `certora.network.*`, a file object from `with open(...)`, or text from
+  `.read_text()` / `f.read()`. Iterating a file (`for line in f`) and `f.readlines()` count as
+  `lines`. The path is a string literal in a small jq subset: `.key`, `."quoted key"`, `[0]`,
+  `[]`; no pipes or filters. Scalars come back as text; `null`, a missing path and non-scalars raise.
+- The result of `extract_all` / `lines` / `readlines` is a typed container: annotate it,
+  `xs: list[typing.Annotated[str, certora.validated("gh-api")]] = certora.extract_all(...)`.
+- Any string operation (`strip`, `+`, f-strings, `split`) drops the fact, as does `json.loads`
+  followed by indexing; guards (`assert re.fullmatch(...)`) keep it. A literal never has it.
+  Where a hole or contract demands a source fact, the extractor is the only spelling that works.
 
 ## Everything else
 

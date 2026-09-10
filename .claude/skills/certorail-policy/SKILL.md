@@ -18,11 +18,15 @@ program in the confined subset.
 ## What you deliver
 
 1. `policy.toml` — data, default-deny, every grant commented with the need it serves.
-2. One executable per validation that is not a plain regex, in a `checks/` directory beside the
-   policy, referenced from `argv` by **absolute path**.
+2. One executable per validation that is not a plain regex, installed in
+   `~/.certorail/checkers/<name>` and referenced from `argv` by **absolute path**. The config
+   directory is the one auditable place for everything the analysis trusts: the policies under
+   `~/.certorail/policy/`, the checkers they run under `~/.certorail/checkers/`. Do not scatter
+   checkers into repositories or `PATH`.
 3. Evidence: the policy loads; each checker accepts and refuses sample inputs; a probe program
    exercising each grant is accepted with `--check`; a probe that oversteps is denied.
-4. Installation: `--policy path/to/policy.toml`, or ambient under the config directory.
+4. Installation: ambient under `~/.certorail/policy/` (the default), or `--policy path` for a
+   one-off.
 5. A program-author note: the validation names, parameters, atoms and regexes programs must use.
    Whoever writes the confined programs (usually a model prompted with `SUBSET_PROMPT.md`) needs
    this vocabulary appended to their prompt.
@@ -66,10 +70,14 @@ interrogating further:
 | read / write / list files under a directory | `[filesystem]` `read` / `write` / `list` location lists; `list` covers directory listing and existence probes |
 | only certain file types | a regex leaf: `reports/**/<\w+\.json>` |
 | a directory outside the root | a leading-`/` location (`/srv/data/**`); absolute and relative grants never relate |
-| run a program | one `[[program]]` per (name, subcommand) with the narrowest `cwd` |
-| program takes paths | `argument-locations`: proven paths must lie within them |
-| program takes opaque arguments (`gh api -f q=...`) | `unknown-arguments = true` on that rule only |
-| program takes runtime-checked values (a checked branch name) | `argument-atoms` **and** `unknown-arguments = true`: vouched-for means literal text or a proven path, so a checked dynamic value still needs the opt-in |
+| run a program with fixed words and a few literal arguments | a flat `[[program]]` per (name, subcommand) with the narrowest `cwd` |
+| run a tool with flags and paths (`find`, `grep`, `rg`, `ls`, `tar`) | a **template**: `argv` with holes, a flagset listing exactly the permitted flags; see `reference.md`. Never `unknown-arguments = true` for these |
+| the same tools under several roots, or across policies | a **ruleset** in `~/.certorail/rulesets/`, applied with `[[apply]] ruleset = "unix.toml" where = ["repos", "/srv/data"]` |
+| program takes paths | `argument-locations` on a flat rule, or `location` on the hole |
+| program takes opaque arguments (`gh api -f q=...`) | `unknown-arguments = true` on that flat rule only, or `any = true` on that one hole |
+| program takes runtime-checked values (a checked branch name) | a hole with `atoms = [...]`; on a flat rule `argument-atoms` **and** `unknown-arguments = true`, since vouched-for means literal text or a proven path |
+| a destructive action the agent must have chosen itself (drop a database, delete a branch) | a hole with `literal = true` plus the shape (`matches`/`one-of`/`location`): the value must appear in the program text, never come from a file, argv or an API |
+| an action only on what a trusted query returned (terminate the runners the inventory listed, push to branches the API listed, email the on-call roster) | mark the query's rule `source = "atom"` (or a `[[source]]` location) and put `atoms = ["atom"]` on the hole: only a value extracted unmodified from that result satisfies it. Identifiers all look alike; which query said so is the whole property |
 | talk to an API | one `[[network]]` per host: `methods`, default `https`, default port; `allow-nonpublic` only for loopback/private targets |
 | gate an action on a property | atoms + validations (step 3), consumed by `requires` / `argument-atoms` / `[[network]].requires` |
 
@@ -130,8 +138,12 @@ Rules:
   interpolate them into a shell string or pass them to `eval`.
 - Fail closed: `set -euo pipefail`; check the argument count; any unexpected condition exits
   non-zero with a one-line reason on stderr.
-- Reference checkers by absolute path (`~` is not expanded). Make them executable.
-- Checkers are trusted code with the host's authority. Review them like the policy.
+- Install checkers in `~/.certorail/checkers/<name>`, mode `0755`, and reference them as
+  `argv = ["${checkers}/<name>", ...]`: the loader resolves it against the config directory and
+  fails at load if the checker is missing, so the policy spells no home directory and travels
+  between users.
+- Checkers are trusted code with the host's authority. Review them like the policy; the whole
+  of `~/.certorail/` is the review unit.
 
 Templates:
 
@@ -190,18 +202,25 @@ A trivial text predicate can be a `test` one-liner with no script at all:
    sink with its proven location: read it. Then write one probe that oversteps each grant and
    confirm the `denied:` line. Literal checkers run during `--check` under `--root`, so the root
    and any directory a cwd-slot checker names must exist.
-4. **Install.** For `--policy`, done. For ambient use: the config directory is
-   `$CERTORAIL_CONFIG_DIR`, else `$XDG_CONFIG_HOME/certorail`, else `~/.certorail`; inside it a
-   directory named by the root with `/` turned into `-` (`/srv/work/repo` → `-srv-work-repo`)
-   holds `*.toml` files, each of which must carry `root = "/srv/work/repo"`. A run then prints
-   `certorail: policy from …`. Two files claiming the same root is an error.
-5. **Hand over.** The commented TOML, the checkers, the run commands, the program-author note,
-   and an explicit list of what is *not* granted.
+4. **Install.** The config directory is `$CERTORAIL_CONFIG_DIR`, else
+   `$XDG_CONFIG_HOME/certorail`, else `~/.certorail`. Checkers go in `checkers/` under it.
+   Policies go in `policy/<munged root>/`, the root with `/` turned into `-`
+   (`/srv/work/repo` → `policy/-srv-work-repo/`), as `*.toml` files each carrying
+   `root = "/srv/work/repo"`. A run rooted there, or below, then prints
+   `certorail: policy from …`. Two files claiming the same root is an error. `--policy path`
+   bypasses discovery for a one-off.
+5. **Put the policy in the agent's context.** `certorail --describe --root ROOT` renders the
+   loaded policy as the program author's interface. Install it as a Claude Code `SessionStart`
+   hook in the project's `.claude/settings.json` (the JSON is in `reference.md`), so every
+   session, resume and compaction re-reads what is permitted instead of guessing.
+6. **Hand over.** The commented TOML, the checkers, the run commands, and an explicit list of
+   what is *not* granted. The program-author note is now `--describe`'s output; add only what it
+   cannot know (which checker to prefer, conventions).
 
 ## Pitfalls
 
-- `unknown-arguments` defaults to **false** in TOML (true in the Python API): a computed
-  argument — an f-string, `.strip()`, a checked value — is denied unless the rule opts in.
+- `unknown-arguments` defaults to **false**: a computed argument — an f-string, `.strip()`, a
+  checked value — is denied unless the rule opts in.
 - Atoms are declared once in `[atoms]`; a name used in `establishes`, `requires`,
   `argument-atoms` or `[[network]].requires` without a declaration is an error.
 - A cwd-free validation cannot establish atoms on `cwd`; a validation with `cwd` requires the
@@ -220,10 +239,13 @@ A trivial text predicate can be a `test` one-liner with no script at all:
 
 Need: scripts clone repositories under `repos/`, inspect them, write reports, push to branches
 whose names come from the command line, but only to certora-org checkouts and never with a
-flag-shaped branch argument; they read the GitHub API.
+flag-shaped branch argument; they read the GitHub API. Sandbox root `/srv/work/audit`, so the
+file is `~/.certorail/policy/-srv-work-audit/audit.toml` and the checker is
+`~/.certorail/checkers/org-checkout`.
 
 ```toml
 policy-version = 1
+root = "/srv/work/audit"
 
 [filesystem]
 read  = ["repos/**", "reports/**"]           # inspect clones, re-read earlier reports
@@ -236,7 +258,7 @@ no-flag      = { matches = '[^-].*' }        # A: a branch argument is not an op
 
 [[validation]]
 name        = "org-repo"
-argv        = ["/srv/policies/checks/org-checkout"]
+argv        = ["${checkers}/org-checkout"]
 cwd         = "repos/**"
 effect-free = true
 establishes = { cwd = ["org-checkout"] }
@@ -252,13 +274,19 @@ name       = "git"
 subcommand = "log"
 cwd        = "repos/**"
 
-[[program]]
-name              = "git"
-subcommand        = "push origin"
-cwd               = "repos/**"
-requires          = ["org-checkout"]
-argument-atoms    = ["no-flag"]
-unknown-arguments = true                     # branch names are argv values, regex-guarded
+[[program]]                                  # a template: the shape, with the branch a hole
+name         = "git"
+cwd          = "repos/**"
+requires     = ["org-checkout"]
+argv         = ["git", "push", "origin", "${BRANCH}"]
+holes.BRANCH = { atoms = ["no-flag"] }       # certora.exec("git", "push", "origin", branch, cwd=repo)
+
+[[program]]                                  # find, with exactly these flags and nothing else
+name  = "find"
+cwd   = "."
+argv  = ["find", "${WHERE}", "${FLAGS...}"]
+holes.WHERE = { location = "repos/**" }
+holes.FLAGS = { kind = "flags", bare = ["-print"], "-name" = { matches = '[^/]+' }, "-maxdepth" = { matches = '\d+' } }
 
 [[network]]
 host    = "api.github.com"

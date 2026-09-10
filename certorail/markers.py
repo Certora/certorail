@@ -25,7 +25,7 @@ import socket
 import struct
 import subprocess
 import typing
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -44,25 +44,68 @@ class ContractViolation(Exception):
 class ExecFailed(RuntimeError):
     """A brokered exec failed before completing: denied by the broker's re-check, over a
     cap, or transport trouble. (A child that ran and exited non-zero is NOT this: that is a
-    normal ``CompletedProcess`` with its returncode.)"""
+    normal ``ExecResult`` with its returncode.)"""
 
 
-def exec(*cmd: str, cwd: pathlib.Path | str) -> subprocess.CompletedProcess[bytes]:
+class ExecResult(subprocess.CompletedProcess[bytes]):
+    """What ``certora.exec`` returns: a ``CompletedProcess`` (``args``, ``returncode``, the raw
+    ``stdout``/``stderr`` bytes) plus the decoded views a program reaches for where it would
+    otherwise pipe into ``head``/``tail``/``wc``. ``stdout_string()``, ``stdout_lines()`` and
+    their stderr twins **raise ``CalledProcessError`` when the child exited non-zero**, so a
+    pipeline over a failed command fails loudly instead of quietly processing empty output;
+    a program that means to handle failure inspects ``returncode`` and the raw bytes instead.
+    Text is UTF-8 with undecodable bytes replaced; lines are split as ``str.splitlines`` does
+    (``\\r\\n`` handled, no trailing empty line)."""
+
+    def stdout_string(self) -> str:
+        self.check_returncode()
+        return self.stdout.decode("utf-8", errors="replace")
+
+    def stdout_lines(self) -> list[str]:
+        return self.stdout_string().splitlines()
+
+    def stderr_string(self) -> str:
+        self.check_returncode()
+        return self.stderr.decode("utf-8", errors="replace")
+
+    def stderr_lines(self) -> list[str]:
+        return self.stderr_string().splitlines()
+
+
+# The exception the decoded views raise, re-exported so the subset -- which cannot import
+# subprocess -- can spell it: ``except certora.CalledProcessError as e: e.returncode``.
+CalledProcessError = subprocess.CalledProcessError
+
+
+def exec(*cmd: str, cwd: pathlib.Path | str, **holes: str | Sequence[str]) -> ExecResult:
     """The only way to run a subprocess: tunneled to the host's broker, which re-checks the
     decidable half of the exec rules (program, fail-closed subcommand, cwd containment --
     defense in depth; the full rules were enforced statically), spawns the child outside the
     sandbox, drains its output, and returns it wholesale. No shell, output always captured,
     ``cwd`` mandatory: exactly the ``subprocess.run(..., capture_output=True)`` this once
-    was, one socket away.
+    was, one socket away -- returned as an ``ExecResult``, whose decoded views raise on a
+    non-zero exit.
+
+    Keywords other than ``cwd`` bind the *holes* of the policy's command template for the
+    program (TEMPLATES.md): a string for a token hole, a list of strings for a splice. The
+    broker binds the call like a signature and composes the argv itself.
 
     This is the runtime half. The static half (``walker``) additionally requires the program to
-    be a string literal, refuses ``*args``/``**kwargs`` and any keyword but ``cwd``, and treats
-    ``cwd`` as a sink whose location must be proven.
+    be a string literal, refuses ``*args``/``**kwargs``, and treats ``cwd`` as a sink whose
+    location must be proven.
     """
     if not cmd:
         raise ValueError("exec: no program given")
     if not all(isinstance(part, str) for part in cmd):
         raise TypeError("exec: every part of the command must be a str")
+    bindings: dict[str, str | list[str]] = {}
+    for name, value in holes.items():
+        if isinstance(value, str):
+            bindings[name] = value
+        elif isinstance(value, (list, tuple)) and all(isinstance(v, str) for v in value):
+            bindings[name] = list(value)
+        else:
+            raise TypeError(f"exec: {name}= must be a str or a list of str")
     socket_path = os.environ.get("CERTORAIL_BROKER_SOCKET")
     if socket_path is None:
         raise ExecFailed("no broker: the policy permits no programs")
@@ -71,14 +114,14 @@ def exec(*cmd: str, cwd: pathlib.Path | str) -> subprocess.CompletedProcess[byte
         reply = _broker_roundtrip(
             socket_path,
             {"kind": "exec", "program": program, "arguments": arguments,
-             "cwd": os.fspath(cwd)},
+             "kwargs": bindings, "cwd": os.fspath(cwd)},
             timeout=None,
         )
     except OSError as exc:
         raise ExecFailed(f"broker transport failure: {exc}")
     if not reply.get("ok"):
         raise ExecFailed(f"{reply.get('error', 'error')}: {reply.get('detail', '')}")
-    return subprocess.CompletedProcess(
+    return ExecResult(
         args=list(cmd),
         returncode=int(reply["returncode"]),
         stdout=base64.b64decode(reply.get("stdout_b64", "")),
@@ -251,6 +294,120 @@ class _Network:
 
 
 network = _Network()
+
+
+# ---------------------------------------------------------------------------
+# extractors: how data gets out of a source with its provenance intact (PROVENANCE.md)
+#
+# The static half binds a *source atom* to what these return: a value extracted from the result
+# of a source-bearing rule is something that source produced, unmodified. Any string operation
+# on it yields a fresh value with no provenance -- the identity semantics -- so these four are
+# the only constructors. Runtime-wise they are plain functions in the child.
+# ---------------------------------------------------------------------------
+
+
+class ExtractError(Exception):
+    """The path misses, selects null or a non-scalar, the text is not JSON, or the source is not
+    something extractable (a failed response, an object with no text)."""
+
+
+def _source_text(x: object) -> str:
+    match x:
+        case ExecResult():
+            return x.stdout_string()  # a failed child raises CalledProcessError here
+        case NetworkResponse():
+            if not 200 <= x.status < 300:
+                raise ExtractError(f"response status {x.status} {x.reason}".rstrip())
+            return x.body.decode("utf-8", errors="replace")
+        case str():
+            return x
+        case bytes():
+            return x.decode("utf-8", errors="replace")
+        case _ if callable(getattr(x, "read", None)):
+            data = getattr(x, "read")()
+            return data.decode("utf-8", errors="replace") if isinstance(data, bytes) else str(data)
+        case _:
+            raise ExtractError(f"not a source: {type(x).__name__}")
+
+
+def _scalar(value: object, path: str) -> str:
+    match value:
+        case bool():
+            return "true" if value else "false"
+        case int() | float():
+            return str(value)
+        case str():
+            return value
+        case None:
+            raise ExtractError(f"{path}: null")
+        case _:
+            raise ExtractError(f"{path}: not a scalar ({type(value).__name__})")
+
+
+def _select(x: object, path: str, want_plural: bool) -> object:
+    from . import jqpath  # stdlib-only; imported lazily to keep the namespace's import light
+
+    try:
+        steps = jqpath.parse(path)
+    except ValueError as exc:
+        raise ExtractError(str(exc)) from None
+    if jqpath.plural(steps) != want_plural:
+        raise ExtractError(
+            f"{path}: a plural path ([]) needs extract_all" if not want_plural
+            else f"{path}: extract_all needs a plural path (one [])"
+        )
+    try:
+        document = json.loads(_source_text(x))
+    except json.JSONDecodeError as exc:
+        raise ExtractError(f"not JSON: {exc}") from None
+    try:
+        return jqpath.walk(steps, document)
+    except ValueError as exc:
+        raise ExtractError(str(exc)) from None
+
+
+def extract(x: object, path: str) -> str:
+    """The scalar *path* selects in the JSON text of *x* -- an exec result (stdout), a response
+    (body), a file object, or text -- as a string. Numbers and booleans are stringified; null,
+    a missing path and a non-scalar are ``ExtractError``."""
+    return _scalar(_select(x, path, want_plural=False), path)
+
+
+def extract_all(x: object, path: str) -> list[str]:
+    """The scalars a plural *path* (one ``[]``) selects, each as a string."""
+    found = _select(x, path, want_plural=True)
+    assert isinstance(found, list)
+    return [_scalar(v, path) for v in found]
+
+
+def lines(x: object) -> list[str]:
+    """The lines of a source's text, newline stripped."""
+    return _source_text(x).splitlines()
+
+
+def field(line: str, index: int, sep: str | None = None) -> str:
+    """One field of a line (``str.split`` semantics); ``ExtractError`` when there is none."""
+    parts = line.split(sep)
+    try:
+        return parts[index]
+    except IndexError:
+        raise ExtractError(f"field {index} of {len(parts)}") from None
+
+
+def pathmatch(text: str, location: str) -> bool:
+    """Is *text* -- a filesystem path (relative to the sandbox root, or absolute) or a URL path
+    -- at the *location*, spelled the way the policy spells locations: ``repos/**``,
+    ``repos/*/foundry.toml``, ``/repos/*/*/issues/<\\d+>/comments``, ``{a,b}/x``?
+
+    As the condition of a guard (``assert certora.pathmatch(p, "repos/*/foundry.toml")``, or
+    ``if ... and certora.pathmatch(urllib.parse.urlsplit(u).path, "/repos/**"):``) it
+    establishes exactly that location on the variable statically; at runtime it is the same
+    matcher on the concrete text. A ``..`` anywhere is within nothing."""
+    if not isinstance(text, str):
+        raise TypeError("pathmatch: the path must be a str (use str(p) for a pathlib path)")
+    from . import locspec  # stdlib-only
+
+    return locspec.matches(locspec.parse(location), text)
 
 
 @dataclass(frozen=True)

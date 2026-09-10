@@ -323,10 +323,36 @@ class TestBrokerExec(unittest.TestCase):
         os.environ["CERTORAIL_BROKER_SOCKET"] = self.sock
         self.addCleanup(os.environ.pop, "CERTORAIL_BROKER_SOCKET", None)
         result = markers.exec("echo", "hi there", cwd=".")
+        self.assertIsInstance(result, markers.ExecResult)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, b"hi there\n")
         self.assertEqual(result.stderr, b"")
         self.assertEqual(result.args, ["echo", "hi there"])
+        self.assertEqual(result.stdout_lines(), ["hi there"])
+        self.assertEqual(result.stderr_string(), "")
+
+
+class TestExecResult(unittest.TestCase):
+    """The decoded views on an exec's result: text and lines of a successful child, a loud
+    ``CalledProcessError`` for a failed one."""
+
+    def test_the_views_of_a_success(self) -> None:
+        r = markers.ExecResult(["git", "log"], 0, b"a\r\nb\n\xff\n", b"warn\n")
+        self.assertEqual(r.stdout_string(), "a\r\nb\n�\n")
+        self.assertEqual(r.stdout_lines(), ["a", "b", "�"])
+        self.assertEqual(r.stderr_lines(), ["warn"])
+        self.assertEqual(r.stderr_string(), "warn\n")
+
+    def test_a_failure_raises_from_every_view(self) -> None:
+        r = markers.ExecResult(["git", "log"], 128, b"partial\n", b"fatal: not a repo\n")
+        for view in (r.stdout_string, r.stdout_lines, r.stderr_string, r.stderr_lines):
+            with self.subTest(view=view.__name__), self.assertRaises(markers.CalledProcessError) as cm:
+                view()
+            self.assertEqual(cm.exception.returncode, 128)
+            self.assertEqual(cm.exception.stderr, b"fatal: not a repo\n")
+        # the raw CompletedProcess surface stays available for handling failure by hand
+        self.assertEqual(r.returncode, 128)
+        self.assertEqual(r.stdout, b"partial\n")
 
 
 if __name__ == "__main__":
