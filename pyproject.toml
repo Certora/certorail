@@ -12,15 +12,46 @@ authors = [
     {name = "Certora Ltd."}
 ]
 
-dependencies = ["typing-extensions"]
+dependencies = ["typing-extensions", "pyright", "pydantic", "textual"]
 
-# `uv tool install .` puts `certorail` on the PATH: analyse, check against the default
-# policy, and run --  `certorail program.py [--root DIR] [--check] [-- ARG ...]`
+# the FUSE view of the sandbox root for confined tools under a patterned policy (MOUNTS.md):
+# `uv sync --extra fuse`, plus libfuse3 / fusermount3 from the distribution. Linux only by
+# marker: macOS takes patterns natively in Seatbelt and never needs the view, and pyfuse3 would
+# otherwise try to build against macFUSE there
+[project.optional-dependencies]
+fuse = ["pyfuse3; sys_platform == 'linux'", "trio; sys_platform == 'linux'"]
+
+# `uv run pytest` must find pytest in the project environment: without it uv falls back to a
+# pytest on PATH under whatever interpreter owns it, and the suite silently tests that
+# interpreter's site-packages instead of this venv's
+[dependency-groups]
+dev = ["pytest"]
+
+# `uv tool install .` puts `certorail` on the PATH: `certorail run|check|describe|explore|init|
+# policy|view …`. `certorail-run [--check] (-c SOURCE | FILE) [-- ARG ...]` is the agent's entry
+# point: the ambient policy only, always jailed -- no --policy/--root/--no-jail exists, so a
+# shell allow-rule on its prefix admits nothing but a program and its arguments
 [project.scripts]
 certorail = "certorail.host:main"
+certorail-run = "certorail.host:run_main"
 
 [tool.setuptools.packages.find]
 include = ["certorail*"]
+
+# package data read through importlib.resources, so it ships in the wheel: the program-author
+# guide the session hook injects (certorail/SUBSET_PROMPT.md), the ruleset packs
+# `certorail policy install NAME` installs by name (certorail/rulesets/<name>/), and the Claude
+# Code plugin as a marketplace directory (certorail/plugin/), which `certorail init` registers
+# from the installed package -- loaded in place, so upgrading the tool upgrades the plugin
+[tool.setuptools.package-data]
+certorail = [
+    "SUBSET_PROMPT.md",
+    "rulesets/*/*.toml", "rulesets/*/*.md",
+    "plugin/.claude-plugin/*.json",
+    "plugin/plugins/certorail/.claude-plugin/*.json",
+    "plugin/plugins/certorail/hooks/*",
+    "plugin/plugins/certorail/skills/certorail-policy/*.md",
+]
 
 
 [tool.pyright]

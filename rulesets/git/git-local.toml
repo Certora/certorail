@@ -1,0 +1,253 @@
+# git, local rung: commands that record work in the repository without touching the network and
+# without discarding anything. Every commit, branch and stash these make is reachable from a
+# reflog afterwards; the working tree is only ever added to, never reset. Every rule is
+# `network = false`.
+#
+# What is destructive lives in git-rewrite.toml (checkout, restore, reset, rebase, rm, clean),
+# and a few flags here that cross into it are gated on the `rewrite` parameter: --amend, and the
+# forced forms of branch and tag.
+#
+# Absent, therefore denied:
+#   interactive and editor-driven forms: add -p/-i/-e, commit without -m (opens $GIT_EDITOR; with
+#     stdin at /dev/null it fails rather than hangs, but it is denied by shape anyway: -m is a
+#     flag the program passes), commit -c REV, tag -a without -m, branch --edit-description,
+#     stash -p, merge with no message and no --no-edit is allowed (git writes one)
+#   -n on commit (it is --no-verify), --author/--date (impersonation), -F/--file and
+#     --pathspec-from-file (read a file the analysis never saw), -S/--gpg-sign (signs with the
+#     host's key; --no-gpg-sign is allowed)
+#   add -f/--force (adds ignored files: .env and friends are ignored for a reason)
+#   stash drop/clear (lose a stash), stash with an explicit stash@{n} (the ref syntax)
+#   checkout entirely: `git checkout X` restores the file X when X is not a ref, silently
+#     discarding uncommitted changes to it. Programs use `switch` here; checkout is in the rewrite
+#     rung with both of its meanings.
+#   submodule entirely: `update --init` clones URLs read from an agent-writable .gitmodules
+#   worktree, notes, replace, filter-branch, update-ref, reflog
+ruleset-version = 1
+description = "git, local rung: add, commit, branch, switch, stash, tag, merge, cherry-pick, mv, apply. No network; nothing is discarded, every result stays reachable from a reflog."
+
+[params]
+where      = { kind = "directory", description = "the directory holding repositories, or a repository itself" }
+rewrite    = { kind = "bool",      description = "permit --amend, branch -D/-M/-f/-C, tag -f" }
+skip-hooks = { kind = "bool",      description = "permit --no-verify on commit and merge" }
+
+[[apply]]
+ruleset = "git-vocabulary.toml"
+where   = "${where}"
+
+# ---------------------------------------------------------------------------------------------
+[[program]]
+name    = "git"
+argv    = ["git", "add", "${FLAGS...}", "--", "${PATHS...}"]
+cwd     = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.bare = [
+  "-A", "--all", "-u", "--update", "-N", "--intent-to-add", "-v", "--verbose", "-n", "--dry-run",
+  "--renormalize", "--ignore-errors", "--ignore-missing", "--sparse", "--no-all", "--no-ignore-removal",
+]
+holes.PATHS = { kind = "each", location = "**" }
+network = false
+writes  = ["git.index"]
+
+# ---------------------------------------------------------------------------------------------
+[[flagset]]
+name = "git.commit"
+bare = [
+  "-a", "--all", "-q", "--quiet", "-v", "--verbose", "--allow-empty", "--allow-empty-message",
+  "--no-edit", "--dry-run", "--short", "--porcelain", "--long", "-z", "--null", "--status", "--no-status",
+  "-o", "--only", "-s", "--signoff", "--no-signoff", "--no-gpg-sign", "--no-post-rewrite", "-u", "--untracked-files",
+  "--cleanup=strip", "--cleanup=whitespace", "--cleanup=verbatim", "--cleanup=scissors", "--cleanup=default",
+]
+"-m"          = { any = true }         # the message: data for git
+"--message"   = { any = true }
+"--trailer"   = { any = true }
+"-C"          = { atoms = ["git.rev"] }   # reuse a commit's message, no editor
+"--reuse-message" = { atoms = ["git.rev"] }
+"--fixup"     = { atoms = ["git.rev"] }   # marks a commit for a later rebase; creates a commit here
+"--squash"    = { atoms = ["git.rev"] }
+"--amend"     = { value = false, when = "${rewrite}" }
+"--no-verify" = { value = false, when = "${skip-hooks}" }
+
+[[program]]
+name    = "git"
+argv    = ["git", "commit", "${FLAGS...}", "--", "${PATHS...}"]
+cwd     = "${where}/**"
+holes.FLAGS = { kind = "flags", flagset = "git.commit" }
+holes.PATHS = { kind = "each", location = "**" }
+network = false
+writes  = ["git.refs", "git.index", "git.head"]   # head: a detached HEAD advances
+
+# ---------------------------------------------------------------------------------------------
+# One shape for listing, creating, renaming and deleting branches. ARGS are the names and start
+# points. -d deletes only merged branches; the forced forms are the rewrite parameter's.
+[[flagset]]
+name = "git.branch"
+bare = [
+  "-l", "--list", "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "--show-current",
+  "--no-color", "-q", "--quiet", "--no-abbrev", "--column", "--no-column",
+  "-d", "--delete", "-m", "--move", "-c", "--copy", "--track", "--no-track", "--unset-upstream",
+  "-i", "--ignore-case",
+]
+"--format"          = { any = true }
+"--sort"            = { matches = '-?[a-z:.]+' }
+"--merged"          = { atoms = ["git.rev"] }
+"--no-merged"       = { atoms = ["git.rev"] }
+"--contains"        = { atoms = ["git.rev"] }
+"--no-contains"     = { atoms = ["git.rev"] }
+"--points-at"       = { atoms = ["git.rev"] }
+"-u"                = { atoms = ["git.ref-name"] }      # remote/branch: writes config
+"--set-upstream-to" = { atoms = ["git.ref-name"] }
+"-D" = { value = false, when = "${rewrite}" }           # delete unmerged
+"-M" = { value = false, when = "${rewrite}" }           # rename over an existing branch
+"-C" = { value = false, when = "${rewrite}" }           # copy over an existing branch
+"-f" = { value = false, when = "${rewrite}" }           # reset an existing branch to a start point
+"--force" = { value = false, when = "${rewrite}" }
+
+[[program]]
+name    = "git"
+argv    = ["git", "branch", "${FLAGS...}", "${ARGS...}"]
+cwd     = "${where}/**"
+holes.FLAGS = { kind = "flags", flagset = "git.branch" }
+holes.ARGS  = { kind = "each", atoms = ["git.rev"] }
+network = false
+writes  = ["git.refs", "git.config"]
+
+# ---------------------------------------------------------------------------------------------
+# switch does one thing: move HEAD to a branch, optionally creating it. It refuses to discard
+# local changes (that flag, --discard-changes / -f, is absent) and refuses a path.
+[[program]]
+name    = "git"
+argv    = ["git", "switch", "${FLAGS...}", "${ARGS...}"]
+cwd     = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.bare = [
+  "-c", "--create", "-d", "--detach", "-q", "--quiet", "--track", "-t", "--no-track", "--guess", "--no-guess",
+  "-m", "--merge", "--progress", "--no-progress", "--recurse-submodules", "--no-recurse-submodules",
+]
+holes.FLAGS."--orphan" = { atoms = ["git.ref-name"] }
+holes.ARGS  = { kind = "each", atoms = ["git.rev"], min = 1 }
+network = false
+writes  = ["git.head", "git.index", "git.worktree", "git.refs"]
+
+# ---------------------------------------------------------------------------------------------
+# The operation is spelled: `git stash push -m note`, `git stash pop`, `git stash list`. Bare
+# `git stash` is `git stash push` and is not a separate shape. Dropping is absent.
+[[program]]
+name    = "git"
+argv    = ["git", "stash", "${OP}", "${FLAGS...}"]
+cwd     = "${where}/**"
+holes.OP    = { one-of = ["push", "pop", "apply", "list", "show"] }
+holes.FLAGS.kind = "flags"
+holes.FLAGS.bare = [           # no -p: interactive on push, and OP is one shape
+  "-u", "--include-untracked", "-k", "--keep-index", "--no-keep-index", "-q", "--quiet", "-S", "--staged",
+  "--index", "--stat", "--name-only", "--oneline",
+]
+holes.FLAGS."-m"        = { any = true }
+holes.FLAGS."--message" = { any = true }
+network = false
+writes  = ["git.refs", "git.index", "git.worktree"]
+
+# ---------------------------------------------------------------------------------------------
+[[flagset]]
+name = "git.tag"
+bare = ["-l", "--list", "-n", "-d", "--delete", "-v", "--verify", "-a", "--annotate", "--no-sign", "-i", "--ignore-case", "--column", "--no-column"]
+"-m"          = { any = true }
+"--message"   = { any = true }
+"--format"    = { any = true }
+"--sort"      = { matches = '-?[a-z:.]+' }
+"--contains"  = { atoms = ["git.rev"] }
+"--no-contains" = { atoms = ["git.rev"] }
+"--merged"    = { atoms = ["git.rev"] }
+"--no-merged" = { atoms = ["git.rev"] }
+"--points-at" = { atoms = ["git.rev"] }
+"-f"      = { value = false, when = "${rewrite}" }      # move an existing tag
+"--force" = { value = false, when = "${rewrite}" }
+
+[[program]]
+name    = "git"
+argv    = ["git", "tag", "${FLAGS...}", "${ARGS...}"]
+cwd     = "${where}/**"
+holes.FLAGS = { kind = "flags", flagset = "git.tag" }
+holes.ARGS  = { kind = "each", atoms = ["git.rev"] }
+network = false
+writes  = ["git.refs"]
+
+# ---------------------------------------------------------------------------------------------
+[[flagset]]
+name = "git.merge"
+bare = [
+  "--ff", "--no-ff", "--ff-only", "--squash", "--no-squash", "--commit", "--no-commit", "--no-edit",
+  "-q", "--quiet", "-v", "--verbose", "--stat", "--no-stat", "-n", "--autostash", "--no-autostash",
+  "--abort", "--continue", "--quit", "--allow-unrelated-histories", "--no-gpg-sign", "--signoff", "--no-signoff",
+  "--rerere-autoupdate", "--no-rerere-autoupdate", "--overwrite-ignore", "--no-overwrite-ignore",
+]
+"-m"                = { any = true }
+"-s"                = { one-of = ["ort", "recursive", "resolve", "octopus", "ours", "subtree"] }
+"--strategy"        = { one-of = ["ort", "recursive", "resolve", "octopus", "ours", "subtree"] }
+"-X"                = { matches = '[a-z-]+(?:=[a-z-]+)?' }
+"--strategy-option" = { matches = '[a-z-]+(?:=[a-z-]+)?' }
+"--log"             = { matches = '[0-9]+' }
+"--no-verify"       = { value = false, when = "${skip-hooks}" }
+
+[[program]]
+name    = "git"
+argv    = ["git", "merge", "${FLAGS...}", "${REVS...}"]
+cwd     = "${where}/**"
+holes.FLAGS = { kind = "flags", flagset = "git.merge" }
+holes.REVS  = { kind = "each", atoms = ["git.rev"] }
+network = false
+writes  = ["git.refs", "git.index", "git.worktree", "git.head"]
+
+# ---------------------------------------------------------------------------------------------
+[[program]]
+name    = "git"
+argv    = ["git", "cherry-pick", "${FLAGS...}", "${REVS...}"]
+cwd     = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.bare = [
+  "-n", "--no-commit", "-x", "--ff", "--continue", "--abort", "--skip", "--quit", "--signoff",
+  "--allow-empty", "--allow-empty-message", "--keep-redundant-commits", "--no-gpg-sign", "--rerere-autoupdate",
+]
+holes.FLAGS."-m"                = { matches = '[0-9]+' }
+holes.FLAGS."--mainline"        = { matches = '[0-9]+' }
+holes.FLAGS."-X"                = { matches = '[a-z-]+(?:=[a-z-]+)?' }
+holes.FLAGS."--strategy-option" = { matches = '[a-z-]+(?:=[a-z-]+)?' }
+holes.FLAGS."-s"                = { one-of = ["ort", "recursive", "resolve", "ours"] }
+holes.FLAGS."--strategy"        = { one-of = ["ort", "recursive", "resolve", "ours"] }
+holes.REVS  = { kind = "each", atoms = ["git.rev"] }
+network = false
+writes  = ["git.refs", "git.index", "git.worktree", "git.head"]
+
+# ---------------------------------------------------------------------------------------------
+# mv refuses to overwrite unless forced; -f is absent.
+[[program]]
+name    = "git"
+argv    = ["git", "mv", "${FLAGS...}", "--", "${PATHS...}"]
+cwd     = "${where}/**"
+holes.FLAGS = { kind = "flags", bare = ["-k", "-v", "--verbose", "-n", "--dry-run", "--sparse"] }
+holes.PATHS = { kind = "each", location = "**", min = 2 }
+network = false
+writes  = ["git.index", "git.worktree"]
+
+# ---------------------------------------------------------------------------------------------
+# apply writes only paths inside the worktree (--unsafe-paths, --directory and --reject are
+# absent). The patch operand, like every path operand in this pack, is text git resolves against
+# its cwd, the repository; a patch the program wrote elsewhere under the root is spelled relative
+# to the repository.
+[[program]]
+name    = "git"
+argv    = ["git", "apply", "${FLAGS...}", "--", "${PATCHES...}"]
+cwd     = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.bare = [
+  "--check", "--stat", "--numstat", "--summary", "--index", "--cached", "--intent-to-add", "-3", "--3way",
+  "-R", "--reverse", "-v", "--verbose", "-q", "--quiet", "--recount", "--allow-empty", "--ignore-whitespace",
+  "--ignore-space-change", "--inaccurate-eof", "--apply", "--no-add",
+  "--whitespace=nowarn", "--whitespace=warn", "--whitespace=fix", "--whitespace=error", "--whitespace=error-all",
+]
+holes.FLAGS."-p"        = { matches = '[0-9]+' }
+holes.FLAGS."-C"        = { matches = '[0-9]+' }
+holes.FLAGS."--include" = { any = true }
+holes.FLAGS."--exclude" = { any = true }
+holes.PATCHES = { kind = "each", location = "**", min = 1 }
+network = false
+writes  = ["git.index", "git.worktree"]

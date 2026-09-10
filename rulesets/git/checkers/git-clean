@@ -1,0 +1,14 @@
+#!/bin/sh
+# certorail checker: the repository at the working directory has no staged or unstaged changes
+# to tracked files. Untracked files do not count. Runs with --no-optional-locks so that the
+# check itself never writes the index.
+set -eu
+out="$(git --no-optional-locks status --porcelain --untracked-files=no 2>&1)" || {
+    printf 'git-clean: not a repository, or git failed:\n%s\n' "$out" >&2
+    exit 1
+}
+if [ -n "$out" ]; then
+    printf 'git-clean: the worktree has uncommitted changes:\n%s\n' "$out" >&2
+    exit 1
+fi
+exit 0

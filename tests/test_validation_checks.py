@@ -13,25 +13,36 @@ import unittest
 
 from certorail import markers
 from certorail.broker import build_server
-from certorail.analysis import RegexLit, checks_of
+from certorail.analysis import RegexLit, atoms_of
+from certorail.effects import EVERYTHING, NOTHING
 from certorail.host import Accepted, Rejected
 from certorail.host import check as host_check
 from certorail.markers import CheckFailed
-from certorail.policy import Policy, atom, param, program, pure, validation
-from certorail.walker import CheckSignature, CheckSite, ExecSite, Report, Vocabulary, analyze
+from certorail.policy import Policy, atom, constraint, hole, param, program, pure, splice, validation
+from certorail.ids import BUILTIN_ATOMS, AtomId, ParamName, ProgramName, ValidationName
+from certorail.templates import Each, Token
+from certorail.walker import CheckSignature, CheckSite, ExecSite, Report, Vocabulary, WriteTable, analyze
 
+CWD = ParamName("cwd")
 VOCAB = Vocabulary(
     signatures={
         # environmental atom, effectful evaluator (the conservative default)
-        "org-repo": CheckSignature("org-repo", (), {"cwd": frozenset({"org-checkout"})}),
+        ValidationName("org-repo"): CheckSignature(
+            ValidationName("org-repo"), (), {CWD: frozenset({AtomId("org-checkout")})}
+        ),
         # environmental atom, effect-free evaluator: kills nothing, so checkers stack
-        "clean-tree": CheckSignature("clean-tree", (), {"cwd": frozenset({"clean"})}, effect_free=True),
+        ValidationName("clean-tree"): CheckSignature(
+            ValidationName("clean-tree"), (), {CWD: frozenset({AtomId("clean")})}, writes=NOTHING
+        ),
         # pure atom on a string parameter
-        "repo-url": CheckSignature("repo-url", ("url",), {"url": frozenset({"good-url"})}, effect_free=True),
+        ValidationName("repo-url"): CheckSignature(
+            ValidationName("repo-url"), (ParamName("url"),),
+            {ParamName("url"): frozenset({AtomId("good-url")})}, writes=NOTHING,
+        ),
     },
-    pure_atoms=frozenset({"good-url", "no-flag"}),
+    pure_atoms=frozenset({AtomId("good-url"), AtomId("no-flag")}),
     # a regex-defined atom: its meaning is a text property, established by saturation
-    defined={"no-flag": RegexLit(r"[^-].*")},
+    defined={AtomId("no-flag"): RegexLit(r"[^-].*")},
 )
 
 HEADER = "import pathlib\nimport typing\n"
@@ -57,7 +68,7 @@ class TestGen(unittest.TestCase):
         report = run(REPO + CHECK + EXEC)
         self.assertEqual(report.violations, [])
         (site,) = exec_sites(report)
-        self.assertEqual(checks_of(site.cwd), frozenset({"org-checkout"}))
+        self.assertEqual(atoms_of(site.cwd), frozenset({"org-checkout"}))
 
     def test_the_check_site_itself_is_reported(self) -> None:
         report = run(REPO + CHECK)
@@ -85,50 +96,50 @@ class TestGen(unittest.TestCase):
 
 
 class TestKill(unittest.TestCase):
-    def test_any_call_kills_environment_atoms(self) -> None:
-        report = run(REPO + CHECK + "xs = sorted([3, 1])\n" + EXEC)
+    def test_an_instantiation_kills_environment_atoms(self) -> None:
+        report = run("class Box:\n    pass\n" + REPO + CHECK + "Box()\n" + EXEC)
         (site,) = exec_sites(report)
-        self.assertEqual(checks_of(site.cwd), frozenset())
+        self.assertEqual(atoms_of(site.cwd), frozenset())
 
     def test_effect_free_calls_do_not_kill(self) -> None:
-        report = run(REPO + CHECK + "msg = str(repo)\nprint(msg)\n" + EXEC)
+        report = run(REPO + CHECK + "msg = str(repo)\nprint(msg)\nxs = sorted([3, 1])\n" + EXEC)
         (site,) = exec_sites(report)
-        self.assertEqual(checks_of(site.cwd), frozenset({"org-checkout"}))
+        self.assertEqual(atoms_of(site.cwd), frozenset({"org-checkout"}))
 
     def test_effect_free_checkers_stack(self) -> None:
         report = run(REPO + CHECK + 'certora.check("clean-tree", cwd=repo)\n' + EXEC)
         (site,) = exec_sites(report)
-        self.assertEqual(checks_of(site.cwd), frozenset({"org-checkout", "clean"}))
+        self.assertEqual(atoms_of(site.cwd), frozenset({"org-checkout", "clean"}))
 
     def test_an_effectful_checker_kills_prior_environment_atoms(self) -> None:
         report = run(REPO + 'certora.check("clean-tree", cwd=repo)\n' + CHECK + EXEC)
         (site,) = exec_sites(report)
-        self.assertEqual(checks_of(site.cwd), frozenset({"org-checkout"}))
+        self.assertEqual(atoms_of(site.cwd), frozenset({"org-checkout"}))
 
     def test_reassignment_kills(self) -> None:
         report = run(REPO + CHECK + REPO + EXEC)
         (site,) = exec_sites(report)
-        self.assertEqual(checks_of(site.cwd), frozenset())
+        self.assertEqual(atoms_of(site.cwd), frozenset())
 
     def test_loop_boundary_kills_environment_atoms(self) -> None:
         report = run(REPO + CHECK + "for i in [1]:\n    " + EXEC)
         (site,) = exec_sites(report)
-        self.assertEqual(checks_of(site.cwd), frozenset())
+        self.assertEqual(atoms_of(site.cwd), frozenset())
 
     def test_check_inside_the_loop_survives_to_its_use(self) -> None:
         report = run(REPO + "for i in [1]:\n    " + CHECK.replace("\n", "\n    ") + EXEC)
         (site,) = exec_sites(report)
-        self.assertEqual(checks_of(site.cwd), frozenset({"org-checkout"}))
+        self.assertEqual(atoms_of(site.cwd), frozenset({"org-checkout"}))
 
     def test_a_branch_only_check_does_not_survive_the_join(self) -> None:
         report = run(REPO + 'if "a" in "ab":\n    ' + CHECK + EXEC)
         (site,) = exec_sites(report)
-        self.assertEqual(checks_of(site.cwd), frozenset())
+        self.assertEqual(atoms_of(site.cwd), frozenset())
 
     def test_the_handler_does_not_see_the_check(self) -> None:
         report = run(REPO + "try:\n    " + CHECK + "except Exception:\n    " + EXEC)
         (site,) = exec_sites(report)
-        self.assertEqual(checks_of(site.cwd), frozenset())
+        self.assertEqual(atoms_of(site.cwd), frozenset())
 
 
 CLONE = (
@@ -171,7 +182,7 @@ class TestContracts(unittest.TestCase):
     def test_the_rely_seeds_the_body(self) -> None:
         report = run(PUSH + REPO + CHECK + "push(repo)\n")
         self.assertTrue(
-            any(checks_of(s.cwd) == frozenset({"org-checkout"}) for s in exec_sites(report))
+            any(atoms_of(s.cwd) == frozenset({"org-checkout"}) for s in exec_sites(report))
         )
 
     def test_guarantee_established_by_a_check(self) -> None:
@@ -198,7 +209,7 @@ ORG_POLICY = Policy.allow(
     read=[markers.within(".")],
     write=[markers.within(".")],
     listing=[markers.within(".")],
-    programs=[program("git", cwd=markers.within("repos"), requires=["org-checkout"])],
+    programs=[program("git", subcommand="log", cwd=markers.within("repos"), requires=["org-checkout"])],
     validations=[
         validation(
             "org-repo",
@@ -231,9 +242,13 @@ class TestPolicy(unittest.TestCase):
             ORG_POLICY.vocabulary(),
             Vocabulary(
                 signatures={
-                    "org-repo": CheckSignature("org-repo", (), {"cwd": frozenset({"org-checkout"})})
+                    ValidationName("org-repo"): CheckSignature(
+                        ValidationName("org-repo"), (), {CWD: frozenset({AtomId("org-checkout")})}
+                    )
                 },
-                pure_atoms=frozenset(),
+                pure_atoms=frozenset(BUILTIN_ATOMS.values()),  # the built-ins are always in scope
+                # the one exec rule declares no media, so it writes everything (EFFECTS.md)
+                writes=WriteTable(exec=((ProgramName("git"), ("log",), EVERYTHING),)),
             ),
         )
 
@@ -279,17 +294,18 @@ SUB_POLICY = Policy.allow(
             argv=("test", param("value"), "!=", "--force"),
             cwd=markers.within("."),
             params=("value",),
-            establishes={"value": [pure("not-force")]},
-            effect_free=True,
+            # the checker vouches for the head too: a checked branch name fills a hole that no
+            # spelled "--" precedes
+            establishes={"value": [pure("not-force"), "not-option"]},
+            writes=[],
         )
     ],
     programs=[
         program(
             "git",
-            subcommand="push origin",
             cwd=markers.within("repos"),
-            argument_atoms=["not-force"],
-            unknown_arguments=True,  # branch names are checked values, not literals: the opt-in
+            argv=["git", "push", "origin", hole("BRANCH")],
+            holes={"BRANCH": Token(constraint(atoms=["not-force"]))},
         ),
         program("git", subcommand="log", cwd=markers.within("repos")),
     ],
@@ -372,7 +388,7 @@ class TestSubcommands(unittest.TestCase):
                     argv=("true",),
                     cwd=markers.within("repos"),
                     establishes={"cwd": [pure("org-checkout")]},
-                    effect_free=True,
+                    writes=[],
                 )
             ],
         )
@@ -405,17 +421,16 @@ CWD_FREE_POLICY = Policy.allow(
             "not-force-check",
             argv=("test", param("value"), "!=", "--force"),
             params=("value",),
-            establishes={"value": [pure("not-force")]},
-            effect_free=True,
+            establishes={"value": [pure("not-force"), "not-option"]},
+            writes=[],
         )
     ],
     programs=[
         program(
             "git",
-            subcommand="push origin",
             cwd=markers.within("repos"),
-            argument_atoms=["not-force"],
-            unknown_arguments=True,  # branch names are checked values, not literals: the opt-in
+            argv=["git", "push", "origin", hole("BRANCH")],
+            holes={"BRANCH": Token(constraint(atoms=["not-force"]))},
         )
     ],
 )
@@ -435,8 +450,10 @@ class TestCwdFreeChecks(unittest.TestCase):
             self.fail("\n".join(outcome.describe("<t>")))
 
     def test_the_vocabulary_marks_cwd_free_checks(self) -> None:
-        self.assertFalse(CWD_FREE_POLICY.vocabulary().signatures["not-force-check"].needs_cwd)
-        self.assertTrue(ORG_POLICY.vocabulary().signatures["org-repo"].needs_cwd)
+        self.assertFalse(
+            CWD_FREE_POLICY.vocabulary().signatures[ValidationName("not-force-check")].needs_cwd
+        )
+        self.assertTrue(ORG_POLICY.vocabulary().signatures[ValidationName("org-repo")].needs_cwd)
 
     def test_a_cwd_free_check_cannot_establish_on_cwd(self) -> None:
         with self.assertRaises(ValueError):
@@ -519,9 +536,10 @@ class TestCheckSingle(unittest.TestCase):
         self.assertTrue(any("exactly one" in what for _, what in report.violations))
 
 
-# unknown_arguments=False admits only vouched-for arguments: exactly-known text or a proven
-# path. A computed str is a StrFact, not the None sentinel, and must not slip past the gate.
-STRICT_POLICY = Policy.allow(
+# A path hole admits only a proven path within its locations: a computed str -- str(p).strip(),
+# an f-string -- is a StrFact, not the None sentinel, and is still no proven path. A spelled
+# path is located like a proven one, so "elsewhere/y" written as a literal is outside too.
+PATHS_POLICY = Policy.allow(
     read=[markers.within(".")],
     write=[markers.within(".")],
     listing=[markers.within(".")],
@@ -529,34 +547,39 @@ STRICT_POLICY = Policy.allow(
         program(
             "git",
             cwd=markers.within("repos"),
-            unknown_arguments=False,
-            argument_locations=[markers.within("repos")],
+            argv=["git", "log", splice("PATHS")],
+            holes={"PATHS": Each(constraint(location=markers.within("repos")))},
         )
     ],
 )
 
 
-class TestUnknownArguments(unittest.TestCase):
+class TestPathHoles(unittest.TestCase):
     def accept(self, body: str) -> None:
-        outcome = host_check(HEADER + body, "<t>", STRICT_POLICY, ROOT)
+        outcome = host_check(HEADER + body, "<t>", PATHS_POLICY, ROOT)
         if isinstance(outcome, Rejected):
             self.fail("\n".join(outcome.describe("<t>")))
 
     def denials(self, body: str) -> list[str]:
-        outcome = host_check(HEADER + body, "<t>", STRICT_POLICY, ROOT)
+        outcome = host_check(HEADER + body, "<t>", PATHS_POLICY, ROOT)
         assert isinstance(outcome, Rejected), "expected a rejection"
         return [d.reason for d in outcome.denials]
 
-    def test_a_proven_path_argument_is_vouched_for(self) -> None:
+    def test_a_proven_path_argument_is_within(self) -> None:
         self.accept(REPO + 'certora.exec("git", "log", repo / "src", cwd=repo)\n')
 
-    def test_a_str_spelled_proven_path_is_vouched_for(self) -> None:
+    def test_a_str_spelled_proven_path_is_within(self) -> None:
         self.accept(REPO + 'certora.exec("git", "log", str(repo), cwd=repo)\n')
 
+    def test_a_spelled_literal_is_located_too(self) -> None:
+        self.accept(REPO + 'certora.exec("git", "log", "repos/x/src", cwd=repo)\n')
+        reasons = self.denials(REPO + 'certora.exec("git", "log", "elsewhere/y", cwd=repo)\n')
+        self.assertTrue(any("not a proven path within repos/**" in r for r in reasons))
+
     def test_a_laundered_string_is_denied(self) -> None:
-        # str(p).strip() builds a fresh StrFact -- not None -- and used to slip past the gate
+        # str(p).strip() builds a fresh StrFact -- not None -- and is no proven path
         reasons = self.denials(REPO + 'certora.exec("git", "log", str(repo).strip(), cwd=repo)\n')
-        self.assertTrue(any("unknown provenance" in r for r in reasons))
+        self.assertTrue(any("not a proven path within" in r for r in reasons))
 
     def test_an_f_string_is_denied(self) -> None:
         reasons = self.denials(
@@ -564,17 +587,21 @@ class TestUnknownArguments(unittest.TestCase):
             + REPO
             + 'certora.exec("git", "log", f"--author={sys.argv[1]}", cwd=repo)\n'
         )
-        self.assertTrue(any("unknown provenance" in r for r in reasons))
+        self.assertTrue(any("not a proven path within" in r for r in reasons))
 
-    def test_locations_still_confine_paths_that_pass_the_gate(self) -> None:
-        # orthogonality: a Located argument satisfies the gate but must lie within the
-        # permitted argument locations
+    def test_a_path_elsewhere_is_denied(self) -> None:
         reasons = self.denials(
             'other = pathlib.Path("elsewhere") / "y"\n'
             + REPO
             + 'certora.exec("git", "log", other, cwd=repo)\n'
         )
-        self.assertTrue(any("outside the permitted locations" in r for r in reasons))
+        self.assertTrue(any("not a proven path within repos/**" in r for r in reasons))
+
+    def test_a_flat_rule_takes_no_arguments(self) -> None:
+        # the words alone: anything after them needs a template that says what it is
+        outcome = host_check(HEADER + REPO + 'certora.exec("git", "log", "-p", cwd=repo)\n', "<t>", SUB_POLICY, ROOT)
+        assert isinstance(outcome, Rejected)
+        self.assertTrue(any("takes no arguments beyond its words" in d.reason for d in outcome.denials))
 
 
 class TestRuntimeCheck(unittest.TestCase):

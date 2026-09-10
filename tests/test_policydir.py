@@ -4,6 +4,7 @@ import os
 import pathlib
 import tempfile
 import unittest
+from unittest import mock
 
 from certorail.host import load_policy
 from certorail.policy import Policy
@@ -24,8 +25,7 @@ class TestMunge(unittest.TestCase):
 class TestFindPolicy(unittest.TestCase):
     def setUp(self) -> None:
         self.base = pathlib.Path(tempfile.mkdtemp())
-        os.environ["CERTORAIL_CONFIG_DIR"] = str(self.base)
-        self.addCleanup(os.environ.pop, "CERTORAIL_CONFIG_DIR", None)
+        self.enterContext(mock.patch.dict(os.environ, {"CERTORAIL_CONFIG_DIR": str(self.base)}))
         # a real directory tree to probe from (resolve() must not invent paths)
         self.tree = pathlib.Path(tempfile.mkdtemp())
         (self.tree / "a" / "b" / "c").mkdir(parents=True)
@@ -96,10 +96,12 @@ class TestFindPolicy(unittest.TestCase):
             f'policy-version = 1\nroot = "{deep}"\n\n[[network]]\nhost = "api.github.com"\n',
             encoding="utf-8",
         )
-        policy = load_policy(None, deep)
-        self.assertIsInstance(policy, Policy)
-        (rule,) = policy.network
+        loaded = load_policy(None, deep)
+        self.assertIsInstance(loaded.policy, Policy)
+        (rule,) = loaded.policy.network
         self.assertEqual(rule.host, "api.github.com")
+        # the provenance is collected, not printed: the host decides when it is news
+        self.assertTrue(loaded.provenance[0].startswith(f"certorail: policy from {bucket / 'here.toml'} (root "))
 
 
 if __name__ == "__main__":

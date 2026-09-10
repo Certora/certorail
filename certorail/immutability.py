@@ -25,7 +25,7 @@ from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from .analysis import NameAccess
+from certorail.analysis import NameAccess
 
 
 @dataclass(frozen=True)

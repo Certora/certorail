@@ -13,8 +13,12 @@ thing::
         write=[markers.within("repos")],
         listing=[markers.within("repos")],
         programs=[
-            program("git", cwd=markers.within("repos"), requires=["org-checkout"]),
-            program("gh", cwd=".", unknown_arguments=True),
+            program("git", cwd=markers.within("repos"), subcommand="status", requires=["org-checkout"]),
+            program(
+                "gh", cwd=".",
+                argv=["gh", "api", hole("ENDPOINT"), splice("FLAGS")],
+                holes={"ENDPOINT": Token(constraint(matches=r"/[a-z/]+")), "FLAGS": Flags(flagset(any=True))},
+            ),
         ],
         validations=[
             validation(
@@ -32,24 +36,35 @@ A ``validation()`` declares a runtime predicate the program may invoke as
 named parameters), where it may run, and which atoms its success establishes on which argument.
 An atom wrapped in ``pure()`` is a property of the value's text alone -- no effect can invalidate
 it -- while a bare atom is about the environment and dies at any potentially-effectful call;
-``effect_free=True`` declares the evaluator itself mutates nothing, so its run kills no atoms
-(without it, two checkers cannot stack environment atoms on one value). Both are trusted
-assertions, like everything in this file. ``program(..., requires=[...])`` consumes atoms: the
-exec's cwd must carry them, live, at the site.
+``writes=[]`` declares the evaluator itself mutates nothing, so its run kills no atoms (without
+it, two checkers cannot stack environment atoms on one value). Both are trusted assertions, like
+everything in this file. ``program(..., requires=[...])`` consumes atoms: the exec's cwd must
+carry them, live, at the site.
+
+*Regions* (EFFECTS.md) make "any potentially-effectful call" precise. ``region()`` names a piece
+of state with one medium -- ``fs``, with a footprint saying where it lives, or ``network`` -- and
+rules say what they
+**write** (``writes=[...]``, within the media they reach: ``network=False``, ``write_fs=False``)
+while environmental atoms say what they depend on (``reads={atom: [...]}``). An effect kills an
+atom exactly when the two sets meet; undeclared means everything, so a policy that says nothing
+keeps today's kill. The media are *enforced*: a grant with ``network=False`` or
+``write_fs=False`` runs its child in a jail that denies the medium (``childjail``, JAILS.md);
+``writes`` stays a claim, since no jail can check regions.
 
 Evaluation presupposes ``Report.ok``: every site already has a proven location. The policy
 decides whether that location is one the host permits.
 """
-from os import PathLike
+import os
 import pathlib
 import subprocess
 import urllib.parse
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
-from typing import Any, Literal, cast
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from os import PathLike
+from typing import TYPE_CHECKING, Any, Literal, cast
 
-from . import markers
-from .analysis import (
+from certorail import markers
+from certorail.analysis import (
     ANY_NAME,
     Alternation,
     Component,
@@ -66,19 +81,34 @@ from .analysis import (
     _literal_location,
     _safe_path_extension,
     alternation,
-    checks_of,
     concat,
     is_prefix,
     is_safe_name,
     known_text,
     location_le,
     pretty_location,
-    saturate,
     url_of,
     ValidationFact
 )
-from .locations import parse_location
-from .templates import (
+from certorail.childjail import Environment, Jail, JailUnavailable, Mounts, View, confined, environment_spec
+from certorail.confinement import Additions, Confinement, FilesystemSection, HostFilesystem, PolicyFilesystem
+from certorail.effects import EVERYTHING, NOTHING, Effects, Medium, effects_of, whole
+from certorail.ids import (
+    BUILTIN_ATOMS,
+    Atom,
+    CheckId,
+    FlagName,
+    HoleName,
+    ParamName,
+    ProgramName,
+    RegionId,
+    SourceId,
+    ValidationName,
+    spelled,
+)
+from certorail.integrity import PIN_PATTERN, materialize
+from certorail.locations import parse_location
+from certorail.templates import (
     BindError,
     Constraint,
     Each,
@@ -96,18 +126,24 @@ from .templates import (
     instantiate,
     matches_leading,
 )
-from .walker import (
+from certorail.enforcement import (
     CheckSignature,
     CheckSite,
+    Discharge,
     ExecSite,
     NetworkSite,
-    Report,
     SinkSite,
     Site,
     SourceTable,
     Vocabulary,
+    WriteTable,
     host_matches,
 )
+from certorail import footprints, fsview
+
+if TYPE_CHECKING:
+    from certorail.viewdaemon import ViewSpec
+from certorail.walker import Report
 
 # ---------------------------------------------------------------------------
 # the marker vocabulary -> the location domain (the runtime-object twin of annotations.py)
@@ -177,7 +213,7 @@ def location_of(where: Where) -> LocationFact:
             else:
                 prefix_components = _components_of(prefix)
             if leaf is None:
-                return DirSplat(prefix_components, ANY_NAME, absolute)
+                return DirSplat(prefix_components, None, absolute)
             leaf_components = _components_of(leaf)
             if len(leaf_components) != 1:
                 raise ValueError("within(leaf=...) must be a single component")
@@ -189,8 +225,8 @@ def _locations(wheres: Iterable[Where]) -> tuple[LocationFact, ...]:
 
 
 def _one_or_many(where: Where | Iterable[Where]) -> tuple[LocationFact, ...]:
-    """A location *slot* (``Program.cwd``, ``Validation.cwd``): one spelling, or several meaning
-    any-of -- the same reading filesystem grants and ``argument_locations`` have always had."""
+    """A location *slot* (``Program.cwd``, ``Validation.cwd``, a hole's ``location``): one
+    spelling, or several meaning any-of -- the reading filesystem grants have always had."""
     if isinstance(where, (str, markers.Within, markers.Exactly, StaticPath, DirSplat)):
         return (location_of(where),)
     out = tuple(location_of(w) for w in where)
@@ -213,11 +249,11 @@ def pretty_locations(locations: Iterable[LocationFact]) -> str:
 class Param:
     """A reference, inside an ``argv`` template, to one of the check's declared parameters."""
 
-    name: str
+    name: ParamName
 
 
 def param(name: str) -> Param:
-    return Param(name)
+    return Param(ParamName(name))
 
 
 @dataclass(frozen=True)
@@ -225,14 +261,33 @@ class Pure:
     """An atom that is a property of the value's text alone: no effect can invalidate it, so it
     survives every call and dies only with the value. A bare-string atom is environmental."""
 
-    name: str
+    name: Atom
 
 
 def pure(name: str) -> Pure:
-    return Pure(name)
+    return Pure(spelled(name))
 
 
-CWD = "cwd"  # the establishes-key for the check's cwd argument
+CWD: ParamName = ParamName("cwd")  # the establishes-key for the check's cwd argument
+
+
+def _permitted(network: bool, write_fs: bool) -> frozenset[Medium]:
+    out: set[Medium] = set()
+    if write_fs:
+        out.add("fs")
+    if network:
+        out.add("network")
+    return frozenset(out)
+
+
+def _write_set(network: bool, write_fs: bool, writes: Effects | None) -> Effects:
+    """What a grant writes (EFFECTS.md): its declaration, else every region of the media it
+    reaches."""
+    return whole(_permitted(network, write_fs)) if writes is None else writes
+
+
+def _env(env: Iterable[str | Mapping[str, str]] | None) -> Environment | None:
+    return None if env is None else environment_spec(env)
 
 
 @dataclass(frozen=True)
@@ -242,14 +297,16 @@ class AtomDef:
     ``atom("not-force", markers.matches(r"[^-].*"))`` with no runtime check -- and it is pure by
     construction. An undefined (opaque) atom is only ever established by an evaluator."""
 
-    name: str
+    name: CheckId
     regex: PseudoRegex
 
 
 def atom(name: str, meaning: markers.Fragment) -> AtomDef:
     if not name:
         raise ValueError("atom: the name must be non-empty")
-    return AtomDef(name, _regex_of(meaning))
+    if name in BUILTIN_ATOMS:
+        raise ValueError(f"atom {name!r} is built in and cannot be declared")
+    return AtomDef(CheckId(name), _regex_of(meaning))
 
 
 @dataclass(frozen=True)
@@ -259,16 +316,51 @@ class Validation:
     analysis-side vocabulary (``Policy.vocabulary``); the argv template is the runtime's business
     (``markers.check``)."""
 
-    name: str
-    params: tuple[str, ...]
+    name: ValidationName
+    params: tuple[ParamName, ...]
     argv: tuple[str | Param, ...]
     # where the check may run: any of these. None: the check does not care where it runs --
     # callers may omit cwd=, and no location is required or proven. Such a check cannot
     # establish atoms on cwd.
     cwd: tuple[LocationFact, ...] | None
-    establishes: dict[str, frozenset[str]]  # param name or CWD -> atoms
-    pure_atoms: frozenset[str] = frozenset()  # the established atoms wrapped in pure()
-    effect_free: bool = False  # the evaluator mutates nothing: its run kills no atoms
+    establishes: dict[ParamName, frozenset[Atom]]  # param name or CWD -> atoms
+    pure_atoms: frozenset[Atom] = frozenset()  # the established atoms wrapped in pure()
+    # the evaluator's media (EFFECTS.md): may it reach the network, may it write the filesystem.
+    # Enforced: the broker jails the evaluator out of a medium it does not reach (childjail)
+    network: bool = True
+    write_fs: bool = True
+    # the regions the evaluator writes, within its media; None: undeclared, every region of them
+    writes: Effects | None = None
+    # the rest of the jail (``exec``): the environment (None: the broker's), process creation,
+    # the filesystem view
+    env: Environment | None = None
+    spawn: bool = True
+    view: View = View.HOST
+    # under the policy view: what the evaluator sees beyond the policy's filesystem section
+    # (``exec.mount-read`` / ``exec.mount-write``, MOUNTS.md); the analysis never consults them
+    mount_read: tuple[LocationFact, ...] = ()
+    mount_write: tuple[LocationFact, ...] = ()
+    # the sha256 the declaring document pinned its evaluator to (INSTALL.md); verified against
+    # the bytes captured at load. None: unpinned
+    pin: str | None = None
+    # the evaluator's bytes, captured when ${checkers}/x was resolved: what runs is a snapshot
+    # of these, so the installed file drifting mid-run changes nothing. None: a plain evaluator
+    # (a system binary), executed by path as spelled
+    evaluator: bytes | None = None
+
+    @property
+    def write_set(self) -> Effects:
+        return _write_set(self.network, self.write_fs, self.writes)
+
+    @property
+    def effect_free(self) -> bool:
+        """The evaluator's run writes no region, so it kills no atoms."""
+        return self.write_set.empty
+
+    @property
+    def jail(self) -> Jail:
+        """How the broker spawns the evaluator: its media, enforced, and its ``exec`` table."""
+        return Jail(self.env, self.network, self.write_fs, self.spawn, self.view)
 
 
 def validation(
@@ -278,9 +370,18 @@ def validation(
     cwd: Where | Iterable[Where] | None = None,
     params: Iterable[str] = (),
     establishes: Mapping[str, Iterable[str | Pure]],
-    effect_free: bool = False,
+    network: bool = True,
+    write_fs: bool = True,
+    writes: Iterable[str] | None = None,
+    env: Iterable[str | Mapping[str, str]] | None = None,
+    spawn: bool = True,
+    view: View = View.HOST,
+    mount_read: Iterable[Where] = (),
+    mount_write: Iterable[Where] = (),
+    pin: str | None = None,
+    evaluator: bytes | None = None,
 ) -> Validation:
-    params_t = tuple(params)
+    params_t = tuple(ParamName(p) for p in params)
     if len(set(params_t)) != len(params_t) or CWD in params_t:
         raise ValueError(f"validation {name!r}: parameters must be unique and may not be named {CWD!r}")
     argv_t = tuple(argv)
@@ -289,25 +390,33 @@ def validation(
     for piece in argv_t:
         if isinstance(piece, Param) and piece.name not in params_t:
             raise ValueError(f"validation {name!r}: argv references undeclared parameter {piece.name!r}")
-    est: dict[str, frozenset[str]] = {}
-    pure_set: set[str] = set()
-    env_set: set[str] = set()
+    if pin is not None and PIN_PATTERN.fullmatch(pin) is None:
+        raise ValueError(f'validation {name!r}: pin is "sha256:" plus 64 lowercase hex digits')
+    est: dict[ParamName, frozenset[Atom]] = {}
+    pure_set: set[Atom] = set()
+    env_set: set[Atom] = set()
     for key, atoms in establishes.items():
-        if key != CWD and key not in params_t:
+        slot = ParamName(key)
+        if slot != CWD and slot not in params_t:
             raise ValueError(f"validation {name!r}: establishes references undeclared parameter {key!r}")
-        names: set[str] = set()
+        names: set[Atom] = set()
         for a in atoms:
             match a:
-                case Pure(name=atom) if atom:
-                    pure_set.add(atom)
-                case str() as atom if atom:
-                    env_set.add(atom)
+                case Pure(name=atom_id) if atom_id:
+                    pure_set.add(atom_id)
+                    names.add(atom_id)
+                case str() as text if text in BUILTIN_ATOMS:
+                    # a checker vouching for a structural property it inspected: pure, unwrapped
+                    pure_set.add(BUILTIN_ATOMS[text])
+                    names.add(BUILTIN_ATOMS[text])
+                case str() as text if text:
+                    env_set.add(CheckId(text))
+                    names.add(CheckId(text))
                 case _:
                     raise ValueError(f"validation {name!r}: atoms must be non-empty strings or pure(...)")
-            names.add(atom)
         if not names:
             raise ValueError(f"validation {name!r}: establishes entries need at least one atom")
-        est[key] = frozenset(names)
+        est[slot] = frozenset(names)
     if pure_set & env_set:
         raise ValueError(
             f"validation {name!r}: atoms declared both pure and environmental: {sorted(pure_set & env_set)}"
@@ -317,10 +426,26 @@ def validation(
             f"validation {name!r}: a check that does not care about its cwd cannot establish "
             "atoms on cwd"
         )
+    mounts = _mounts(name, view, write_fs, mount_read, mount_write)
     return Validation(
-        name, params_t, argv_t, None if cwd is None else _one_or_many(cwd), est,
-        frozenset(pure_set), effect_free,
+        ValidationName(name), params_t, argv_t, None if cwd is None else _one_or_many(cwd), est,
+        frozenset(pure_set), network, write_fs, None if writes is None else effects_of(writes),
+        _env(env), spawn, view, *mounts, pin, evaluator=evaluator,
     )
+
+
+def _mounts(
+    name: str, view: View, write_fs: bool, mount_read: Iterable[Where], mount_write: Iterable[Where],
+) -> tuple[tuple[LocationFact, ...], tuple[LocationFact, ...]]:
+    """A grant's view additions, checked: they widen the policy view, so they need it, and a
+    writable addition needs the filesystem medium (the schema says the same for documents; the
+    constructors are the object model and hold the rule themselves)."""
+    reads, writes = _locations(mount_read), _locations(mount_write)
+    if (reads or writes) and view is not View.POLICY:
+        raise ValueError(f"{name!r}: mount-read / mount-write widen the policy view: they need view = policy")
+    if writes and not write_fs:
+        raise ValueError(f"{name!r}: mount-write with write-fs = false: nothing it mounts could be written")
+    return reads, writes
 
 
 # ---------------------------------------------------------------------------
@@ -332,34 +457,54 @@ def validation(
 class Program:
     """A permitted ``certora.exec`` program."""
 
-    name: str
+    name: ProgramName
     cwd: tuple[LocationFact, ...]  # the exec's cwd must lie within one of these
-    # may the arguments include values the analysis cannot vouch for (URLs, JSON fields)?
-    # Vouched-for means exactly-known text or a proven path; a computed str is unknown even
-    # when it is tracked as a fact
-    unknown_arguments: bool = True
-    # located arguments must lie within one of these; empty means anywhere proven
-    argument_locations: tuple[LocationFact, ...] = ()
     # validation atoms the cwd must carry, live, at the exec (established by certora.check)
-    requires: frozenset[str] = frozenset()
+    requires: frozenset[Atom] = frozenset()
     # the leading literal arguments this rule governs ("push origin"). Once any rule for a
     # program names a subcommand, that program fails closed: an exec matching no declared
     # subcommand -- unlisted, or computed -- is denied. Prefix-freedom (checked in allow())
     # makes the applicable rule unique.
     subcommand: tuple[str, ...] = ()
-    # atoms every argument after the subcommand must satisfy: by a live check, or -- for a
-    # defined atom -- by its known text (saturate)
-    argument_atoms: frozenset[str] = frozenset()
-    # the command-line shape (TEMPLATES.md). None for the flat rule above, which is the template
-    # [name, *subcommand, ${REST...}] in disguise: a trailing each hole taking any statically
-    # known text (or anything, with unknown_arguments)
+    # the command-line shape (TEMPLATES.md). None for the flat rule: exactly the words
+    # [name, *subcommand] and nothing after them -- a template with no holes. Any argument
+    # beyond the words needs a template that says what it is.
     template: Template | None = None
     # provenance for reports: the ruleset (and bindings) this rule came from, None for a rule
     # the root policy wrote itself
     origin: str | None = None
     # the source atom this rule's results yield (PROVENANCE.md): a value extracted from the
     # exec's output is something this program produced, unmodified
-    source: str | None = None
+    source: SourceId | None = None
+    # the tool's media (EFFECTS.md): they bound its write set without naming a region, and the
+    # broker enforces them -- the tool runs jailed out of a medium it does not reach (childjail)
+    network: bool = True
+    write_fs: bool = True
+    # the regions the tool writes, within its media; None: undeclared, every region of them
+    writes: Effects | None = None
+    # the rest of the jail (``exec``): the environment (None: the broker's), process creation,
+    # the filesystem view
+    env: Environment | None = None
+    spawn: bool = True
+    view: View = View.HOST
+    # under the policy view: what the tool sees beyond the policy's filesystem section
+    # (``exec.mount-read`` / ``exec.mount-write``, MOUNTS.md); the analysis never consults them
+    mount_read: tuple[LocationFact, ...] = ()
+    mount_write: tuple[LocationFact, ...] = ()
+
+    @property
+    def write_set(self) -> Effects:
+        return _write_set(self.network, self.write_fs, self.writes)
+
+    @property
+    def effect_free(self) -> bool:
+        """The tool writes no region: it changes nothing an atom could depend on."""
+        return self.write_set.empty
+
+    @property
+    def jail(self) -> Jail:
+        """How the broker spawns the tool: its media, enforced, and its ``exec`` table."""
+        return Jail(self.env, self.network, self.write_fs, self.spawn, self.view)
 
     @property
     def leading_words(self) -> tuple[str, ...]:
@@ -370,63 +515,116 @@ class Program:
         return (self.name, *self.subcommand)
 
 
+def _demanded(c: Constraint, atoms: frozenset[Atom]) -> Constraint:
+    """*c* with *atoms* also required. A requirement stays a requirement: folded into ``any``
+    (a root's binding, say) it leaves an atoms-only constraint."""
+    if c.any:
+        return Constraint(atoms=atoms)
+    return replace(c, atoms=c.atoms | atoms)
+
+
 def program(
     name: str,
     *,
     cwd: Where | Iterable[Where],
     subcommand: str | Iterable[str] = (),
-    # None: not given, meaning False -- as in the data format, looseness is opted into explicitly
-    unknown_arguments: bool | None = None,
-    argument_locations: Iterable[Where] = (),
-    requires: Iterable[str] = (),
-    argument_atoms: Iterable[str] = (),
+    requires: Iterable[str] | Mapping[str, Iterable[str]] = (),
     argv: Iterable[Piece] | None = None,
     holes: Mapping[str, Hole] | None = None,
     origin: str | None = None,
     source: str | None = None,
+    network: bool = True,
+    write_fs: bool = True,
+    writes: Iterable[str] | None = None,
+    env: Iterable[str | Mapping[str, str]] | None = None,
+    spawn: bool = True,
+    view: View = View.HOST,
+    mount_read: Iterable[Where] = (),
+    mount_write: Iterable[Where] = (),
 ) -> Program:
+    """*requires* is the atoms the cwd must carry, or a table ``{cwd: [...], HOLE: [...]}``
+    that also demands atoms of a hole's value, folded into that hole's constraint."""
     words = tuple(subcommand.split()) if isinstance(subcommand, str) else tuple(subcommand)
     if not all(isinstance(w, str) and w for w in words):
         raise ValueError(f"program {name!r}: subcommand words must be non-empty strings")
+    if isinstance(requires, Mapping):
+        cwd_atoms = frozenset(spelled(a) for a in requires.get(CWD, ()))
+        hole_atoms = {HoleName(k): frozenset(spelled(a) for a in v) for k, v in requires.items() if k != CWD}
+    else:
+        cwd_atoms = frozenset(spelled(a) for a in requires)
+        hole_atoms = {}
     template = None
     if argv is not None or holes is not None:
         if argv is None or holes is None:
             raise ValueError(f"program {name!r}: argv and holes go together")
-        if (
-            words
-            or unknown_arguments is not None
-            or tuple(argument_locations)
-            or tuple(argument_atoms)
-        ):
+        if words:
             raise ValueError(
-                f"program {name!r}: a templated rule carries no subcommand or argument keys; "
-                "constrain the holes instead"
+                f"program {name!r}: a templated rule carries no subcommand; its leading words are "
+                "the argv's literal head"
             )
-        template = Template(tuple(argv), dict(holes))
+        shaped: dict[HoleName, Hole] = {HoleName(k): h for k, h in holes.items()}
+        for hname, atoms in hole_atoms.items():
+            h = shaped.get(hname)
+            match h:
+                case Token(constraint=c):
+                    shaped[hname] = Token(_demanded(c, atoms))
+                case Each(constraint=c, min=minimum):
+                    shaped[hname] = Each(_demanded(c, atoms), minimum)
+                case _:
+                    raise ValueError(
+                        f"program {name!r}: requires names {hname!r}, which is not a token or "
+                        "each hole of the template"
+                    )
+        template = Template(tuple(argv), shaped)
         if template.program != name:
             raise ValueError(f"program {name!r}: its template begins with {template.program!r}")
+    elif hole_atoms:
+        raise ValueError(f"program {name!r}: requires names holes, but the rule has no template")
+    writes_e = None if writes is None else effects_of(writes)
+    if writes_e is not None and template is not None:
+        # a claim about what the tool writes presupposes knowing what the tool is told to do:
+        # nothing may reach it as text it could read as an option or a subcommand
+        for hname, h in template.holes.items():
+            if isinstance(h, Flags) and h.flagset.any:
+                raise ValueError(
+                    f"program {name!r}: hole {hname!r} admits any flag, so the rule cannot say "
+                    "what it writes"
+                )
+            if (
+                isinstance(h, (Token, Each))
+                and h.constraint.any
+                and not template.dash_exempt(hname)
+            ):
+                raise ValueError(
+                    f"program {name!r}: hole {hname!r} admits anything where the tool could "
+                    "read it as an option, so the rule cannot say what it writes"
+                )
     return Program(
-        name,
+        ProgramName(name),
         _one_or_many(cwd),
-        bool(unknown_arguments),
-        _locations(argument_locations),
-        frozenset(requires),
+        cwd_atoms,
         words,
-        frozenset(argument_atoms),
         template,
         origin,
-        source,
+        None if source is None else SourceId(source),
+        network,
+        write_fs,
+        writes_e,
+        _env(env),
+        spawn,
+        view,
+        *_mounts(name, view, write_fs, mount_read, mount_write),
     )
 
 
 def hole(name: str) -> HoleRef:
     """``${name}``: one token."""
-    return HoleRef(name)
+    return HoleRef(HoleName(name))
 
 
 def splice(name: str) -> HoleRef:
     """``${name...}``: a splice of zero or more tokens."""
-    return HoleRef(name, variadic=True)
+    return HoleRef(HoleName(name), variadic=True)
 
 
 def constraint(
@@ -448,12 +646,37 @@ def constraint(
             raise ValueError("matches and one_of exclude each other")
         regex = alternation(*(Exact(n) for n in names))
     return Constraint(
-        _one_or_many(location) if location else (), regex, frozenset(atoms), literal, any
+        _one_or_many(location) if location else (),
+        regex,
+        frozenset(spelled(a) for a in atoms),
+        literal,
+        any,
     )
 
 
-def flagset(bare: Iterable[str] = (), valued: Mapping[str, Constraint] | None = None) -> Flagset:
-    return Flagset(frozenset(bare), dict(valued or {}))
+def flagset(
+    bare: Iterable[str] = (),
+    valued: Mapping[str, Constraint] | None = None,
+    *,
+    any: bool = False,
+    requires: Mapping[str, Mapping[str, Iterable[str]]] | None = None,
+    holes: Iterable[str] = (),
+    expand_single_flags: bool = False,
+) -> Flagset:
+    """*requires* maps a flag to what it demands while present: atoms of ``cwd`` or of a hole,
+    by name; *holes* is a named flagset's contract, the holes those demands may reach;
+    *expand_single_flags* reads ``-lr`` as ``-l -r`` (``templates.Flagset``)."""
+    return Flagset(
+        frozenset(FlagName(b) for b in bare),
+        {FlagName(k): c for k, c in (valued or {}).items()},
+        any,
+        {
+            FlagName(f): {t: frozenset(spelled(a) for a in atoms) for t, atoms in d.items()}
+            for f, d in (requires or {}).items()
+        },
+        frozenset(HoleName(h) for h in holes),
+        expand_single_flags,
+    )
 
 
 @dataclass(frozen=True)
@@ -474,24 +697,24 @@ class RequiredAtom:
     Whatever the mode, the static check demands the atom on the original URL at every
     ``certora.network`` site."""
 
-    name: str
+    name: Atom
     on_redirect: Literal["recheck", "stop", "waive"] | None = None
 
 
 def waived(atom_name: str) -> RequiredAtom:
     """The atom applies to the original request only; redirects do not re-demand it."""
-    return RequiredAtom(atom_name, "waive")
+    return RequiredAtom(spelled(atom_name), "waive")
 
 
 def rechecked(atom_name: str) -> RequiredAtom:
     """The atom is re-established from every hop URL's text; ``Policy.allow`` rejects this
     for atoms that are not textually establishable."""
-    return RequiredAtom(atom_name, "recheck")
+    return RequiredAtom(spelled(atom_name), "recheck")
 
 
 def no_redirect(atom_name: str) -> RequiredAtom:
     """The atom refuses redirects outright, even when it could be re-checked textually."""
-    return RequiredAtom(atom_name, "stop")
+    return RequiredAtom(spelled(atom_name), "stop")
 
 
 @dataclass(frozen=True)
@@ -521,10 +744,13 @@ class NetworkRule:
     total_timeout: float | None = None
     max_response_bytes: int | None = None
     # the source atom responses from this rule yield (PROVENANCE.md)
-    source: str | None = None
+    source: SourceId | None = None
     # the URL paths this rule admits, server-absolute (a leading "/"), any-of; empty: any path.
     # Checked statically on the proven URL path, and by the broker on every hop, percent-decoded
     paths: tuple[LocationFact, ...] = ()
+    # the network regions requests under this rule write (EFFECTS.md); None: undeclared -- the
+    # whole network medium, or nothing when the rule admits only GET and HEAD
+    writes: Effects | None = None
 
 
 def network(
@@ -540,6 +766,7 @@ def network(
     max_response_bytes: int | None = None,
     source: str | None = None,
     path: Where | Iterable[Where] = (),
+    writes: Iterable[str] | None = None,
 ) -> NetworkRule:
     normalized = host.lower().rstrip(".")
     if not normalized:
@@ -560,12 +787,13 @@ def network(
         frozenset(int(p) for p in ports),
         frozenset(m.upper() for m in methods),
         allow_nonpublic,
-        frozenset(r if isinstance(r, RequiredAtom) else RequiredAtom(r) for r in requires),
+        frozenset(r if isinstance(r, RequiredAtom) else RequiredAtom(spelled(r)) for r in requires),
         None if read_timeout is None else float(read_timeout),
         None if total_timeout is None else float(total_timeout),
         None if max_response_bytes is None else int(max_response_bytes),
-        source,
+        None if source is None else SourceId(source),
         path_locs,
+        None if writes is None else effects_of(writes),
     )
 
 
@@ -584,14 +812,55 @@ class Source:
     and friends on a proven path within one of *locations* yield a handle carrying *name*.
     Grants nothing -- the read must still be permitted by the filesystem grants."""
 
-    name: str
+    name: SourceId
     locations: tuple[LocationFact, ...]
 
 
 def source(name: str, location: Where | Iterable[Where]) -> Source:
     if not name:
         raise ValueError("source: the atom name must be non-empty")
-    return Source(name, _one_or_many(location))
+    return Source(SourceId(name), _one_or_many(location))
+
+
+# ---------------------------------------------------------------------------
+# effect regions (EFFECTS.md)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Region:
+    """A piece of state a checker can observe and a command can change, with exactly one
+    medium. ``fs``: the *footprint* says where it lives, one or more locations each meaning that
+    path and every descendant -- for the reader, and for a per-program write jail if one comes;
+    the kill does not consult it (a program's file write is a write of the whole medium).
+    ``network``: remote state, no footprint."""
+
+    name: RegionId
+    medium: Medium
+    footprint: tuple[LocationFact, ...] = ()
+    about: str = ""
+
+
+def region(
+    name: str,
+    *,
+    footprint: Where | Iterable[Where] | None = None,
+    network: bool = False,
+    about: str = "",
+) -> Region:
+    if not name:
+        raise ValueError("region: the name must be non-empty")
+    if name in ("fs", "network"):
+        raise ValueError(f"region: {name!r} names a medium and is reserved")
+    if network and footprint is not None:
+        raise ValueError(f"region {name!r}: one medium -- a footprint (fs) or network = true, not both")
+    if not network and footprint is None:
+        raise ValueError(f"region {name!r}: one medium -- give a footprint (fs) or network = true")
+    if network:
+        assert footprint is None
+        return Region(RegionId(name), "network", (), about)
+    assert footprint is not None
+    return Region(RegionId(name), "fs", _one_or_many(footprint), about)
 
 
 def default_port(scheme: str) -> int:
@@ -659,11 +928,11 @@ class Refusal:
 # ---------------------------------------------------------------------------
 
 
-def _literal_slot(v: Validation, atom_name: str) -> str | None:
+def literal_slot(v: Validation, atom_name: Atom) -> str | None:
     """The single input slot through which *v* can establish *atom_name* on a literal, if it is a
-    literal checker at all: effect-free (safe to run at check time), the atom pure (the result
-    stays valid), and exactly one input -- one declared parameter, or none plus cwd -- so the
-    binding of the literal is unambiguous."""
+    literal checker at all: effect-free (an empty write set: safe to run at check time), the atom
+    pure (the result stays valid), and exactly one input -- one declared parameter, or none plus
+    cwd -- so the binding of the literal is unambiguous."""
     if not v.effect_free or atom_name not in v.pure_atoms:
         return None
     if not v.params and atom_name in v.establishes.get(CWD, frozenset()):
@@ -673,19 +942,36 @@ def _literal_slot(v: Validation, atom_name: str) -> str | None:
     return None
 
 
-def _run_literal_checker(v: Validation, slot: str, text: str, root: pathlib.Path) -> bool:
+def _run_literal_checker(v: Validation, slot: str, text: str, root: pathlib.Path, mounts: Mounts) -> bool:
     """One evaluator run with *text* bound to *slot*: argv substitution for a parameter slot,
     ``cwd=root/text`` for the cwd slot (a pure text predicate should not care where it runs, so a
-    parameter-slot checker runs at the root)."""
+    parameter-slot checker runs at the root). *mounts* is the policy's view, for a confined
+    evaluator."""
     argv = [piece if isinstance(piece, str) else text for piece in v.argv]
+    if v.evaluator is not None:
+        # exec the load-time snapshot: what was (pin-)verified at load is what runs
+        argv[0] = materialize(v.evaluator)
     cwd = root / text if slot == CWD else root
     if not cwd.is_dir():
         return False
     try:
-        result = subprocess.run(argv, cwd=cwd, shell=False, capture_output=True, check=False)
-    except OSError:
-        return False
+        with confined(argv, v.jail, mounts=mounts, cwd=cwd) as spawn:
+            result = subprocess.run(
+                spawn.argv, cwd=cwd, env=spawn.env, pass_fds=spawn.pass_fds, shell=False,
+                capture_output=True, check=False,
+            )
+    except (OSError, JailUnavailable):
+        return False  # a checker that cannot run vouches for nothing
     return result.returncode == 0
+
+
+@dataclass(frozen=True)
+class Command:
+    """A permitted concrete exec, as the broker spawns it: the composed argv and the rule that
+    admitted it (its jail says how the child is confined)."""
+
+    argv: list[str]
+    rule: Program
 
 
 @dataclass(frozen=True)
@@ -699,11 +985,30 @@ class Policy:
     read: tuple[LocationFact, ...] = ()
     write: tuple[LocationFact, ...] = ()
     listing: tuple[LocationFact, ...] = ()
+    # protected: a program write that may lie at or below one of these is denied, whatever
+    # ``write`` grants (a ruleset's obligation on the root, or the root's own)
+    no_write: tuple[LocationFact, ...] = ()
+    # the rulesets the loader composed into this policy, by label, in application order
+    # ("base.toml", "unix.toml (where=repos)"): what --describe and the run announce
+    applied: tuple[str, ...] = ()
+    # default-allow: a program that no rule and no deny names runs with any arguments, with the
+    # user's authority (unjailed, its write set undeclared: every environmental fact dies). A
+    # named program is governed by its rules exactly as without it. Decided on the leading
+    # program name and nothing finer -- the one classification of an exec that is decidable
+    # (`git -C x push` is a `git push`, and no shape matching would say so)
+    default_allow: bool = False
+    # the programs `[[deny]]` named, by leading name: named, so governed; with no rule of their
+    # own, refused outright -- the first-verb blacklist under default-allow
+    denied: frozenset[ProgramName] = frozenset()
     programs: tuple[Program, ...] = ()
     validations: tuple[Validation, ...] = ()
     atoms: tuple[AtomDef, ...] = ()
     network: tuple[NetworkRule, ...] = ()
     sources: tuple[Source, ...] = ()
+    # EFFECTS.md: the state vocabulary, and what each environmental atom depends on (an atom
+    # absent here depends on everything)
+    regions: tuple[Region, ...] = ()
+    reads: Mapping[Atom, Effects] = field(default_factory=dict)
 
     @classmethod
     def allow(
@@ -712,11 +1017,17 @@ class Policy:
         read: Iterable[Where] = (),
         write: Iterable[Where] = (),
         listing: Iterable[Where] = (),
+        no_write: Iterable[Where] = (),
         programs: Iterable[Program] = (),
         validations: Iterable[Validation] = (),
         atoms: Iterable[AtomDef] = (),
         network: Iterable[NetworkRule] = (),
         sources: Iterable[Source] = (),
+        regions: Iterable[Region] = (),
+        reads: Mapping[str, Iterable[str]] | None = None,
+        applied: Iterable[str] = (),
+        default_allow: bool = False,
+        denied: Iterable[str] = (),
     ) -> "Policy":
         vals = tuple(validations)
         names = [v.name for v in vals]
@@ -740,6 +1051,10 @@ class Policy:
             raise ValueError(
                 f"source atoms cannot be defined atoms: {sorted(source_atoms & defined_names)}"
             )
+        if source_atoms & BUILTIN_ATOMS.keys():
+            raise ValueError(
+                f"source atoms cannot be built-in atoms: {sorted(source_atoms & BUILTIN_ATOMS.keys())}"
+            )
         for v in vals:
             established = frozenset(a for atoms_ in v.establishes.values() for a in atoms_)
             if established & source_atoms:
@@ -747,7 +1062,7 @@ class Policy:
                     f"validation {v.name!r} establishes source atom(s) "
                     f"{sorted(established & source_atoms)}; only extraction establishes those"
                 )
-        by_name: dict[str, list[Program]] = {}
+        by_name: dict[ProgramName, list[Program]] = {}
         for p in progs:
             by_name.setdefault(p.name, []).append(p)
         for pname, rs in by_name.items():
@@ -764,27 +1079,79 @@ class Policy:
                             f"{' '.join(b.leading_words)!r} overlap; the applicable rule must be unique"
                         )
         # an atom means one thing: pure in one declaration and environmental in another is a bug.
-        # A defined atom is pure by construction, however it is established.
-        pure_names = {a for v in vals for a in v.pure_atoms} | defined_names
+        # A defined atom is pure by construction, however it is established; so are the
+        # built-ins (properties of the text), which a checker may establish without pure()
+        builtin_names = frozenset(BUILTIN_ATOMS.values())
+        pure_names = {a for v in vals for a in v.pure_atoms} | defined_names | builtin_names
         conflicted = {
             a
             for v in vals
             for established in v.establishes.values()
             for a in established
-            if a not in defined_names and (a in pure_names) != (a in v.pure_atoms)
+            if a not in defined_names and a not in builtin_names and (a in pure_names) != (a in v.pure_atoms)
         }
         if conflicted:
             raise ValueError(f"atoms declared both pure and environmental: {sorted(conflicted)}")
+        # regions (EFFECTS.md): unique names; every write claim names declared regions within the
+        # media the rule claims to reach; every read claim belongs to an environmental atom some
+        # validation establishes and names declared regions
+        regs = tuple(regions)
+        medium_of: dict[RegionId, Medium] = {r.name: r.medium for r in regs}
+        if len(medium_of) != len(regs):
+            raise ValueError("region names must be unique")
+
+        def within_media(what: str, e: Effects, permitted: frozenset[Medium]) -> None:
+            for r in sorted(e.regions):
+                if r not in medium_of:
+                    raise ValueError(f"{what}: region {r!r} is not declared")
+                if medium_of[r] not in permitted:
+                    raise ValueError(
+                        f"{what} says it writes {r!r} ({medium_of[r]}) but does not reach that medium"
+                    )
+            for m in sorted(e.media):
+                if m not in permitted:
+                    raise ValueError(f"{what} says it writes the whole {m} medium but does not reach it")
+
+        for p in progs:
+            if p.writes is not None:
+                within_media(f"program {p.name!r}", p.writes, _permitted(p.network, p.write_fs))
+        for v in vals:
+            if v.writes is not None:
+                within_media(f"validation {v.name!r}", v.writes, _permitted(v.network, v.write_fs))
+        for r in net_in:
+            if r.writes is not None:
+                within_media(f"network rule {r.host!r}", r.writes, frozenset({"network"}))
+        environmental = {
+            a for v in vals for established in v.establishes.values() for a in established
+        } - pure_names - source_atoms
+        reads_m: dict[Atom, Effects] = {}
+        for spelt, region_names in (reads or {}).items():
+            name = CheckId(spelt)
+            state = effects_of(region_names)
+            if state.empty:
+                raise ValueError(
+                    f"atom {name!r}: an atom that depends on nothing is pure; declare it pure instead"
+                )
+            if name in pure_names or name in source_atoms:
+                raise ValueError(
+                    f"atom {name!r} is pure and depends on no state; reads applies to environmental atoms"
+                )
+            if name not in environmental:
+                raise ValueError(f"reads declared for atom {name!r}, which no validation establishes")
+            for r in sorted(state.regions):
+                if r not in medium_of:
+                    raise ValueError(f"atom {name!r} reads region {r!r}, which is not declared")
+            reads_m[name] = state
         # resolve each network requirement's redirect treatment: a textually-establishable
         # atom (defined, or with a literal checker: an effect-free single-input validation)
         # defaults to being re-checked by the broker on every hop; anything else defaults to
         # refusing hops. Only an *explicit* recheck of a non-textual atom is an error.
-        recheckable = defined_names | {
+        recheckable = defined_names | builtin_names | {
             a
             for v in vals
             for established in v.establishes.values()
             for a in established
-            if _literal_slot(v, a) is not None
+            if literal_slot(v, a) is not None
         }
         net_rules = []
         for r in net_in:
@@ -805,12 +1172,35 @@ class Policy:
                     resolved.add(ra)
             net_rules.append(replace(r, requires=frozenset(resolved)))
         return cls(
-            _locations(read), _locations(write), _locations(listing), progs, vals, atoms_t,
-            tuple(net_rules), srcs,
+            read=_locations(read), write=_locations(write), listing=_locations(listing),
+            no_write=_locations(no_write), programs=progs, validations=vals, atoms=atoms_t,
+            network=tuple(net_rules), sources=srcs, regions=regs, reads=reads_m, applied=tuple(applied),
+            default_allow=default_allow, denied=frozenset(ProgramName(d) for d in denied),
         )
 
+    def governed(self, name: str) -> bool:
+        """Is *name* a program the policy speaks about -- by a rule, or by a deny? The one
+        classification default-allow makes: a program it does not govern is let through, a
+        program it governs is held to its rules."""
+        return name in self.denied or any(p.name == name for p in self.programs)
+
+    def _ungoverned(self, name: str) -> Program:
+        """The rule an ungoverned program runs under when default-allow lets it through: any
+        cwd within the root, no template (any arguments), the user's authority -- unjailed, its
+        writes undeclared."""
+        return Program(ProgramName(name), (parse_location("**"),), origin="default-allow")
+
+    def protected(self, loc: LocationFact) -> LocationFact | None:
+        """The first ``no_write`` location a write at *loc* may touch -- a path the write may name
+        lying at or below one the protection names (``footprints.overlaps``) -- or None when the
+        write provably stays outside every one."""
+        for guarded in self.no_write:
+            if footprints.overlaps(loc, footprints.footprint_of(guarded)):
+                return guarded
+        return None
+
     @property
-    def source_atoms(self) -> frozenset[str]:
+    def source_atoms(self) -> frozenset[SourceId]:
         """The atoms extraction establishes (PROVENANCE.md): pure, never re-checkable from text."""
         return frozenset(
             [p.source for p in self.programs if p.source is not None]
@@ -818,20 +1208,52 @@ class Policy:
             + [s.name for s in self.sources]
         )
 
+    @property
+    def medium_of(self) -> dict[RegionId, Medium]:
+        return {r.name: r.medium for r in self.regions}
+
+    def write_set(self, rule: Program | Validation | NetworkRule) -> Effects:
+        """What *rule* writes (EFFECTS.md): its declaration, else every region of the media it
+        reaches. A network rule reaches the network only, and one admitting only GET and HEAD
+        writes nothing: a GET that mutates the server is the server's bug."""
+        if isinstance(rule, NetworkRule):
+            if rule.writes is not None:
+                return rule.writes
+            if rule.methods and rule.methods <= {"GET", "HEAD"}:
+                return NOTHING
+            return whole(["network"])
+        return rule.write_set
+
+    def read_set(self, atom_name: Atom) -> Effects:
+        """What *atom_name* depends on: its declaration, else everything."""
+        return self.reads.get(atom_name, EVERYTHING)
+
+    def kills(self, rule: Program | Validation | NetworkRule, atom_name: Atom) -> bool:
+        """Does an effect under *rule* kill *atom_name*? The two sets meet."""
+        return self.write_set(rule).meets(self.read_set(atom_name), self.medium_of)
+
     def vocabulary(self) -> Vocabulary:
         """The analysis-side half of the validations, defined atoms and sources, for ``analyze``."""
         return Vocabulary(
             signatures={
                 v.name: CheckSignature(
-                    v.name, v.params, dict(v.establishes), v.effect_free,
+                    v.name, v.params, dict(v.establishes), self.write_set(v),
                     needs_cwd=v.cwd is not None,
                 )
                 for v in self.validations
             },
             pure_atoms=frozenset(a for v in self.validations for a in v.pure_atoms)
             | frozenset(a.name for a in self.atoms)
-            | self.source_atoms,
+            | self.source_atoms
+            | frozenset(BUILTIN_ATOMS.values()),
             defined={a.name: a.regex for a in self.atoms},
+            checkable=frozenset(
+                CheckId(a)
+                for v in self.validations
+                for established in v.establishes.values()
+                for a in established
+                if a not in BUILTIN_ATOMS and literal_slot(v, a) is not None
+            ),
             sources=SourceTable(
                 exec=tuple(
                     (p.name, p.leading_words[1:], p.source)
@@ -843,11 +1265,13 @@ class Policy:
                 ),
                 read=tuple((loc, s.name) for s in self.sources for loc in s.locations),
             ),
+            reads=dict(self.reads),
+            writes=WriteTable(
+                exec=tuple((p.name, p.leading_words[1:], self.write_set(p)) for p in self.programs),
+                network=tuple((r.host, r.methods, self.write_set(r)) for r in self.network),
+            ),
+            medium_of=self.medium_of,
         )
-
-    @property
-    def _defined(self) -> dict[str, PseudoRegex]:
-        return {a.name: a.regex for a in self.atoms}
 
     def exec_command(
         self,
@@ -855,24 +1279,29 @@ class Policy:
         arguments: Sequence[str],
         keywords: Mapping[str, str | Sequence[str]],
         cwd: str,
-        discharge: Callable[[str, str], bool] | None = None,
-    ) -> list[str] | Refusal:
-        """The broker's re-check of one concrete exec, and the argv to spawn for it.
+        discharge: Discharge | None = None,
+    ) -> "Command | Refusal":
+        """The broker's re-check of one concrete exec, and the command to spawn for it: the
+        argv, and the rule it came from (whose jail says how to spawn it).
 
         Necessarily incomplete against the full rules -- runtime strings carry no provenance,
-        so environmental atoms and the flat rule's ``unknown_arguments``/``argument_*`` are the
-        static analysis' alone. What IS decidable on concrete values is decided: the program is
+        so environmental atoms and source atoms are the static analysis' alone. What IS
+        decidable on concrete values is decided: the program is
         permitted, its leading words select a declared form (fail closed), the cwd lies within
         the rule's locations, and for a templated form the same ``bind`` and hole checks the
         analysis ran -- flag vocabulary and arity, regexes, lexical locations, the leading-dash
         guard, textual atoms -- run again on the strings. The template, not the program,
         then composes the argv."""
         rules = [p for p in self.programs if p.name == program_name]
-        if not rules:
-            return Refusal(f"program {program_name!r} is not permitted")
         cwd_loc = _literal_location(cwd)
         if cwd_loc is None:
             return Refusal(f"cwd {cwd!r} has no safe location")
+        if not rules:
+            if self.default_allow and not self.governed(program_name):
+                if keywords:
+                    return Refusal(f"{program_name!r} is not governed by a rule: it has no holes to bind by keyword")
+                return Command([program_name, *arguments], self._ungoverned(program_name))
+            return Refusal(f"program {program_name!r} is not permitted")
         rule = _select(rules, arguments)
         if rule is None:
             return Refusal(
@@ -883,7 +1312,7 @@ class Policy:
         if rule.template is None:
             if keywords:
                 return Refusal(f"the rule for {program_name!r} takes no keyword arguments")
-            return [program_name, *arguments]
+            return Command([program_name, *arguments], rule)
         bound = bind(
             rule.template,
             list(arguments),
@@ -891,63 +1320,117 @@ class Policy:
         )
         if isinstance(bound, BindError):
             return Refusal("; ".join(bound.reasons))
-        # only textual atoms can be re-established from a string; the environmental ones, and
-        # the source atoms (provenance is not a property of text), were the static check's
-        textual = self.vocabulary().pure_atoms - self.source_atoms
+        # only what a string can be shown to carry is re-asked here (built-ins, defined and
+        # checkable atoms, by kind); the environmental atoms and the sources were the static
+        # check's
+        vocabulary = self.vocabulary()
+        textual = vocabulary.decidable_from_text()
         failures = hole_failures(
-            bound, lambda value, atoms: self._missing_atoms(value, atoms & textual, discharge)
+            bound,
+            lambda value, atoms: vocabulary.missing(value, atoms & textual, discharge),
+            lambda atoms: vocabulary.missing(Located(cwd_loc, "path"), atoms & textual, discharge),
         )
         if failures:
             return Refusal("; ".join(failures))
-        return instantiate(bound)
+        return Command(instantiate(bound), rule)
 
     def exec_refusal(self, program_name: str, arguments: Sequence[str], cwd: str) -> str | None:
         """``exec_command`` for the flat form: the refusal's reason, or None when permitted."""
         outcome = self.exec_command(program_name, arguments, {}, cwd)
         return outcome.reason if isinstance(outcome, Refusal) else None
 
-    def discharger(self, root: PathLike[str] | str) -> Callable[[str, str], bool]:
+    def mounts(
+        self, root: pathlib.Path, rule: "Program | Validation | None" = None, view: pathlib.Path | None = None,
+    ) -> Mounts:
+        """The filesystem section lowered to the binds a confined child gets (``fsview``,
+        MOUNTS.md): the same grants and protections the program is held to, under *root*, plus
+        what *rule* mounts for itself (``exec.mount-read`` / ``exec.mount-write``). With *view*,
+        the FUSE mountpoint serving the root (``viewdaemon``), the root-relative section is the
+        view's and only the absolute locations and the rule's additions are binds."""
+        base = fsview.mounts(root, self.read, self.write, self.no_write, self.listing, view=view)
+        if rule is None or not (rule.mount_read or rule.mount_write):
+            return base
+        return base | fsview.additions(root, rule.mount_read, rule.mount_write)
+
+    @property
+    def confines(self) -> bool:
+        """Does some grant run its child under the policy view (``exec.view = "policy"``)?"""
+        return any(r.view is View.POLICY for r in (*self.programs, *self.validations))
+
+    def view_spec(self, root: pathlib.Path) -> "ViewSpec":
+        """What a FUSE view of this policy under *root* serves (``viewdaemon``)."""
+        from certorail.viewdaemon import ViewSpec
+
+        return ViewSpec(os.path.realpath(root), self.read, self.write, self.no_write, self.listing)
+
+    def section(self) -> FilesystemSection:
+        """The ``[filesystem]`` section as one value (``certorail.confinement``)."""
+        return FilesystemSection(self.read, self.write, self.no_write, self.listing)
+
+    def confinement(self, rule: "Program | Validation", root: pathlib.Path) -> Confinement:
+        """What *rule*'s child may do (``certorail.confinement``): its media and ``exec`` table,
+        and the filesystem it sees -- the host's, or this policy's section under *root* plus the
+        rule's own additions. The one constructor of a ``Confinement``."""
+        filesystem: HostFilesystem | PolicyFilesystem = (
+            PolicyFilesystem(root, self.section(), Additions(rule.mount_read, rule.mount_write))
+            if rule.view is View.POLICY
+            else HostFilesystem()
+        )
+        return Confinement(rule.env, rule.network, rule.write_fs, rule.spawn, filesystem)
+
+    def discharger(self, root: PathLike[str] | str, view: pathlib.Path | None = None) -> Discharge:
         """A runner for literal checkers: ``discharge(atom, text)`` is True when some effect-free
         validation establishing the pure *atom* through a single slot accepts the exact *text*,
-        run right now under *root*. Cached per (atom, text); handed to ``evaluate`` and to
+        run right now under *root* (a confined one under the policy view, *view* being the FUSE
+        mountpoint when one is attached). Cached per (atom, text); handed to ``evaluate`` and to
         ``analyze`` so constants need neither a ``certora.check`` nor a regex definition."""
         rootpath = pathlib.Path(root)
-        cache: dict[tuple[str, str], bool] = {}
+        cache: dict[tuple[Atom, str], bool] = {}
 
-        def discharge(atom_name: str, text: str) -> bool:
-            key = (atom_name, text)
+        def discharge(atom: Atom, text: str) -> bool:
+            key = (atom, text)
             if key not in cache:
                 cache[key] = any(
-                    _run_literal_checker(v, slot, text, rootpath)
+                    _run_literal_checker(v, slot, text, rootpath, self.mounts(rootpath, v, view))
                     for v in self.validations
-                    if (slot := _literal_slot(v, atom_name)) is not None
+                    if (slot := literal_slot(v, atom)) is not None
                 )
             return cache[key]
 
         return discharge
 
     def evaluate(
-        self, report: Report, discharge: Callable[[str, str], bool] | None = None
+        self, report: Report, discharge: Discharge | None = None
     ) -> list[Denial]:
         return [d for site in report.sinks for d in self._evaluate(site, discharge)]
 
     def _evaluate(
-        self, site: Site, discharge: Callable[[str, str], bool] | None = None
+        self, site: Site, discharge: Discharge | None = None
     ) -> list[Denial]:
         match site:
             case SinkSite(kind=kind, fact=Located(location=loc)):
                 permitted = {"read": self.read, "write": self.write, "list": self.listing}[kind]
-                if any(location_le(loc, allowed) for allowed in permitted):
-                    return []
-                return [Denial(site, f"{kind} of {pretty_location(loc)} is not permitted")]
+                if not any(location_le(loc, allowed) for allowed in permitted):
+                    return [Denial(site, f"{kind} of {pretty_location(loc)} is not permitted")]
+                if kind == "write" and (hit := self.protected(loc)) is not None:
+                    return [Denial(
+                        site,
+                        f"write of {pretty_location(loc)} may touch {pretty_location(hit)}, which is "
+                        "protected (no-write): name a path that provably lies outside it",
+                    )]
+                return []
             case SinkSite():
                 return [Denial(site, "the location of the path is not proven")]
             case ExecSite(program=name, cwd=cwd, arguments=arguments, keywords=keywords):
                 rules = [p for p in self.programs if p.name == name]
-                if not rules:
-                    return [Denial(site, f"program {name!r} is not permitted")]
                 if not isinstance(cwd, Located):
-                    return [Denial(site, "the cwd is not proven")]
+                    return [Denial(site, "the cwd is not proven")]  # a sink, default-allow or not
+                if not rules:
+                    if self.default_allow and not self.governed(name):
+                        if keywords:
+                            return [Denial(site, f"{name!r} is not governed by a rule: it has no holes to bind by keyword")]
+                        return []  # let it ride: the user's authority, every fact killed
+                    return [Denial(site, f"program {name!r} is not permitted")]
                 # forms fail closed: the leading words select exactly one rule
                 # (prefix-freedom); an unlisted or computed form matches nothing
                 rule = _select(rules, arguments)
@@ -1060,22 +1543,14 @@ class Policy:
     def _missing_atoms(
         self,
         value: str | ValidationFact | None,
-        required: frozenset[str],
-        discharge: Callable[[str, str], bool] | None,
-    ) -> frozenset[str]:
-        """The required atoms *value* does not carry, after saturation (regex-defined atoms on
-        known text) and after running literal checkers on exactly-known text."""
-        if not required:
-            return required
-        sat = saturate(value, self._defined)
-        have = frozenset() if sat is None or isinstance(sat, str) else sat.checks
-        missing = required - have
-        if missing and discharge is not None and (text := known_text(value)) is not None:
-            missing = frozenset(a for a in missing if not discharge(a, text))
-        return missing
+        required: frozenset[Atom],
+        discharge: Discharge | None,
+    ) -> frozenset[Atom]:
+        """The required atoms *value* does not carry: ``Vocabulary.missing`` (ATOMS.md)."""
+        return self.vocabulary().missing(value, required, discharge)
 
     def _cwd_mismatch(
-        self, rule: Program, cwd: Located, discharge: Callable[[str, str], bool] | None
+        self, rule: Program, cwd: Located, discharge: Discharge | None
     ) -> str | None:
         if not any(location_le(cwd.location, allowed) for allowed in rule.cwd):
             return f"cwd {pretty_location(cwd.location)} is not within {pretty_locations(rule.cwd)}"
@@ -1091,7 +1566,7 @@ class Policy:
         cwd: Located,
         arguments: Sequence[Value],
         keywords: Mapping[str, object],
-        discharge: Callable[[str, str], bool] | None,
+        discharge: Discharge | None,
     ) -> str | None:
         """The templated form: bind the call like a signature, then every hole is a rely."""
         reason = self._cwd_mismatch(rule, cwd, discharge)
@@ -1101,7 +1576,9 @@ class Policy:
         if isinstance(bound, BindError):
             return "; ".join(bound.reasons)
         failures = hole_failures(
-            bound, lambda value, atoms: self._missing_atoms(value, atoms, discharge)
+            bound,
+            lambda value, atoms: self._missing_atoms(value, atoms, discharge),
+            lambda atoms: self._missing_atoms(cwd, atoms, discharge),
         )
         return "; ".join(failures) if failures else None
 
@@ -1110,45 +1587,29 @@ class Policy:
         rule: Program,
         cwd: Located,
         arguments: tuple,
-        discharge: Callable[[str, str], bool] | None = None,
+        discharge: Discharge | None = None,
     ) -> str | None:
-        """The flat form. *arguments* excludes the matched subcommand words, if any."""
+        """The flat form: exactly its words. *arguments* excludes the matched subcommand words,
+        so anything left is one argument too many -- a template says what an argument is."""
         reason = self._cwd_mismatch(rule, cwd, discharge)
         if reason is not None:
             return reason
-        if not rule.unknown_arguments:
-            for i, a in enumerate(arguments):
-                # vouched-for means exactly-known text or a proven path: a computed str
-                # (f-string, .strip()) is a StrFact, not None, but is still unknown
-                if known_text(a) is None and not isinstance(a, Located):
-                    return (
-                        f"argument {i + len(rule.subcommand) + 1} is of unknown provenance "
-                        "(neither statically known text nor a proven path)"
-                    )
-        if rule.argument_locations:
-            for a in arguments:
-                if isinstance(a, Located) and not any(
-                    location_le(a.location, allowed) for allowed in rule.argument_locations
-                ):
-                    return f"argument at {pretty_location(a.location)} is outside the permitted locations"
-        if rule.argument_atoms:
-            for i, a in enumerate(arguments):
-                missing = self._missing_atoms(a, rule.argument_atoms, discharge)
-                if missing:
-                    return (
-                        f"argument {i + len(rule.subcommand) + 1} is not validated by: "
-                        f"{', '.join(sorted(missing))}"
-                    )
+        if arguments:
+            return (
+                f"{' '.join(rule.leading_words)!r} takes no arguments beyond its words "
+                f"({len(arguments)} given); a rule that takes arguments is a template (argv + holes)"
+            )
         return None
 
 
 # ---------------------------------------------------------------------------
-# the default policy: what ``certorail program.py`` applies when no policy file is given
+# the default policy: what ``certorail run program.py`` applies when no policy file is given
 # ---------------------------------------------------------------------------
 
-# Everything the analysis proves to lie within the root, plus the two programs the reference
-# example shells out to, run anywhere within the root. Tight enough that any escape from the root
-# is a denial, loose enough that a well-formed script needs no policy file.
+# Everything the analysis proves to lie within the root and no programs: tight enough that any
+# escape from the root is a denial, loose enough that a well-formed script needs no policy file.
+# The host uses ``policyfile.default_policy()``, which is this plus the installed base ruleset;
+# this constant is the same posture for tests that want no rulesets involved.
 DEFAULT_POLICY = Policy.allow(
     read=[markers.within(".")],
     write=[markers.within(".")],

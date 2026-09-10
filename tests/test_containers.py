@@ -235,5 +235,58 @@ class TestReturns(unittest.TestCase):
         self.assertTrue(any("container guarantee" in v for v in got))
 
 
+class TestClosures(unittest.TestCase):
+    """A typed container may not be closed over (safepy.ContainerClosureAnalysis): a def or a
+    lambda naming a container of an enclosing scope is a violation, whatever it does with it,
+    unless it binds that name itself. Pass the container as a parameter instead."""
+
+    CLOSED = "may not be closed over"
+
+    def test_a_closure_over_a_module_container(self) -> None:
+        for body in ('    xs.append("c/d")\n', '    xs.append("c")\n', "    print(xs)\n", "    return xs\n"):
+            with self.subTest(body=body):
+                got = violations(DECL + "def f():\n" + body)
+                self.assertTrue(any(self.CLOSED in v for v in got), got)
+
+    def test_a_closure_over_a_local_container(self) -> None:
+        got = violations(
+            f"def hello():\n    foo: list[{P}] = []\n    def blah():\n        foo.append(\"/\")\n    blah()\n"
+        )
+        self.assertTrue(any(self.CLOSED in v for v in got), got)
+
+    def test_declared_after_the_def_still_counts(self) -> None:
+        # closures bind late: the declaration below the def is the one the body would reach
+        got = violations(f'def f():\n    xs.append("c")\n' + DECL)
+        self.assertTrue(any(self.CLOSED in v for v in got), got)
+
+    def test_a_lambda_is_a_closure_too(self) -> None:
+        got = violations(DECL + 'f = lambda: xs.append("c")\n')
+        self.assertTrue(any(self.CLOSED in v for v in got), got)
+
+    def test_binding_the_name_makes_it_local(self) -> None:
+        for src in (
+            DECL + 'def f():\n    xs = ["z/z"]\n    print(xs)\n',
+            DECL + f"def f(xs: list[{P}]):\n    xs.append(\"c\")\n",
+            DECL + "f = lambda xs: xs.append(1)\n",
+        ):
+            with self.subTest(src=src):
+                self.assertEqual(violations(src), [])
+
+    def test_a_comprehension_is_not_a_closure(self) -> None:
+        # the walker walks comprehensions inline; iterating the container there is a roster read
+        self.assertEqual(violations(DECL + "n = [len(x) for x in xs]\n"), [])
+        # but a def inside a function that declared the container is
+        got = violations(f"def g():\n    ys: list[{P}] = []\n    h = lambda: len(ys)\n")
+        self.assertTrue(any(self.CLOSED in v for v in got), got)
+
+    def test_passing_it_is_the_way(self) -> None:
+        self.assertEqual(violations(USE + DECL + f"def f(zs: list[{P}]):\n    zs.append(\"c\")\nf(xs)\n"), [])
+
+    def test_a_sink_inside_a_lambda_is_recorded(self) -> None:
+        report = analyze(HEADER + 'g = lambda p: open(p, "w")\n')
+        self.assertEqual(report.violations, [])
+        self.assertEqual(len(report.sinks), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

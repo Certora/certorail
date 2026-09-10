@@ -25,14 +25,7 @@ import ast
 from dataclasses import dataclass, field
 from types import EllipsisType
 
-from .analysis import resolve_callee
-from .markers import NAMESPACE
-
-# Names whose dotted attributes the analysis interprets. The walker can pass its actual imports
-# instead; the default is the vocabulary the recognizers know about.
-KNOWN_MODULES: frozenset[str] = frozenset(
-    {"os", "pathlib", "re", "sys", "typing", "urllib", NAMESPACE}
-)
+from certorail.analysis import KNOWN_MODULES, resolve_callee
 
 
 @dataclass(frozen=True)

@@ -20,10 +20,13 @@ from certorail.analysis import (
     pretty_location,
 )
 from certorail.host import load_policy
+from certorail.ids import AtomId, ValidationName
 from certorail.policy import (
     Policy,
     RequiredAtom,
     atom,
+    constraint,
+    hole,
     network,
     param,
     program,
@@ -31,6 +34,7 @@ from certorail.policy import (
     validation,
 )
 from certorail.policyfile import PolicyFileError, from_data, load_policy_file, parse_location
+from certorail.templates import Token
 
 
 def loads(text: str) -> Policy:
@@ -40,9 +44,11 @@ def loads(text: str) -> Policy:
 class TestParseLocation(unittest.TestCase):
     CASES = {
         ".": StaticPath(()),
-        "**": DirSplat((), ANY_NAME),
+        "**": DirSplat((), None),
+        "**/*": DirSplat((), ANY_NAME),  # strictly below the root: not the root itself
         "data/x": StaticPath((Named("data"), Named("x"))),
-        "repos/**": DirSplat((Named("repos"),), ANY_NAME),
+        "repos/**": DirSplat((Named("repos"),), None),
+        "repos/**/*": DirSplat((Named("repos"),), ANY_NAME),
         "repos/**/x.tar": DirSplat((Named("repos"),), Named("x.tar")),
         r"repos/**/<\w+\.tar>": DirSplat((Named("repos"),), Matching(RegexLit(r"\w+\.tar"))),
         "repos/{2025,2026}/x": StaticPath(
@@ -93,7 +99,7 @@ name        = "not-force-check"
 params      = ["value"]
 argv        = ["test", "${value}", "!=", "--force"]
 cwd         = "**"
-effect-free = true
+writes      = []
 establishes = { value = ["not-force"] }
 
 [[validation]]
@@ -103,11 +109,11 @@ cwd         = "repos/**"
 establishes = { cwd = ["org-checkout"] }
 
 [[program]]
-name           = "git"
-subcommand     = "push origin"
-cwd            = "repos/**"
-requires       = ["org-checkout"]
-argument-atoms = ["not-force"]
+name         = "git"
+argv         = ["git", "push", "origin", "${BRANCH}"]
+cwd          = "repos/**"
+requires     = ["org-checkout"]
+holes.BRANCH = { atoms = ["not-force"] }
 
 [[program]]
 name       = "git"
@@ -127,7 +133,7 @@ EXPECTED = Policy.allow(
             cwd=markers.within("."),
             params=("value",),
             establishes={"value": [pure("not-force")]},
-            effect_free=True,
+            writes=[],
         ),
         validation(
             "org-repo",
@@ -139,13 +145,12 @@ EXPECTED = Policy.allow(
     programs=[
         program(
             "git",
-            subcommand="push origin",
             cwd=markers.within("repos"),
             requires=["org-checkout"],
-            argument_atoms=["not-force"],
-            unknown_arguments=False,
+            argv=["git", "push", "origin", hole("BRANCH")],
+            holes={"BRANCH": Token(constraint(atoms=["not-force"]))},
         ),
-        program("git", subcommand="log", cwd=markers.within("repos"), unknown_arguments=False),
+        program("git", subcommand="log", cwd=markers.within("repos")),
     ],
 )
 
@@ -164,7 +169,7 @@ class TestPolicyDocument(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             p = pathlib.Path(tmp) / "policy.toml"
             p.write_text(DOCUMENT)
-            self.assertEqual(load_policy(p), EXPECTED)
+            self.assertEqual(load_policy(p).policy, EXPECTED)
 
 
 class TestStrictness(unittest.TestCase):
@@ -264,7 +269,7 @@ class TestNetworkTables(unittest.TestCase):
         (rule,) = pol.network
         self.assertEqual(
             rule.requires,
-            frozenset({RequiredAtom("not-prod", "recheck"), RequiredAtom("vetted", "waive")}),
+            frozenset({RequiredAtom(AtomId("not-prod"), "recheck"), RequiredAtom(AtomId("vetted"), "waive")}),
         )
 
     def test_a_bad_redirect_mode_is_an_error(self) -> None:
@@ -289,12 +294,12 @@ class TestCwdFreeValidations(unittest.TestCase):
             name        = "not-force-check"
             params      = ["value"]
             argv        = ["test", "${value}", "!=", "--force"]
-            effect-free = true
+            writes      = []
             establishes = { value = ["not-force"] }
         """)
         (v,) = pol.validations
         self.assertIsNone(v.cwd)
-        self.assertFalse(pol.vocabulary().signatures["not-force-check"].needs_cwd)
+        self.assertFalse(pol.vocabulary().signatures[ValidationName("not-force-check")].needs_cwd)
 
 
 if __name__ == "__main__":

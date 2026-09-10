@@ -177,7 +177,9 @@ Rules of use:
   `certora.exactly("a/b", …)` (components: literals, `certora.matches(r)`, `certora.one_of("a", "b")`),
   `certora.matches(r"…")`, `certora.one_of("a", "b")`, `certora.seq("pre-", certora.matches(r"\d+"))`,
   `certora.no_slash`, `certora.no_parent_traversal`, `certora.not_absolute`, `certora.not_dot_dot`,
+  `certora.not_option` (the text does not begin with `-`; `assert not s.startswith("-")` establishes it),
   `certora.validated("atom", …)` (the value carries the named policy facts — see validations),
+  `certora.source("atom", …)` (the value came, unmodified, from the source that yields the atom — see provenance),
   `certora.url(scheme="https", netloc="api.github.com", path_within="/repos")` (the value is a URL with these
   components; each keyword is optional and claims only what it names — see network).
   A location marker (`within`/`exactly`) does not combine with text markers; constrain the file name with
@@ -235,7 +237,11 @@ slugs: list[typing.Annotated[str, certora.no_slash, certora.not_dot_dot]] = []
   positionally in order — `certora.exec("git", "push", "origin", branch, cwd=repo)`,
   `certora.exec("find", where, "-mindepth", "1", "-name", "*.py", cwd=here)` — or by keyword
   (`BRANCH=branch`). Some holes are keyword-only (the description says which):
-  `certora.exec("tar", FLAGS=["-c", "-z"], ARCHIVE=out, FILES=[a, b], cwd=here)`. A list hole takes a
+  `certora.exec("git", "log", REVS=["main..HEAD"], PATHS=[src], cwd=repo)`. A flags list before
+  other holes ends at the first argument that provably is not a flag (a literal, a path, a guarded
+  string): `certora.exec("tar", "-c", "-z", out, a, b, cwd=here)`. If the next argument could be a
+  flag (text read from a file or `sys.argv`), the call is rejected: name the holes instead,
+  `certora.exec("grep", FLAGS=["-r"], PATTERN=pat, FILES=[repo], cwd=here)`. A list hole takes a
   list display (or a typed container); a flags hole takes a list of flag names with their values
   following, and only the flags the policy lists. Never spell the words the host inserts (`--`,
   `-f`). Every hole is checked like a parameter annotation (a proven path within a location, text
@@ -315,7 +321,8 @@ slugs: list[typing.Annotated[str, certora.no_slash, certora.not_dot_dot]] = []
   `lines`. The path is a string literal in a small jq subset: `.key`, `."quoted key"`, `[0]`,
   `[]`; no pipes or filters. Scalars come back as text; `null`, a missing path and non-scalars raise.
 - The result of `extract_all` / `lines` / `readlines` is a typed container: annotate it,
-  `xs: list[typing.Annotated[str, certora.validated("gh-api")]] = certora.extract_all(...)`.
+  `xs: list[typing.Annotated[str, certora.source("gh-api")]] = certora.extract_all(...)`
+  (`certora.source`, not `certora.validated`: provenance is spelled as what it is).
 - Any string operation (`strip`, `+`, f-strings, `split`) drops the fact, as does `json.loads`
   followed by indexing; guards (`assert re.fullmatch(...)`) keep it. A literal never has it.
   Where a hole or contract demands a source fact, the extractor is the only spelling that works.

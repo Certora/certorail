@@ -1,0 +1,8 @@
+{
+  "name": "certorail",
+  "description": "Run agent-written scripts under a reviewed security policy: injects the ambient certorail policy into every session and ships the policy-authoring skill.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Certora"
+  }
+}

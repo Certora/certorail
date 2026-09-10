@@ -1,0 +1,13 @@
+{
+  "name": "certorail",
+  "owner": {
+    "name": "Certora"
+  },
+  "plugins": [
+    {
+      "name": "certorail",
+      "source": "./certorail/plugin/plugins/certorail",
+      "description": "The program-author guide and the ambient certorail policy in every session's context, plus the certorail-policy authoring skill."
+    }
+  ]
+}

@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""certorail checker: the argument is a URL git may fetch from over the network.
+
+Establishes git.remote-url and not-option. Admits https://host/path, ssh://[user@]host[:port]/path
+and the scp-like user@host:path. Refuses everything that is not a network transport: a local
+path, file://, git:// (unauthenticated), ext:: (runs a command), fd:: (an inherited descriptor),
+and any URL carrying a password or an empty host.
+"""
+import sys
+import urllib.parse
+
+
+def refuse(why: str) -> None:
+    print(f"git-remote-url: {why}", file=sys.stderr)
+    sys.exit(1)
+
+
+def check_host(host: str, url: str) -> None:
+    if not host:
+        refuse(f"{url!r} has no host")
+    if any(c.isspace() for c in host):
+        refuse(f"{url!r} has whitespace in the host")
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        refuse("expected exactly one argument")
+    url = sys.argv[1]
+    if not url:
+        refuse("empty")
+    if url.startswith("-"):
+        refuse(f"{url!r} begins with '-': an option, not a URL")
+    if any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F for c in url):
+        refuse(f"{url!r} contains whitespace or a control character")
+    if "::" in url:
+        refuse(f"{url!r} names a remote helper transport (ext::, fd::, ...)")
+
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme in ("https", "ssh"):
+        if parts.password is not None:
+            refuse(f"{url!r} carries a password")
+        check_host(parts.hostname or "", url)
+        if not parts.path or parts.path == "/":
+            refuse(f"{url!r} has no repository path")
+        sys.exit(0)
+    if parts.scheme:
+        refuse(f"{url!r}: scheme {parts.scheme!r} is not https or ssh")
+
+    # scp-like: user@host:path, no scheme; a "/" before the first ":" would make it a local path
+    if "@" not in url or ":" not in url:
+        refuse(f"{url!r} is neither a URL nor user@host:path")
+    userhost, _, path = url.partition(":")
+    if "/" in userhost:
+        refuse(f"{url!r} is a local path")
+    user, _, host = userhost.rpartition("@")
+    if not user:
+        refuse(f"{url!r} has no user")
+    check_host(host, url)
+    if not path:
+        refuse(f"{url!r} has no repository path")
+    sys.exit(0)
+
+
+main()

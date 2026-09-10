@@ -8,6 +8,7 @@ from certorail.host import Accepted, Rejected
 from certorail.host import check as host_check
 from certorail.markers import ExecResult, ExtractError, NetworkResponse
 from certorail.policy import (
+    Command,
     Policy,
     atom,
     constraint,
@@ -119,7 +120,7 @@ class TestContainers(Base):
     def test_extract_all_constructs_and_the_loop_consumes(self) -> None:
         self.accept(
             GET
-            + 'branches: list[typing.Annotated[str, certora.validated("gh-api")]] = certora.extract_all(resp, ".[].name")\n'
+            + 'branches: list[typing.Annotated[str, certora.source("gh-api")]] = certora.extract_all(resp, ".[].name")\n'
             + "for b in branches:\n    " + GUARD + '    certora.exec("git", "push", "origin", b, cwd=repo)\n'
         )
 
@@ -212,10 +213,9 @@ class TestPolicySide(unittest.TestCase):
 
     def test_source_atoms_are_never_textual_at_runtime(self) -> None:
         # the broker cannot see provenance: the hole's source atom is the static check's alone
-        self.assertEqual(
-            POLICY.exec_command("git", ["push", "origin", "feature"], {}, "repos/x"),
-            ["git", "push", "origin", "feature"],
-        )
+        command = POLICY.exec_command("git", ["push", "origin", "feature"], {}, "repos/x")
+        assert isinstance(command, Command)
+        self.assertEqual(command.argv, ["git", "push", "origin", "feature"])
 
     def test_only_extraction_establishes_a_source_atom(self) -> None:
         with self.assertRaises(ValueError):
@@ -241,6 +241,25 @@ class TestPolicySide(unittest.TestCase):
         self.assertEqual(policy.programs[0].source, "gh-api")
         (src,) = policy.sources
         self.assertEqual((src.name, len(src.locations)), ("manifest", 2))
+
+    def test_a_source_atom_is_yielded_by_rules_alone_in_the_data_format(self) -> None:
+        # the same exclusivity, as a policy author would trip it: a validation that establishes
+        # a source atom, and a regex definition of one
+        with self.assertRaises(PolicyFileError) as cm:
+            from_data({
+                "policy-version": 1,
+                "atoms": {"gh-api": {"pure": True}},
+                "network": [{"host": "api.github.com", "source": "gh-api"}],
+                "validation": [{"name": "v", "argv": ["true"], "cwd": ".", "establishes": {"cwd": ["gh-api"]}}],
+            })
+        self.assertIn("only extraction establishes", str(cm.exception))
+        with self.assertRaises(PolicyFileError) as cm:
+            from_data({
+                "policy-version": 1,
+                "atoms": {"gh-api": {"matches": ".*"}},
+                "network": [{"host": "api.github.com", "source": "gh-api"}],
+            })
+        self.assertIn("cannot be defined atoms", str(cm.exception))
 
     def test_a_source_atom_must_be_declared_pure(self) -> None:
         for atoms, expected in (

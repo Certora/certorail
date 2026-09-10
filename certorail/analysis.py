@@ -7,6 +7,20 @@ import urllib.parse
 from typing import Any, cast, Callable, Literal, Mapping, Sequence
 from dataclasses import dataclass, is_dataclass, replace
 
+from certorail.dangerous import INERT_BUILTIN_TYPES, INERT_BUILTIN_VALUES, NAMESPACE, inert_condition
+from certorail.ids import (
+    BUILTIN_ATOMS,
+    NO_PARENT_TRAVERSAL,
+    NO_SLASH,
+    NOT_ABSOLUTE,
+    NOT_DOT_DOT,
+    NOT_OPTION,
+    Atom,
+    AtomId,
+    AtomIdName,
+    SourceId,
+)
+
 sensitive_builtins = (
     "getattr",
     "setattr",
@@ -27,50 +41,8 @@ sensitive_builtins = (
     "slice",
 )
 
-validator_funcs = frozenset([
-    "certora_within",
-    "certora_matches"
-])
-
 def is_dunder(x: str) -> bool:
     return x.startswith("__") and x.endswith("__")
-
-@dataclass
-class RegexMatch:
-    regex: str
-
-@dataclass
-class PathConfinement:
-    confined_path: str
-
-type ContainerSort = Literal["set", "list", "dict_key", "dict_val", "tuple"]
-
-@dataclass
-class ContainerOf:
-    of: "ValidationRule"
-    sort: ContainerSort
-
-
-type ValidationRule = PathConfinement | RegexMatch | ContainerOf
-
-@dataclass
-class ValidatedUsage:
-    ident: str
-    validation_rule: ValidationRule
-
-@dataclass
-class OpenCall:
-    where: ast.AST
-    mode: str
-    target: str | list[ValidationRule]
-
-type AuditEvents = OpenCall
-
-@dataclass
-class Validated:
-    ident: str
-    validations: list[ValidationRule]
-
 
 @dataclass
 class NameAccess:
@@ -127,15 +99,6 @@ def unfold_attr(e: ast.Attribute) -> NameAccess:
         else:
             return NameAccess(it, list(reversed(attr_path)))  # a computed base
 
-def is_call_to(
-    i: ast.AST
-) -> str | None:
-    if not isinstance(i, ast.Call):
-        return None
-    if not isinstance(i.func, ast.Name):
-        return None
-    return i.func.id
-
 def resolve_callee(
     i: ast.AST
 ) -> NameAccess | None:
@@ -150,33 +113,6 @@ def resolve_callee(
 class InvalidConstantForm(Exception):
     ...
 
-def cast_as_const_or_default[T](
-    t: type[T],
-    elem: Any
-) -> T:
-    if not isinstance(elem, ast.expr) and not isinstance(elem, t):
-        raise InvalidConstantForm(f"Unexpected type: {type(elem)}")
-    return as_const_or_default(t, elem)
-
-def as_const_or_default[T](
-    t: type[T],
-    elem: T | ast.expr
-) -> T:
-    if isinstance(elem, t):
-        return elem
-    if not isinstance(elem, ast.Constant):
-        raise InvalidConstantForm(f"Not a constnat expr: {type(elem).__name__}")
-    if not isinstance(elem.value, t):
-        raise InvalidConstantForm(f"Invalid constant type, expected: {t}, got {type(elem.value)}")
-    return elem.value
-
-def as_const[T](t: type[T], elem: ast.expr) -> T:
-    if not isinstance(elem, ast.Constant):
-        raise InvalidConstantForm(f"Expression is not a constant, got: {type(elem)}")
-    if not isinstance(elem.value, t):
-        raise InvalidConstantForm(f"Constant value is not a {t}, got {type(elem.value)}")
-    return elem.value
-
 def as_const_or_null[T](t: type[T], elem: ast.expr) -> T | None:
     if not isinstance(elem, ast.Constant):
         return None
@@ -184,51 +120,26 @@ def as_const_or_null[T](t: type[T], elem: ast.expr) -> T | None:
         return None
     return elem.value
 
-@dataclass
-class PyOpenCall:
-    file: ast.expr
-    mode: ast.expr | str = "r"
-    encoding: ast.expr | None = None
-    errors : ast.expr | None = None
-    newline: ast.expr | None = None
-    closefd: ast.expr | bool = True
-    opener: ast.expr | None = None
+def bind_values[T](spec: type[T], args: Sequence[object], kwargs: Mapping[str, object]) -> T | None:
+    """Match positional *args* and keyword *kwargs* -- AST nodes, facts, strings, whatever a
+    caller has for the arguments of a call -- against the dataclass type *spec*, whose generated
+    ``__init__`` is the signature. On success returns ``spec(...)`` built from them. Returns None
+    when the call can't be statically bound:
 
-def bind_call_args[T](call: ast.Call, spec: type[T]) -> T | None:
-    """Match the arguments of *call* against the dataclass type *spec*.
- 
-    On success returns ``spec(...)`` built from the call's argument
-    expressions. Returns None when the call can't be statically bound:
- 
-      - *args / **kwargs splats anywhere in the call
       - too many positional arguments
       - unknown or duplicate keyword arguments
       - a required (no-default) field isn't supplied
       - a kw_only field passed positionally
       - an argument supplied both positionally and by keyword
- 
-    Only *binding* failures become None. The instance is constructed after
-    binding succeeds, so exceptions from your own __post_init__ (a natural
-    place for validation) propagate instead of masquerading as parse
-    failures.
+
+    Only *binding* failures become None. The instance is constructed after binding succeeds, so
+    exceptions from your own __post_init__ (a natural place for validation) propagate instead of
+    masquerading as parse failures.
     """
     if not (isinstance(spec, type) and is_dataclass(spec)):
         raise TypeError(f"spec must be a dataclass type, got {spec!r}")
- 
-    # Splats defeat static binding.
-    if any(isinstance(arg, ast.Starred) for arg in call.args):
-        return None
-    kwargs: dict[str, ast.expr] = {}
-    for kw in call.keywords:
-        if kw.arg is None:  # a **splat
-            return None
-        if kw.arg in kwargs:  # impossible in parsed source; hand-built ASTs only
-            return None
-        kwargs[kw.arg] = kw.value
- 
-    # The dataclass's generated __init__ is the signature; bind against it.
     try:
-        bound = inspect.signature(spec).bind(*call.args, **kwargs)
+        bound = inspect.signature(spec).bind(*args, **kwargs)
     except TypeError:  # any way the binding can fail at runtime
         return None
     return spec(*bound.args, **bound.kwargs)
@@ -353,23 +264,37 @@ class StaticPath:
     def extend_single(self, other: Component) -> "StaticPath":
         return StaticPath(self.path_components + (other,), self.absolute)
 
-    def to_splat(self, final_component: Component) -> "DirSplat":
+    def to_splat(self, final_component: Component | None) -> "DirSplat":
         return DirSplat(self.path_components, final_component, self.absolute)
 
 @dataclass(frozen=True)
 class DirSplat:
+    """Paths at some depth under ``static_prefix``. ``final_component`` None: the prefix
+    itself and everything below it (``a/**``, reflexive); a component: strictly below the
+    prefix, the last component satisfying it (``a/**/*`` any name, ``a/**/<re>``). The two
+    are different sets -- they differ in whether the prefix itself is denoted -- and share no
+    spelling."""
     static_prefix: tuple[Component, ...]
-    final_component: Component
+    final_component: Component | None
     absolute: bool = False
 
     def merge_other(self, other: "LocationFact") -> "LocationFact":
+        """Joined with *other* below: somewhere under the prefix, ending as *other* ends -- the
+        intervening components are widened away, but not the depth: the result is strictly
+        below the prefix whenever this splat demanded a component or *other* contributes one,
+        and only ``.`` joined onto a reflexive splat stays reflexive."""
         if other.absolute:
             return other  # joining onto an absolute path discards the left side (pathlib)
-        return DirSplat(
-            static_prefix=self.static_prefix,
-            final_component=other.final_component,
-            absolute=self.absolute,
-        )
+        match other:
+            case StaticPath(path_components=()):
+                return self  # joining "." adds nothing
+            case StaticPath(path_components=cs):
+                return DirSplat(self.static_prefix, cs[-1], self.absolute)
+            case DirSplat(static_prefix=ps, final_component=None):
+                strict = self.final_component is not None or bool(ps)
+                return DirSplat(self.static_prefix, ANY_NAME if strict else None, self.absolute)
+            case DirSplat(final_component=leaf):
+                return DirSplat(self.static_prefix, leaf, self.absolute)
 
     def extend_static(self, ext: tuple[str, ...]) -> "DirSplat":
         return DirSplat(
@@ -385,7 +310,7 @@ class DirSplat:
             self.absolute
         )
 
-    def to_splat(self, final_component: Component) -> "DirSplat":
+    def to_splat(self, final_component: Component | None) -> "DirSplat":
         return DirSplat(self.static_prefix, final_component, self.absolute)
 
 
@@ -532,10 +457,10 @@ def location_to_regex(loc: LocationFact) -> PseudoRegex:
             head: list[PseudoRegex] = [_joined(prefix), SLASH] if prefix else []
             if ab:
                 head = [SLASH, *head]
-            below = concat(*head, DESCENDANTS, component_to_regex(final))
-            if final != ANY_NAME:
+            below = concat(*head, DESCENDANTS, component_to_regex(ANY_NAME if final is None else final))
+            if final is not None:
                 return below
-            # an unconstrained leaf means "at or below": the prefix itself is denoted too
+            # no leaf means "at or below": the prefix itself is denoted too
             self_spelling = (
                 (concat(SLASH, _joined(prefix)) if ab else _joined(prefix))
                 if prefix
@@ -582,15 +507,19 @@ def pretty_location(loc: LocationFact) -> str:
             return ("/" if ab else "") + "/".join(pretty_component(c) for c in cs)
         case DirSplat(static_prefix=ps, final_component=leaf, absolute=ab):
             prefix = "/".join(pretty_component(c) for c in ps)
-            tail = "**" if leaf == ANY_NAME else f"**/{pretty_component(leaf)}"
+            tail = "**" if leaf is None else f"**/{pretty_component(leaf)}"
             return ("/" if ab else "") + (f"{prefix}/{tail}" if prefix else tail)
 
 
 def splat_under(loc: LocationFact) -> DirSplat:
-    """The location "somewhere at or below *loc*"."""
+    """The location "somewhere at or below *loc*", *loc* itself included. Below a strict splat
+    the leaf constraint is widened away but the depth is kept: every path is still strictly
+    below the prefix."""
     match loc:
         case StaticPath(path_components=components, absolute=ab):
-            return DirSplat(components, ANY_NAME, ab)
+            return DirSplat(components, None, ab)
+        case DirSplat(final_component=None):
+            return loc
         case DirSplat(static_prefix=prefix, absolute=ab):
             return DirSplat(prefix, ANY_NAME, ab)
 
@@ -718,13 +647,22 @@ def subsumes(general: Component, specific: Component) -> bool:
             return False
 
 
-# "not-dot-dot": the string is not exactly "..". Together with "no-slash" it implies
-# "no-parent-traversal" (a single component traverses upward only if it is exactly "..").
-type AtomicFact = Literal["no-slash", "no-parent-traversal", "not-absolute", "not-dot-dot"]
+# The built-in atoms (ids.BUILTIN_ATOMS, ATOMS.md): structural properties of a value, derived
+# from its text or location by ``holds`` below. "not-dot-dot": the string is not exactly "..".
+# Together with "no-slash" it implies "no-parent-traversal" (a single component traverses upward
+# only if it is exactly ".."). "not-option": the string does not begin with "-".
+type AtomicFact = AtomId
 
-ALL_ATOMS: frozenset[AtomicFact] = frozenset(
-    {"no-slash", "no-parent-traversal", "not-absolute", "not-dot-dot"}
-)
+# the four path atoms: what a listed name (os.listdir, iterdir) or a matched component carries.
+# Not not-option -- "-rf" is a perfectly good file name
+PATH_ATOMS: frozenset[AtomId] = frozenset({NO_SLASH, NO_PARENT_TRAVERSAL, NOT_ABSOLUTE, NOT_DOT_DOT})
+
+
+def carried(atoms: frozenset[Atom]) -> frozenset[Atom]:
+    """*atoms* less the built-ins: what a value keeps when it changes reading (text to path,
+    text to URL). A built-in is a property of the text; the new reading derives its own."""
+    return frozenset(a for a in atoms if a not in BUILTIN_ATOMS)
+
 
 def _explicit_check_no_parent(regex: PseudoRegex) -> bool:
     match regex:
@@ -779,30 +717,188 @@ def _explicit_check_not_dot_dot(regex: PseudoRegex) -> bool:
         case Both(all_of=parts):
             return any(_explicit_check_not_dot_dot(p) for p in parts)
 
-def _explicit_check(other: AtomicFact, regex: PseudoRegex) -> bool:
-    match other:
-        case "no-parent-traversal":
-            return _explicit_check_no_parent(regex)
-        case "no-slash":
-            return _explicit_check_no_slash(regex)
-        case "not-absolute":
-            return _explicit_check_not_absolute(regex)
-        case "not-dot-dot":
-            return _explicit_check_not_dot_dot(regex)
+# The regex parser behind ``re.compile`` (``sre_parse`` of old). Private, so reached by name and
+# typed Any; it is the one parser whose reading of a pattern is the reading that will be enforced.
+_RE_PARSER: Any = getattr(re, "_parser")
+_RE_CONSTANTS: Any = getattr(re, "_constants")
+_DASH = ord("-")
 
-def _holds(atom: AtomicFact, atoms: frozenset[AtomicFact], regex: PseudoRegex) -> bool:
-    """Does *atom* hold, either as stated, as derivable from the regex, or as implied by other atoms?"""
-    if atom in atoms or _explicit_check(atom, regex):
+
+def _charset_has_dash(items: Any) -> bool:
+    """Does a bracket class (the ``IN`` operand) admit ``-``? Literals, ranges and the ``\\d``,
+    ``\\w``, ``\\s`` categories (their negations admit it), under an optional ``NEGATE``."""
+    negate = False
+    hit = False
+    for op, av in items:
+        if op is _RE_CONSTANTS.NEGATE:
+            negate = True
+        elif op is _RE_CONSTANTS.LITERAL:
+            hit = hit or av == _DASH
+        elif op is _RE_CONSTANTS.RANGE:
+            lo, hi = av
+            hit = hit or lo <= _DASH <= hi
+        elif op is _RE_CONSTANTS.CATEGORY:
+            hit = hit or "NOT" in str(av)  # \D \W \S match "-"; \d \w \s do not
+        else:
+            return True  # anything unforeseen: may
+    return hit != negate
+
+
+def _first(sub: Any) -> tuple[bool, bool]:
+    """Of a parsed (sub)pattern: (may its first matched character be ``-``, can it match the
+    empty string). A sequence's first character comes from its first non-nullable item and
+    everything nullable before it."""
+    may = False
+    for op, av in sub:
+        item_may, item_nullable = _first_item(op, av)
+        may = may or item_may
+        if not item_nullable:
+            return may, False
+    return may, True
+
+
+def _first_item(op: Any, av: Any) -> tuple[bool, bool]:
+    c = _RE_CONSTANTS
+    if op is c.LITERAL:
+        return av == _DASH, False
+    if op is c.NOT_LITERAL:
+        return av != _DASH, False
+    if op is c.ANY:
+        return True, False
+    if op is c.IN:
+        return _charset_has_dash(av), False
+    if op is c.AT or op is c.ASSERT or op is c.ASSERT_NOT:
+        return False, True  # zero-width; ignoring a lookaround only widens "may": sound
+    if op is c.SUBPATTERN:
+        return _first(av[3])
+    if op is c.ATOMIC_GROUP:
+        return _first(av)
+    if op is c.BRANCH:
+        results = [_first(b) for b in av[1]]
+        return any(m for m, _ in results), any(n for _, n in results)
+    if op in (c.MAX_REPEAT, c.MIN_REPEAT, c.POSSESSIVE_REPEAT):
+        lo, _, body = av
+        body_may, body_nullable = _first(body)
+        return body_may, lo == 0 or body_nullable
+    if op is c.GROUPREF_EXISTS:
+        _, yes, no = av
+        yes_may, yes_nullable = _first(yes)
+        no_may, no_nullable = _first(no) if no is not None else (False, True)
+        return yes_may or no_may, yes_nullable or no_nullable
+    return True, True  # GROUPREF and anything unforeseen: may, and may be empty
+
+
+def _literal_regex_may_start_with_dash(reg: str) -> bool:
+    """Could a string this regex fullmatches begin with ``-``? Decided on the parse tree the
+    ``re`` module itself builds; an unparsable pattern is "may"."""
+    try:
+        parsed = _RE_PARSER.parse(reg)
+    except re.error:
         return True
-    match atom:
-        case "not-absolute":
-            # a string without "/" cannot start with one
-            return _holds("no-slash", atoms, regex)
-        case "no-parent-traversal":
-            # a single component traverses upward only if it is exactly ".."
-            return _holds("no-slash", atoms, regex) and _holds("not-dot-dot", atoms, regex)
+    may, _ = _first(parsed)
+    return may
+
+
+def _regex_may_start_with_dash(r: PseudoRegex) -> bool:
+    match r:
+        case Exact(exact_str=s):
+            return s.startswith("-")
+        case Alternation(any_of=branches):
+            return any(_regex_may_start_with_dash(b) for b in branches)
+        case Concat(seq=pieces):
+            head = pieces[0]
+            if head == Exact(""):
+                return _regex_may_start_with_dash(concat(*pieces[1:])) if len(pieces) > 1 else False
+            return _regex_may_start_with_dash(head)
+        case Both(all_of=parts):
+            return all(_regex_may_start_with_dash(p) for p in parts)
+        case RegexLit(reg=reg):
+            return _literal_regex_may_start_with_dash(reg)
+        case AnyStr():
+            return True
+
+
+def _explicit_check(other: AtomId, regex: PseudoRegex) -> bool:
+    """Does the text's regex alone establish the built-in *other*?"""
+    if other == NO_PARENT_TRAVERSAL:
+        return _explicit_check_no_parent(regex)
+    if other == NO_SLASH:
+        return _explicit_check_no_slash(regex)
+    if other == NOT_ABSOLUTE:
+        return _explicit_check_not_absolute(regex)
+    if other == NOT_DOT_DOT:
+        return _explicit_check_not_dot_dot(regex)
+    if other == NOT_OPTION:
+        return not _regex_may_start_with_dash(regex)
+    return False
+
+
+def _holds(atom: Atom, atoms: frozenset[Atom], regex: PseudoRegex) -> bool:
+    """Does *atom* hold of a text value: as stated, or -- for a built-in -- as derivable from the
+    regex or implied by other built-ins? A policy atom holds only as stated; whether the
+    vocabulary can supply it from the text is ``Vocabulary.missing``'s question."""
+    if atom in atoms:
+        return True
+    if atom not in BUILTIN_ATOMS:
+        return False
+    if _explicit_check(BUILTIN_ATOMS[atom], regex):
+        return True
+    # the implication table
+    if atom == NOT_ABSOLUTE:
+        # a string without "/" cannot start with one
+        return _holds(NO_SLASH, atoms, regex)
+    if atom == NO_PARENT_TRAVERSAL:
+        # a single component traverses upward only if it is exactly ".."
+        return _holds(NO_SLASH, atoms, regex) and _holds(NOT_DOT_DOT, atoms, regex)
+    if atom == NOT_DOT_DOT:
+        # a string with no ".." part is not the string ".."
+        return NO_PARENT_TRAVERSAL in atoms or _explicit_check_no_parent(regex)
+    return False
+
+
+def holds(atom: Atom, fact: "ValidationFact") -> bool:
+    """Does *atom* hold of *fact*, structurally? Stated atoms hold of every fact; a built-in also
+    by derivation from a text fact's regex and atoms, and -- for ``not-option`` -- from a located
+    value's head: an absolute path begins with "/", a path under a literally named directory
+    with that name. Nothing else is derivable of a located or URL value, whose text is not
+    tracked."""
+    match fact:
+        case StrFact(regex=regex, atoms=atoms):
+            return _holds(atom, atoms, regex)
+        case PathFact(atoms=atoms):
+            return _holds(atom, atoms, ANY_STR)
+        case Located(location=loc, atoms=atoms):
+            if atom in atoms:
+                return True
+            if atom != NOT_OPTION:
+                return False
+            if loc.absolute:
+                return True
+            components = loc.path_components if isinstance(loc, StaticPath) else loc.static_prefix
+            if not components:
+                # "." itself for a StaticPath; for a DirSplat the first component is unknown
+                return isinstance(loc, StaticPath)
+            match components[0]:
+                case Named(name=n):
+                    return not n.startswith("-")
+                case OneOf(names=ns):
+                    return not any(n.startswith("-") for n in ns)
+                case _:
+                    return False
+        case UrlString(atoms=atoms):
+            return atom in atoms
+
+
+def may_start_with_dash(value: "str | ValidationFact | None") -> bool:
+    """Could this token's text begin with ``-``, and so be read by a tool as an option? True
+    unless its structure shows otherwise (``holds`` of ``not-option``)."""
+    match value:
+        case str():
+            return value.startswith("-")
+        case None:
+            return True
         case _:
-            return False
+            return not holds(NOT_OPTION, value)
 
 # ---------------------------------------------------------------------------
 # Facts
@@ -817,23 +913,29 @@ def _holds(atom: AtomicFact, atoms: frozenset[AtomicFact], regex: PseudoRegex) -
 # Going into text is giving up on the path (or URL) reading; the transfer functions stay in
 # path-land for as long as the operation is a path operation.
 #
-# Every fact additionally carries ``checks``: the policy-declared validations (certora.check) this
-# exact value has passed. Checks belong to the value as it was at the check site: they ride along
-# assignment and the same-value respellings (str(), locate), and everything that builds a *new*
-# value -- joins, string methods, concatenation -- starts with none. The walker kills them at
-# every call that may have effects.
+# Every fact additionally carries ``atoms``: the atoms this exact value carries (ATOMS.md), of
+# every kind -- built-ins stated by a guard or an annotation, check atoms established by
+# ``certora.check`` or a guard's regex, source atoms constructed by extraction. Atoms belong to
+# the value as it was when it gained them: they ride along assignment and the same-value
+# respellings (str(), locate), and everything that builds a *new* value -- joins, string methods,
+# concatenation -- starts with none but what its own structure gives. The walker kills the
+# environmental ones at every call that may have effects. Built-ins are not only stated:
+# ``holds`` derives them from a fact's shape, and ``x in fact`` asks it.
 # ---------------------------------------------------------------------------
 
 type Repr = Literal["str", "path"]
+
+type StructuralIdName = AtomId | AtomIdName
 
 @dataclass(frozen=True)
 class StrFact:
     """A ``str`` read as text."""
     regex: PseudoRegex = ANY_STR
-    atoms: frozenset[AtomicFact] = frozenset()
-    checks: frozenset[str] = frozenset()
+    atoms: frozenset[Atom] = frozenset()
 
-    def __contains__(self, atom: AtomicFact) -> bool:
+    def __contains__(self, atom: StructuralIdName) -> bool:
+        if not isinstance(atom, AtomId):
+            atom = AtomId(atom)
         return _holds(atom, self.atoms, self.regex)
 
 @dataclass(frozen=True)
@@ -841,10 +943,11 @@ class PathFact:
     """A ``pathlib.Path`` of unknown location, read as text through ``str(p)``: ``no-slash`` means
     a single relative component, ``not-absolute`` means ``not p.is_absolute()``,
     ``no-parent-traversal`` means no ``..`` part."""
-    atoms: frozenset[AtomicFact] = frozenset()
-    checks: frozenset[str] = frozenset()
+    atoms: frozenset[Atom] = frozenset()
 
-    def __contains__(self, atom: AtomicFact) -> bool:
+    def __contains__(self, atom: StructuralIdName) -> bool:
+        if not isinstance(atom, AtomId):
+            atom = AtomId(atom)
         return _holds(atom, self.atoms, ANY_STR)
 
 @dataclass(frozen=True)
@@ -852,7 +955,12 @@ class Located:
     """A value read as a path: where it points, spelled as a ``str`` or a ``pathlib.Path``."""
     location: LocationFact
     repr: Repr
-    checks: frozenset[str] = frozenset()
+    atoms: frozenset[Atom] = frozenset()
+
+    def __contains__(self, atom: StructuralIdName) -> bool:
+        if not isinstance(atom, AtomId):
+            atom = AtomId(atom)
+        return holds(atom, self)
 
 @dataclass(frozen=True)
 class UrlString:
@@ -870,7 +978,10 @@ class UrlString:
     netloc: PseudoRegex | None = None
     path: LocationFact | None = None
     scheme: Literal["http", "https"] | None = None
-    checks: frozenset[str] = frozenset()
+    atoms: frozenset[Atom] = frozenset()
+
+    def __contains__(self, atom: Atom) -> bool:
+        return holds(atom, self)
 
 type ValidationFact = StrFact | PathFact | Located | UrlString
 
@@ -878,7 +989,8 @@ type ValidationFact = StrFact | PathFact | Located | UrlString
 class Container:
     """A tracked ``list``/``set``: the reduced-product partner of the scalar facts
     (CONTAINERS.md). Deliberately NOT a ValidationFact: the scalar transfer functions never
-    see one -- ``interpret_expr`` yields None for a container-valued name -- and the two
+    see one -- the scalar projection (``scalar``, ``Interpreter.expr``) is None for a
+    container-valued name -- and the two
     domains meet only at the roster operations the walker recognizes.
 
     ``elem`` is an ordinary ValidationFact: the *current* element fact, degraded by kills
@@ -894,18 +1006,104 @@ class Container:
 class Data:
     """A *source handle* (PROVENANCE.md): the result of a ``certora.exec``, a ``certora.network``
     request, or a file read, bound to a name. Like ``Container``, deliberately NOT a
-    ValidationFact: ``interpret_expr`` yields None for a handle-valued name, and the two domains
+    ValidationFact: the scalar projection is None for a handle-valued name, and the two domains
     meet only at the extractors (``certora.extract`` & co.) and at iteration (``for line in f``).
 
     ``sources`` is the *source atoms* the handle yields -- the pure atoms the policy attached to
     the rule that produced it. Empty for a handle from a rule that names no source: still
-    extractable, vouching for nothing."""
-    sources: frozenset[str] = frozenset()
+    extractable, vouching for nothing.
+
+    ``closed`` is the inertness bit shared with ``Std`` (EFFECTS.md, the callee analysis): a
+    handle is a Python object an attribute store can patch (``h.read = f``), so it is inert --
+    handing it to an extractor or calling its methods runs no program code -- only while no
+    program code can have touched it. Any call that may run program code, and any attribute
+    store, opens every handle in the state, since an alias may have been the receiver.
+
+    ``writes`` makes the handle a *file opened for writing* at a proven location (EFFECTS.md,
+    "File writes"): None for a read handle (and a source); a tuple of the locations the file
+    may be at otherwise -- one for ``f = open(p, "w")``, several after a join. A write through
+    it (``f.write``, ``print(file=f)``) is a file write like ``p.write_text()``: a write of the
+    whole filesystem medium. **The locations themselves are not load-bearing**: no kill and no
+    audit reads them (the open was audited at its sink, and a write through the handle writes
+    the whole medium whatever they say); only ``reveal_fact``'s wording and the join's union
+    touch them. What matters is None versus not-None. This is what keeps a file object out of
+    the inert set by accident: a write-mode ``open`` at an *unproven* location binds no handle
+    at all, so the object is unknown and every method on it opaque."""
+    sources: frozenset[SourceId] = frozenset()
+    closed: bool = True
+    writes: tuple[LocationFact, ...] | None = None
+
+    def opened(self) -> "Data":
+        return replace(self, closed=False) if self.closed else self
+
+type StdKind = Literal[
+    "bytes", "number", "bool", "none", "match", "pattern", "list", "tuple", "set", "frozenset", "dict"
+]
+
+@dataclass(frozen=True)
+class Std:
+    """A value of standard type about which nothing more is tracked: the coarse partner of the
+    facts, for the callee analysis (EFFECTS.md) -- a number, ``None``, a ``re.Match``, a list
+    or a dict of such things. Like ``Container`` and ``Data``, deliberately NOT a
+    ValidationFact: the scalar projection is None for a Std-valued name, nothing is ever
+    established on one, and it exists only to answer "can a call on, or with, this value run
+    program code?".
+
+    ``kind`` names the type when it is known -- a literal, a display, a constructor, a roster
+    call; None is a standard value of unknown kind: an element read out of a closed container,
+    the result of a method on an inert receiver. Every named kind is a C type: it cannot be
+    patched with an attribute, so its methods are the interpreter's own.
+
+    ``closed`` says the value holds no program object: for a container, every element is inert,
+    recursively; for an unknown kind, also that no program object has been registered with it.
+    A closed value is *inert* -- no operation on it transfers control to program code -- and
+    inertness is what exempts a call from the kill. The scalar kinds are closed by construction
+    and stay so. A container, a tuple (it may hold a list) or an unknown kind is *opened* by any
+    call that may run program code -- an alias may have been mutated behind the analysis' back
+    -- and by any store of a non-inert value into a standard value (``lst.append(f)``,
+    ``d[k] = gen``, ``obj.attr = v``): the whole state at once, since the receiver may alias
+    anything."""
+    kind: StdKind | None = None
+    closed: bool = True
+
+    @property
+    def openable(self) -> bool:
+        """Can program code end up inside this value? Not inside a scalar, a match, a pattern,
+        or a frozenset (its elements are hashable, hence immutable all the way down)."""
+        return self.kind not in ("bytes", "number", "bool", "none", "match", "pattern", "frozenset")
+
+    def opened(self) -> "Std":
+        return replace(self, closed=False) if self.closed and self.openable else self
 
 # what the expression semantics read facts from: the walker's state. A Mapping, not a dict,
 # both because these functions only ever read it and because covariance then lets a plain
 # dict[str, ValidationFact] (tests, sub-states) flow in despite dict's invariance.
-type StateMap = Mapping[str, ValidationFact | Container | Data]
+type Entry = ValidationFact | Container | Data | Std
+type StateMap = Mapping[str, Entry]
+
+def inert(entry: Entry | None) -> bool:
+    """Is a state entry an inert value (EFFECTS.md)? A str or path fact and a tracked container
+    (of facts) always; a standard value and a source handle while closed; an unknown value
+    never."""
+    match entry:
+        case None:
+            return False
+        case Std(closed=closed) | Data(closed=closed):
+            return closed
+        case _:
+            return True
+
+def inert_receiver(entry: Entry | None) -> bool:
+    """Does the receiver's entry make a method call the interpreter's own code? An inert value,
+    of course; also a standard value of *known* kind even when opened -- a C type's methods
+    never dispatch to the contents beyond the fixed dunders (``lst.sort()`` compares with
+    ``__lt__``, which no program class defines) -- but not an opened unknown kind, which may be
+    a stdlib object a program callback was registered with, nor an opened handle."""
+    match entry:
+        case Std(kind=kind, closed=closed):
+            return kind is not None or closed
+        case _:
+            return inert(entry)
 
 def is_path_typed(fact: ValidationFact | None) -> bool:
     return isinstance(fact, PathFact) or (isinstance(fact, Located) and fact.repr == "path")
@@ -913,14 +1111,9 @@ def is_path_typed(fact: ValidationFact | None) -> bool:
 def location_of(fact: ValidationFact | None) -> LocationFact | None:
     return fact.location if isinstance(fact, Located) else None
 
-def checks_of(fact: ValidationFact | None) -> frozenset[str]:
-    return frozenset() if fact is None else fact.checks
-
-def drop_checks(fact: ValidationFact, keep: frozenset[str] = frozenset()) -> ValidationFact:
-    """The value with its environment-dependent checks forgotten (the crude kill). *keep* is the
-    policy's pure atoms -- true of the value's text alone, so no effect can invalidate them."""
-    kept = fact.checks & keep
-    return fact if kept == fact.checks else replace(fact, checks=kept)
+def atoms_of(fact: ValidationFact | None) -> frozenset[Atom]:
+    """The atoms a value states; nothing of an unknown value."""
+    return frozenset() if fact is None else fact.atoms
 
 def known_text(value: "str | ValidationFact | None") -> str | None:
     """The exact text of a statically-known value: a literal, a str fact with an exact regex, or
@@ -938,22 +1131,9 @@ def known_text(value: "str | ValidationFact | None") -> str | None:
         case _:
             return None
 
-def saturate(
-    value: "str | ValidationFact | None", defined: Mapping[str, PseudoRegex]
-) -> "str | ValidationFact | None":
-    """The value with every *defined* atom its known text entails added to ``checks``. A defined
-    atom is a pure text property (the policy's ``atom()``), so establishing it from the text is
-    sound anywhere -- this is how a literal satisfies an atom with no runtime check."""
-    if value is None or not defined:
-        return value
-    fact: ValidationFact = StrFact(regex=Exact(value)) if isinstance(value, str) else value
-    text = as_text(fact).regex
-    gained = frozenset(
-        name
-        for name, meaning in defined.items()
-        if name not in fact.checks and _regex_subsumes(meaning, text)
-    )
-    return fact if not gained else replace(fact, checks=fact.checks | gained)
+def as_fact(value: str | ValidationFact) -> ValidationFact:
+    """A literal as the exactly-known text fact it is; a fact as itself."""
+    return StrFact(regex=Exact(value)) if isinstance(value, str) else value
 
 
 class InvalidProgram(Exception):
@@ -1030,16 +1210,38 @@ def locate(fact: ValidationFact | None) -> Located | None:
             return fact
         case StrFact() | PathFact():
             rp: Repr = "str" if isinstance(fact, StrFact) else "path"
+            kept = carried(fact.atoms)  # the path reading derives its own built-ins
             if isinstance(fact, StrFact) and isinstance(fact.regex, Exact):
                 loc = _literal_location(fact.regex.exact_str)
-                return None if loc is None else Located(loc, rp, fact.checks)
+                return None if loc is None else Located(loc, rp, kept)
+            if isinstance(fact, StrFact) and isinstance(fact.regex, Alternation) and all(
+                isinstance(b, Exact) for b in fact.regex.any_of
+            ):
+                # one of several literals (a constant collection, iterated): each is located and
+                # the locations joined; none if any literal is not a safe path or anchors mix
+                loc = _literal_locations_joined([b.exact_str for b in fact.regex.any_of if isinstance(b, Exact)])
+                return None if loc is None else Located(loc, rp, kept)
             if (comp := as_component(fact)) is not None:
-                return Located(StaticPath((comp,)), rp, fact.checks)
+                return Located(StaticPath((comp,)), rp, kept)
             if "no-parent-traversal" in fact and "not-absolute" in fact:
-                return Located(DirSplat((), ANY_NAME), rp, fact.checks)
+                return Located(DirSplat((), None), rp, kept)  # the root, or anywhere below
             return None
         case UrlString():
             return None  # a URL is not a filesystem path
+
+
+def _literal_locations_joined(texts: Sequence[str]) -> LocationFact | None:
+    """The one location covering every literal in *texts* (``join_loc`` folded), or None when
+    some literal is not a safe path or the literals mix anchors."""
+    joined: LocationFact | None = None
+    for text in texts:
+        loc = _literal_location(text)
+        if loc is None:
+            return None
+        joined = loc if joined is None else join_loc(joined, loc)
+        if joined is None:
+            return None
+    return joined
 
 
 def url_of(value: str | ValidationFact | None) -> UrlString | None:
@@ -1060,7 +1262,7 @@ def url_of(value: str | ValidationFact | None) -> UrlString | None:
         netloc=Exact(parts.netloc),
         path=_literal_location(parts.path),
         scheme=scheme,
-        checks=checks_of(value) if not isinstance(value, str) else frozenset(),
+        atoms=carried(atoms_of(value)) if not isinstance(value, str) else frozenset(),
     )
 
 
@@ -1086,26 +1288,43 @@ def location_le(actual: LocationFact, required: LocationFact) -> bool:
             if len(cs) < len(ps) or not all(subsumes(p, c) for p, c in zip(ps, cs)):
                 return False
             if len(cs) == len(ps):
-                return leaf == ANY_NAME  # the prefix itself is denoted only by an unconstrained leaf
-            return subsumes(leaf, cs[-1])
+                return leaf is None  # the prefix itself is denoted only by the reflexive form
+            return leaf is None or subsumes(leaf, cs[-1])
         case DirSplat(), StaticPath():
             return False
         case DirSplat(static_prefix=ps, final_component=l), DirSplat(static_prefix=qs, final_component=m):
-            # a's leaves must satisfy m (an unconstrained l therefore needs an unconstrained m),
-            # and a's prefix must lie under b's
-            return (
-                len(ps) >= len(qs)
-                and all(subsumes(q, p) for q, p in zip(qs, ps))
-                and subsumes(m, l)
-            )
+            # a's prefix must lie under b's, and a's leaves must satisfy m: a reflexive b covers
+            # any a; a reflexive a (which denotes its prefix) needs a reflexive b
+            if len(ps) < len(qs) or not all(subsumes(q, p) for q, p in zip(qs, ps)):
+                return False
+            if m is None:
+                return True
+            return l is not None and subsumes(m, l)
 
-def entails(actual: str | ValidationFact | None, required: ValidationFact) -> bool:
-    """Does what is known of *actual* establish *required*?"""
+# the atoms of *required* a fact does not carry. ``structural_missing`` is the answer the
+# analysis can give alone -- stated atoms, and built-ins by ``holds``; ``Vocabulary.missing``
+# (enforcement) adds the policy's routes: defined regexes and literal checkers.
+type AtomsMissing = Callable[[ValidationFact, frozenset[Atom]], frozenset[Atom]]
+
+
+def structural_missing(fact: ValidationFact, required: frozenset[Atom]) -> frozenset[Atom]:
+    return frozenset(a for a in required if not holds(a, fact))
+
+
+def entails(
+    actual: str | ValidationFact | None,
+    required: ValidationFact,
+    missing: AtomsMissing = structural_missing,
+) -> bool:
+    """Does what is known of *actual* establish *required*? The shape -- regex, location, URL
+    claims -- by the lattice; the atoms by *missing*, which the caller supplies with whatever
+    it has: structure alone here, or the vocabulary's regex definitions and literal checkers
+    (``Vocabulary.missing``, with a discharger)."""
     if actual is None:
         return False
     fact: ValidationFact = StrFact(regex=Exact(actual)) if isinstance(actual, str) else actual
     match required:
-        case UrlString(netloc=netloc, path=path, scheme=scheme, checks=checks):
+        case UrlString(netloc=netloc, path=path, scheme=scheme, atoms=atoms):
             # component-wise: each stated claim must be established; None claims nothing.
             # url_of makes exactly-known text discharge with no guard ceremony.
             got = url_of(fact)
@@ -1119,35 +1338,28 @@ def entails(actual: str | ValidationFact | None, required: ValidationFact) -> bo
                 return False
             if scheme is not None and got.scheme != scheme:
                 return False
-            return checks <= got.checks
-        case Located(location=loc, repr=rp, checks=checks):
+            return not missing(got, atoms)
+        case Located(location=loc, repr=rp, atoms=atoms):
             got = locate(fact)
             return (
                 got is not None
                 and got.repr == rp
                 and location_le(got.location, loc)
-                and checks <= got.checks
+                and not missing(got, atoms)
             )
-        case StrFact(regex=regex, atoms=atoms, checks=checks):
+        case StrFact(regex=regex, atoms=atoms):
             match fact:
                 case StrFact():
-                    return (
-                        _regex_subsumes(regex, fact.regex)
-                        and all(a in fact for a in atoms)
-                        and checks <= fact.checks
-                    )
+                    return _regex_subsumes(regex, fact.regex) and not missing(fact, atoms)
                 case Located(repr="str") | UrlString():
                     # a str, but nothing is tracked about its text
-                    return regex == ANY_STR and not atoms and checks <= fact.checks
+                    return regex == ANY_STR and not missing(fact, atoms)
                 case _:
                     return False
-        case PathFact(atoms=atoms, checks=checks):
+        case PathFact(atoms=atoms):
             match fact:
-                case PathFact():
-                    return all(a in fact for a in atoms) and checks <= fact.checks
-                case Located(repr="path"):
-                    # nothing lexical is tracked about a located value
-                    return not atoms and checks <= fact.checks
+                case PathFact() | Located(repr="path"):
+                    return not missing(fact, atoms)
                 case _:
                     return False
 
@@ -1178,7 +1390,7 @@ def combine_containment(
             if (component := as_component(child)) is not None:
                 return cont.extend_single(component)
             if "no-parent-traversal" in child and "not-absolute" in child:
-                return cont.to_splat(ANY_NAME)
+                return splat_under(cont)  # a relative path free of "..": "." included
             return None
 
 def as_text(v: str | ValidationFact | None) -> StrFact:
@@ -1204,10 +1416,10 @@ def as_str_value(fact: ValidationFact | None) -> ValidationFact | None:
     match fact:
         case None:
             return None
-        case Located(location=loc, checks=checks):
-            return Located(loc, "str", checks)
-        case PathFact(atoms=atoms, checks=checks):
-            return StrFact(atoms=atoms, checks=checks)
+        case Located(location=loc, atoms=atoms):
+            return Located(loc, "str", atoms)
+        case PathFact(atoms=atoms):
+            return StrFact(atoms=atoms)
         case StrFact() | UrlString():
             return fact  # already a str; str() is the identity and every claim survives
 
@@ -1231,11 +1443,11 @@ def _component_token(c: Component) -> _Chunk:
         case Named(name=n):
             return n
         case AnyName():
-            return StrFact(atoms=ALL_ATOMS)
+            return StrFact(atoms=PATH_ATOMS)
         case Matching(regex=r):
-            return StrFact(regex=r, atoms=ALL_ATOMS)
+            return StrFact(regex=r, atoms=PATH_ATOMS)
         case OneOf(names=ns):
-            return StrFact(regex=alternation(*(Exact(n) for n in sorted(ns))), atoms=ALL_ATOMS)
+            return StrFact(regex=alternation(*(Exact(n) for n in sorted(ns))), atoms=PATH_ATOMS)
 
 def _component_of(chunks: Sequence[_Chunk]) -> Component | None:
     """The text of one component as a component, or None if it can't be shown to be one."""
@@ -1287,7 +1499,8 @@ class _Spelling:
                 return state._components(cs)
             case DirSplat(static_prefix=ps, final_component=leaf):
                 state = state._components(ps).sep() if ps else state
-                return state.splat().sep().chunk(_component_token(leaf))
+                state = state.splat()
+                return state if leaf is None else state.sep().chunk(_component_token(leaf))
 
     def _components(self, cs: Sequence[Component]) -> "_Spelling":
         state: _Spelling = self
@@ -1330,7 +1543,25 @@ class _Start(_Spelling):
         return _Boundary(StaticPath((), absolute=True))  # a leading "/": absolute
 
     def splat(self) -> _Spelling:
-        return _Boundary(DirSplat((), ANY_NAME))
+        return _AfterSplat(DirSplat((), None))
+
+
+@dataclass(frozen=True)
+class _AfterSplat(_Spelling):
+    """Just replayed a ``**``: the text so far is some path at or below *loc*, and it ends in a
+    component, not a separator (``data/**`` stands for ``data``, ``data/x``, ``data/x/y``). So a
+    chunk glued on here (``f"{p}.bak"``) lands inside that last component -- ``data.bak``,
+    ``data/x.bak`` -- and has no location; only a ``/`` opens a new component below."""
+    loc: LocationFact
+
+    def sep(self) -> _Spelling:
+        return _Boundary(self.loc)
+
+    def splat(self) -> _Spelling:
+        return self  # "**" onto "**" adds nothing
+
+    def finish(self) -> LocationFact | None:
+        return self.loc
 
 @dataclass(frozen=True)
 class _Boundary(_Spelling):
@@ -1344,7 +1575,7 @@ class _Boundary(_Spelling):
         return self  # "//" collapses
 
     def splat(self) -> _Spelling:
-        return _Boundary(splat_under(self.loc))
+        return _AfterSplat(splat_under(self.loc))
 
     def finish(self) -> LocationFact | None:
         return self.loc  # a trailing "/" adds nothing
@@ -1400,8 +1631,8 @@ def _text_of_pieces(pieces: Sequence[str | ValidationFact | None]) -> StrFact:
             case _:
                 return False  # unknown, or a located value (a path may well contain "/")
 
-    atoms: frozenset[AtomicFact] = (
-        frozenset({"no-slash"}) if all(slash_free(p) for p in pieces) else frozenset()
+    atoms: frozenset[Atom] = (
+        frozenset({NO_SLASH}) if all(slash_free(p) for p in pieces) else frozenset()
     )
     regexes = [as_text(p).regex for p in pieces]
     return StrFact(regex=concat(*regexes) if regexes else Exact(""), atoms=atoms)
@@ -1426,12 +1657,19 @@ def _argv_read(e: ast.expr) -> bool:
     return access is not None and access.matches("sys", "argv")
 
 
-def operand_value(e: ast.expr, st: StateMap) -> str | ValidationFact | None:
-    """An operand as the joins see it: a string literal stays a literal (so a multi-component
-    literal can be split into components); anything else is interpreted."""
-    if (s := as_const_or_null(str, e)) is not None:
-        return s
-    return interpret_expr(e, st)
+# The names that denote modules, for the expression semantics: a dotted callee is a module
+# function only under one of them (``json.loads`` is the module's only if ``json`` was imported;
+# a program class of that name is program code). The walker passes the program's actual imports
+# plus the marker namespace; this default is the vocabulary the recognizers know about, for
+# callers without a program (tests, the guards).
+KNOWN_MODULES: frozenset[str] = frozenset(
+    {"os", "pathlib", "re", "sys", "typing", "urllib", NAMESPACE}
+)
+
+def scalar(entry: Entry | None) -> ValidationFact | None:
+    """A state entry as a fact: containers, handles and standard values have no scalar reading
+    -- those domains are the walker's, and only their touchpoints reach into them."""
+    return None if isinstance(entry, (Container, Data, Std)) else entry
 
 def _head_location(v: str | ValidationFact | None) -> LocationFact | None:
     match v:
@@ -1442,16 +1680,6 @@ def _head_location(v: str | ValidationFact | None) -> LocationFact | None:
         case _:
             return containment_of(v)
 
-def join_args(args: Sequence[ast.expr], st: StateMap) -> LocationFact | None:
-    """``pathlib.Path(a, b, ...)`` / ``os.path.join(a, b, ...)``: the first argument's location,
-    extended by the rest."""
-    loc = _head_location(operand_value(args[0], st))
-    for a in args[1:]:
-        if loc is None:
-            return None
-        loc = combine_containment(loc, operand_value(a, st))
-    return loc
-
 def _flatten_add(e: ast.expr) -> list[ast.expr]:
     match e:
         case ast.BinOp(left=left, op=ast.Add(), right=right):
@@ -1459,17 +1687,9 @@ def _flatten_add(e: ast.expr) -> list[ast.expr]:
         case _:
             return [e]
 
-def _fstring_pieces(e: ast.JoinedStr, st: StateMap) -> list[str | ValidationFact | None]:
-    out: list[str | ValidationFact | None] = []
-    for v in e.values:
-        match v:
-            case ast.Constant(value=str() as s):
-                out.append(s)
-            case ast.FormattedValue(value=inner, conversion=-1, format_spec=None):
-                out.append(operand_value(inner, st))
-            case _:
-                out.append(None)  # ``!r`` / ``:spec`` rewrite the text unpredictably
-    return out
+def is_text(fact: ValidationFact | None) -> bool:
+    """Is the value a ``str``: text, a URL reading, a path spelled as a str?"""
+    return isinstance(fact, (StrFact, UrlString)) or (isinstance(fact, Located) and fact.repr == "str")
 
 _PATH_CONSTRUCTORS = ("Path", "PurePath", "PosixPath", "PurePosixPath")
 
@@ -1481,81 +1701,485 @@ _STR_RETURNING_METHODS = frozenset({
     "format", "zfill", "center", "ljust", "rjust", "expandtabs", "join", "translate",
 })
 
-def interpret_expr(e: ast.expr, st: StateMap) -> ValidationFact | None:
-    match e:
-        case ast.Name(id=name):
-            found = st.get(name)
-            # a container- or handle-valued name has no scalar reading: those domains are the
-            # walker's, and only their touchpoints reach into them
-            return None if isinstance(found, (Container, Data)) else found
-        case ast.Constant(value=str() as s):
-            return StrFact(regex=Exact(s))
-        case ast.Call(func=ast.Attribute(value=ast.Name(id=rname), attr="pop"), args=pargs) if (
-            isinstance((popped := st.get(rname)), Container)
-            and popped.kind != "sequence"
-            and len(pargs) <= 1
-        ):
-            return popped.elem  # x.pop(): one element, with the container's current fact
-        case ast.Call(func=func, args=args, keywords=keywords):
-            call = resolve_callee(func)
-            if call is None:
-                # ``f()()``: a callee with no name at all is refused structurally. (``f().g()`` is
-                # fine: the callee is the *name* ``g`` on a computed receiver.)
-                raise InvalidProgram(func, "computed callee")
-            if keywords or any(isinstance(a, ast.Starred) for a in args):
-                return None
-            if args and any(call.matches("pathlib", c) for c in _PATH_CONSTRUCTORS):
-                loc = join_args(args, st)
-                return PathFact() if loc is None else Located(loc, "path")
-            if args and call.matches("os", "path", "join"):
-                loc = join_args(args, st)
-                return None if loc is None else Located(loc, "str")
-            if len(args) == 1 and (call.matches("str") or call.matches("os", "fspath")):
-                return as_str_value(interpret_expr(args[0], st))
-            if isinstance(func, ast.Attribute) and func.attr in _STR_RETURNING_METHODS:
-                receiver = interpret_expr(func.value, st)
-                if isinstance(receiver, (StrFact, UrlString)) or (
-                    isinstance(receiver, Located) and receiver.repr == "str"
-                ):
-                    return StrFact()  # text stays text; nothing is known about the new characters
-            return None
-        case ast.BinOp(left=left, op=ast.Div(), right=right):
-            # ``str / x`` is a TypeError and ``"lit" / path`` (__rtruediv__) is not modelled
-            head = locate(interpret_expr(left, st))
-            if head is None or head.repr != "path":
-                return None
-            loc = combine_containment(head.location, operand_value(right, st))
-            return None if loc is None else Located(loc, "path")
-        case ast.BinOp(op=ast.Add()):
-            values = [operand_value(p, st) for p in _flatten_add(e)]
-            if any(is_path_typed(v) for v in values if not isinstance(v, str)):
-                return None  # ``Path + str`` is a TypeError
-            return join_text(values)
-        case ast.JoinedStr():
-            return join_text(_fstring_pieces(e, st))
-        case ast.Subscript(value=value, slice=index) if _argv_read(value):
-            # an element of sys.argv is a str of unknown text; a slice is a list of them --
-            # no scalar fact, but the iteration transfer knows its elements
-            return None if isinstance(index, ast.Slice) else StrFact()
-        case ast.Subscript(value=ast.Name(id=cname), slice=index) if (
-            isinstance((indexed := st.get(cname)), Container)
-            and indexed.kind in ("list", "sequence")
-            and not isinstance(index, ast.Slice)
-        ):
-            return indexed.elem  # x[i]: an element; a slice is a fresh, untracked copy
-        case _:
-            return None
+# builtins that return a str whatever they are given (``repr(obj)`` runs ``object.__repr__``:
+# no program class defines a dunder); ``str`` is handled apart, since it may keep a fact
+_STR_RETURNING_BUILTINS = frozenset({"repr", "format", "chr", "hex", "oct", "bin", "ascii"})
 
-# --- iteration -----------------------------------------------------------------------------------
+# --- standard values (EFFECTS.md, the callee analysis) --------------------------------------------
 #
-# In ``for p in <iterable>`` the loop variable is rebound by the header on every iteration, so its
-# fact is the iterable's *element* fact -- no fixpoint needed. Only the directory-traversal
-# iterables are modelled: ``iterdir``/``glob``/``rglob`` on a located path, ``os.listdir`` (bare
-# names), ``os.walk`` (via its tuple target), through the element-preserving wrappers
-# ``sorted``/``list``/``tuple``/``reversed``/``iter`` and ``enumerate``.
+# Beside text and paths, the walker needs one bit about every other value -- can a call on, or
+# with, it run program code? -- and a ``Std`` tracks a kind and closedness for that. The
+# knowledge is the interpreter's: which builtins and module functions are its own code (the
+# roster in ``dangerous``), which constructors build which kind, that every operator dunder is
+# fixed (a program class may define none but ``__init__``), that an element of a closed
+# container is inert.
+
+# the constructors: their kind is certain, their closedness is their arguments'
+_CONSTRUCTOR_KINDS: dict[str, StdKind] = {
+    "list": "list", "tuple": "tuple", "set": "set", "frozenset": "frozenset", "dict": "dict",
+    "sorted": "list",
+}
+# what a roster callee returns, when the kind is worth knowing: every kind here is closed
+# whatever the arguments (a list of strs, a match, a number)
+_RESULT_KINDS: dict[tuple[str, ...], StdKind] = {
+    ("len",): "number", ("int",): "number", ("float",): "number", ("complex",): "number",
+    ("abs",): "number", ("round",): "number", ("hash",): "number", ("id",): "number",
+    ("ord",): "number", ("pow",): "number",
+    ("bool",): "bool", ("isinstance",): "bool", ("issubclass",): "bool", ("callable",): "bool",
+    ("any",): "bool", ("all",): "bool",
+    ("bytes",): "bytes", ("divmod",): "tuple", ("print",): "none",
+    ("re", "compile"): "pattern",
+    ("re", "match"): "match", ("re", "search"): "match", ("re", "fullmatch"): "match",
+    ("re", "findall"): "list", ("re", "split"): "list",
+    ("os", "listdir"): "list",
+    ("os", "path", "exists"): "bool", ("os", "path", "isfile"): "bool",
+    ("os", "path", "isdir"): "bool", ("os", "path", "isabs"): "bool",
+    ("os", "path", "split"): "tuple", ("os", "path", "splitext"): "tuple",
+}
+# ``type(x)`` is the interpreter's code but its result may be a program class
+_OPAQUE_RESULTS: frozenset[tuple[str, ...]] = frozenset({("type",)})
+# what a method on an inert receiver returns when the kind is fixed by the method -- and then
+# closed whatever the arguments: a list of strs, a bytes -- or "same", the receiver's own kind
+# and closedness (a copy)
+_METHOD_RESULT_KINDS: dict[str, StdKind | Literal["same"]] = {
+    "split": "list", "rsplit": "list", "splitlines": "list", "findall": "list",
+    "partition": "tuple", "rpartition": "tuple", "encode": "bytes", "copy": "same",
+}
+
+def _module_call(call: NameAccess, modules: frozenset[str], *path: str) -> bool:
+    """Is *call* the module function *path* -- spelled so, under a name that denotes the module?"""
+    return call.matches(*path) and path[0] in modules
 
 # the names the loop variable can never have from a listing: never ".", never "..", never a "/"
-_LISTED_NAME = StrFact(atoms=ALL_ATOMS)
+_LISTED_NAME = StrFact(atoms=PATH_ATOMS)
+
+_ELEMENT_WRAPPERS = ("sorted", "list", "tuple", "reversed", "iter")
+
+
+@dataclass(frozen=True)
+class Interpreter:
+    """The expression semantics against one state, under the names that denote modules.
+
+    ``interpret`` answers what an expression evaluates to, as precisely as the state knows: a
+    fact for text and paths, the tracked container or the handle a name is bound to (their
+    touchpoints project), a standard value for the rest of the interpreter's own values, None
+    for an unknown value -- a program object, or a value derived from one. The other methods
+    are that answer seen through one domain's eyes: ``expr`` the scalar facts, ``operand`` the
+    text joins, ``is_inert`` the callee analysis, ``iteration_bindings`` the loop headers.
+
+    *modules* are the names that denote modules: only under one of them is a dotted callee the
+    module's function; a variable or a class that happens to be named ``json`` is program code.
+    The walker passes the program's imports; the default is the vocabulary the recognizers
+    know about, for callers without a program."""
+
+    st: StateMap
+    modules: frozenset[str] = KNOWN_MODULES
+
+    def under(self, st: StateMap) -> "Interpreter":
+        """The same semantics against another state (a comprehension's scope, a seed); *st* is
+        the caller's own."""
+        return replace(self, st=st)
+
+    # -- projections ------------------------------------------------------------------------
+
+    def expr(self, e: ast.expr) -> ValidationFact | None:
+        """The fact *e* evaluates to, for the text and path transfer functions."""
+        return scalar(self.interpret(e))
+
+    def operand(self, e: ast.expr) -> str | ValidationFact | None:
+        """An operand as the joins see it: a string literal stays a literal (so a
+        multi-component literal can be split into components); anything else is interpreted."""
+        if (s := as_const_or_null(str, e)) is not None:
+            return s
+        return self.expr(e)
+
+    def is_inert(self, e: ast.expr) -> bool:
+        """Is the value of *e* inert: text, a path, a tracked container, a closed standard value
+        or handle -- anything but an unknown value or a program object?"""
+        match e:
+            case ast.Starred(value=inner):
+                return self.is_inert(inner)
+            case ast.Call(func=func) if resolve_callee(func) is None:
+                return False  # a computed callee: refused elsewhere
+            case _:
+                return inert(self.interpret(e))
+
+    def _all_inert(self, exprs: Sequence[ast.expr]) -> bool:
+        return all(self.is_inert(x) for x in exprs)
+
+    # -- the semantics ----------------------------------------------------------------------
+
+    def interpret(self, e: ast.expr) -> Entry | None:
+        st = self.st
+        match e:
+            case ast.Name(id=name):
+                found = st.get(name)
+                if found is None and name in INERT_BUILTIN_VALUES:
+                    return Std()  # a builtin as a value (``key=len``): never rebound, so never in the state
+                return found
+            case ast.Constant(value=str() as s):
+                return StrFact(regex=Exact(s))
+            case ast.Constant(value=bool()):
+                return Std("bool")
+            case ast.Constant(value=int() | float() | complex()):
+                return Std("number")
+            case ast.Constant(value=bytes()):
+                return Std("bytes")
+            case ast.Constant(value=None):
+                return Std("none")
+            case ast.Constant():
+                return Std()  # Ellipsis
+            case ast.Call(func=func, args=args, keywords=keywords):
+                return self._call(func, args, keywords)
+            case ast.BinOp(left=left, op=ast.Div(), right=right):
+                # ``path / x`` joins when x is shown safe (no ``..``, not absolute, a proven
+                # location or a vouched-for name); otherwise the join is unknown -- not merely a
+                # path of unknown location, since where it went is the whole question. ``"lit"
+                # / path`` (__rtruediv__) and ``7 / 2`` are standard values over inert operands
+                head = locate(self.expr(left))
+                if head is not None and head.repr == "path":
+                    loc = combine_containment(head.location, self.operand(right))
+                    return None if loc is None else Located(loc, "path")
+                return Std() if self._all_inert([left, right]) else None
+            case ast.BinOp(left=left, op=ast.Add(), right=right):
+                values = [self.operand(p) for p in _flatten_add(e)]
+                if any(isinstance(v, str) or is_text(v) for v in values) and not any(
+                    is_path_typed(v) for v in values if not isinstance(v, str)
+                ):
+                    # text concatenation: a str plus anything is a str or a TypeError (no
+                    # program class defines ``__radd__``); a path in the chain is a TypeError
+                    return join_text(values)
+                return Std() if self._all_inert([left, right]) else None
+            case ast.BinOp(left=left, right=right):
+                # every operator dunder is the interpreter's: over inert operands the result is
+                # a standard value; over others it may be a program object (an enum's ``|``
+                # yields a member) or hold one (``[f] * 2``)
+                return Std() if self._all_inert([left, right]) else None
+            case ast.JoinedStr():
+                return join_text(self._fstring_pieces(e))
+            case ast.Subscript(value=value, slice=index):
+                return self._subscript(value, index)
+            case ast.List(elts=elts):
+                return Std("list", self._all_inert(elts))
+            case ast.Tuple(elts=elts):
+                return Std("tuple", self._all_inert(elts))
+            case ast.Set(elts=elts):
+                return Std("set", self._all_inert(elts))
+            case ast.Dict(keys=keys, values=values):
+                # a None key is a ``**x`` splat: its value is the mapping spliced in
+                return Std("dict", self._all_inert([k for k in keys if k is not None] + values))
+            case ast.ListComp(elt=elt, generators=gens):
+                return Std("list", self._comprehension_inert([elt], gens))
+            case ast.SetComp(elt=elt, generators=gens):
+                return Std("set", self._comprehension_inert([elt], gens))
+            case ast.DictComp(key=key, value=value, generators=gens):
+                return Std("dict", self._comprehension_inert([key, value], gens))
+            case ast.BoolOp(values=operands):
+                return Std() if self._all_inert(operands) else None  # one of the operands
+            case ast.IfExp(body=body, orelse=orelse):
+                return Std() if self._all_inert([body, orelse]) else None
+            case ast.UnaryOp(op=ast.Not()):
+                return Std("bool")
+            case ast.UnaryOp(operand=operand):
+                return Std() if self.is_inert(operand) else None
+            case ast.Compare():
+                return Std("bool")  # every comparison dunder is fixed
+            case ast.Attribute(value=ast.Name(id=base) as recv, attr=attr):
+                if base not in st:
+                    if base in INERT_BUILTIN_TYPES:
+                        return Std()  # ``str.lower``: a builtin type's method, as a value
+                    if base == "sys" and attr == "argv" and "sys" in self.modules:
+                        return Std("list")  # the argument vector: strs
+                return self._attribute(recv)
+            case ast.Attribute(value=recv):
+                return self._attribute(recv)
+            case _:
+                return None  # a lambda, a generator expression, a yield, ...
+
+    def _attribute(self, recv: ast.expr) -> Entry | None:
+        # a data attribute of an inert value is inert (a path's ``name``, a match's
+        # ``string``); so is a bound method taken as a value. Not on a tracked container: that
+        # is its escape, the walker's to report
+        entry = self.interpret(recv)
+        return Std() if inert(entry) and not isinstance(entry, Container) else None
+
+    def _subscript(self, value: ast.expr, index: ast.expr) -> Entry | None:
+        sliced = isinstance(index, ast.Slice)
+        if _argv_read(value):
+            # an element of sys.argv is a str of unknown text; a slice is a list of them
+            return Std("list") if sliced else StrFact()
+        whole = self.interpret(value)
+        match whole:
+            case Container(kind="list" | "sequence", elem=elem):
+                # x[i]: an element; a slice is a fresh list of them, untracked but inert
+                return Std("list") if sliced else elem
+            case Container():
+                return None  # a set is unsubscriptable
+            case _ if is_text(scalar(whole)):
+                return StrFact()  # a character, or a substring: text, the path reading gone
+            case Std(kind=kind, closed=True):
+                if sliced:
+                    return Std(kind if kind in ("list", "tuple", "bytes") else None)  # a copy
+                return Std()  # an element, or a key's value, of a closed value: inert
+            case _ if inert(whole):
+                return Std() if not sliced else None  # a path is unsubscriptable; a handle too
+            case _:
+                return None  # an element of an open container may be anything
+
+    def _fstring_pieces(self, e: ast.JoinedStr) -> list[str | ValidationFact | None]:
+        out: list[str | ValidationFact | None] = []
+        for v in e.values:
+            match v:
+                case ast.Constant(value=str() as s):
+                    out.append(s)
+                case ast.FormattedValue(value=inner, conversion=-1, format_spec=None):
+                    out.append(self.operand(inner))
+                case _:
+                    out.append(None)  # ``!r`` / ``:spec`` rewrite the text unpredictably
+        return out
+
+    def _join_args(self, args: Sequence[ast.expr]) -> LocationFact | None:
+        """``pathlib.Path(a, b, ...)`` / ``os.path.join(a, b, ...)``: the first argument's
+        location, extended by the rest."""
+        loc = _head_location(self.operand(args[0]))
+        for a in args[1:]:
+            if loc is None:
+                return None
+            loc = combine_containment(loc, self.operand(a))
+        return loc
+
+    def _comprehension_inert(
+        self, exprs: Sequence[ast.expr], generators: Sequence[ast.comprehension]
+    ) -> bool:
+        """Are the elements a comprehension builds inert? The element expressions, under the
+        iteration bindings (an ``if`` clause refines nothing about inertness)."""
+        inner: dict[str, Entry] = dict(self.st)
+        for gen in generators:
+            if gen.is_async:
+                return False
+            for n in ast.walk(gen.target):
+                if isinstance(n, ast.Name):
+                    inner.pop(n.id, None)
+            inner.update(self.under(inner).iteration_bindings(gen.target, gen.iter))
+        return self.under(inner)._all_inert(exprs)
+
+    def _call(
+        self, func: ast.expr, args: Sequence[ast.expr], keywords: Sequence[ast.keyword]
+    ) -> Entry | None:
+        call = resolve_callee(func)
+        if call is None:
+            # ``f()()``: a callee with no name at all is refused structurally. (``f().g()`` is
+            # fine: the callee is the *name* ``g`` on a computed receiver.)
+            raise InvalidProgram(func, "computed callee")
+        modules = self.modules
+        # the argument conditions (``dangerous.INERT_CALLEES``), over the expressions
+        positional = [a for a in args if not isinstance(a, ast.Starred)]
+        splats = [a for a in args if isinstance(a, ast.Starred)] + [k.value for k in keywords if k.arg is None]
+        named = [k.value for k in keywords if k.arg is not None]
+        keywords_and_splats_inert = self._all_inert(named) and self._all_inert(splats)
+        all_inert = keywords_and_splats_inert and self._all_inert(positional)
+        plain = not keywords and not splats  # positional arguments only
+
+        # a bare name, or a member of a module: a builtin, a constructor, a roster function or
+        # a program function. ``line.strip()`` is none of these -- its base is a variable -- and
+        # falls through to the method branch
+        if call.is_var_base and (len(call.full_path) == 1 or call.full_path[0] in modules):
+            full = call.full_path
+            # -- the path and text constructors: a fact
+            if plain and args and any(_module_call(call, modules, "pathlib", c) for c in _PATH_CONSTRUCTORS):
+                loc = self._join_args(args)
+                return PathFact() if loc is None else Located(loc, "path")
+            if plain and args and _module_call(call, modules, "os", "path", "join"):
+                loc = self._join_args(args)
+                return None if loc is None else Located(loc, "str")
+            if plain and len(args) == 1 and call.matches("str"):
+                # ``str(x)`` is a str whatever x is; of a path or text it keeps the claims
+                return as_str_value(self.expr(args[0])) or StrFact()
+            if plain and len(args) == 1 and _module_call(call, modules, "os", "fspath"):
+                return as_str_value(self.expr(args[0]))  # str or bytes: only a fact says
+            if len(full) == 1 and full[0] in _STR_RETURNING_BUILTINS:
+                return StrFact() if keywords_and_splats_inert else None
+            # -- the standard constructors: their kind, closed iff the arguments are inert
+            if len(full) == 1 and (kind := _CONSTRUCTOR_KINDS.get(full[0])) is not None:
+                return Std(kind, all_inert)  # ``list(gen)`` is a list, of who knows what
+            if full in _OPAQUE_RESULTS:
+                return None  # ``type(x)`` may be a program class
+            # -- the roster: the interpreter's own code under its argument condition
+            condition = inert_condition(full, modules)
+            if condition is None:
+                return None  # a program function or class; a module function off the roster
+            if not (all_inert if condition == "all" else keywords_and_splats_inert):
+                return None  # program code may decide the result (``json.loads(s, object_hook=f)``)
+            return Std(_RESULT_KINDS.get(full))
+        if not call.is_var_base and call.computed_base is None:
+            return None  # ``super().m()``: a program method
+
+        # -- a method call, on a variable or a computed receiver: the receiver decides
+        assert isinstance(func, ast.Attribute)
+        method = func.attr
+        receiver = self.interpret(func.value)
+        if isinstance(receiver, Container):
+            if method == "pop" and receiver.kind != "sequence" and len(args) <= 1 and not keywords:
+                return receiver.elem  # x.pop(): one element, with the container's current fact
+            return None  # the other roster methods return None or are the walker's; the rest escape
+        if not inert(receiver):
+            return None  # a program object's method, or a method on an opened unknown value
+        if method == "open":
+            return None  # a file object: its writes are effects, so it is no standard value
+        fact = scalar(receiver)
+        if method in _STR_RETURNING_METHODS and is_text(fact):
+            return StrFact()  # text stays text; nothing is known about the new characters
+        if method == "decode":
+            return StrFact()  # bytes.decode(): the only decode an inert value has yields text
+        kind = _METHOD_RESULT_KINDS.get(method)
+        if kind == "same":
+            return Std(receiver.kind, receiver.closed) if isinstance(receiver, Std) else Std()
+        if kind is not None:
+            return Std(kind)  # fixed by the method, closed whatever the arguments
+        # a result of unknown kind holds what it is handed (``d.get(k, default)``,
+        # ``xs.pop()``): inert only over inert arguments
+        return Std() if all_inert else None
+
+    # -- iteration --------------------------------------------------------------------------
+    #
+    # In ``for p in <iterable>`` the loop variable is rebound by the header on every iteration,
+    # so its fact is the iterable's *element* fact -- no fixpoint needed. The directory
+    # traversals are modelled exactly: ``iterdir``/``glob``/``rglob`` on a located path,
+    # ``os.listdir`` (bare names), ``os.walk`` (via its tuple target), through the
+    # element-preserving wrappers ``sorted``/``list``/``tuple``/``reversed``/``iter`` and
+    # ``enumerate``. Any other inert iterable yields inert elements of unknown kind.
+
+    def _path_location(self, recv: ast.expr) -> LocationFact | None:
+        """The location of a receiver that must be a ``pathlib.Path`` (``iterdir``/``glob``
+        exist only there)."""
+        located = locate(self.expr(recv))
+        return located.location if located is not None and located.repr == "path" else None
+
+    def element_fact(self, iterable: ast.expr) -> ValidationFact | None:
+        """The fact for ``p`` in ``for p in <iterable>``, when the iterable is a directory
+        traversal, a container of facts, a handle, or the argument vector."""
+        match iterable:
+            case ast.Call(func=ast.Name(id=wrapper), args=[inner], keywords=kws) if (
+                wrapper in _ELEMENT_WRAPPERS and all(k.arg in ("key", "reverse") for k in kws)
+            ):
+                return self.element_fact(inner)
+            case ast.Call(func=ast.Attribute(value=recv, attr="iterdir"), args=[], keywords=[]):
+                loc = self._path_location(recv)
+                return None if loc is None else Located(loc.extend_single(ANY_NAME), "path")
+            case ast.Call(
+                func=ast.Attribute(value=recv, attr=("glob" | "rglob") as method), args=[pat], keywords=[]
+            ):
+                loc = self._path_location(recv)
+                pattern = as_const_or_null(str, pat)
+                if loc is None or pattern is None:
+                    return None
+                found = _glob_location(splat_under(loc) if method == "rglob" else loc, pattern)
+                return None if found is None else Located(found, "path")
+            case ast.Call(func=func, args=args, keywords=[]) if (
+                len(args) <= 1
+                and (callee := resolve_callee(func)) is not None
+                and _module_call(callee, self.modules, "os", "listdir")
+            ):
+                return _LISTED_NAME  # bare names, whatever the directory
+            case _ if _argv_read(iterable):
+                # sys.argv or a slice of it: command-line arguments, strs of unknown text
+                return StrFact()
+            case ast.Name(id=name) if isinstance(self.st.get(name), Container):
+                container = self.st[name]
+                assert isinstance(container, Container)
+                return container.elem  # iterating a tracked container: its current element fact
+            case ast.Name(id=name) if isinstance(self.st.get(name), Data):
+                handle = self.st[name]
+                assert isinstance(handle, Data)
+                # ``for line in f`` over a source handle: each line is something the source
+                # produced, unmodified (PROVENANCE.md) -- ``certora.lines`` spelled the stdlib way
+                return StrFact(atoms=frozenset(handle.sources))
+            case (ast.List(elts=elts) | ast.Tuple(elts=elts) | ast.Set(elts=elts)) if elts and not any(
+                isinstance(e, ast.Starred) for e in elts
+            ):
+                # a constant collection: the element is one of the values, so its fact is the one
+                # covering all of them -- one fold over the display (``join_fact``); an element the
+                # interpreter cannot read, or a pair with no covering fact, yields nothing
+                joined: ValidationFact | None = None
+                for e in elts:
+                    v = self.operand(e)
+                    if v is None:
+                        return None
+                    fact = as_fact(v)
+                    joined = fact if joined is None else join_fact(joined, fact)
+                    if joined is None:
+                        return None
+                return joined
+            case _:
+                return None
+
+    def element_std(self, iterable: ast.expr) -> Std | None:
+        """The element of an iterable the traversal semantics do not know but inertness does:
+        the elements of an inert value are inert (``for line in text.splitlines()``, ``for k, v
+        in d.items()``), and ``range`` yields numbers whatever it was given."""
+        match iterable:
+            case ast.Call(func=ast.Name(id="range")):
+                return Std("number")
+            case _:
+                return Std() if self.is_inert(iterable) else None
+
+    def iteration_bindings(self, target: ast.expr, iterable: ast.expr) -> dict[str, ValidationFact | Std]:
+        """Facts for the names ``for <target> in <iterable>`` binds: the traversal iterables'
+        element facts, and inert elements of unknown kind for any other inert iterable."""
+        match target, iterable:
+            case ast.Name(id=name), _:
+                fact = self.element_fact(iterable)
+                if fact is not None:
+                    return {name: fact}
+                std = self.element_std(iterable)
+                return {} if std is None else {name: std}
+            case ast.Tuple(elts=[ast.Name(id=index), inner_target]), ast.Call(
+                func=ast.Name(id="enumerate"), args=[inner], keywords=_
+            ):
+                return {index: Std("number"), **self.iteration_bindings(inner_target, inner)}
+            case ast.Tuple(elts=[ast.Name(id=dirpath), dirnames, filenames]), ast.Call(
+                func=func, args=[top, *_], keywords=_
+            ) if (callee := resolve_callee(func)) is not None and _module_call(callee, self.modules, "os", "walk"):
+                # dirpath is a str at or below top; dirnames/filenames are lists of bare names
+                lists: dict[str, ValidationFact | Std] = {
+                    n.id: Std("list") for n in (dirnames, filenames) if isinstance(n, ast.Name)
+                }
+                loc = _head_location(self.operand(top))
+                return lists if loc is None else {dirpath: Located(splat_under(loc), "str"), **lists}
+            case _:
+                std = self.element_std(iterable)
+                return {} if std is None else dict(destructure(target, std))
+
+
+# the one-off entry points: the semantics against *st* for a single expression (tests, guards)
+
+def interpret_expr(e: ast.expr, st: StateMap, modules: frozenset[str] = KNOWN_MODULES) -> ValidationFact | None:
+    return Interpreter(st, modules).expr(e)
+
+def operand_value(e: ast.expr, st: StateMap, modules: frozenset[str] = KNOWN_MODULES) -> str | ValidationFact | None:
+    return Interpreter(st, modules).operand(e)
+
+def iteration_bindings(
+    target: ast.expr, iterable: ast.expr, st: StateMap, modules: frozenset[str] = KNOWN_MODULES
+) -> dict[str, ValidationFact | Std]:
+    return Interpreter(st, modules).iteration_bindings(target, iterable)
+
+def destructure(target: ast.expr, elem: Std) -> dict[str, Std]:
+    """The names a target binds when every element it takes apart is *elem*: ``a`` is elem;
+    ``a, (b, c)`` binds each to elem (an element of an inert value is inert); ``*rest`` is a
+    list of them."""
+    match target:
+        case ast.Name(id=name):
+            return {name: elem}
+        case ast.Tuple(elts=elts) | ast.List(elts=elts):
+            out: dict[str, Std] = {}
+            for t in elts:
+                out.update(destructure(t, elem))
+            return out
+        case ast.Starred(value=ast.Name(id=name)):
+            return {name: Std("list", elem.closed)}
+        case _:
+            return {}
 
 def _glob_location(base: LocationFact, pattern: str) -> LocationFact | None:
     """Where ``base.glob(pattern)`` yields: each pattern component is a ``Named``, a ``Matching``
@@ -1577,76 +2201,6 @@ def _glob_location(base: LocationFact, pattern: str) -> LocationFact | None:
         else:
             return None
     return loc
-
-def _path_location(recv: ast.expr, st: StateMap) -> LocationFact | None:
-    """The location of a receiver that must be a ``pathlib.Path`` (``iterdir``/``glob`` exist only there)."""
-    located = locate(interpret_expr(recv, st))
-    return located.location if located is not None and located.repr == "path" else None
-
-_ELEMENT_WRAPPERS = ("sorted", "list", "tuple", "reversed", "iter")
-
-def element_fact(iterable: ast.expr, st: StateMap) -> ValidationFact | None:
-    """The fact for ``p`` in ``for p in <iterable>``, when the iterable is a directory traversal."""
-    match iterable:
-        case ast.Call(func=ast.Name(id=wrapper), args=[inner], keywords=kws) if (
-            wrapper in _ELEMENT_WRAPPERS and all(k.arg in ("key", "reverse") for k in kws)
-        ):
-            return element_fact(inner, st)
-        case ast.Call(func=ast.Attribute(value=recv, attr="iterdir"), args=[], keywords=[]):
-            loc = _path_location(recv, st)
-            return None if loc is None else Located(loc.extend_single(ANY_NAME), "path")
-        case ast.Call(
-            func=ast.Attribute(value=recv, attr=("glob" | "rglob") as method), args=[pat], keywords=[]
-        ):
-            loc = _path_location(recv, st)
-            pattern = as_const_or_null(str, pat)
-            if loc is None or pattern is None:
-                return None
-            found = _glob_location(splat_under(loc) if method == "rglob" else loc, pattern)
-            return None if found is None else Located(found, "path")
-        case ast.Call(func=func, args=args, keywords=[]) if (
-            len(args) <= 1
-            and (callee := resolve_callee(func)) is not None
-            and callee.matches("os", "listdir")
-        ):
-            return _LISTED_NAME  # bare names, whatever the directory
-        case _ if _argv_read(iterable):
-            # sys.argv or a slice of it: command-line arguments, strs of unknown text
-            return StrFact()
-        case ast.Name(id=name) if isinstance(st.get(name), Container):
-            container = st[name]
-            assert isinstance(container, Container)
-            return container.elem  # iterating a tracked container: its current element fact
-        case ast.Name(id=name) if isinstance(st.get(name), Data):
-            handle = st[name]
-            assert isinstance(handle, Data)
-            # ``for line in f`` over a source handle: each line is something the source
-            # produced, unmodified (PROVENANCE.md) -- ``certora.lines`` spelled the stdlib way
-            return StrFact(checks=handle.sources)
-        case _:
-            return None
-
-def iteration_bindings(
-    target: ast.expr, iterable: ast.expr, st: StateMap
-) -> dict[str, ValidationFact]:
-    """Facts for the names ``for <target> in <iterable>`` binds, for the traversal iterables."""
-    match target, iterable:
-        case ast.Name(id=name), _:
-            fact = element_fact(iterable, st)
-            return {} if fact is None else {name: fact}
-        case ast.Tuple(elts=[ast.Name(), inner_target]), ast.Call(
-            func=ast.Name(id="enumerate"), args=[inner], keywords=_
-        ):
-            return iteration_bindings(inner_target, inner, st)  # the index is an int: nothing
-        case ast.Tuple(elts=[ast.Name(id=dirpath), _, _]), ast.Call(
-            func=func, args=[top, *_], keywords=_
-        ) if (callee := resolve_callee(func)) is not None and callee.matches("os", "walk"):
-            # dirpath is a str at or below top; dirnames/filenames are lists of bare names, which
-            # the state cannot hold yet
-            loc = _head_location(operand_value(top, st))
-            return {} if loc is None else {dirpath: Located(splat_under(loc), "str")}
-        case _:
-            return {}
 
 def widen_loc(
     prev: LocationFact,
@@ -1684,25 +2238,40 @@ def join_loc(
     left: LocationFact,
     right: LocationFact
 ) -> LocationFact | None:
+    """The location covering every path *left* or *right* denotes: pointwise where the two
+    agree in shape, degrading to a splat where they do not. Total on one anchor -- ``**`` (or
+    ``/**``) covers every path of an anchor, so the only None is a mix of anchors, which no
+    location relates.
+
+    Used to abstract a *constant collection* of literals as one fact (``for f in ["a/x", "a/y"]``,
+    ``locate`` of an alternation of exact texts): a finite one-shot fold. Deliberately NOT the
+    walker's control-flow join, which does not merge two located values (see the join decision
+    recorded with the design notes): no lattice iteration is implied anywhere."""
     if left.absolute != right.absolute:
         return None  # anchors never relate: there is no location covering both
     match left, right:
-        case (DirSplat(static_prefix=dir_prefix) as splat, StaticPath(path_components=known_path) as _static) | \
-             (StaticPath(path_components=known_path) as _static, DirSplat(static_prefix=dir_prefix) as splat):
-            if len(dir_prefix) > len(known_path):
-                return None
-            for (splat_comp, static_comp) in zip(dir_prefix, known_path[:-1]):
-                if not subsumes(splat_comp, static_comp):
-                    return None
-            if not subsumes(splat.final_component, known_path[-1]):
-                return None
-            return splat
+        case (DirSplat(static_prefix=dir_prefix) as splat, StaticPath(path_components=known_path)) | \
+             (StaticPath(path_components=known_path), DirSplat(static_prefix=dir_prefix) as splat):
+            # the prefix the two agree on pointwise, over the components both have
+            shared = min(len(dir_prefix), len(known_path))
+            prefix = tuple(join_component(a, b) for a, b in zip(dir_prefix[:shared], known_path[:shared]))
+            below = known_path[shared:]  # the static path's components past the splat's prefix
+            if len(dir_prefix) > len(known_path) or not below:
+                # the static path ends at or inside the (joined) prefix: only the reflexive form
+                # denotes the prefix itself
+                return DirSplat(prefix, None, left.absolute)
+            if splat.final_component is None:
+                return DirSplat(prefix, None, left.absolute)
+            # the static path lies strictly below: a strict splat with a leaf covering both
+            return DirSplat(prefix, join_component(splat.final_component, below[-1]), left.absolute)
         case (StaticPath(path_components=p1), StaticPath(path_components=p2)):
             if len(p1) == len(p2):
                 paths = tuple(join_component(
                     c1, c2
                 ) for (c1, c2) in zip(p1, p2))
                 return StaticPath(paths, left.absolute)
+            if not p1 or not p2:
+                return DirSplat((), None, left.absolute)  # the root and a path below it
             last_comps = join_component(p1[-1], p2[-1])
             static_prefix = tuple(join_component(
                 c1, c2
@@ -1712,7 +2281,7 @@ def join_loc(
             )
         case DirSplat(static_prefix=p1, final_component=c1), DirSplat(static_prefix=p2, final_component=c2):
             return DirSplat(
-                final_component=join_component(c1, c2),
+                final_component=None if c1 is None or c2 is None else join_component(c1, c2),
                 static_prefix=tuple(join_component(c1, c2) for (c1, c2) in zip(p1, p2)),
                 absolute=left.absolute
             )
@@ -1722,6 +2291,25 @@ def join_regex(
     right: PseudoRegex
 ) -> PseudoRegex:
     return alternation(left, right)
+
+
+def join_fact(left: ValidationFact, right: ValidationFact) -> ValidationFact | None:
+    """The fact covering a value that is *left* or *right*, for abstracting a constant
+    collection of literals as one element fact. Two text facts join to the alternation of their
+    regexes and the atoms both carry; two located values of one spelling to the location covering
+    both (``join_loc``); anything else -- different readings, unrelated anchors -- has no single
+    fact, and the caller knows nothing. A one-shot fold over a finite display, never the
+    walker's control-flow join."""
+    match left, right:
+        case StrFact(regex=r1, atoms=a1), StrFact(regex=r2, atoms=a2):
+            return StrFact(regex=alternation(r1, r2), atoms=a1 & a2)
+        case PathFact(atoms=a1), PathFact(atoms=a2):
+            return PathFact(atoms=a1 & a2)
+        case Located(location=l1, repr=rp1, atoms=a1), Located(location=l2, repr=rp2, atoms=a2) if rp1 == rp2:
+            loc = join_loc(l1, l2)
+            return None if loc is None else Located(loc, rp1, a1 & a2)
+        case _:
+            return None
 
 def widen_regex(
     prev: PseudoRegex,

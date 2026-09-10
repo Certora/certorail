@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""certorail checker: the argument is a revision, range or object spelling for a READING command.
+
+Establishes git.rev and not-option. Admits what git-ref-name admits plus the revision syntax:
+"~N", "^N", "a..b", "a...b", "rev:path" (an object in a tree), "rev@{u}", "@{upstream}",
+"@{push}", "@{-N}", and "HEAD" / "@". Still never an option: no leading "-". Refuses the
+reflog-by-time forms ("@{yesterday}") and every glob or whitespace.
+"""
+import re
+import sys
+
+_AT = re.compile(r"@\{(?:u|upstream|push|-?[0-9]+)\}")
+_BODY = re.compile(r"[A-Za-z0-9_@][A-Za-z0-9_./^~:-]*")
+
+
+def refuse(why: str) -> None:
+    print(f"git-rev: {why}", file=sys.stderr)
+    sys.exit(1)
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        refuse("expected exactly one argument")
+    rev = sys.argv[1]
+    if not rev:
+        refuse("empty")
+    if rev.startswith("-"):
+        refuse(f"{rev!r} begins with '-': an option, not a revision")
+    if any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F for c in rev):
+        refuse(f"{rev!r} contains whitespace or a control character")
+    for bad in ("*", "?", "[", "\\"):
+        if bad in rev:
+            refuse(f"{rev!r} contains {bad!r}")
+    # strip every @{...} form; a rev that IS exactly one form stands alone (@{u}, @{-1}, ...)
+    if _AT.fullmatch(rev):
+        sys.exit(0)
+    stripped = _AT.sub("", rev)
+    if "@{" in stripped:
+        refuse(f"{rev!r} uses an @{{...}} form other than @{{u}}, @{{upstream}}, @{{push}}, @{{-N}}")
+    if _BODY.fullmatch(stripped) is None:
+        refuse(f"{rev!r} is not revision text")
+    sys.exit(0)
+
+
+main()

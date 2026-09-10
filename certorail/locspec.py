@@ -9,9 +9,10 @@ This module imports nothing of the analysis so the runtime namespace stays light
 
     .            the root itself            **           the root and everything below
     a/b          exactly that path          a/**         a and everything below it
-    a/*/c        one arbitrary component    a/**/<re>    an entry anywhere below a whose name
-    a/{x,y}/c    one of the names                        fullmatches re
-    a/<re>/c     a name fullmatching re     /a/b         anchored at the filesystem root
+    a/*/c        one arbitrary component    a/**/*       anything strictly below a (not a itself)
+    a/{x,y}/c    one of the names           a/**/<re>    an entry anywhere below a whose name
+    a/<re>/c     a name fullmatching re                  fullmatches re
+                                            /a/b         anchored at the filesystem root
 
 A component is a *safe name*: not empty, not ``.`` or ``..``, no ``/``. ``**`` appears at most
 once, last or followed by one leaf. Regexes are raw and may contain ``/``.

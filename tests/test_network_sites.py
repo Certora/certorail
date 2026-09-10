@@ -39,7 +39,7 @@ KILL_POLICY = Policy.allow(
             establishes={"cwd": ["org-checkout"]},
         )
     ],
-    programs=[program("git", cwd=markers.within("repos"), requires=["org-checkout"])],
+    programs=[program("git", subcommand="log", cwd=markers.within("repos"), requires=["org-checkout"])],
     network=[network("api.github.com")],
 )
 
@@ -139,7 +139,7 @@ REQ_POLICY = Policy.allow(
             argv=("test-not-prod", param("value")),
             params=("value",),
             establishes={"value": ["not-prod-db"]},
-            effect_free=True,
+            writes=[],
         )
     ],
     network=[network("cloud-api.provider.com", requires=["not-prod-db"])],

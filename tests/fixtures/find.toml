@@ -1,0 +1,56 @@
+# Test fixture (shape only, tests/test_schema.py): a large flagset with every entry form.
+# A read-only `find` under two trees. Everything find can do that writes, executes, or leaves
+# the tree is absent from the vocabulary and therefore denied: -exec -execdir -ok -okdir
+# -delete -fprint -fprint0 -fprintf -fls (write or run), -L -follow (leave the tree through
+# symlinks), -H -P -O -D (must precede the starting point; our shape puts flags after it).
+# Grouping with ( ) is not expressible -- flag names begin with "-" -- so write two finds.
+policy-version = 1
+
+[filesystem]
+read = ["repos/**", "data/**"]
+list = ["repos/**", "data/**"]
+
+[[flagset]]
+name = "find-ro"
+bare = [
+  # actions that only print
+  "-print", "-print0", "-ls",
+  # tests without a value
+  "-empty", "-readable", "-writable", "-executable", "-true", "-false",
+  # traversal control that stays inside the tree
+  "-prune", "-quit", "-depth", "-xdev", "-mount", "-noleaf", "-daystart",
+  # operators
+  "-not", "-a", "-and", "-o", "-or",
+]
+# name tests: a name pattern never contains "/"
+"-name"      = { matches = '[^/]+' }
+"-iname"     = { matches = '[^/]+' }
+# whole-path tests: the pattern is data for find, any text is fine
+"-path"      = { any = true }
+"-ipath"     = { any = true }
+"-regex"     = { any = true }
+"-iregex"    = { any = true }
+"-regextype" = { one-of = ["posix-basic", "posix-extended", "posix-egrep", "posix-awk", "emacs"] }
+# type and numeric tests
+"-type"      = { one-of = ["f", "d", "l", "b", "c", "p", "s"] }
+"-maxdepth"  = { matches = '\d+' }
+"-mindepth"  = { matches = '\d+' }
+"-size"      = { matches = '[+-]?\d+[bcwkMG]?' }
+"-mtime"     = { matches = '[+-]?\d+' }
+"-mmin"      = { matches = '[+-]?\d+' }
+"-atime"     = { matches = '[+-]?\d+' }
+"-ctime"     = { matches = '[+-]?\d+' }
+"-newermt"   = { any = true }                       # a date: data for find
+"-perm"      = { matches = '[-/]?[0-7]{3,4}' }
+# tests that read another file: confined like the starting point
+"-newer"     = { location = ["repos/**", "data/**"] }
+"-samefile"  = { location = ["repos/**", "data/**"] }
+# -printf writes to stdout only; the format is data
+"-printf"    = { any = true }
+
+[[program]]
+name  = "find"
+cwd   = "."
+argv  = ["find", "${WHERE}", "${FLAGS...}"]
+holes.WHERE = { location = ["repos/**", "data/**"] }
+holes.FLAGS = { kind = "flags", flagset = "find-ro" }

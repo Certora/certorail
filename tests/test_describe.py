@@ -30,11 +30,11 @@ POLICY = Policy.allow(
     validations=[
         validation(
             "org-repo", argv=("/x/org-checkout",), cwd=markers.within("repos"),
-            establishes={"cwd": ["org-checkout"]}, effect_free=True,
+            establishes={"cwd": ["org-checkout"]}, writes=[],
         ),
         validation(
             "vetted", argv=("test", param("value"), "!=", "x"), params=("value",),
-            establishes={"value": [pure("vetted")]}, effect_free=True,
+            establishes={"value": [pure("vetted")]}, writes=[],
         ),
     ],
     programs=[
@@ -43,7 +43,7 @@ POLICY = Policy.allow(
             argv=["git", "push", "origin", hole("BRANCH")],
             holes={"BRANCH": Token(constraint(atoms=["no-flag"]))},
         ),
-        program("git", cwd=markers.within("repos"), subcommand="log", unknown_arguments=False),
+        program("git", cwd=markers.within("repos"), subcommand="log"),
         program(
             "tar", cwd=".", argv=["tar", splice("FLAGS"), "-f", hole("ARCHIVE"), splice("FILES")],
             holes={
@@ -67,14 +67,15 @@ class TestDescribe(unittest.TestCase):
             "- read: repos/**, reports/**",
             r"- write: repos/**/</\w+\.md/>",
             "- list: nothing",
-            "Notation: <...> marks a value",
             "- git push origin BRANCH",
             "cwd validated by org-checkout",
             "BRANCH: <validated no-flag>",
-            "- git log ARGS...",
-            "ARGS...: each <literal>",
+            "- git log\n",
+            "exactly these words: no further arguments",
+            "- built in (every policy",
+            "not-option: the text does not begin with '-'",
             "- tar FLAGS... -f ARCHIVE FILES...",
-            "bind by keyword: FLAGS, ARCHIVE, FILES",
+            "FLAGS... ends at the first positional that is not a flag; ARCHIVE begins there",
             "inserted by the host, do not spell: -f",
             "bare: -c -z",
             "-C <path within repos/**>",
@@ -83,13 +84,19 @@ class TestDescribe(unittest.TestCase):
             "establishes on cwd: org-checkout (environmental)",
             'certora.check("vetted", value=<str>)',
             'certora.check_single("vetted", value)',
+            "on a literal: no check needed -- a literal (or a value whose text is exactly known) where vetted is "
+            "required is checked at analysis time and carries it",
             "- no-flag: </[^-].*/>",
-            "- vetted: a property of the value's text",
+            "- vetted: a property of the value's text, established by a check; survives calls; a literal carries "
+            "it without a check (checked at analysis time)",
             "- org-checkout: a property of the environment",
             "- GET https://api.github.com; the URL must be validated by vetted",
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, self.text)
+        # only the literal checker says so: org-repo is environmental, and its atom is never
+        # discharged on a literal
+        self.assertEqual(self.text.count("on a literal:"), 1)
 
     def test_the_cli_flag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -100,15 +107,18 @@ class TestDescribe(unittest.TestCase):
             )
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                code = main(["--describe", "--policy", str(policy), "--root", tmp])
+                code = main(["describe", "--policy", str(policy), "--root", tmp])
             self.assertEqual(code, 0)
             self.assertIn("## Programs", out.getvalue())
-            self.assertIn("- gh ARGS...", out.getvalue())
+            self.assertIn("- gh\n", out.getvalue())
+            self.assertIn("exactly these words", out.getvalue())
             self.assertIn(f"Policy: {policy}", out.getvalue())
 
     def test_describe_takes_no_program(self) -> None:
         with self.assertRaises(SystemExit):
-            main(["--describe", "-c", "pass"])
+            main(["describe", "-c", "pass"])
+        with self.assertRaises(SystemExit):
+            main(["describe", "prog.py"])
 
 
 if __name__ == "__main__":

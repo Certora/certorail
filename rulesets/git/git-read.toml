@@ -1,0 +1,293 @@
+# git, read rung: commands that report and change nothing a program could observe later. Every
+# rule is `network = false`; every rule but status and diff is `write-fs = false` (those two refresh
+# the index's stat cache, so they declare `writes = ["git.index"]` honestly). Both media keys are
+# enforced: the tool runs jailed out of the medium (JAILS.md).
+#
+# Absent, therefore denied, everywhere in this file:
+#   global options (they precede the subcommand): -c key=value, -C, --git-dir, --work-tree,
+#     --exec-path, --namespace, --config-env, -p/--paginate
+#   --output / -o (diff family: writes a file)      --ext-diff, --textconv (run configured programs)
+#   -O / --open-files-in-pager (grep: runs a program)   -f FILE (grep: reads a file the analysis never saw)
+#   -L <start>,<end>:<file> on log (reads a file by name inside one token)
+#   `git remote get-url` and friends: the leading words `git remote` are one shape; read the URL
+#     with `git config --get remote.<name>.url`
+#   `git branch`/`git tag` listing: those subcommands create as well as list, so they live in
+#     git-local.toml as one shape each
+ruleset-version = 1
+description = "git, read rung: log, show, diff, status, rev-parse, remote -v, config --get/--list, ls-files, ls-tree, blame, grep, describe, cat-file, check-ignore. No network; status and diff write git.index."
+
+[params]
+where = { kind = "directory", description = "the directory holding repositories, or a repository itself" }
+
+[[apply]]
+ruleset = "git-vocabulary.toml"
+where   = "${where}"
+
+# ---------------------------------------------------------------------------------------------
+[[flagset]]
+name = "git.log"
+bare = [
+  "--oneline", "--graph", "--decorate", "--no-decorate", "--all", "--branches", "--tags", "--remotes",
+  "--stat", "--shortstat", "--numstat", "--name-only", "--name-status", "--summary",
+  "--reverse", "--first-parent", "--merges", "--no-merges", "--topo-order", "--date-order", "--author-date-order",
+  "--abbrev-commit", "--no-abbrev-commit", "--follow", "--left-right", "--cherry-pick", "--cherry-mark", "--boundary",
+  "-p", "--patch", "--no-patch", "-s", "-z", "--no-color", "--color=never",
+  "--date=iso", "--date=iso-strict", "--date=short", "--date=relative", "--date=unix", "--date=raw",
+  "--pretty=oneline", "--pretty=short", "--pretty=medium", "--pretty=full", "--pretty=fuller", "--pretty=reference",
+  "--no-show-signature",
+]
+"-n"          = { matches = '[0-9]+' }
+"--max-count" = { matches = '[0-9]+' }
+"--skip"      = { matches = '[0-9]+' }
+"--since"     = { any = true }         # a date: data for git
+"--after"     = { any = true }
+"--until"     = { any = true }
+"--before"    = { any = true }
+"--author"    = { any = true }         # a pattern: data for git
+"--committer" = { any = true }
+"--grep"      = { any = true }
+"--format"    = { any = true }         # a pretty format: placeholders, never a command
+"--pretty"    = { any = true }
+"-S"          = { any = true }         # pickaxe text
+"-G"          = { any = true }         # pickaxe regex
+"--diff-filter" = { matches = '[ACDMRTUXB*]+' }
+
+[[program]]
+name    = "git"
+argv    = ["git", "log", "${FLAGS...}", "${REVS...}", "--", "${PATHS...}"]
+cwd     = "${where}/**"
+holes.FLAGS = { kind = "flags", flagset = "git.log" }
+holes.REVS  = { kind = "each", atoms = ["git.rev"] }
+holes.PATHS = { kind = "each", location = "**" }
+network  = false
+write-fs = false
+
+# ---------------------------------------------------------------------------------------------
+[[flagset]]
+name = "git.show"
+bare = [
+  "--stat", "--shortstat", "--numstat", "--name-only", "--name-status", "--summary",
+  "-p", "--patch", "--no-patch", "-s", "--oneline", "--abbrev-commit", "--no-color", "--color=never",
+  "--pretty=oneline", "--pretty=short", "--pretty=medium", "--pretty=full", "--pretty=fuller", "--pretty=raw",
+  "--no-ext-diff", "--no-textconv", "--no-show-signature", "-z",
+]
+"--format"    = { any = true }
+"--pretty"    = { any = true }
+"-U"          = { matches = '[0-9]+' }
+"--unified"   = { matches = '[0-9]+' }
+"--diff-filter" = { matches = '[ACDMRTUXB*]+' }
+
+[[program]]
+name    = "git"
+argv    = ["git", "show", "${FLAGS...}", "${REVS...}", "--", "${PATHS...}"]
+cwd     = "${where}/**"
+holes.FLAGS = { kind = "flags", flagset = "git.show" }
+holes.REVS  = { kind = "each", atoms = ["git.rev"] }
+holes.PATHS = { kind = "each", location = "**" }
+network  = false
+write-fs = false
+
+# ---------------------------------------------------------------------------------------------
+[[flagset]]
+name = "git.diff"
+bare = [
+  "--stat", "--shortstat", "--numstat", "--name-only", "--name-status", "--summary",
+  "--cached", "--staged", "-p", "--patch", "--no-patch", "-s", "--raw",
+  "-w", "--ignore-all-space", "-b", "--ignore-space-change", "--ignore-blank-lines", "--ignore-cr-at-eol",
+  "--no-renames", "--find-renames", "-M", "--find-copies", "-C",
+  "--histogram", "--patience", "--minimal", "--word-diff", "--word-diff=porcelain", "--color-words",
+  "--no-color", "--color=never", "-z", "--exit-code", "--quiet", "--relative", "--no-relative",
+  "--no-ext-diff", "--no-textconv", "--no-prefix", "--merge-base", "--no-index",
+]
+"-U"            = { matches = '[0-9]+' }
+"--unified"     = { matches = '[0-9]+' }
+"--diff-filter" = { matches = '[ACDMRTUXB*]+' }
+"-S"            = { any = true }
+"-G"            = { any = true }
+"--src-prefix"  = { any = true }
+"--dst-prefix"  = { any = true }
+
+[[program]]
+name    = "git"
+argv    = ["git", "diff", "${FLAGS...}", "${REVS...}", "--", "${PATHS...}"]
+cwd     = "${where}/**"
+holes.FLAGS = { kind = "flags", flagset = "git.diff" }
+holes.REVS  = { kind = "each", atoms = ["git.rev"] }
+holes.PATHS = { kind = "each", location = "**" }
+network = false
+writes  = ["git.index"]               # refreshes the stat cache; nothing a checker reads changes, but it is a write
+
+# ---------------------------------------------------------------------------------------------
+[[program]]
+name    = "git"
+argv    = ["git", "status", "${FLAGS...}"]
+cwd     = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.bare = [
+  "-s", "--short", "--long", "-b", "--branch", "--show-stash", "-z",
+  "--porcelain", "--porcelain=v1", "--porcelain=v2",
+  "--ignored", "--ignored=traditional", "--ignored=matching", "--ignored=no",
+  "-uno", "-unormal", "-uall", "--untracked-files=no", "--untracked-files=normal", "--untracked-files=all",
+  "--no-renames", "--renames", "--ahead-behind", "--no-ahead-behind", "--no-column",
+]
+network = false
+writes  = ["git.index"]
+
+# ---------------------------------------------------------------------------------------------
+[[program]]
+name    = "git"
+argv    = ["git", "rev-parse", "${FLAGS...}", "${REVS...}"]
+cwd     = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.bare = [
+  "--verify", "--short", "--abbrev-ref", "--symbolic", "--symbolic-full-name", "-q", "--quiet",
+  "--show-toplevel", "--show-prefix", "--show-cdup", "--git-dir", "--git-common-dir", "--is-inside-work-tree",
+  "--is-bare-repository", "--is-shallow-repository",
+]
+holes.REVS  = { kind = "each", atoms = ["git.rev"] }
+network  = false
+write-fs = false
+
+# ---------------------------------------------------------------------------------------------
+[[program]]
+name    = "git"
+argv    = ["git", "remote", "${FLAGS...}"]
+cwd     = "${where}/**"
+holes.FLAGS = { kind = "flags", bare = ["-v", "--verbose"] }
+network  = false
+write-fs = false
+
+# ---------------------------------------------------------------------------------------------
+[[program]]
+name    = "git"
+argv    = ["git", "config", "--get", "${KEY}"]
+cwd     = "${where}/**"
+holes.KEY = { atoms = ["git.config-key"] }
+network  = false
+write-fs = false
+
+[[program]]
+name    = "git"
+argv    = ["git", "config", "--list", "${FLAGS...}"]
+cwd     = "${where}/**"
+holes.FLAGS = { kind = "flags", bare = ["--local", "--show-origin", "--show-scope", "--name-only", "-z"] }
+network  = false
+write-fs = false
+
+# ---------------------------------------------------------------------------------------------
+[[program]]
+name    = "git"
+argv    = ["git", "ls-files", "${FLAGS...}", "--", "${PATHS...}"]
+cwd     = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.bare = [
+  "-z", "-c", "--cached", "-m", "--modified", "-o", "--others", "-d", "--deleted", "-i", "--ignored",
+  "-s", "--stage", "-u", "--unmerged", "--exclude-standard", "--full-name", "--directory", "--no-empty-directory",
+  "-t", "--error-unmatch", "--recurse-submodules",
+]
+holes.FLAGS."--exclude" = { any = true }     # a glob: data for git
+holes.FLAGS."-x"        = { any = true }
+holes.PATHS = { kind = "each", location = "**" }
+network  = false
+write-fs = false
+
+# ---------------------------------------------------------------------------------------------
+# ls-tree <tree-ish> [-- <path>...]: the tree at a revision, without touching the worktree or the
+# index. TREE is one checked revision (a token, so the shape binds positionally: `"HEAD"` after
+# the flags); `--format` takes placeholders git expands, never a command.
+[[program]]
+name    = "git"
+argv    = ["git", "ls-tree", "${FLAGS...}", "${TREE}", "--", "${PATHS...}"]
+cwd     = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.bare = [
+  "-d", "-r", "-t", "-l", "--long", "-z", "--name-only", "--name-status", "--object-only",
+  "--full-name", "--full-tree",
+]
+holes.FLAGS."--abbrev" = { matches = '[0-9]+' }
+holes.FLAGS."--format" = { any = true }
+holes.TREE  = { atoms = ["git.rev"] }
+holes.PATHS = { kind = "each", location = "**" }
+network  = false
+write-fs = false
+
+# ---------------------------------------------------------------------------------------------
+[[program]]
+name    = "git"
+argv    = ["git", "blame", "${FLAGS...}", "${REVS...}", "--", "${FILE}"]
+cwd     = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.bare = [
+  "-l", "-s", "-e", "--show-email", "-w", "-p", "--porcelain", "--line-porcelain", "--incremental",
+  "-t", "-n", "--show-number", "-f", "--show-name", "--root", "--no-color", "-M", "-C",
+]
+holes.FLAGS."-L"      = { matches = '[0-9]*,[+-]?[0-9]*|[0-9]+' }
+holes.FLAGS."--since" = { any = true }
+holes.REVS  = { kind = "each", atoms = ["git.rev"] }
+holes.FILE  = { location = "**" }
+network  = false
+write-fs = false
+
+# ---------------------------------------------------------------------------------------------
+# The pattern travels through -e, a flag's value: exempt from the leading-dash guard, and data.
+[[program]]
+name    = "git"
+argv    = ["git", "grep", "${FLAGS...}", "${REVS...}", "--", "${PATHS...}"]
+cwd     = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.bare = [
+  "-n", "--line-number", "-i", "--ignore-case", "-l", "--files-with-matches", "-L", "--files-without-match",
+  "-c", "--count", "-w", "--word-regexp", "-E", "--extended-regexp", "-F", "--fixed-strings", "-P", "--perl-regexp",
+  "-G", "--basic-regexp", "-v", "--invert-match", "-h", "-H", "--name-only", "-z", "--null", "--no-color",
+  "--cached", "--untracked", "--no-index", "--break", "--heading", "-q", "--quiet", "--full-name", "-I",
+  "--and", "--or", "--not", "--all-match",
+]
+holes.FLAGS."-e"               = { any = true }
+holes.FLAGS."--max-depth"      = { matches = '[0-9]+' }
+holes.FLAGS."-A"               = { matches = '[0-9]+' }
+holes.FLAGS."-B"               = { matches = '[0-9]+' }
+holes.FLAGS."-C"               = { matches = '[0-9]+' }
+holes.FLAGS."--after-context"  = { matches = '[0-9]+' }
+holes.FLAGS."--before-context" = { matches = '[0-9]+' }
+holes.FLAGS."--context"        = { matches = '[0-9]+' }
+holes.REVS  = { kind = "each", atoms = ["git.rev"] }
+holes.PATHS = { kind = "each", location = "**" }
+network  = false
+write-fs = false
+
+# ---------------------------------------------------------------------------------------------
+[[program]]
+name    = "git"
+argv    = ["git", "describe", "${FLAGS...}", "${REVS...}"]
+cwd     = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.bare = [
+  "--tags", "--all", "--always", "--long", "--dirty", "--broken", "--exact-match", "--first-parent", "--contains",
+]
+holes.FLAGS."--abbrev"     = { matches = '[0-9]+' }
+holes.FLAGS."--match"      = { any = true }
+holes.FLAGS."--exclude"    = { any = true }
+holes.FLAGS."--candidates" = { matches = '[0-9]+' }
+holes.REVS  = { kind = "each", atoms = ["git.rev"] }
+network  = false
+write-fs = false
+
+# ---------------------------------------------------------------------------------------------
+[[program]]
+name    = "git"
+argv    = ["git", "cat-file", "${FLAGS...}", "${OBJECT}"]
+cwd     = "${where}/**"
+holes.FLAGS  = { kind = "flags", bare = ["-p", "-t", "-s", "-e"] }
+holes.OBJECT = { atoms = ["git.rev"] }
+network  = false
+write-fs = false
+
+# ---------------------------------------------------------------------------------------------
+[[program]]
+name    = "git"
+argv    = ["git", "check-ignore", "${FLAGS...}", "--", "${PATHS...}"]
+cwd     = "${where}/**"
+holes.FLAGS = { kind = "flags", bare = ["-v", "--verbose", "-q", "--quiet", "-n", "--non-matching", "-z"] }
+holes.PATHS = { kind = "each", location = "**", min = 1 }
+network  = false
+write-fs = false

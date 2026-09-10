@@ -31,9 +31,12 @@ denylists.
 
 `certorail program.py` (the `certorail.host` entry point) is a four-step pipeline:
 
-1. **Analyse** (`walker.py`, `safepy.py`): the lexical subset rules, plus a dataflow over an
-   abstract domain of paths and strings — each variable carries facts about where it can point.
-   Any violation, or any sink whose location is not proven, rejects the program.
+1. **Analyse** (`safepy.py`, `walker.py`, `enforcement.py`, `summaries.py`): the lexical subset
+   rules, then a dataflow over an abstract domain of paths and strings — each variable carries
+   facts about where it can point — with every policy-facing verdict about a call (is it a site,
+   what does it write, what does it yield, does a value establish what is demanded) in
+   `enforcement.py`, and what a call to one of the program's own functions does in
+   `summaries.py`. Any violation, or any sink whose location is not proven, rejects the program.
 2. **Policy** (`policy.py`): every proven filesystem site (read / write / list, with its
    location) and every `certora.exec` site (program, cwd, arguments) is evaluated against the
    policy. Any denial rejects the program.
@@ -70,7 +73,7 @@ fact a hole can demand, so a program acts only on what a trusted query returned;
 [`PROVENANCE.md`](PROVENANCE.md).
 
 The policy is **trusted**. It is normally a TOML document ([`examples/policy.toml`](examples/policy.toml);
-the schema is documented in [`certorail/policyfile.py`](certorail/policyfile.py)), passed with
+the schema is [`certorail/schema.py`](certorail/schema.py), the loader [`certorail/policyfile.py`](certorail/policyfile.py)), passed with
 `--policy` or discovered ambiently under `~/.certorail/policy/` for the sandbox root, with the
 checker programs its validations run kept beside it under `~/.certorail/checkers/`. The
 [`certorail-policy`](.claude/skills/certorail-policy/SKILL.md) skill walks a Claude Code session

@@ -24,6 +24,7 @@ import pathlib
 import socket
 import struct
 import subprocess
+import sys
 import typing
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -77,7 +78,12 @@ class ExecResult(subprocess.CompletedProcess[bytes]):
 CalledProcessError = subprocess.CalledProcessError
 
 
-def exec(*cmd: str, cwd: pathlib.Path | str, **holes: str | Sequence[str]) -> ExecResult:
+type Word = str | os.PathLike[str]  # one command word: text, or a path standing for its text
+
+
+def exec(
+    *cmd: Word, cwd: pathlib.Path | str, stream: bool = False, **holes: Word | Sequence[Word]
+) -> ExecResult:
     """The only way to run a subprocess: tunneled to the host's broker, which re-checks the
     decidable half of the exec rules (program, fail-closed subcommand, cwd containment --
     defense in depth; the full rules were enforced statically), spawns the child outside the
@@ -86,9 +92,15 @@ def exec(*cmd: str, cwd: pathlib.Path | str, **holes: str | Sequence[str]) -> Ex
     was, one socket away -- returned as an ``ExecResult``, whose decoded views raise on a
     non-zero exit.
 
-    Keywords other than ``cwd`` bind the *holes* of the policy's command template for the
-    program (TEMPLATES.md): a string for a token hole, a list of strings for a splice. The
-    broker binds the call like a signature and composes the argv itself.
+    ``stream=True`` sends the child's stdout and stderr straight to the terminal the host is
+    running on -- the same descriptors the program's own ``print`` reaches -- as it happens,
+    instead of capturing them: for a build or a test run one wants to watch. The result then
+    carries the exit code and empty ``stdout``/``stderr``; live output and extraction from the
+    output are one or the other, per call.
+
+    Keywords other than ``cwd`` and ``stream`` bind the *holes* of the policy's command template
+    for the program (TEMPLATES.md): a string or a path for a token hole, a list of them for a
+    splice. The broker binds the call like a signature and composes the argv itself.
 
     This is the runtime half. The static half (``walker``) additionally requires the program to
     be a string literal, refuses ``*args``/``**kwargs``, and treats ``cwd`` as a sink whose
@@ -96,25 +108,34 @@ def exec(*cmd: str, cwd: pathlib.Path | str, **holes: str | Sequence[str]) -> Ex
     """
     if not cmd:
         raise ValueError("exec: no program given")
-    if not all(isinstance(part, str) for part in cmd):
-        raise TypeError("exec: every part of the command must be a str")
+    # a command word is a str or a path (``os.fspath`` yields exactly the text the analysis
+    # reasoned about for a located value); anything else -- a list, a number, an object -- is
+    # not a word, and the static side let it through only as an unknown value under a rule
+    # that admits those, so this is the backstop
+    words = [_word(part, "every part of the command") for part in cmd]
     bindings: dict[str, str | list[str]] = {}
     for name, value in holes.items():
-        if isinstance(value, str):
-            bindings[name] = value
-        elif isinstance(value, (list, tuple)) and all(isinstance(v, str) for v in value):
-            bindings[name] = list(value)
+        if isinstance(value, (list, tuple)):
+            bindings[name] = [_word(v, f"every element of {name}=") for v in value]
         else:
-            raise TypeError(f"exec: {name}= must be a str or a list of str")
+            bindings[name] = _word(value, f"{name}=")
     socket_path = os.environ.get("CERTORAIL_BROKER_SOCKET")
     if socket_path is None:
         raise ExecFailed("no broker: the policy permits no programs")
-    program, *arguments = cmd
+    program, *arguments = words
+    if stream:
+        # the program's own prints may still sit in this process's buffers (block-buffered when
+        # stdout is a pipe); push them out so the child's output lands after them, in order
+        for out in (sys.stdout, sys.stderr):
+            try:
+                out.flush()
+            except (OSError, ValueError):
+                pass
     try:
         reply = _broker_roundtrip(
             socket_path,
             {"kind": "exec", "program": program, "arguments": arguments,
-             "kwargs": bindings, "cwd": os.fspath(cwd)},
+             "kwargs": bindings, "cwd": os.fspath(cwd), "stream": bool(stream)},
             timeout=None,
         )
     except OSError as exc:
@@ -122,11 +143,22 @@ def exec(*cmd: str, cwd: pathlib.Path | str, **holes: str | Sequence[str]) -> Ex
     if not reply.get("ok"):
         raise ExecFailed(f"{reply.get('error', 'error')}: {reply.get('detail', '')}")
     return ExecResult(
-        args=list(cmd),
+        args=words,
         returncode=int(reply["returncode"]),
         stdout=base64.b64decode(reply.get("stdout_b64", "")),
         stderr=base64.b64decode(reply.get("stderr_b64", "")),
     )
+
+
+def _word(value: object, what: str) -> str:
+    """One command word: a ``str`` as is, a path as its text."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, os.PathLike):
+        text = os.fspath(value)
+        if isinstance(text, str):
+            return text
+    raise TypeError(f"exec: {what} must be a str or a path")
 
 
 class CheckFailed(Exception):
@@ -345,7 +377,7 @@ def _scalar(value: object, path: str) -> str:
 
 
 def _select(x: object, path: str, want_plural: bool) -> object:
-    from . import jqpath  # stdlib-only; imported lazily to keep the namespace's import light
+    from certorail import jqpath  # stdlib-only; imported lazily to keep the namespace's import light
 
     try:
         steps = jqpath.parse(path)
@@ -394,6 +426,17 @@ def field(line: str, index: int, sep: str | None = None) -> str:
         raise ExtractError(f"field {index} of {len(parts)}") from None
 
 
+def reveal_fact(value: object) -> None:
+    """Show what the analysis knows about a variable at this point of the program.
+
+    ``certora.reveal_fact(x)`` -- a bare name, nothing else -- makes ``certorail --check`` (and
+    a run, on stderr) print the fact the analysis holds for ``x`` there: its location, the text
+    shape it matches, the atoms it carries, or that nothing is known. It changes nothing: no fact
+    is established or killed, and at runtime it does nothing at all. For finding out why a sink
+    was denied."""
+    return None
+
+
 def pathmatch(text: str, location: str) -> bool:
     """Is *text* -- a filesystem path (relative to the sandbox root, or absolute) or a URL path
     -- at the *location*, spelled the way the policy spells locations: ``repos/**``,
@@ -405,7 +448,7 @@ def pathmatch(text: str, location: str) -> bool:
     matcher on the concrete text. A ``..`` anywhere is within nothing."""
     if not isinstance(text, str):
         raise TypeError("pathmatch: the path must be a str (use str(p) for a pathlib path)")
-    from . import locspec  # stdlib-only
+    from certorail import locspec  # stdlib-only
 
     return locspec.matches(locspec.parse(location), text)
 
@@ -419,6 +462,7 @@ no_slash = Atom("no-slash")
 no_parent_traversal = Atom("no-parent-traversal")
 not_absolute = Atom("not-absolute")
 not_dot_dot = Atom("not-dot-dot")
+not_option = Atom("not-option")  # the text does not begin with "-": no tool reads it as an option
 
 
 @dataclass(frozen=True)
@@ -472,6 +516,13 @@ class Validated:
 
 
 @dataclass(frozen=True)
+class Source:
+    """The value came, unmodified, from the rule that yields the named source atom(s)
+    (``extract`` and friends): provenance, never established by a check or a literal."""
+    tags: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class Url:
     """The value is a URL: claims about its urlsplit reading (``analysis.UrlString``). Each
     component given is a claim; an omitted one claims nothing."""
@@ -482,6 +533,10 @@ class Url:
 
 def validated(*tags: str) -> Validated:
     return Validated(tags)
+
+
+def source(*tags: str) -> Source:
+    return Source(tags)
 
 
 def url(

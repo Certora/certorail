@@ -1,0 +1,7 @@
+name = "gitrev"
+version = "0.1.0"
+defaultTargets = ["gitrev"]
+
+[[lean_exe]]
+name = "gitrev"
+root = "GitRev"

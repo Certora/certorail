@@ -89,7 +89,7 @@ class TestGuard(unittest.TestCase):
             got, Located(StaticPath((Named("repos"), ANY_NAME, Named("foundry.toml"))), "str")
         )
         got = refine(StrFact(), 'certora.pathmatch(u, "repos/**")')
-        self.assertEqual(got, Located(DirSplat((Named("repos"),), ANY_NAME), "str"))
+        self.assertEqual(got, Located(DirSplat((Named("repos"),), None), "str"))
 
     def test_a_url_path(self) -> None:
         got = refine(
@@ -120,7 +120,7 @@ class TestGuard(unittest.TestCase):
     def test_through_a_str_view(self) -> None:
         # pathlib values are matched through str(p); the containment lands on p
         got = refine(StrFact(), 'certora.pathmatch(str(u), "repos/**")')
-        self.assertEqual(got, Located(DirSplat((Named("repos"),), ANY_NAME), "str"))
+        self.assertEqual(got, Located(DirSplat((Named("repos"),), None), "str"))
 
 
 # NB: the Python API reads a plain string as a literal path ("*" would be a directory named "*");

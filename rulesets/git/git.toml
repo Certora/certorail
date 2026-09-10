@@ -1,0 +1,68 @@
+# git: the umbrella. One `[[apply]]` in a root policy gets the read and local rungs, and turns the
+# rest on by parameter. Every parameter passes through to the rung that owns it; nothing is
+# defined here. A root that wants a different mix applies the rungs directly instead.
+#
+#   [[apply]]
+#   ruleset    = "git.toml"
+#   where      = "repos"
+#   remote     = { one-of = ["origin"] }
+#   branch     = { atoms = ["my-branch"] }
+#   push-gate  = ["org-checkout"]
+#   force-gate = []
+#
+# The bools default to false, and false is always the tighter policy: an unbound bool never
+# grants anything. Nothing else has a default: the root binds every constraint and atom list
+# a rung it enables reaches (`[]` for no gate), in its own hand.
+ruleset-version = 1
+description = "git: the read and local rungs (log, show, diff, status, add, commit, branch, switch, stash, ...) from one [[apply]]; push, fetch, history rewrite and clone unlocked per root by parameter, with seven checkers for revisions, ref names, remote URLs and config keys."
+
+[params]
+where       = { kind = "directory",  description = "the directory holding repositories, or a repository itself; commands run from any directory below it" }
+# remote rung
+remote      = { kind = "constraint", description = "what REMOTE may be on push, fetch and pull, e.g. { one-of = [\"origin\"] }" }
+branch      = { kind = "constraint", description = "what BRANCH may be on push; { atoms = [\"git.ref-name\"] } is any well-formed branch" }
+push-gate   = { kind = "atom",       description = "atoms the repository must carry to push; [] is no gate" }
+force       = { kind = "bool",       description = "permit push --force / --force-with-lease" }
+force-gate  = { kind = "atom",       description = "atoms BRANCH must carry to force-push or delete; [] is no gate; bound only when force or delete" }
+delete      = { kind = "bool",       description = "permit push --delete" }
+rebase-pull = { kind = "bool",       description = "permit pull --rebase" }
+# local and rewrite rungs
+rewrite     = { kind = "bool",       description = "apply the rewrite rung (checkout, restore, reset, rebase, rm, clean) and unlock --amend, branch -D/-M/-f, tag -f" }
+skip-hooks  = { kind = "bool",       description = "permit --no-verify on commit, merge, rebase, push and pull" }
+# create rung
+clone       = { kind = "bool",       description = "apply the create rung: clone and init" }
+clone-from  = { kind = "constraint", description = "what may be cloned; bound only when clone = true" }
+
+[[apply]]
+ruleset = "git-read.toml"
+where   = "${where}"
+
+[[apply]]
+ruleset    = "git-local.toml"
+where      = "${where}"
+rewrite    = "${rewrite}"
+skip-hooks = "${skip-hooks}"
+
+[[apply]]
+ruleset    = "git-rewrite.toml"
+when       = "${rewrite}"
+where      = "${where}"
+skip-hooks = "${skip-hooks}"
+
+[[apply]]
+ruleset     = "git-remote.toml"
+where       = "${where}"
+remote      = "${remote}"
+branch      = "${branch}"
+push-gate   = "${push-gate}"
+force       = "${force}"
+force-gate  = "${force-gate}"
+delete      = "${delete}"
+rebase-pull = "${rebase-pull}"
+skip-hooks  = "${skip-hooks}"
+
+[[apply]]
+ruleset = "git-create.toml"
+when    = "${clone}"
+where   = "${where}"
+from    = "${clone-from}"

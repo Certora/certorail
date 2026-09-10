@@ -13,36 +13,28 @@ the runtime re-check is the same check: ``bind`` and the constraint, flag and da
 functions below take either.
 """
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
 
-from .analysis import (
-    Alternation,
-    Both,
-    Concat,
-    DirSplat,
+from certorail.analysis import (
     Exact,
-    Located,
     LocationFact,
-    Named,
-    OneOf,
-    PathFact,
     PseudoRegex,
     RegexLit,
-    AnyStr,
-    StaticPath,
     StrFact,
-    UrlString,
     ValidationFact,
-    concat,
     entails,
     known_text,
     locate,
     location_le,
+    may_start_with_dash,
     pretty_location,
     pretty_regex,
 )
+from certorail.dangerous import EXEC_CWD, EXEC_RESERVED_KEYWORDS
+from certorail.ids import NOT_OPTION, Atom, FlagName, HoleName
+
+__all__ = ["NOT_OPTION", "may_start_with_dash"]  # re-exported for their old importers
 
 # ---------------------------------------------------------------------------
 # the vocabulary
@@ -55,11 +47,14 @@ type Value = str | ValidationFact | None  # one token as the analysis sees it (a
 class HoleRef:
     """``${name}`` (one token) or ``${name...}`` (a splice) in a template's pieces."""
 
-    name: str
+    name: HoleName
     variadic: bool = False
 
 
 type Piece = str | HoleRef
+
+
+CWD = EXEC_CWD  # the target of a demand on the exec's cwd; like every exec keyword, never a hole
 
 
 @dataclass(frozen=True)
@@ -69,13 +64,14 @@ class Constraint:
     to match); *provenance* -- ``literal``: the text is statically known, so the program named
     it (a literal, a constant, a join of literals) rather than read it from a file, argv or an
     API -- the intent gate for destructive actions; *facts* -- ``atoms``, live validation facts.
-    ``any`` admits anything, the local successor of ``unknown-arguments``, and combines with
-    nothing. A located value is textless, so ``locations`` excludes ``regex``; everything else
-    combines (``locations`` + ``literal`` is a constant path within). Empty says nothing."""
+    ``any`` admits anything -- an explicit, local statement that this position is data for the
+    tool -- and combines with nothing. A located value is textless, so ``locations`` excludes
+    ``regex``; everything else combines (``locations`` + ``literal`` is a constant path within).
+    Empty says nothing."""
 
     locations: tuple[LocationFact, ...] = ()
     regex: PseudoRegex | None = None
-    atoms: frozenset[str] = frozenset()
+    atoms: frozenset[Atom] = frozenset()
     literal: bool = False
     any: bool = False
 
@@ -99,24 +95,133 @@ class Each:
     min: int = 0
 
 
+# what a flag demands when present: atoms of the exec's cwd (under ``CWD``) or of another hole's
+# value, by hole name
+type Demands = Mapping[str, frozenset[Atom]]
+
+
 @dataclass(frozen=True)
 class Flagset:
     """A flag vocabulary: the bare flags, and the valued ones with the constraint on their
-    value. Every flag name begins with ``-``."""
+    value. Every flag name begins with ``-``. ``any`` is the open vocabulary -- any flag, any
+    value, unknown values included -- for a tool the deployment trusts wholesale (under a jail,
+    say) and does not care to enumerate; it stands alone, and a rule carrying it cannot say
+    what it writes, since anything may reach the tool as an option.
 
-    bare: frozenset[str] = frozenset()
-    valued: Mapping[str, Constraint] = field(default_factory=dict)
+    A flag may carry ``requires``: atoms demanded, when the flag is present, of the exec's cwd
+    or of another hole's value (``--force`` requires ``not-default-branch`` of ``BRANCH``), on
+    top of what the rule and that hole already ask. ``holes`` is a named flagset's contract with
+    the templates that use it: the holes its demands reach, which every such template must
+    have; an inline vocabulary names its own template's holes directly.
+
+    ``expand_single_flags`` (opt-in: not every tool bundles) reads ``-lr`` as ``-l -r`` when
+    every letter is a declared bare single-letter flag; a bundle with a valued or unknown letter
+    is an error, and the tool receives the expanded words. It is refused on a vocabulary that
+    declares any single-dash multi-letter flag (``find -name``): such a word is one flag to that
+    tool, so the two readings cannot share a vocabulary and a bundle is never ambiguous."""
+
+    bare: frozenset[FlagName] = frozenset()
+    valued: Mapping[FlagName, Constraint] = field(default_factory=dict)
+    any: bool = False
+    requires: Mapping[FlagName, Demands] = field(default_factory=dict)
+    holes: frozenset[HoleName] = frozenset()
+    expand_single_flags: bool = False
 
     def __post_init__(self) -> None:
         names = set(self.bare) | set(self.valued)
+        if self.any:
+            if names or self.requires or self.holes:
+                raise ValueError("an open flag vocabulary (any = true) lists no flags")
+            if self.expand_single_flags:
+                raise ValueError("expand-single-flags says nothing about an open flag vocabulary (any = true)")
+            return
         if not names:
-            raise ValueError("a flag vocabulary needs at least one flag")
+            raise ValueError("a flag vocabulary needs at least one flag, or any = true")
         for n in names:
             if not n.startswith("-"):
                 raise ValueError(f"flag names begin with '-': {n!r}")
         both = self.bare & self.valued.keys()
         if both:
             raise ValueError(f"flags both bare and valued: {sorted(both)}")
+        if self.expand_single_flags:
+            long_single = sorted(n for n in names if _BUNDLE.fullmatch(n))
+            if long_single:
+                raise ValueError(
+                    f"expand-single-flags: {long_single[0]!r} is a single-dash multi-letter flag, so this "
+                    "tool does not bundle short flags"
+                )
+        for name in sorted(EXEC_RESERVED_KEYWORDS & self.holes):
+            raise ValueError(f"{name!r} is reserved and cannot be a hole")
+        for flag, demands in self.requires.items():
+            if flag not in names:
+                raise ValueError(f"requires on {flag!r}, which is not a flag of the vocabulary")
+            for target in demands:
+                if target != CWD and self.holes and target not in self.holes:
+                    raise ValueError(
+                        f"flag {flag!r} requires atoms of {target!r}, which is not among the "
+                        f"flagset's holes ({', '.join(sorted(self.holes))})"
+                    )
+
+    def demands_of(self, present: Iterable[FlagName]) -> dict[str, frozenset[Atom]]:
+        """What the *present* flags demand, by target, unioned."""
+        out: dict[str, frozenset[Atom]] = {}
+        for flag in present:
+            for target, atoms in self.requires.get(flag, {}).items():
+                out[target] = out.get(target, frozenset()) | atoms
+        return out
+
+    def declared(self, flag: str) -> bool:
+        return flag in self.bare or flag in self.valued
+
+    def words(self, text: str) -> tuple[str, ...] | str:
+        """The flag words a flag-position *text* stands for: itself when declared, its letters
+        when it is a bundle this vocabulary expands (the two never compete: an expanding
+        vocabulary declares no multi-letter single-dash flag), else the problem with it."""
+        if self.declared(text):
+            return (text,)
+        if not self.expand_single_flags or _BUNDLE.fullmatch(text) is None:
+            return f"{text!r} is not a declared flag"
+        letters = tuple(f"-{ch}" for ch in text[1:])
+        for letter in letters:
+            if letter in self.valued:
+                return f"the bundle {text!r} contains the valued flag {letter!r}: spell it separately"
+            if letter not in self.bare:
+                return f"{letter!r} is not a declared flag (from the bundle {text!r})"
+        return letters
+
+
+# a bundle of short flags, ``-lr``: one dash, two or more characters that are not dashes
+_BUNDLE = re.compile(r"-[^-]{2,}")
+
+
+def expand_bundles(fs: Flagset, elements: Sequence[Value]) -> tuple[list[Value], str | None]:
+    """*elements* with every bundle the vocabulary expands replaced by its letters, so that
+    ``flags_failure``, ``present_flags`` and ``instantiate`` see one word per flag. Elements in
+    value position are left alone; anything else undeclared is left for ``flags_failure`` to
+    report. Returns (the elements, the problem with a bundle that does not expand)."""
+    if fs.any or not fs.expand_single_flags:
+        return list(elements), None
+    out: list[Value] = []
+    i = 0
+    while i < len(elements):
+        element = elements[i]
+        text = known_text(element)
+        if text is None or fs.declared(text):
+            out.append(element)
+            i += 1
+            if text is not None and text in fs.valued and i < len(elements):
+                out.append(elements[i])
+                i += 1
+            continue
+        words = fs.words(text)
+        if isinstance(words, str):
+            if _BUNDLE.fullmatch(text) is not None:
+                return out, words
+            out.append(element)  # not a bundle: flags_failure names it
+        else:
+            out.extend(words)
+        i += 1
+    return out, None
 
 
 @dataclass(frozen=True)
@@ -126,15 +231,13 @@ class Flags:
 
 type Hole = Token | Each | Flags
 
-CWD = "cwd"  # reserved: never a hole name
-
 
 @dataclass(frozen=True)
 class Template:
     """One permitted command-line shape. ``pieces[0]`` is the program, a literal."""
 
     pieces: tuple[Piece, ...]
-    holes: Mapping[str, Hole]
+    holes: Mapping[HoleName, Hole]
 
     def __post_init__(self) -> None:
         if not self.pieces or not isinstance(self.pieces[0], str):
@@ -143,8 +246,8 @@ class Template:
         names = [r.name for r in refs]
         if len(set(names)) != len(names):
             raise ValueError("a hole appears once in a template")
-        if CWD in self.holes:
-            raise ValueError(f"{CWD!r} is reserved and cannot be a hole")
+        for name in sorted(EXEC_RESERVED_KEYWORDS & self.holes.keys()):
+            raise ValueError(f"{name!r} is reserved and cannot be a hole")
         for r in refs:
             hole = self.holes.get(r.name)
             if hole is None:
@@ -156,6 +259,19 @@ class Template:
         for name in self.holes:
             if name not in names:
                 raise ValueError(f"hole {name!r} is declared but not used")
+        # a flag's demands reach the cwd or a token/each hole of this template: a named flagset
+        # declares the holes it reaches (its contract), an inline vocabulary names them directly
+        for name, hole in self.holes.items():
+            if not isinstance(hole, Flags):
+                continue
+            fs = hole.flagset
+            reached = set(fs.holes) | {t for d in fs.requires.values() for t in d if t != CWD}
+            for target in sorted(reached):
+                if not isinstance(self.holes.get(HoleName(target)), (Token, Each)):
+                    raise ValueError(
+                        f"the flags of {name!r} require atoms of hole {target!r}, which this "
+                        "template does not have (a token or each hole of that name)"
+                    )
 
     @property
     def program(self) -> str:
@@ -173,20 +289,29 @@ class Template:
             out.append(p)
         return tuple(out)
 
-    def variadic(self, name: str) -> bool:
+    def variadic(self, name: HoleName) -> bool:
         return isinstance(self.holes[name], (Each, Flags))
 
+    def terminable(self, name: HoleName) -> bool:
+        """Can a positional tail bound to this variadic hole be ended without a marker? A flags
+        hole with a closed vocabulary can: its elements are flags (known text beginning with
+        ``-``) and their values, so the first positional that carries ``not-option`` is not in it
+        and begins the next hole. An open vocabulary cannot -- which of its flags take a value is
+        unknown -- and neither can an each hole, whose elements have no shape of their own."""
+        hole = self.holes[name]
+        return isinstance(hole, Flags) and not hole.flagset.any
+
     @property
-    def keyword_only(self) -> tuple[str, ...]:
-        """The holes from the first non-last variadic hole onward: nothing marks where such a
-        splice would end, so they are bound by name."""
+    def keyword_only(self) -> tuple[HoleName, ...]:
+        """The holes from the first non-last variadic hole that cannot terminate positionally
+        onward: nothing marks where such a splice would end, so they are bound by name."""
         refs = [p for p in self.pieces if isinstance(p, HoleRef)]
         for i, r in enumerate(refs):
-            if r.variadic and r is not self.pieces[-1]:
+            if r.variadic and r is not self.pieces[-1] and not self.terminable(r.name):
                 return tuple(x.name for x in refs[i:])
         return ()
 
-    def dash_exempt(self, name: str) -> bool:
+    def dash_exempt(self, name: HoleName) -> bool:
         """A literal ``--`` earlier in the template makes a later hole safe from being read as
         an option, for tools that honour it."""
         for p in self.pieces:
@@ -223,7 +348,7 @@ type Binding = Value | Many | Elements
 @dataclass(frozen=True)
 class Bound:
     template: Template
-    bindings: Mapping[str, Binding]
+    bindings: Mapping[HoleName, Binding]
 
 
 @dataclass(frozen=True)
@@ -243,22 +368,44 @@ def bind(
 ) -> Bound | BindError:
     """*arguments* are the positionals after the program, leading words included (the caller
     selected the template by them). Positionals fill holes in template order; a trailing
-    variadic takes the rest; a non-last variadic and everything after it is keyword-only;
-    keywords fill by name. Interior literal words are never spelled by the program."""
+    variadic takes the rest; a flags hole that is not last takes the flags and flag values at
+    the head of the remaining positionals and ends at the first that carries ``not-option``
+    (``Template.terminable``) -- a positional that could be either is a binding error, never a
+    guess; any other non-last variadic and everything after it is keyword-only; keywords fill by
+    name. Interior literal words are never spelled by the program."""
     reasons: list[str] = []
-    bindings: dict[str, Binding] = {}
+    bindings: dict[HoleName, Binding] = {}
     lead = len(template.leading_words) - 1
     positionals = list(arguments[lead:])
     keyword_only = set(template.keyword_only)
-    for piece in template.pieces[len(template.leading_words):]:
-        if isinstance(piece, str) or piece.name in keyword_only:
+    holes = [p for p in template.pieces[len(template.leading_words):] if isinstance(p, HoleRef)]
+    for i, piece in enumerate(holes):
+        if piece.name in keyword_only:
             continue
-        if piece.variadic:  # necessarily the last piece: it takes whatever positionals remain
+        if not piece.variadic:
+            if positionals:
+                bindings[piece.name] = positionals.pop(0)
+            continue
+        if piece is holes[-1] and piece is template.pieces[-1]:
+            # the last piece: it takes whatever positionals remain
             if positionals:
                 bindings[piece.name] = Many(tuple(positionals))
                 positionals = []
-        elif positionals:
-            bindings[piece.name] = positionals.pop(0)
+            continue
+        # a terminable flags hole with holes after it: take the flag-shaped head
+        hole = template.holes[piece.name]
+        assert isinstance(hole, Flags)
+        following = holes[i + 1].name if i + 1 < len(holes) else None
+        # "bind FOLLOWING by keyword" is advice only where a dash-shaped value can land there:
+        # a hole after a spelled "--"; elsewhere the value would fail the dash guard the same way
+        takes_dashes = following is not None and template.dash_exempt(following)
+        taken, consumed, problem = _flag_head(hole.flagset, positionals, piece.name, following, takes_dashes)
+        if problem is not None:
+            reasons.append(problem)
+            break
+        if taken:  # an empty head leaves the hole to a keyword (or to its default, nothing)
+            bindings[piece.name] = Many(tuple(taken))
+            positionals = positionals[consumed:]
     if positionals:
         reasons.append(
             f"{len(positionals)} positional argument(s) too many"
@@ -268,7 +415,8 @@ def bind(
                 else ""
             )
         )
-    for name, value in keywords.items():
+    for spelled, value in keywords.items():
+        name = HoleName(spelled)  # the program's keyword, entering the template's domain
         if name not in template.holes:
             reasons.append(f"{name!r} is not a hole of this form")
         elif name in bindings:
@@ -285,16 +433,70 @@ def bind(
                 bindings[name] = Many(())
             else:
                 reasons.append(f"hole {name!r} is unbound")
+    # a flags display bound by keyword may spell bundles; the positional head already expanded
+    for name, hole in template.holes.items():
+        value = bindings.get(name)
+        if isinstance(hole, Flags) and isinstance(value, Many):
+            elements, problem = expand_bundles(hole.flagset, value.elements)
+            if problem is not None:
+                reasons.append(f"{name}: {problem}")
+            else:
+                bindings[name] = Many(tuple(elements))
     return BindError(tuple(reasons)) if reasons else Bound(template, bindings)
+
+
+def _flag_head(
+    fs: Flagset,
+    positionals: Sequence[Value],
+    name: HoleName,
+    following: HoleName | None,
+    following_takes_dashes: bool = False,
+) -> tuple[list[Value], int, str | None]:
+    """The prefix of *positionals* a non-last flags hole takes: flags -- known text beginning
+    with ``-`` -- each valued one with the positional after it, up to the first positional that
+    carries ``not-option``, which begins the next hole. A positional that is neither a flag nor
+    shown not to be one is ambiguous, and the answer is a binding error naming the fix rather
+    than a guess. Returns (the elements taken, with a bundle expanded to its letters; how many
+    positionals they came from; the problem)."""
+    taken: list[Value] = []
+    i = 0
+    while i < len(positionals):
+        value = positionals[i]
+        text = known_text(value)
+        if text is not None and text.startswith("-"):
+            words = fs.words(text)
+            if isinstance(words, str):
+                if fs.expand_single_flags and _BUNDLE.fullmatch(text) is not None:
+                    return taken, i, f"{name}: {words}"
+                hint = (
+                    f"; if it is the value of {following}, bind {following} by keyword"
+                    if following is not None and following_takes_dashes
+                    else f" (the flags of {name}: {' '.join(sorted(fs.bare | fs.valued.keys()))})"
+                )
+                return taken, i, f"{text!r} is not a flag of {name}{hint}"
+            taken.extend(words if len(words) > 1 else (value,))
+            i += 1
+            if text in fs.valued and i < len(positionals):
+                taken.append(positionals[i])  # the flag's value, whatever it is
+                i += 1
+            continue
+        if not may_start_with_dash(value):
+            return taken, i, None  # shown not to be an option: the next hole begins here
+        where = "the next hole" if following is None else following
+        return taken, i, (
+            f"positional {i + 1} after the leading words could be a flag of {name} or the "
+            f"value of {where} (it lacks not-option): bind by keyword to say which"
+        )
+    return taken, i, None
 
 
 # ---------------------------------------------------------------------------
 # checking a bound template
 # ---------------------------------------------------------------------------
 
-# atoms of *required* that *value* does not carry (the policy supplies this: saturation and
-# literal checkers live there)
-type AtomsMissing = Callable[[Value, frozenset[str]], frozenset[str]]
+# atoms of *required* that *value* does not carry (``Vocabulary.missing``, partially applied:
+# structure, regex definitions and literal checkers live there)
+type AtomsMissing = Callable[[Value, frozenset[Atom]], frozenset[Atom]]
 
 
 def _as_fact(value: str | ValidationFact) -> ValidationFact:
@@ -323,143 +525,26 @@ def constraint_failure(c: Constraint, value: Value, atoms_missing: AtomsMissing)
     return None
 
 
-# The regex parser behind ``re.compile`` (``sre_parse`` of old). Private, so reached by name and
-# typed Any; it is the one parser whose reading of a pattern is the reading that will be enforced.
-_RE_PARSER: Any = getattr(re, "_parser")
-_RE_CONSTANTS: Any = getattr(re, "_constants")
-_DASH = ord("-")
-
-
-def _charset_has_dash(items: Any) -> bool:
-    """Does a bracket class (the ``IN`` operand) admit ``-``? Literals, ranges and the ``\\d``,
-    ``\\w``, ``\\s`` categories (their negations admit it), under an optional ``NEGATE``."""
-    negate = False
-    hit = False
-    for op, av in items:
-        if op is _RE_CONSTANTS.NEGATE:
-            negate = True
-        elif op is _RE_CONSTANTS.LITERAL:
-            hit = hit or av == _DASH
-        elif op is _RE_CONSTANTS.RANGE:
-            lo, hi = av
-            hit = hit or lo <= _DASH <= hi
-        elif op is _RE_CONSTANTS.CATEGORY:
-            hit = hit or "NOT" in str(av)  # \D \W \S match "-"; \d \w \s do not
-        else:
-            return True  # anything unforeseen: may
-    return hit != negate
-
-
-def _first(sub: Any) -> tuple[bool, bool]:
-    """Of a parsed (sub)pattern: (may its first matched character be ``-``, can it match the
-    empty string). A sequence's first character comes from its first non-nullable item and
-    everything nullable before it."""
-    may = False
-    for op, av in sub:
-        item_may, item_nullable = _first_item(op, av)
-        may = may or item_may
-        if not item_nullable:
-            return may, False
-    return may, True
-
-
-def _first_item(op: Any, av: Any) -> tuple[bool, bool]:
-    c = _RE_CONSTANTS
-    if op is c.LITERAL:
-        return av == _DASH, False
-    if op is c.NOT_LITERAL:
-        return av != _DASH, False
-    if op is c.ANY:
-        return True, False
-    if op is c.IN:
-        return _charset_has_dash(av), False
-    if op is c.AT or op is c.ASSERT or op is c.ASSERT_NOT:
-        return False, True  # zero-width; ignoring a lookaround only widens "may": sound
-    if op is c.SUBPATTERN:
-        return _first(av[3])
-    if op is c.ATOMIC_GROUP:
-        return _first(av)
-    if op is c.BRANCH:
-        results = [_first(b) for b in av[1]]
-        return any(m for m, _ in results), any(n for _, n in results)
-    if op in (c.MAX_REPEAT, c.MIN_REPEAT, c.POSSESSIVE_REPEAT):
-        lo, _, body = av
-        body_may, body_nullable = _first(body)
-        return body_may, lo == 0 or body_nullable
-    if op is c.GROUPREF_EXISTS:
-        _, yes, no = av
-        yes_may, yes_nullable = _first(yes)
-        no_may, no_nullable = _first(no) if no is not None else (False, True)
-        return yes_may or no_may, yes_nullable or no_nullable
-    return True, True  # GROUPREF and anything unforeseen: may, and may be empty
-
-
-def _literal_regex_may_start_with_dash(reg: str) -> bool:
-    """Could a string this regex fullmatches begin with ``-``? Decided on the parse tree the
-    ``re`` module itself builds; an unparsable pattern is "may"."""
-    try:
-        parsed = _RE_PARSER.parse(reg)
-    except re.error:
-        return True
-    may, _ = _first(parsed)
-    return may
-
-
-def _regex_may_start_with_dash(r: PseudoRegex) -> bool:
-    match r:
-        case Exact(exact_str=s):
-            return s.startswith("-")
-        case Alternation(any_of=branches):
-            return any(_regex_may_start_with_dash(b) for b in branches)
-        case Concat(seq=pieces):
-            head = pieces[0]
-            if head == Exact(""):
-                return _regex_may_start_with_dash(concat(*pieces[1:])) if len(pieces) > 1 else False
-            return _regex_may_start_with_dash(head)
-        case Both(all_of=parts):
-            return all(_regex_may_start_with_dash(p) for p in parts)
-        case RegexLit(reg=reg):
-            return _literal_regex_may_start_with_dash(reg)
-        case AnyStr():
-            return True
-
-
-def may_start_with_dash(value: Value) -> bool:
-    """Could this token's text begin with ``-``, and so be read by a tool as an option? True
-    unless the value's known text, regex head, or location's first component rules it out."""
-    match value:
-        case str():
-            return value.startswith("-")
-        case None | PathFact() | UrlString():
-            return True
-        case Located(location=loc):
-            if loc.absolute:
-                return False  # begins with "/"
-            components = loc.path_components if isinstance(loc, StaticPath) else loc.static_prefix
-            if not components:
-                # "." itself for a StaticPath; for a DirSplat the first component is unknown
-                return isinstance(loc, DirSplat)
-            match components[0]:
-                case Named(name=n):
-                    return n.startswith("-")
-                case OneOf(names=ns):
-                    return any(n.startswith("-") for n in ns)
-                case _:
-                    return True
-        case StrFact(regex=regex):
-            return _regex_may_start_with_dash(regex)
-
-
-DASH_REASON = "may begin with '-' and be read as an option; confine it under a named directory or guard its text"
+# The leading-dash guard (TEMPLATES.md): a token or each hole not preceded by a literal "--"
+# requires the built-in ``not-option``, asked of the value like any other atom -- structure
+# (``analysis.holds``), or a checker's ``establishes`` -- and denied with this reason
+DASH_REASON = (
+    "may begin with '-' and be read as an option (it lacks not-option): confine it under a named "
+    "directory, guard its text, or have a checker that establishes not-option vouch for it"
+)
+_NOT_OPTION_ONLY: frozenset[Atom] = frozenset({NOT_OPTION})
 
 
 def flags_failure(fs: Flagset, elements: Sequence[Value], atoms_missing: AtomsMissing) -> str | None:
     """Parse *elements* against the vocabulary, left to right."""
+    if fs.any:
+        return None  # the open vocabulary: whatever the program passes is the tool's business
     i = 0
     while i < len(elements):
-        name = known_text(elements[i])
-        if name is None:
+        text = known_text(elements[i])
+        if text is None:
             return f"element {i + 1} is in flag position but is not statically known text"
+        name = FlagName(text)
         if name in fs.bare:
             i += 1
             continue
@@ -475,8 +560,65 @@ def flags_failure(fs: Flagset, elements: Sequence[Value], atoms_missing: AtomsMi
     return None
 
 
-def hole_failures(bound: Bound, atoms_missing: AtomsMissing) -> list[str]:
-    """Every way the bound values fall short of their holes, each naming the hole."""
+def option_shaped(value: Value, atoms_missing: AtomsMissing) -> bool:
+    """The leading-dash guard: may the tool read *value* as an option? Only while it lacks
+    ``not-option``."""
+    return bool(atoms_missing(value, _NOT_OPTION_ONLY))
+
+
+# atoms of *required* that the exec's cwd does not carry
+type CwdMissing = Callable[[frozenset[Atom]], frozenset[Atom]]
+
+
+def present_flags(fs: Flagset, elements: Sequence[Value]) -> list[FlagName]:
+    """The flags a well-formed (``flags_failure`` is None) flags list names."""
+    out: list[FlagName] = []
+    i = 0
+    while i < len(elements):
+        text = known_text(elements[i])
+        if text is None:
+            break
+        name = FlagName(text)
+        out.append(name)
+        i += 1 if name in fs.bare else 2
+    return out
+
+
+def _demand_failures(bound: Bound, atoms_missing: AtomsMissing, cwd_missing: CwdMissing) -> list[str]:
+    """What the present flags demand of the cwd and of other holes, and is not carried."""
+    out: list[str] = []
+    for name, hole in bound.template.holes.items():
+        if not isinstance(hole, Flags):
+            continue
+        value = bound.bindings[name]
+        if not isinstance(value, Many) or hole.flagset.any:
+            continue
+        flags = present_flags(hole.flagset, value.elements)
+        for target, atoms in sorted(hole.flagset.demands_of(flags).items()):
+            demanding = ", ".join(f for f in flags if target in hole.flagset.requires.get(f, {}))
+            if target == CWD:
+                missing = cwd_missing(atoms)
+                if missing:
+                    out.append(f"{demanding} requires the cwd validated by: {', '.join(sorted(missing))}")
+                continue
+            target_value = bound.bindings[HoleName(target)]
+            missing = frozenset()
+            match target_value:
+                case Many(elements=elements):
+                    for e in elements:
+                        missing |= atoms_missing(e, atoms)
+                case Elements(elem=elem):
+                    missing = atoms_missing(elem, atoms)
+                case _:
+                    missing = atoms_missing(target_value, atoms)
+            if missing:
+                out.append(f"{demanding} requires {target} validated by: {', '.join(sorted(missing))}")
+    return out
+
+
+def hole_failures(bound: Bound, atoms_missing: AtomsMissing, cwd_missing: CwdMissing) -> list[str]:
+    """Every way the bound values fall short of their holes, each naming the hole; then what
+    the present flags demand of the cwd and of other holes."""
     out: list[str] = []
     template = bound.template
     for name, hole in template.holes.items():
@@ -486,7 +628,7 @@ def hole_failures(bound: Bound, atoms_missing: AtomsMissing) -> list[str]:
             case Token(constraint=c):
                 assert not isinstance(value, (Many, Elements))
                 reason = constraint_failure(c, value, atoms_missing)
-                if reason is None and guard and may_start_with_dash(value):
+                if reason is None and guard and option_shaped(value, atoms_missing):
                     reason = DASH_REASON
                 if reason is not None:
                     out.append(f"{name} {reason}")
@@ -497,13 +639,13 @@ def hole_failures(bound: Bound, atoms_missing: AtomsMissing) -> list[str]:
                             out.append(f"{name} needs at least {minimum} element(s)")
                         for i, e in enumerate(elements):
                             reason = constraint_failure(c, e, atoms_missing)
-                            if reason is None and guard and may_start_with_dash(e):
+                            if reason is None and guard and option_shaped(e, atoms_missing):
                                 reason = DASH_REASON
                             if reason is not None:
                                 out.append(f"{name}[{i}] {reason}")
                     case Elements(elem=elem):
                         reason = constraint_failure(c, elem, atoms_missing)
-                        if reason is None and guard and may_start_with_dash(elem):
+                        if reason is None and guard and option_shaped(elem, atoms_missing):
                             reason = DASH_REASON
                         if reason is not None:
                             out.append(f"the elements of {name} {reason}")
@@ -517,6 +659,8 @@ def hole_failures(bound: Bound, atoms_missing: AtomsMissing) -> list[str]:
                             out.append(f"{name}: {reason}")
                     case _:
                         out.append(f"{name} takes a display of flags, not a container")
+    if not out:
+        out = _demand_failures(bound, atoms_missing, cwd_missing)
     return out
 
 
