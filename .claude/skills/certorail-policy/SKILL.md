@@ -73,16 +73,16 @@ interrogating further:
 | read / write / list files under a directory | `[filesystem]` `read` / `write` / `list` location lists; `list` covers directory listing and existence probes |
 | only certain file types | a regex leaf: `reports/**/<\w+\.json>` |
 | a directory outside the root | a leading-`/` location (`/srv/data/**`); absolute and relative grants never relate |
-| run a program with fixed words and a few literal arguments | a flat `[[program]]` per (name, subcommand) with the narrowest `cwd` |
-| run a tool with flags and paths (`find`, `grep`, `rg`, `ls`, `tar`) | a **template**: `argv` with holes, a flagset listing exactly the permitted flags. Put the variadic hole last when you can (the program spells a plain positional call); a variadic hole that is not last makes it and everything after it keyword-only. See "Calling a template" in `reference.md`. Never `unknown-arguments = true` for these |
+| run a program with fixed words and no arguments | a flat `[[program]]` per (name, subcommand) with the narrowest `cwd`; anything after the words needs a template |
+| run a tool with flags and paths (`find`, `grep`, `rg`, `ls`, `tar`) | a **template**: `argv` with holes, a flagset listing exactly the permitted flags. Put the variadic hole last when you can (the program spells a plain positional call); a variadic hole that is not last makes it and everything after it keyword-only. See "Calling a template" in `reference.md` |
 | the same tools under several roots, or across policies | a **ruleset** in `~/.certorail/rulesets/`, applied with `[[apply]] ruleset = "unix.toml" where = ["repos", "/srv/data"]` |
-| program takes paths | `argument-locations` on a flat rule, or `location` on the hole |
-| program takes opaque arguments (`gh api -f q=...`) | `unknown-arguments = true` on that flat rule only, or `any = true` on that one hole |
-| program takes runtime-checked values (a checked branch name) | a hole with `atoms = [...]`; on a flat rule `argument-atoms` **and** `unknown-arguments = true`, since vouched-for means literal text or a proven path |
+| program takes paths | `location` on the hole |
+| program takes opaque arguments (`gh api -f q=...`) | `any = true` on that one hole, or an open flag vocabulary (`holes.FLAGS = { kind = "flags", any = true }`) for a tool trusted with all its options |
+| program takes runtime-checked values (a checked branch name) | a hole with `atoms = [...]`; have the checker also establish the built-in `not-option`, or the dash guard denies text whose head it cannot see |
 | a destructive action the agent must have chosen itself (drop a database, delete a branch) | a hole with `literal = true` plus the shape (`matches`/`one-of`/`location`): the value must appear in the program text, never come from a file, argv or an API |
 | an action only on what a trusted query returned (terminate the runners the inventory listed, push to branches the API listed, email the on-call roster) | mark the query's rule `source = "atom"` (or a `[[source]]` location) and put `atoms = ["atom"]` on the hole: only a value extracted unmodified from that result satisfies it. Identifiers all look alike; which query said so is the whole property |
 | talk to an API | one `[[network]]` per host: `methods`, default `https`, default port; `allow-nonpublic` only for loopback/private targets |
-| gate an action on a property | atoms + validations (step 3), consumed by `requires` / `argument-atoms` / `[[network]].requires` |
+| gate an action on a property | atoms + validations (step 3), consumed by `requires` / a hole's `atoms` / `[[network]].requires` |
 | a check that must survive an intervening command (check the checkout, then commit, then push) | regions: `writes` on the command, `reads` on the atom (step 3b). Without them every command kills every environmental fact |
 | a tool that never touches the network, or never writes files | `network = false` / `write = false` on its rule: a claim that bounds what it can kill with no region named; `effect-free = true` for both |
 
@@ -153,7 +153,7 @@ checked fact must outlive an intervening command, or when the same fact gates se
 4. **Narrow within the medium** only where the batch needs it: `writes = ["git.refs",
    "git.index"]` on `git commit` is what lets a commit sit between the org check and the push.
    `writes` is admissible only on a rule whose arguments cannot smuggle an option past the shape
-   (no `unknown-arguments`, no `any` hole outside a flag value or after `--`).
+   (no open flag vocabulary, no `any` hole outside a flag value or after `--`).
 
 Honesty rules, in addition to the ones above: `writes` is complete when it names every declared
 region the tool can change, not every file it touches (`cargo build` writes registries and
@@ -260,10 +260,12 @@ A trivial text predicate can be a `test` one-liner with no script at all:
 
 ## Pitfalls
 
-- `unknown-arguments` defaults to **false**: a computed argument — an f-string, `.strip()`, a
-  checked value — is denied unless the rule opts in.
-- Atoms are declared once in `[atoms]`; a name used in `establishes`, `requires`,
-  `argument-atoms` or `[[network]].requires` without a declaration is an error.
+- A flat rule takes no arguments at all; the moment a program needs one, the rule is a template.
+  A hole with `location` denies a computed argument — an f-string, `.strip()` — since that is no
+  proven path; a hole with `atoms` denies a value nothing checked.
+- Atoms are declared once in `[atoms]`; a name used in `establishes`, `requires`, a hole's
+  `atoms` or `[[network]].requires` without a declaration is an error. `not-option` is built in
+  and may not be declared.
 - A cwd-free validation cannot establish atoms on `cwd`; a validation with `cwd` requires the
   program to pass a proven `cwd=`.
 - `certora.check_single` needs a validation with exactly one parameter; inside a comprehension
@@ -279,8 +281,8 @@ A trivial text predicate can be a `test` one-liner with no script at all:
   `certora.exec("tar", FLAGS=[...], FILES=[...], cwd=root)`, not a positional list. Put the
   variadic hole last when the tool allows it.
 - Regions are declared once in `[regions]`; a `writes` or `reads` naming an undeclared region is
-  an error, and so is a `writes` outside the rule's media, or on a rule with
-  `unknown-arguments = true` / an unguarded `any` hole.
+  an error, and so is a `writes` outside the rule's media, or on a rule with an open flag
+  vocabulary / an unguarded `any` hole.
 - A validation without `cwd` cannot establish an atom that reads a filesystem region.
 - The program's own file writes still kill every environmental atom that reads any filesystem
   region; only exec, network and check rules have precise write sets today.
@@ -321,10 +323,11 @@ effect-free = true
 establishes = { cwd = ["org-checkout"] }
 
 [[program]]                                  # clone into repos/ from its parent
-name       = "git"
-subcommand = "clone"
-cwd        = "repos"
-unknown-arguments = true                     # clone URLs come from the API; so no `writes`
+name      = "git"
+argv      = ["git", "clone", "--", "${URL}", "${DIR}"]   # the "--" exempts URL from the dash guard
+cwd       = "repos"
+holes.URL = { any = true }                   # clone URLs come from the API; so no `writes`
+holes.DIR = { location = "*" }               # one name, directly under repos/
 
 [[program]]
 name        = "git"
@@ -374,4 +377,6 @@ so `check("org-repo")`, `git add`, `git commit`, `git push` is one accepted sequ
 Program-author note to append to their prompt (the rest is `--describe`'s output): *"Call
 `certora.check("org-repo", cwd=<path under repos/>)` once per repository before the git
 sequence; `git add`/`commit` preserve it, `git clone` and any file write do not. Atom
-`no-flag` is `[^-].*`: guard branch names with `assert re.fullmatch(r"[^-].*", branch)`."*
+`no-flag` is `[^-].*`: guard branch names with `assert re.fullmatch(r"[^-].*", branch)`; the
+same guard shows the name does not begin with `-`, which the push's `BRANCH` hole requires.
+Clone as `certora.exec("git", "clone", "--", url, name, cwd=pathlib.Path("repos"))`."*

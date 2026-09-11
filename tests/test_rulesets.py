@@ -13,7 +13,7 @@ from certorail.host import check as host_check
 from certorail.ids import HoleName
 from certorail.policy import Policy
 from certorail.policyfile import PolicyFileError, from_data
-from certorail.templates import Flags, Token
+from certorail.templates import Each, Flags, Token
 
 UNIX = """
 ruleset-version = 1
@@ -250,10 +250,14 @@ class TestRulesetWellFormedness(RulesetCase):
     def test_a_root_rule_may_reference_a_ruleset_atom(self) -> None:
         policy = from_data(self.root(
             {"ruleset": "unix.toml", "where": "repos"},
-            program=[{"name": "echo", "cwd": ".", "argument-atoms": ["unix.no-flag"]}],
+            program=[{"name": "echo", "cwd": ".", "argv": ["echo", "${WORDS...}"],
+                      "holes": {"WORDS": {"kind": "each", "atoms": ["unix.no-flag"]}}}],
         ))
         echo = next(p for p in policy.programs if p.name == "echo")
-        self.assertEqual(echo.argument_atoms, frozenset({"unix.no-flag"}))
+        assert echo.template is not None
+        words = echo.template.holes[HoleName("WORDS")]
+        assert isinstance(words, Each)
+        self.assertEqual(words.constraint.atoms, frozenset({"unix.no-flag"}))
 
     def test_flagsets_are_private_to_their_document(self) -> None:
         with self.assertRaises(PolicyFileError) as cm:

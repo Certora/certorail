@@ -18,8 +18,9 @@ from certorail.effects import EVERYTHING, NOTHING
 from certorail.host import Accepted, Rejected
 from certorail.host import check as host_check
 from certorail.markers import CheckFailed
-from certorail.policy import Policy, atom, param, program, pure, validation
+from certorail.policy import Policy, atom, constraint, hole, param, program, pure, splice, validation
 from certorail.ids import AtomId, ParamName, ProgramName, ValidationName
+from certorail.templates import Each, Token
 from certorail.walker import CheckSignature, CheckSite, ExecSite, Report, Vocabulary, WriteTable, analyze
 
 CWD = ParamName("cwd")
@@ -208,7 +209,7 @@ ORG_POLICY = Policy.allow(
     read=[markers.within(".")],
     write=[markers.within(".")],
     listing=[markers.within(".")],
-    programs=[program("git", cwd=markers.within("repos"), requires=["org-checkout"])],
+    programs=[program("git", subcommand="log", cwd=markers.within("repos"), requires=["org-checkout"])],
     validations=[
         validation(
             "org-repo",
@@ -245,9 +246,9 @@ class TestPolicy(unittest.TestCase):
                         ValidationName("org-repo"), (), {CWD: frozenset({AtomId("org-checkout")})}
                     )
                 },
-                pure_atoms=frozenset(),
+                pure_atoms=frozenset({AtomId("not-option")}),  # the built-in is always in scope
                 # the one exec rule declares no media, so it writes everything (EFFECTS.md)
-                writes=WriteTable(exec=((ProgramName("git"), (), EVERYTHING),)),
+                writes=WriteTable(exec=((ProgramName("git"), ("log",), EVERYTHING),)),
             ),
         )
 
@@ -293,17 +294,18 @@ SUB_POLICY = Policy.allow(
             argv=("test", param("value"), "!=", "--force"),
             cwd=markers.within("."),
             params=("value",),
-            establishes={"value": [pure("not-force")]},
+            # the checker vouches for the head too: a checked branch name fills a hole that no
+            # spelled "--" precedes
+            establishes={"value": [pure("not-force"), "not-option"]},
             effect_free=True,
         )
     ],
     programs=[
         program(
             "git",
-            subcommand="push origin",
             cwd=markers.within("repos"),
-            argument_atoms=["not-force"],
-            unknown_arguments=True,  # branch names are checked values, not literals: the opt-in
+            argv=["git", "push", "origin", hole("BRANCH")],
+            holes={"BRANCH": Token(constraint(atoms=["not-force"]))},
         ),
         program("git", subcommand="log", cwd=markers.within("repos")),
     ],
@@ -419,17 +421,16 @@ CWD_FREE_POLICY = Policy.allow(
             "not-force-check",
             argv=("test", param("value"), "!=", "--force"),
             params=("value",),
-            establishes={"value": [pure("not-force")]},
+            establishes={"value": [pure("not-force"), "not-option"]},
             effect_free=True,
         )
     ],
     programs=[
         program(
             "git",
-            subcommand="push origin",
             cwd=markers.within("repos"),
-            argument_atoms=["not-force"],
-            unknown_arguments=True,  # branch names are checked values, not literals: the opt-in
+            argv=["git", "push", "origin", hole("BRANCH")],
+            holes={"BRANCH": Token(constraint(atoms=["not-force"]))},
         )
     ],
 )
@@ -535,9 +536,10 @@ class TestCheckSingle(unittest.TestCase):
         self.assertTrue(any("exactly one" in what for _, what in report.violations))
 
 
-# unknown_arguments=False admits only vouched-for arguments: exactly-known text or a proven
-# path. A computed str is a StrFact, not the None sentinel, and must not slip past the gate.
-STRICT_POLICY = Policy.allow(
+# A path hole admits only a proven path within its locations: a computed str -- str(p).strip(),
+# an f-string -- is a StrFact, not the None sentinel, and is still no proven path. A spelled
+# path is located like a proven one, so "elsewhere/y" written as a literal is outside too.
+PATHS_POLICY = Policy.allow(
     read=[markers.within(".")],
     write=[markers.within(".")],
     listing=[markers.within(".")],
@@ -545,34 +547,39 @@ STRICT_POLICY = Policy.allow(
         program(
             "git",
             cwd=markers.within("repos"),
-            unknown_arguments=False,
-            argument_locations=[markers.within("repos")],
+            argv=["git", "log", splice("PATHS")],
+            holes={"PATHS": Each(constraint(location=markers.within("repos")))},
         )
     ],
 )
 
 
-class TestUnknownArguments(unittest.TestCase):
+class TestPathHoles(unittest.TestCase):
     def accept(self, body: str) -> None:
-        outcome = host_check(HEADER + body, "<t>", STRICT_POLICY, ROOT)
+        outcome = host_check(HEADER + body, "<t>", PATHS_POLICY, ROOT)
         if isinstance(outcome, Rejected):
             self.fail("\n".join(outcome.describe("<t>")))
 
     def denials(self, body: str) -> list[str]:
-        outcome = host_check(HEADER + body, "<t>", STRICT_POLICY, ROOT)
+        outcome = host_check(HEADER + body, "<t>", PATHS_POLICY, ROOT)
         assert isinstance(outcome, Rejected), "expected a rejection"
         return [d.reason for d in outcome.denials]
 
-    def test_a_proven_path_argument_is_vouched_for(self) -> None:
+    def test_a_proven_path_argument_is_within(self) -> None:
         self.accept(REPO + 'certora.exec("git", "log", repo / "src", cwd=repo)\n')
 
-    def test_a_str_spelled_proven_path_is_vouched_for(self) -> None:
+    def test_a_str_spelled_proven_path_is_within(self) -> None:
         self.accept(REPO + 'certora.exec("git", "log", str(repo), cwd=repo)\n')
 
+    def test_a_spelled_literal_is_located_too(self) -> None:
+        self.accept(REPO + 'certora.exec("git", "log", "repos/x/src", cwd=repo)\n')
+        reasons = self.denials(REPO + 'certora.exec("git", "log", "elsewhere/y", cwd=repo)\n')
+        self.assertTrue(any("not a proven path within repos/**" in r for r in reasons))
+
     def test_a_laundered_string_is_denied(self) -> None:
-        # str(p).strip() builds a fresh StrFact -- not None -- and used to slip past the gate
+        # str(p).strip() builds a fresh StrFact -- not None -- and is no proven path
         reasons = self.denials(REPO + 'certora.exec("git", "log", str(repo).strip(), cwd=repo)\n')
-        self.assertTrue(any("unknown provenance" in r for r in reasons))
+        self.assertTrue(any("not a proven path within" in r for r in reasons))
 
     def test_an_f_string_is_denied(self) -> None:
         reasons = self.denials(
@@ -580,17 +587,21 @@ class TestUnknownArguments(unittest.TestCase):
             + REPO
             + 'certora.exec("git", "log", f"--author={sys.argv[1]}", cwd=repo)\n'
         )
-        self.assertTrue(any("unknown provenance" in r for r in reasons))
+        self.assertTrue(any("not a proven path within" in r for r in reasons))
 
-    def test_locations_still_confine_paths_that_pass_the_gate(self) -> None:
-        # orthogonality: a Located argument satisfies the gate but must lie within the
-        # permitted argument locations
+    def test_a_path_elsewhere_is_denied(self) -> None:
         reasons = self.denials(
             'other = pathlib.Path("elsewhere") / "y"\n'
             + REPO
             + 'certora.exec("git", "log", other, cwd=repo)\n'
         )
-        self.assertTrue(any("outside the permitted locations" in r for r in reasons))
+        self.assertTrue(any("not a proven path within repos/**" in r for r in reasons))
+
+    def test_a_flat_rule_takes_no_arguments(self) -> None:
+        # the words alone: anything after them needs a template that says what it is
+        outcome = host_check(HEADER + REPO + 'certora.exec("git", "log", "-p", cwd=repo)\n', "<t>", SUB_POLICY, ROOT)
+        assert isinstance(outcome, Rejected)
+        self.assertTrue(any("takes no arguments beyond its words" in d.reason for d in outcome.denials))
 
 
 class TestRuntimeCheck(unittest.TestCase):

@@ -25,6 +25,8 @@ from certorail.policy import (
     Policy,
     RequiredAtom,
     atom,
+    constraint,
+    hole,
     network,
     param,
     program,
@@ -32,6 +34,7 @@ from certorail.policy import (
     validation,
 )
 from certorail.policyfile import PolicyFileError, from_data, load_policy_file, parse_location
+from certorail.templates import Token
 
 
 def loads(text: str) -> Policy:
@@ -41,9 +44,11 @@ def loads(text: str) -> Policy:
 class TestParseLocation(unittest.TestCase):
     CASES = {
         ".": StaticPath(()),
-        "**": DirSplat((), ANY_NAME),
+        "**": DirSplat((), None),
+        "**/*": DirSplat((), ANY_NAME),  # strictly below the root: not the root itself
         "data/x": StaticPath((Named("data"), Named("x"))),
-        "repos/**": DirSplat((Named("repos"),), ANY_NAME),
+        "repos/**": DirSplat((Named("repos"),), None),
+        "repos/**/*": DirSplat((Named("repos"),), ANY_NAME),
         "repos/**/x.tar": DirSplat((Named("repos"),), Named("x.tar")),
         r"repos/**/<\w+\.tar>": DirSplat((Named("repos"),), Matching(RegexLit(r"\w+\.tar"))),
         "repos/{2025,2026}/x": StaticPath(
@@ -104,11 +109,11 @@ cwd         = "repos/**"
 establishes = { cwd = ["org-checkout"] }
 
 [[program]]
-name           = "git"
-subcommand     = "push origin"
-cwd            = "repos/**"
-requires       = ["org-checkout"]
-argument-atoms = ["not-force"]
+name         = "git"
+argv         = ["git", "push", "origin", "${BRANCH}"]
+cwd          = "repos/**"
+requires     = ["org-checkout"]
+holes.BRANCH = { atoms = ["not-force"] }
 
 [[program]]
 name       = "git"
@@ -140,13 +145,12 @@ EXPECTED = Policy.allow(
     programs=[
         program(
             "git",
-            subcommand="push origin",
             cwd=markers.within("repos"),
             requires=["org-checkout"],
-            argument_atoms=["not-force"],
-            unknown_arguments=False,
+            argv=["git", "push", "origin", hole("BRANCH")],
+            holes={"BRANCH": Token(constraint(atoms=["not-force"]))},
         ),
-        program("git", subcommand="log", cwd=markers.within("repos"), unknown_arguments=False),
+        program("git", subcommand="log", cwd=markers.within("repos")),
     ],
 )
 

@@ -65,7 +65,7 @@ class TestUrlGuards(unittest.TestCase):
         self.assertEqual(refine(StrFact(), cond), StrFact())
         got = refine(StrFact(), f'".." not in u and {cond}')
         self.assertEqual(
-            got, UrlString(path=DirSplat((Named("repos"),), ANY_NAME, absolute=True))
+            got, UrlString(path=DirSplat((Named("repos"),), None, absolute=True))
         )
 
     def test_netloc_alternation(self) -> None:

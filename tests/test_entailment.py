@@ -98,15 +98,21 @@ class TestRepresentationMustAgree(unittest.TestCase):
 
 class TestLocatedAgainstLocation(unittest.TestCase):
     def test_a_splat_below_the_prefix_is_within(self) -> None:
-        deeper = Located(DirSplat((Named("foo"), Named("sub")), ANY_NAME), "path")
+        # the reflexive form denotes its prefix; the strict form (an unconstrained leaf) does not
+        self.assertTrue(location_le(static("foo"), DirSplat((Named("foo"),), None)))
+        self.assertFalse(location_le(static("foo"), DirSplat((Named("foo"),), ANY_NAME)))
+        self.assertTrue(location_le(static("foo", "x"), DirSplat((Named("foo"),), ANY_NAME)))
+        self.assertTrue(location_le(DirSplat((Named("foo"),), ANY_NAME), DirSplat((Named("foo"),), None)))
+        self.assertFalse(location_le(DirSplat((Named("foo"),), None), DirSplat((Named("foo"),), ANY_NAME)))
+        deeper = Located(DirSplat((Named("foo"), Named("sub")), None), "path")
         self.assertTrue(entails(deeper, rely(WITHIN_FOO_PATH)))
 
     def test_a_splat_above_the_prefix_is_not_within(self) -> None:
-        shallower = Located(DirSplat((Named("foo"),), ANY_NAME), "path")
+        shallower = Located(DirSplat((Named("foo"),), None), "path")
         self.assertFalse(entails(shallower, rely('typing.Annotated[pathlib.Path, certora.within("foo/sub")]')))
 
     def test_an_unconstrained_leaf_does_not_meet_a_constrained_one(self) -> None:
-        anything = Located(DirSplat((Named("foo"),), ANY_NAME), "str")
+        anything = Located(DirSplat((Named("foo"),), None), "str")
         self.assertFalse(entails(anything, rely(TXT_UNDER_FOO_STR)))
 
     def test_a_matching_component_meets_the_same_leaf_constraint(self) -> None:

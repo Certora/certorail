@@ -20,8 +20,7 @@ if TYPE_CHECKING:
 
     class AtomId(str):
         """A validation fact. Declared as a key of ``[atoms]``; spelled in a validation's
-        ``establishes`` values, a rule's ``requires`` and ``argument-atoms``, a constraint's
-        ``atoms``, a network rule's ``requires`` (bare, or its ``atom =``), the ``source`` of a
+        ``establishes`` values, a rule's ``requires``, a constraint's ``atoms``, a network rule's ``requires`` (bare, or its ``atom =``), the ``source`` of a
         ``[[program]]`` or ``[[network]]`` rule and the ``name`` of a ``[[source]]``; and by a
         program as ``certora.validated("...")``."""
 

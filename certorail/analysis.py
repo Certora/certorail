@@ -345,23 +345,37 @@ class StaticPath:
     def extend_single(self, other: Component) -> "StaticPath":
         return StaticPath(self.path_components + (other,), self.absolute)
 
-    def to_splat(self, final_component: Component) -> "DirSplat":
+    def to_splat(self, final_component: Component | None) -> "DirSplat":
         return DirSplat(self.path_components, final_component, self.absolute)
 
 @dataclass(frozen=True)
 class DirSplat:
+    """Paths at some depth under ``static_prefix``. ``final_component`` None: the prefix
+    itself and everything below it (``a/**``, reflexive); a component: strictly below the
+    prefix, the last component satisfying it (``a/**/*`` any name, ``a/**/<re>``). The two
+    are different sets -- they differ in whether the prefix itself is denoted -- and share no
+    spelling."""
     static_prefix: tuple[Component, ...]
-    final_component: Component
+    final_component: Component | None
     absolute: bool = False
 
     def merge_other(self, other: "LocationFact") -> "LocationFact":
+        """Joined with *other* below: somewhere under the prefix, ending as *other* ends -- the
+        intervening components are widened away, but not the depth: the result is strictly
+        below the prefix whenever this splat demanded a component or *other* contributes one,
+        and only ``.`` joined onto a reflexive splat stays reflexive."""
         if other.absolute:
             return other  # joining onto an absolute path discards the left side (pathlib)
-        return DirSplat(
-            static_prefix=self.static_prefix,
-            final_component=other.final_component,
-            absolute=self.absolute,
-        )
+        match other:
+            case StaticPath(path_components=()):
+                return self  # joining "." adds nothing
+            case StaticPath(path_components=cs):
+                return DirSplat(self.static_prefix, cs[-1], self.absolute)
+            case DirSplat(static_prefix=ps, final_component=None):
+                strict = self.final_component is not None or bool(ps)
+                return DirSplat(self.static_prefix, ANY_NAME if strict else None, self.absolute)
+            case DirSplat(final_component=leaf):
+                return DirSplat(self.static_prefix, leaf, self.absolute)
 
     def extend_static(self, ext: tuple[str, ...]) -> "DirSplat":
         return DirSplat(
@@ -377,7 +391,7 @@ class DirSplat:
             self.absolute
         )
 
-    def to_splat(self, final_component: Component) -> "DirSplat":
+    def to_splat(self, final_component: Component | None) -> "DirSplat":
         return DirSplat(self.static_prefix, final_component, self.absolute)
 
 
@@ -524,10 +538,10 @@ def location_to_regex(loc: LocationFact) -> PseudoRegex:
             head: list[PseudoRegex] = [_joined(prefix), SLASH] if prefix else []
             if ab:
                 head = [SLASH, *head]
-            below = concat(*head, DESCENDANTS, component_to_regex(final))
-            if final != ANY_NAME:
+            below = concat(*head, DESCENDANTS, component_to_regex(ANY_NAME if final is None else final))
+            if final is not None:
                 return below
-            # an unconstrained leaf means "at or below": the prefix itself is denoted too
+            # no leaf means "at or below": the prefix itself is denoted too
             self_spelling = (
                 (concat(SLASH, _joined(prefix)) if ab else _joined(prefix))
                 if prefix
@@ -574,15 +588,19 @@ def pretty_location(loc: LocationFact) -> str:
             return ("/" if ab else "") + "/".join(pretty_component(c) for c in cs)
         case DirSplat(static_prefix=ps, final_component=leaf, absolute=ab):
             prefix = "/".join(pretty_component(c) for c in ps)
-            tail = "**" if leaf == ANY_NAME else f"**/{pretty_component(leaf)}"
+            tail = "**" if leaf is None else f"**/{pretty_component(leaf)}"
             return ("/" if ab else "") + (f"{prefix}/{tail}" if prefix else tail)
 
 
 def splat_under(loc: LocationFact) -> DirSplat:
-    """The location "somewhere at or below *loc*"."""
+    """The location "somewhere at or below *loc*", *loc* itself included. Below a strict splat
+    the leaf constraint is widened away but the depth is kept: every path is still strictly
+    below the prefix."""
     match loc:
         case StaticPath(path_components=components, absolute=ab):
-            return DirSplat(components, ANY_NAME, ab)
+            return DirSplat(components, None, ab)
+        case DirSplat(final_component=None):
+            return loc
         case DirSplat(static_prefix=prefix, absolute=ab):
             return DirSplat(prefix, ANY_NAME, ab)
 
@@ -898,9 +916,18 @@ class Data:
     handle is a Python object an attribute store can patch (``h.read = f``), so it is inert --
     handing it to an extractor or calling its methods runs no program code -- only while no
     program code can have touched it. Any call that may run program code, and any attribute
-    store, opens every handle in the state, since an alias may have been the receiver."""
+    store, opens every handle in the state, since an alias may have been the receiver.
+
+    ``writes`` makes the handle a *file opened for writing* at a proven location (EFFECTS.md,
+    "File writes"): None for a read handle (and a source); a tuple of the locations the file
+    may be at otherwise -- one for ``f = open(p, "w")``, several after a join. A write through
+    it (``f.write``, ``print(file=f)``) is a file write at those locations, killed by footprint
+    like ``p.write_text()``. This is what keeps a file object out of the inert set by accident:
+    a write-mode ``open`` at an *unproven* location binds no handle at all, so the object is
+    unknown and every method on it opaque."""
     sources: frozenset[str] = frozenset()
     closed: bool = True
+    writes: tuple[LocationFact, ...] | None = None
 
     def opened(self) -> "Data":
         return replace(self, closed=False) if self.closed else self
@@ -1103,7 +1130,7 @@ def locate(fact: ValidationFact | None) -> Located | None:
             if (comp := as_component(fact)) is not None:
                 return Located(StaticPath((comp,)), rp, fact.checks)
             if "no-parent-traversal" in fact and "not-absolute" in fact:
-                return Located(DirSplat((), ANY_NAME), rp, fact.checks)
+                return Located(DirSplat((), None), rp, fact.checks)  # the root, or anywhere below
             return None
         case UrlString():
             return None  # a URL is not a filesystem path
@@ -1153,18 +1180,18 @@ def location_le(actual: LocationFact, required: LocationFact) -> bool:
             if len(cs) < len(ps) or not all(subsumes(p, c) for p, c in zip(ps, cs)):
                 return False
             if len(cs) == len(ps):
-                return leaf == ANY_NAME  # the prefix itself is denoted only by an unconstrained leaf
-            return subsumes(leaf, cs[-1])
+                return leaf is None  # the prefix itself is denoted only by the reflexive form
+            return leaf is None or subsumes(leaf, cs[-1])
         case DirSplat(), StaticPath():
             return False
         case DirSplat(static_prefix=ps, final_component=l), DirSplat(static_prefix=qs, final_component=m):
-            # a's leaves must satisfy m (an unconstrained l therefore needs an unconstrained m),
-            # and a's prefix must lie under b's
-            return (
-                len(ps) >= len(qs)
-                and all(subsumes(q, p) for q, p in zip(qs, ps))
-                and subsumes(m, l)
-            )
+            # a's prefix must lie under b's, and a's leaves must satisfy m: a reflexive b covers
+            # any a; a reflexive a (which denotes its prefix) needs a reflexive b
+            if len(ps) < len(qs) or not all(subsumes(q, p) for q, p in zip(qs, ps)):
+                return False
+            if m is None:
+                return True
+            return l is not None and subsumes(m, l)
 
 def entails(actual: str | ValidationFact | None, required: ValidationFact) -> bool:
     """Does what is known of *actual* establish *required*?"""
@@ -1245,7 +1272,7 @@ def combine_containment(
             if (component := as_component(child)) is not None:
                 return cont.extend_single(component)
             if "no-parent-traversal" in child and "not-absolute" in child:
-                return cont.to_splat(ANY_NAME)
+                return splat_under(cont)  # a relative path free of "..": "." included
             return None
 
 def as_text(v: str | ValidationFact | None) -> StrFact:
@@ -1354,7 +1381,8 @@ class _Spelling:
                 return state._components(cs)
             case DirSplat(static_prefix=ps, final_component=leaf):
                 state = state._components(ps).sep() if ps else state
-                return state.splat().sep().chunk(_component_token(leaf))
+                state = state.splat()
+                return state if leaf is None else state.sep().chunk(_component_token(leaf))
 
     def _components(self, cs: Sequence[Component]) -> "_Spelling":
         state: _Spelling = self
@@ -1397,7 +1425,7 @@ class _Start(_Spelling):
         return _Boundary(StaticPath((), absolute=True))  # a leading "/": absolute
 
     def splat(self) -> _Spelling:
-        return _Boundary(DirSplat((), ANY_NAME))
+        return _Boundary(DirSplat((), None))
 
 @dataclass(frozen=True)
 class _Boundary(_Spelling):
@@ -2068,7 +2096,10 @@ def join_loc(
             for (splat_comp, static_comp) in zip(dir_prefix, known_path[:-1]):
                 if not subsumes(splat_comp, static_comp):
                     return None
-            if not subsumes(splat.final_component, known_path[-1]):
+            if len(dir_prefix) == len(known_path):
+                # the static path is the splat's prefix itself: only the reflexive form covers it
+                return splat if splat.final_component is None else splat.to_splat(None)
+            if splat.final_component is not None and not subsumes(splat.final_component, known_path[-1]):
                 return None
             return splat
         case (StaticPath(path_components=p1), StaticPath(path_components=p2)):
@@ -2077,6 +2108,8 @@ def join_loc(
                     c1, c2
                 ) for (c1, c2) in zip(p1, p2))
                 return StaticPath(paths, left.absolute)
+            if not p1 or not p2:
+                return DirSplat((), None, left.absolute)  # the root and a path below it
             last_comps = join_component(p1[-1], p2[-1])
             static_prefix = tuple(join_component(
                 c1, c2
@@ -2086,7 +2119,7 @@ def join_loc(
             )
         case DirSplat(static_prefix=p1, final_component=c1), DirSplat(static_prefix=p2, final_component=c2):
             return DirSplat(
-                final_component=join_component(c1, c2),
+                final_component=None if c1 is None or c2 is None else join_component(c1, c2),
                 static_prefix=tuple(join_component(c1, c2) for (c1, c2) in zip(p1, p2)),
                 absolute=left.absolute
             )

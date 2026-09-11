@@ -41,13 +41,13 @@ def absolute(*names: str) -> StaticPath:
 
 class TestAnchorSeparation(unittest.TestCase):
     def test_anchors_never_relate(self) -> None:
-        under_abs = DirSplat((Named("repos"),), ANY_NAME, absolute=True)
-        under_rel = DirSplat((Named("repos"),), ANY_NAME)
+        under_abs = DirSplat((Named("repos"),), None, absolute=True)
+        under_rel = DirSplat((Named("repos"),), None)
         self.assertFalse(location_le(rel("repos", "x"), under_abs))
         self.assertFalse(location_le(absolute("repos", "x"), under_rel))
 
     def test_absolute_within_absolute(self) -> None:
-        under = DirSplat((Named("srv"), Named("work")), ANY_NAME, absolute=True)
+        under = DirSplat((Named("srv"), Named("work")), None, absolute=True)
         self.assertTrue(location_le(absolute("srv", "work", "x"), under))
         self.assertFalse(location_le(absolute("srv", "other", "x"), under))
 
@@ -75,7 +75,7 @@ class TestPythonSpelling(unittest.TestCase):
     def test_within_absolute_prefix(self) -> None:
         self.assertEqual(
             location_of(markers.within("/srv/work")),
-            DirSplat((Named("srv"), Named("work")), ANY_NAME, absolute=True),
+            DirSplat((Named("srv"), Named("work")), None, absolute=True),
         )
 
     def test_traversal_in_an_absolute_prefix_is_rejected(self) -> None:
@@ -124,7 +124,7 @@ HEADER = "import pathlib\n"
 
 ABS_POLICY = Policy.allow(
     read=[markers.within("/opt/data")],
-    programs=[program("git", cwd=markers.within("/opt/repos"))],
+    programs=[program("git", subcommand="log", cwd=markers.within("/opt/repos"))],
 )
 
 

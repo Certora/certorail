@@ -124,7 +124,11 @@ class TestFastPath(Base):
         self.accept(REPO + 'certora.exec("git", "push", "origin", BRANCH="feature", cwd=repo)\n')
 
     def test_the_flat_rule_beside_it_still_works(self) -> None:
-        self.accept(REPO + 'certora.exec("git", "log", "--oneline", cwd=repo)\n')
+        self.accept(REPO + 'certora.exec("git", "log", cwd=repo)\n')
+        self.assertIn(
+            "takes no arguments beyond its words",
+            self.denial(REPO + 'certora.exec("git", "log", "--oneline", cwd=repo)\n'),
+        )
         self.assertIn(
             "no declared subcommand", self.denial(REPO + 'certora.exec("git", "rebase", cwd=repo)\n')
         )
@@ -294,7 +298,7 @@ class TestDashGuard(Base):
         self.assertFalse(may_start_with_dash(Located(StaticPath((Named("repos"),)), "str")))
         self.assertFalse(may_start_with_dash(Located(StaticPath((), absolute=True), "str")))
         self.assertFalse(may_start_with_dash(Located(StaticPath(()), "str")))  # "." itself
-        self.assertTrue(may_start_with_dash(Located(DirSplat((), ANY_NAME), "str")))
+        self.assertTrue(may_start_with_dash(Located(DirSplat((), None), "str")))
 
     def test_the_report_shows_the_bindings(self) -> None:
         accepted = self.accept(

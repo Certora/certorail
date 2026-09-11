@@ -19,7 +19,7 @@ TWO_ROOTS = Policy.allow(
     read=[markers.within(".")],
     write=[markers.within(".")],
     listing=[markers.within(".")],
-    programs=[program("git", cwd=[markers.within("repos"), markers.within("data")])],
+    programs=[program("git", subcommand="log", cwd=[markers.within("repos"), markers.within("data")])],
     validations=[
         validation(
             "probe",

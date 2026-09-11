@@ -22,7 +22,8 @@ from certorail.analysis import (
 from certorail.guards import apply, recognize
 from certorail.host import Rejected
 from certorail.host import check as host_check
-from certorail.policy import Policy, atom, program
+from certorail.policy import Policy, atom, constraint, hole, program
+from certorail.templates import Token
 from certorail.walker import analyze
 
 A, B, C = RegexLit("a"), RegexLit("b"), RegexLit("c")
@@ -149,10 +150,9 @@ class TestEndToEnd(unittest.TestCase):
             programs=[
                 program(
                     "git",
-                    subcommand="push origin",
                     cwd=markers.within("repos"),
-                    argument_atoms=["no-flag"],
-                    unknown_arguments=True,
+                    argv=["git", "push", "origin", hole("BRANCH")],
+                    holes={"BRANCH": Token(constraint(atoms=["no-flag"]))},
                 )
             ],
         )

@@ -15,7 +15,8 @@ import unittest
 
 from certorail import markers
 from certorail.broker import build_server, exec_request, request
-from certorail.policy import Policy, atom, network, param, program, pure, validation, waived
+from certorail.policy import Policy, atom, constraint, network, param, program, pure, splice, validation, waived
+from certorail.templates import Each
 
 
 class _Origin(http.server.BaseHTTPRequestHandler):
@@ -275,7 +276,10 @@ class TestBrokerExec(unittest.TestCase):
         (cls.root / "repos" / "x").mkdir(parents=True)
         policy = Policy.allow(
             programs=[
-                program("echo", cwd=markers.within(".")),
+                program(
+                    "echo", cwd=markers.within("."), argv=["echo", splice("WORDS")],
+                    holes={"WORDS": Each(constraint(any=True))},
+                ),
                 program("pwd", cwd=markers.within("repos")),
                 program("git", subcommand="log", cwd=markers.within("repos")),
             ],

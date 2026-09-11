@@ -38,6 +38,7 @@ from certorail.analysis import (
     ValidationFact,
     interpret_expr,
     iteration_bindings,
+    splat_under,
 )
 
 type State = dict[str, ValidationFact]
@@ -54,7 +55,8 @@ def static(*parts: str | Component) -> StaticPath:
     return StaticPath(tuple(Named(p) if isinstance(p, str) else p for p in parts))
 
 
-def splat(*prefix: str | Component, final: Component = ANY) -> DirSplat:
+def splat(*prefix: str | Component, final: Component | None = None) -> DirSplat:
+    """``prefix/**`` by default -- the prefix itself and everything below -- or ``prefix/**/final``."""
     return DirSplat(
         static_prefix=tuple(Named(p) if isinstance(p, str) else p for p in prefix),
         final_component=final,
@@ -489,6 +491,42 @@ class TestJoinOperandRestrictions(unittest.TestCase):
         for src in ('p + "x"', 'p // "x"', 'p % "x"'):
             with self.subTest(src=src):
                 self.assertIsNone(evaluate(src, {"p": BASE}))
+
+
+class TestSplatDepth(unittest.TestCase):
+    """Widening a join or a descent below a splat may forget the leaf's constraint, never the
+    depth: a path strictly below a prefix stays strictly below it. Only ``.`` joined onto a
+    reflexive splat (``a/**``) is reflexive again."""
+
+    def test_merging_a_reflexive_splat_below_a_strict_one_stays_strict(self) -> None:
+        self.assertEqual(splat("a", final=ANY).merge_other(splat()), splat("a", final=ANY))
+        self.assertEqual(splat("a", final=Named("x")).merge_other(splat("b")), splat("a", final=ANY))
+
+    def test_a_nonempty_prefix_makes_the_join_strict(self) -> None:
+        self.assertEqual(splat("a").merge_other(splat("b")), splat("a", final=ANY))
+
+    def test_reflexive_onto_reflexive_stays_reflexive(self) -> None:
+        self.assertEqual(splat("a").merge_other(splat()), splat("a"))
+        self.assertEqual(splat("a").merge_other(static()), splat("a"))
+
+    def test_a_constrained_leaf_below_carries_over(self) -> None:
+        self.assertEqual(splat("a").merge_other(splat("b", final=Named("x"))), splat("a", final=Named("x")))
+        self.assertEqual(splat("a", final=ANY).merge_other(static("b", "c")), splat("a", final=Named("c")))
+
+    def test_splat_under_keeps_the_depth(self) -> None:
+        self.assertEqual(splat_under(splat("a", final=Named("x"))), splat("a", final=ANY))
+        self.assertEqual(splat_under(splat("a")), splat("a"))
+        self.assertEqual(splat_under(static("a")), splat("a"))
+
+    def test_a_relative_string_joined_below_a_strict_splat(self) -> None:
+        # ``p / s`` with s a ".."-free relative string (possibly "."): at or below p, which is
+        # strictly below a, so still strictly below a
+        rel = validated("no-parent-traversal", "not-absolute")
+        self.assertEqual(
+            evaluate("p / s", {"p": path_of(splat("a", final=ANY)), "s": rel}),
+            path_of(splat("a", final=ANY)),
+        )
+        self.assertEqual(evaluate("p / s", {"p": path_of(splat("a")), "s": rel}), path_of(splat("a")))
 
 
 class TestCompoundExpressions(unittest.TestCase):

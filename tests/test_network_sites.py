@@ -39,7 +39,7 @@ KILL_POLICY = Policy.allow(
             establishes={"cwd": ["org-checkout"]},
         )
     ],
-    programs=[program("git", cwd=markers.within("repos"), requires=["org-checkout"])],
+    programs=[program("git", subcommand="log", cwd=markers.within("repos"), requires=["org-checkout"])],
     network=[network("api.github.com")],
 )
 

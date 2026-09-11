@@ -18,7 +18,7 @@ from .analysis import pretty_location, pretty_regex
 from .effects import EVERYTHING, Effects
 from .ids import AtomId
 from .policy import NetworkRule, Policy, Program, Validation, pretty_locations
-from .templates import Constraint, Each, Flags, Flagset, Template, Token
+from .templates import NOT_OPTION, Constraint, Each, Flags, Flagset, Template, Token
 
 NOTATION = (
     "Notation: <...> marks a value the program supplies. </re/> text known to match the regex "
@@ -51,6 +51,8 @@ def _constraint(c: Constraint) -> str:
 
 
 def _flagset(fs: Flagset) -> list[str]:
+    if fs.any:
+        return ["any flag, any value: the tool is trusted with its own options"]
     out: list[str] = []
     if fs.bare:
         out.append("bare: " + " ".join(sorted(fs.bare)))
@@ -158,21 +160,14 @@ def _program(p: Program, policy: Policy) -> list[str]:
     origin = f"    [from {p.origin}]" if p.origin else ""
     t = p.template
     if t is None:
-        out.append("- " + " ".join(p.leading_words) + " ARGS..." + origin)
+        out.append("- " + " ".join(p.leading_words) + origin)
         out.append(f"    cwd within {pretty_locations(p.cwd)}")
         if p.requires:
             out.append(f"    cwd validated by {', '.join(sorted(p.requires))} (check right before)")
         if p.source:
             out.append(f"    yields {p.source}: extract values from the result with certora.extract / extract_all / lines")
         out.append(f"    {_effects_line(policy, p)}")
-        parts = ["any" if p.unknown_arguments else "literal"]
-        if p.argument_locations:
-            parts.append(
-                "paths within " + ", ".join(pretty_location(loc) for loc in p.argument_locations)
-            )
-        if p.argument_atoms:
-            parts.append("validated " + ", ".join(sorted(p.argument_atoms)))
-        out.append(f"    ARGS...: each <{'; '.join(parts)}>")
+        out.append("    exactly these words: no further arguments")
         return out
     out.append("- " + _signature(t) + origin)
     out.append(f"    cwd within {pretty_locations(p.cwd)}")
@@ -231,8 +226,13 @@ def _atoms(policy: Policy) -> list[str]:
     for name in sorted(defined):
         out.append(f"- {name}: <{pretty_regex(defined[name])}> -- a literal has it; so does a variable after "
                    "assert re.fullmatch with that exact regex")
-    for name in sorted(pure):
+    for name in sorted(pure - {NOT_OPTION}):
         out.append(f"- {name}: a property of the value's text, established by a check; survives calls")
+    out.append(
+        f"- {NOT_OPTION}: built in -- the text does not begin with '-'. A literal, a regex with a "
+        "fixed head and a path under a named directory have it; a check may establish it on other "
+        "text. Every hole not preceded by a spelled '--' requires it"
+    )
     for name in sorted(environmental):
         state = policy.read_set(name)
         if state == EVERYTHING:

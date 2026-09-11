@@ -43,7 +43,7 @@ POLICY = Policy.allow(
             argv=["git", "push", "origin", hole("BRANCH")],
             holes={"BRANCH": Token(constraint(atoms=["no-flag"]))},
         ),
-        program("git", cwd=markers.within("repos"), subcommand="log", unknown_arguments=False),
+        program("git", cwd=markers.within("repos"), subcommand="log"),
         program(
             "tar", cwd=".", argv=["tar", splice("FLAGS"), "-f", hole("ARCHIVE"), splice("FILES")],
             holes={
@@ -71,8 +71,9 @@ class TestDescribe(unittest.TestCase):
             "- git push origin BRANCH",
             "cwd validated by org-checkout",
             "BRANCH: <validated no-flag>",
-            "- git log ARGS...",
-            "ARGS...: each <literal>",
+            "- git log\n",
+            "exactly these words: no further arguments",
+            "- not-option: built in",
             "- tar FLAGS... -f ARCHIVE FILES...",
             "bind by keyword: FLAGS, ARCHIVE, FILES",
             "inserted by the host, do not spell: -f",
@@ -103,7 +104,8 @@ class TestDescribe(unittest.TestCase):
                 code = main(["--describe", "--policy", str(policy), "--root", tmp])
             self.assertEqual(code, 0)
             self.assertIn("## Programs", out.getvalue())
-            self.assertIn("- gh ARGS...", out.getvalue())
+            self.assertIn("- gh\n", out.getvalue())
+            self.assertIn("exactly these words", out.getvalue())
             self.assertIn(f"Policy: {policy}", out.getvalue())
 
     def test_describe_takes_no_program(self) -> None:

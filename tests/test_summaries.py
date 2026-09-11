@@ -157,7 +157,7 @@ class TestSummariesCarryWriteSets(unittest.TestCase):
     def test_a_committing_helper_preserves_unrelated_atoms(self) -> None:
         source = (
             PRELUDE
-            + 'def commit():\n    certora.exec("git", "commit", "-m", "x", cwd=repo)\n'
+            + 'def commit():\n    certora.exec("git", "commit", cwd=repo)\n'
             + CHECK
             + "commit()\n"
             + 'certora.exec("git", "push", cwd=repo)\n'
@@ -170,7 +170,7 @@ class TestSummariesCarryWriteSets(unittest.TestCase):
     def test_inside_a_loop_too(self) -> None:
         source = (
             PRELUDE
-            + 'def commit():\n    certora.exec("git", "commit", "-m", "x", cwd=repo)\n'
+            + 'def commit():\n    certora.exec("git", "commit", cwd=repo)\n'
             + CHECK
             + "for i in [1, 2]:\n    commit()\n"
             + 'certora.exec("git", "push", cwd=repo)\n'

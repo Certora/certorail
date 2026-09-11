@@ -45,6 +45,7 @@ from .analysis import (
     StrFact,
     UrlString,
     Interpreter,
+    LocationFact,
     StateMap,
     ValidationFact,
     destructure,
@@ -54,7 +55,6 @@ from .analysis import (
 )
 from .annotations import Contract, bind_arguments, default_of, is_plain_type, parse_annotation
 from .dangerous import CHECK_CALLEE, EXEC_CALLEE, EXTRACT_ALL_CALLEE, LINES_CALLEE
-from .effects import EVERYTHING
 from .enforcement import (
     CONTAINER_METHODS,
     CONTAINER_READ_CALLS,
@@ -289,9 +289,12 @@ def _kill(st: State, names: set[str]) -> State:
 
 def _join(a: State, b: State) -> State:
     """Facts that hold on both paths: equal entries as they are; two standard values as one of
-    the common kind, closed when both are; two inert scalars that differ -- text on one path, a
-    number on the other -- as a standard value of unknown kind. Equality otherwise; the lattice
-    join for facts (``join_loc`` &c.) slots in here once it lands."""
+    the common kind, closed when both are; two handles as one with the sources both have, the
+    locations either may write, closed when both are; two inert scalars that differ -- text on
+    one path, a number on the other -- as a standard value of unknown kind. A container or a
+    handle against anything else is dropped: a write handle must never become a mere inert
+    value, or a write through it would go unkilled. Equality otherwise; the lattice join for
+    facts (``join_loc`` &c.) slots in here once it lands."""
     out: State = {}
     for k, v in a.items():
         other = b.get(k)
@@ -301,10 +304,23 @@ def _join(a: State, b: State) -> State:
             out[k] = v
         elif isinstance(v, Std) and isinstance(other, Std):
             out[k] = Std(v.kind if v.kind == other.kind else None, v.closed and other.closed)
-        elif isinstance(v, Data) and isinstance(other, Data) and v.sources == other.sources:
-            out[k] = Data(v.sources, v.closed and other.closed)
-        elif not isinstance(v, (Container, Data)) and not isinstance(other, (Container, Data)):
+        elif isinstance(v, Data) and isinstance(other, Data):
+            writes: tuple[LocationFact, ...] | None
+            if v.writes is None and other.writes is None:
+                writes = None
+            else:
+                writes = tuple(v.writes or ()) + tuple(w for w in other.writes or () if w not in (v.writes or ()))
+            out[k] = Data(v.sources & other.sources, v.closed and other.closed, writes)
+        elif isinstance(v, (Container, Data)) or isinstance(other, (Container, Data)):
+            continue
+        elif isinstance(v, Std) or isinstance(other, Std):
             out[k] = Std(None, inert(v) and inert(other))
+        elif replace(v, checks=frozenset()) == replace(other, checks=frozenset()):
+            # the same fact, differently checked: a check died on one path (an effect there),
+            # or was established on one path only -- what both paths carry survives
+            out[k] = replace(v, checks=v.checks & other.checks)
+        else:
+            out[k] = Std(None, True)  # two facts of different shape: text or a path either way
     return out
 
 
@@ -548,18 +564,18 @@ class ValidationWalker(ast.NodeVisitor):
         the current, possibly degraded fact); a handle carries only source atoms, which are pure.
         When the call opens the state -- program code may have run, or a program object was
         stored -- every standard value and handle that can hold one is opened."""
-        if kill.writes.empty and not kill.opens:
+        if kill.nothing:
             return st
         forget = self.enforcement.forget
         out: State = {}
         for k, v in st.items():
             match v:
                 case Container(elem=elem):
-                    out[k] = replace(v, elem=forget(elem, kill.writes))
+                    out[k] = replace(v, elem=forget(elem, kill))
                 case Data() | Std():
                     out[k] = v.opened() if kill.opens else v
                 case _:
-                    out[k] = forget(v, kill.writes)
+                    out[k] = forget(v, kill)
         return out
 
     def _kill_state(self, kill: Kill) -> None:
@@ -686,7 +702,7 @@ class ValidationWalker(ast.NodeVisitor):
                 local.add(extra.arg)
         local |= _assigned_names(node.body)
         seed: State = {
-            k: v if isinstance(v, Std) else self.enforcement.forget(v, EVERYTHING)
+            k: v if isinstance(v, Std) else self.enforcement.forget(v, OPAQUE)
             for k, v in self.module_constants.items()
             if k not in local
         }
@@ -962,7 +978,7 @@ class ValidationWalker(ast.NodeVisitor):
             # what any iteration may do, rehearsed from the state after the comprehension ran
             # (the comprehension's own walk already answers for every iteration)
             every = self._rehearse(lambda: self.visit(comp), self.state)
-            fact = self.enforcement.forget(fact, every.writes)
+            fact = self.enforcement.forget(fact, every)
         if not self.enforcement.establishes(fact, declared.elem):
             self._violation(
                 elt,

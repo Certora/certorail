@@ -15,7 +15,7 @@ functions below take either.
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Final
 
 from .analysis import (
     Alternation,
@@ -63,6 +63,14 @@ class HoleRef:
 type Piece = str | HoleRef
 
 
+# The one atom certorail declares itself: the value does not begin with "-", so a tool cannot
+# read it as an option. Every token or each hole not preceded by a literal "--" requires it. A
+# literal, a regex with a fixed head, a located value under a named directory or an absolute
+# one carry it by structure (``may_start_with_dash``); a checker lists it in ``establishes`` to
+# vouch for text it has inspected. No policy declares it, and none may.
+NOT_OPTION: Final = AtomId("not-option")
+
+
 @dataclass(frozen=True)
 class Constraint:
     """What one token must be: a rely, in the annotation vocabulary. Three orthogonal kinds of
@@ -70,9 +78,10 @@ class Constraint:
     to match); *provenance* -- ``literal``: the text is statically known, so the program named
     it (a literal, a constant, a join of literals) rather than read it from a file, argv or an
     API -- the intent gate for destructive actions; *facts* -- ``atoms``, live validation facts.
-    ``any`` admits anything, the local successor of ``unknown-arguments``, and combines with
-    nothing. A located value is textless, so ``locations`` excludes ``regex``; everything else
-    combines (``locations`` + ``literal`` is a constant path within). Empty says nothing."""
+    ``any`` admits anything -- an explicit, local statement that this position is data for the
+    tool -- and combines with nothing. A located value is textless, so ``locations`` excludes
+    ``regex``; everything else combines (``locations`` + ``literal`` is a constant path within).
+    Empty says nothing."""
 
     locations: tuple[LocationFact, ...] = ()
     regex: PseudoRegex | None = None
@@ -103,15 +112,23 @@ class Each:
 @dataclass(frozen=True)
 class Flagset:
     """A flag vocabulary: the bare flags, and the valued ones with the constraint on their
-    value. Every flag name begins with ``-``."""
+    value. Every flag name begins with ``-``. ``any`` is the open vocabulary -- any flag, any
+    value, unknown values included -- for a tool the deployment trusts wholesale (under a jail,
+    say) and does not care to enumerate; it stands alone, and a rule carrying it cannot say
+    what it writes, since anything may reach the tool as an option."""
 
     bare: frozenset[FlagName] = frozenset()
     valued: Mapping[FlagName, Constraint] = field(default_factory=dict)
+    any: bool = False
 
     def __post_init__(self) -> None:
         names = set(self.bare) | set(self.valued)
+        if self.any:
+            if names:
+                raise ValueError("an open flag vocabulary (any = true) lists no flags")
+            return
         if not names:
-            raise ValueError("a flag vocabulary needs at least one flag")
+            raise ValueError("a flag vocabulary needs at least one flag, or any = true")
         for n in names:
             if not n.startswith("-"):
                 raise ValueError(f"flag names begin with '-': {n!r}")
@@ -452,11 +469,16 @@ def may_start_with_dash(value: Value) -> bool:
             return _regex_may_start_with_dash(regex)
 
 
-DASH_REASON = "may begin with '-' and be read as an option; confine it under a named directory or guard its text"
+DASH_REASON = (
+    "may begin with '-' and be read as an option (it lacks not-option): confine it under a named "
+    "directory, guard its text, or have a checker that establishes not-option vouch for it"
+)
 
 
 def flags_failure(fs: Flagset, elements: Sequence[Value], atoms_missing: AtomsMissing) -> str | None:
     """Parse *elements* against the vocabulary, left to right."""
+    if fs.any:
+        return None  # the open vocabulary: whatever the program passes is the tool's business
     i = 0
     while i < len(elements):
         text = known_text(elements[i])
@@ -478,6 +500,15 @@ def flags_failure(fs: Flagset, elements: Sequence[Value], atoms_missing: AtomsMi
     return None
 
 
+def option_shaped(value: Value, atoms_missing: AtomsMissing) -> bool:
+    """The leading-dash guard: may the tool read *value* as an option? Not when its structure
+    shows a fixed head other than ``-`` (``may_start_with_dash``), and not when it carries the
+    ``not-option`` atom -- a checker vouched for text the analysis cannot see the head of."""
+    if not may_start_with_dash(value):
+        return False
+    return NOT_OPTION in atoms_missing(value, frozenset({NOT_OPTION}))
+
+
 def hole_failures(bound: Bound, atoms_missing: AtomsMissing) -> list[str]:
     """Every way the bound values fall short of their holes, each naming the hole."""
     out: list[str] = []
@@ -489,7 +520,7 @@ def hole_failures(bound: Bound, atoms_missing: AtomsMissing) -> list[str]:
             case Token(constraint=c):
                 assert not isinstance(value, (Many, Elements))
                 reason = constraint_failure(c, value, atoms_missing)
-                if reason is None and guard and may_start_with_dash(value):
+                if reason is None and guard and option_shaped(value, atoms_missing):
                     reason = DASH_REASON
                 if reason is not None:
                     out.append(f"{name} {reason}")
@@ -500,13 +531,13 @@ def hole_failures(bound: Bound, atoms_missing: AtomsMissing) -> list[str]:
                             out.append(f"{name} needs at least {minimum} element(s)")
                         for i, e in enumerate(elements):
                             reason = constraint_failure(c, e, atoms_missing)
-                            if reason is None and guard and may_start_with_dash(e):
+                            if reason is None and guard and option_shaped(e, atoms_missing):
                                 reason = DASH_REASON
                             if reason is not None:
                                 out.append(f"{name}[{i}] {reason}")
                     case Elements(elem=elem):
                         reason = constraint_failure(c, elem, atoms_missing)
-                        if reason is None and guard and may_start_with_dash(elem):
+                        if reason is None and guard and option_shaped(elem, atoms_missing):
                             reason = DASH_REASON
                         if reason is not None:
                             out.append(f"the elements of {name} {reason}")

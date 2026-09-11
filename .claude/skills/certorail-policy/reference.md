@@ -28,7 +28,7 @@ name        = "not-force-check"
 params      = ["value"]
 argv        = ["test", "${value}", "!=", "--force"]
 effect-free = true
-establishes = { value = ["not-force"] }
+establishes = { value = ["not-force", "not-option"] }   # also vouches the value is no option
 
 [[program]]
 name       = "git"
@@ -38,12 +38,12 @@ network    = false                         # a claim about the tool: it writes n
 writes     = ["git.refs"]                  # and within the filesystem, only this
 
 [[program]]
-name           = "git"
-subcommand     = "push origin"
-cwd            = "repos/**"
-requires       = ["org-checkout"]
-argument-atoms = ["not-force"]
-writes         = ["git.remote", "git.refs"]
+name         = "git"
+argv         = ["git", "push", "origin", "${BRANCH}"]
+cwd          = "repos/**"
+requires     = ["org-checkout"]
+holes.BRANCH = { atoms = ["not-force"] }
+writes       = ["git.remote", "git.refs"]
 
 [[network]]
 host    = "api.github.com"
@@ -62,7 +62,8 @@ Components separated by `/`. Each component is a literal name, `*` (any one name
 | `repos/*` | any direct child of `repos` |
 | `repos/{a,b}` | `repos/a` or `repos/b` |
 | `repos/**` | `repos` and anything at or below it |
-| `reports/**/<\w+\.json>` | a `.json`-named entry anywhere at or below `reports` (the leaf after `**` is exactly one component) |
+| `repos/**/*` | anything strictly below `repos`, not `repos` itself |
+| `reports/**/<\w+\.json>` | a `.json`-named entry anywhere below `reports` (the leaf after `**` is exactly one component) |
 | `/srv/data/**` | anchored at the *filesystem* root |
 
 `**` appears at most once, as the last component or followed by exactly one leaf. No `..`, no
@@ -151,8 +152,9 @@ two layers, both trusted like the rest of the policy:
   stands for the whole medium: `writes = ["network"]`.
 
 Only a rule whose arguments cannot smuggle an option or a subcommand past the shape may declare
-`writes`: no `unknown-arguments = true`, and no `any` hole except where the leading-dash guard
-already exempts it (a flag's value, a hole after a literal `--`). Media need no such condition.
+`writes`: no open flag vocabulary (`any = true` on a flags hole), and no `any` hole except where
+the leading-dash guard already exempts it (a flag's value, a hole after a literal `--`). Media
+need no such condition.
 
 A `[[network]]` rule is network medium by construction. Its default write set is every network
 region; a rule whose methods are only `GET` and `HEAD` defaults to writing nothing. The
@@ -163,13 +165,14 @@ footprint-based derivation is not yet in). `--describe` renders the result per r
 
 ## `[[program]]`
 
-Two forms. The **flat** form governs a program (or one subcommand of it) by rules over its
-arguments as a whole; the **templated** form (`argv` + `holes`) states the shape of the command
-line. A program's rules, of either form, must be prefix-free in their leading literal words, so
-an exec selects exactly one and an unlisted form fails closed: once any rule for a program names
-a subcommand or a template, an exec matching none of them (unlisted, or not literal) is denied,
-and subcommands cannot mix with a bare rule for the same program. `cwd` is a location *slot* on
-both: one location or a list meaning any-of.
+Two forms. The **flat** form (`name` plus `subcommand`) permits exactly those words and nothing
+after them; the **templated** form (`argv` + `holes`) states the shape of a command line that
+takes arguments, each hole saying what its argument is. There is no third form: a rule that
+takes arguments it does not describe cannot be written. A program's rules, of either form, must
+be prefix-free in their leading literal words, so an exec selects exactly one and an unlisted
+form fails closed: once any rule for a program names a subcommand or a template, an exec matching
+none of them (unlisted, or not literal) is denied, and subcommands cannot mix with a bare rule for
+the same program. `cwd` is a location *slot* on both: one location or a list meaning any-of.
 
 | Key | Type | Meaning |
 |---|---|---|
@@ -181,19 +184,17 @@ both: one location or a list meaning any-of.
 | `argv` | list of words | templated form: literal words, `${X}` (one token), `${X...}` (a splice); the first is the program |
 | `holes` | table | templated form: one table per hole named in `argv` (below) |
 
-Flat-form keys (not allowed together with `argv`):
+Flat-form key (not allowed together with `argv`):
 
 | Key | Type | Meaning |
 |---|---|---|
-| `subcommand` | string | leading literal words this rule governs (`"push origin"`) |
-| `argument-atoms` | list of atoms | every argument after the subcommand must carry these |
-| `argument-locations` | list of locations | every argument that is a proven path must lie within one |
-| `unknown-arguments` | bool, default **false** | may arguments include values the analysis cannot vouch for? |
+| `subcommand` | string | the leading literal words after the program (`"push origin"`); the exec must spell exactly these and no more |
 
-Vouched-for means exactly-known text or a proven path; an f-string, a `.strip()` result or a
-runtime-checked value is *not*, even when it carries atoms. Prefer a template over
-`unknown-arguments = true` whenever the program takes flags or paths: a template grants exactly
-the flags and positions listed and nothing else, and it may declare `writes`.
+A tool trusted with its own options -- under a jail, or because enumerating them buys nothing --
+gets a template with an **open flag vocabulary**: `holes.FLAGS = { kind = "flags", any = true }`
+admits any flag and any value, unknown values included. It is the one place the policy says
+"whatever the program passes"; `--describe` renders it as such, and a rule carrying it cannot
+declare `writes`.
 
 ### Holes
 
@@ -260,12 +261,16 @@ naming a flag of the vocabulary (a computed flag is a violation, an unlisted one
 valued flag consumes the next element as its value. `--describe` prints `bind by keyword: …` on
 every template whose holes are keyword-only.
 
-**The leading-dash guard.** A value in a token or each hole must be shown not to begin with `-`:
-a located value whose first component is a literal name (`repos/…`) or an absolute path, or text
-whose known regex begins with a literal that is not `-`. A value known only to lie somewhere
-under `**`, or unguarded text, is denied with the fix in the message. Flag *values* are exempt
-(the flag consumed the slot), and so is every hole after a literal `--` in the template, for
-tools that honour it (`argv = ["grep", "--", "${PATTERN}", "${FILES...}"]`).
+**The leading-dash guard.** A value in a token or each hole must carry the built-in atom
+`not-option`, "the text does not begin with `-`". Structure supplies it for a located value
+whose first component is a literal name (`repos/…`) or an absolute path, and for text whose
+known regex begins with a literal that is not `-`; a checker supplies it for text the analysis
+cannot see the head of, by listing `not-option` in `establishes` beside the atom it checks
+(every text checker should). A value known only to lie somewhere under `**`, or unguarded,
+unchecked text, is denied with the fix in the message. Flag *values* are exempt (the flag
+consumed the slot), and so is every hole after a literal `--` in the template, for tools that
+honour it (`argv = ["grep", "--", "${PATTERN}", "${FILES...}"]`). `not-option` may not be
+declared in `[atoms]`.
 
 ## Sources: `source = "…"` and `[[source]]`
 
@@ -297,7 +302,7 @@ org     = "org-checkout"              # an atom parameter names an atom the root
 `[params] where = { kind = "directory" }` binds one directory or a list (plain paths, no `**`);
 the ruleset writes `${where}` for the directory and `${where}/**` for its subtree, and every
 location slot so written becomes a one-of list over the bound directories. `kind = "atom"`
-parameters are substituted whole into atom lists (`requires`, `argument-atoms`, `atoms`,
+parameters are substituted whole into atom lists (`requires`, a hole's `atoms`,
 `establishes`). A ruleset is applied at most once; two applications with different bindings is
 an error (apply it once with the union), the same application reached twice through nested
 rulesets is one document. Atom and validation names are unique across the whole composition

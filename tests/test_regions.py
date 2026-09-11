@@ -61,7 +61,8 @@ def policy_data() -> dict:
              "writes": ["git.head", "git.index", "git.worktree"]},
             {"name": "git", "subcommand": "status", "cwd": "repos/**", "effect-free": True},
             {"name": "cargo", "subcommand": "build", "cwd": "repos/**"},
-            {"name": "gh", "cwd": ".", "unknown-arguments": True, "write": False},
+            {"name": "gh", "cwd": ".", "argv": ["gh", "${FLAGS...}"],
+             "holes": {"FLAGS": {"kind": "flags", "any": True}}, "write": False},
         ],
         "network": [
             {"host": "api.github.com", "methods": ["GET"]},
@@ -213,9 +214,9 @@ class TestLoadErrors(unittest.TestCase):
         data["regions"]["fs"] = {"network": True}
         self.rejects(data, "names a medium and is reserved")
 
-    def test_unknown_arguments_cannot_say_what_they_write(self) -> None:
+    def test_an_open_flag_vocabulary_cannot_say_what_it_writes(self) -> None:
         data = policy_data()
-        data["program"][6]["writes"] = ["git.remote"]  # gh: unknown-arguments = true
+        data["program"][6]["writes"] = ["git.remote"]  # gh: any flag, any value
         self.rejects(data, "cannot say what it writes")
 
     def test_effect_free_disagrees_with_a_claimed_medium(self) -> None:

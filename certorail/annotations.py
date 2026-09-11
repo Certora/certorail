@@ -249,7 +249,7 @@ def _location_of(t: Term, name: str, args: Args, kwargs: Kwargs) -> LocationFact
                 absolute = True
             else:
                 prefix = _components_of(prefix_t)
-            leaf = ANY_NAME if leaf_t is None else _single_component(leaf_t, "within(leaf=)")
+            leaf = None if leaf_t is None else _single_component(leaf_t, "within(leaf=)")
             return DirSplat(prefix, leaf, absolute)
         case _:
             raise _err(t, f"unknown marker certora.{name}")

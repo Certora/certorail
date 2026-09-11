@@ -356,6 +356,11 @@ PATH_SINK_METHODS: dict[str, AccessKind] = {
     # because `replace` is also str.replace. Its target is a second path written: see below.
 }
 
+# file-object methods that change the file: on a handle opened for writing, each is a file write
+# at the handle's location (enforcement.Enforcement.kill_of). ``flush``/``close`` only land what a
+# write already counted. ``print(..., file=f)`` is the other way to write through a handle.
+FILE_WRITE_METHODS: frozenset[str] = frozenset({"write", "writelines", "truncate"})
+
 # pathlib methods that write a SECOND path, given as their first argument (positionally or by
 # the keyword named here): ``p.replace(target)`` moves p onto target, ``p.link_to(target)``
 # creates target. The target is a write sink in its own right, audited beside the receiver;

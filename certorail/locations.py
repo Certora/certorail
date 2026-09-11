@@ -21,7 +21,8 @@ def to_location(spec: locspec.Spec) -> LocationFact:
     components = tuple(_component(c) for c in spec.components)
     if not spec.splat:
         return StaticPath(components, spec.absolute)
-    leaf = ANY_NAME if spec.leaf is None else _component(spec.leaf)
+    # ``a/**`` (no leaf): a and everything below; ``a/**/*`` (a wildcard leaf): strictly below
+    leaf = None if spec.leaf is None else _component(spec.leaf)
     return DirSplat(components, leaf, spec.absolute)
 
 

@@ -25,12 +25,12 @@
     establishes = { value = ["not-force"] }
 
     [[program]]
-    name           = "git"
-    subcommand     = "push origin"
-    cwd            = "repos/**"
-    requires       = ["org-checkout"]
-    argument-atoms = ["not-force"]
-    writes         = ["git.remote"]
+    name         = "git"
+    argv         = ["git", "push", "origin", "${BRANCH}"]
+    cwd          = "repos/**"
+    requires     = ["org-checkout"]
+    holes.BRANCH = { atoms = ["not-force"] }
+    writes       = ["git.remote"]
 
     [[network]]
     host    = "api.github.com"
@@ -47,8 +47,13 @@ a location *slot*: one spelling, or a list of them meaning any-of. Argv pieces a
 except a whole-token ``${param}``, which substitutes the named parameter, and
 ``${checkers}/<name>`` heading ``argv[0]``, which names the executable ``<name>`` in the config
 directory's ``checkers/`` (resolved at load; it must exist). Atoms are declared once, centrally:
-purity and any text meaning live in ``[atoms]``, and ``establishes``/``requires``/
-``argument-atoms`` refer to them by name.
+purity and any text meaning live in ``[atoms]``, and ``establishes``/``requires``/a hole's
+``atoms`` refer to them by name. One atom is built in and may not be declared: ``not-option``,
+the value does not begin with ``-``; a checker may list it in ``establishes``.
+A ``[[program]]`` rule is either its words alone (``name`` plus ``subcommand``: exactly those,
+no arguments) or a template (``argv`` with ``${HOLE}`` pieces and a ``holes`` table saying what
+each hole is); there is no third form that takes arguments it does not describe. A flags hole
+may carry ``any = true``, the open vocabulary, for a tool trusted with its own options.
 A validation's ``cwd`` is optional: omitted, the check does not care where it runs --
 ``certora.check`` may then be called without ``cwd=`` -- and it may not establish atoms on cwd.
 ``[[network]]`` rules govern the program's own requests (``certora.network``), enforced
@@ -68,14 +73,12 @@ or absolute, each meaning that path and everything below -- or ``network = true`
 validation may claim the media it reaches (``network = false``, ``write = false``;
 ``effect-free = true`` is neither) and what it ``writes`` within them, region names or a medium
 name for the whole medium; an environmental atom may say what it ``reads``. Undeclared means
-everything, so a policy that says nothing keeps the crude kill. A rule with ``unknown-arguments``
-or an ``any`` hole the tool could read as an option cannot say what it writes.
+everything, so a policy that says nothing keeps the crude kill. A rule with an open flag
+vocabulary or an ``any`` hole the tool could read as an option cannot say what it writes.
 
 The schema is strict and fails closed: unknown keys, undeclared atoms, malformed locations and
-mistyped values are all errors, and all of them are reported, not just the first.
-``unknown-arguments`` is *false* by default: the reviewed artifact opts into looseness
-explicitly. This is the only policy language; the constructors in ``policy`` are the object
-model it builds.
+mistyped values are all errors, and all of them are reported, not just the first. This is the
+only policy language; the constructors in ``policy`` are the object model it builds.
 """
 import hashlib
 import json
@@ -89,6 +92,7 @@ from typing import Any, cast
 
 from . import markers
 from .effects import Medium, as_medium
+from .templates import NOT_OPTION
 from .ids import AtomId, FlagName, FlagsetId, HoleName, ParamName, RegionId
 from .locations import parse_location
 from .policydir import config_dir
@@ -288,7 +292,7 @@ class _Loader:
     ) -> list[AtomId]:
         names = self.str_list(path, table, key)
         for n in names:
-            if n not in declared:
+            if n not in declared and n != NOT_OPTION:
                 self.error(f"{path}.{key}", f"atom {n!r} is not declared in [atoms]")
         return [AtomId(n) for n in names]
 
@@ -323,7 +327,7 @@ class _Loader:
                     where, 'expected an atom name or { atom = "...", on-redirect = "..." }'
                 )
                 continue
-            if name not in declared:
+            if name not in declared and name != NOT_OPTION:
                 self.error(where, f"atom {name!r} is not declared in [atoms]")
             out.append(name if mode is None else RequiredAtom(AtomId(name), mode))
         return out
@@ -371,8 +375,8 @@ _SOURCE_KEYS = frozenset({"name", "location"})
 _PARAM_KINDS = ("directory", "atom")
 # where a ruleset's parameters may be substituted: location slots (a directory parameter heads
 # the spelling) and atom lists (an atom parameter is the whole entry)
-_LOCATION_KEYS = frozenset({"cwd", "location", "argument-locations"})
-_ATOM_LIST_KEYS = frozenset({"requires", "argument-atoms", "atoms"})
+_LOCATION_KEYS = frozenset({"cwd", "location"})
+_ATOM_LIST_KEYS = frozenset({"requires", "atoms"})
 _HEAD_PARAM = re.compile(r"\$\{(\w+)\}(?:/(.+))?")
 _WHOLE_PARAM = re.compile(r"\$\{(\w+)\}")
 # stock, config-free, non-spawning predicates a ruleset's validation may run besides
@@ -386,19 +390,18 @@ _NETWORK_KEYS = frozenset({
     "host", "schemes", "ports", "methods", "allow-nonpublic", "requires",
     "read-timeout", "total-timeout", "max-response-bytes", "source", "path", "writes",
 })
-_LEGACY_PROGRAM_KEYS = frozenset(
-    {"subcommand", "argument-atoms", "unknown-arguments", "argument-locations"}
-)
+# the flat rule's argument keys of old: an argument is now a hole of a template, which knows
+# which position it fills. Named here so the error says where the spelling went
+_RETIRED_PROGRAM_KEYS = frozenset({"argument-atoms", "unknown-arguments", "argument-locations"})
 _PROGRAM_KEYS = (
-    frozenset({"name", "cwd", "requires", "argv", "holes", "source", "effect-free"})
+    frozenset({"name", "cwd", "requires", "argv", "holes", "source", "effect-free", "subcommand"})
     | _MEDIA_KEYS
-    | _LEGACY_PROGRAM_KEYS
 )
 # a constraint table: a token hole, an each hole's elements, a valued flag (TEMPLATES.md)
 _CONSTRAINT_KEYS = frozenset({"location", "matches", "one-of", "atoms", "literal", "any"})
 _HOLE_KEYS = _CONSTRAINT_KEYS | {"kind", "min", "flagset", "bare"}
 _HOLE_KINDS = ("token", "each", "flags")
-_FLAGSET_KEYS = frozenset({"name", "bare"})
+_FLAGSET_KEYS = frozenset({"name", "bare", "any"})
 _HOLE_REF = re.compile(r"\$\{(\w+)(\.\.\.)?\}")
 
 
@@ -479,7 +482,14 @@ def _flag_vocabulary(
     declared: frozenset[AtomId],
     reserved: frozenset[str],
 ) -> Flagset | None:
-    """``bare`` plus every ``-``-keyed valued flag; *reserved* are the table's own keys."""
+    """``bare`` plus every ``-``-keyed valued flag, or ``any = true`` alone -- the open
+    vocabulary; *reserved* are the table's own keys."""
+    if loader.field(path, table, "any", bool):
+        listed = sorted(k for k in table if k == "bare" or k.startswith("-"))
+        if listed:
+            loader.error(path, f"an open flag vocabulary (any = true) lists no flags: {', '.join(listed)}")
+            return None
+        return Flagset(any=True)
     bare = loader.str_list(path, table, "bare")
     valued: dict[FlagName, Constraint] = {}
     ok = True
@@ -523,10 +533,12 @@ def _hole(
     if kind not in _HOLE_KINDS:
         loader.error(f"{path}.kind", f"expected one of {', '.join(_HOLE_KINDS)}")
         return None
-    inline = "bare" in table or any(k.startswith("-") for k in table)
+    # `any` is a vocabulary only on a flags hole (the open vocabulary); on a token or each hole
+    # it is the constraint
+    inline = "bare" in table or (kind == "flags" and "any" in table) or any(k.startswith("-") for k in table)
     if kind == "flags":
         ref = loader.field(path, table, "flagset", str)
-        for k in sorted((_CONSTRAINT_KEYS | {"min"}) & table.keys()):
+        for k in sorted(((_CONSTRAINT_KEYS - {"any"}) | {"min"}) & table.keys()):
             loader.error(path, f"a flags hole carries a vocabulary, not {k!r}")
             return None
         if ref is not None and inline:
@@ -944,6 +956,9 @@ def _declare_atoms(
         for name, spec_data in atoms_table.items():
             path = f"atoms.{name}"
             aid = AtomId(name)
+            if aid == NOT_OPTION:
+                dl.error(path, f"atom {name!r} is built in (the value does not begin with '-') and cannot be declared")
+                continue
             if aid in declared_by:
                 dl.error(path, f"atom {name!r} is also declared by {declared_by[aid]}; atom names are unique")
                 continue
@@ -1086,19 +1101,26 @@ def _programs(
     programs: list[Program] = []
     for i, entry in enumerate(loader.entries("program", top)):
         path = f"program[{i}]"
+        if isinstance(entry, dict):
+            for k in sorted(_RETIRED_PROGRAM_KEYS & entry.keys()):
+                loader.error(
+                    path,
+                    f"{k!r} is no longer a rule key: a rule is its words alone, or a template "
+                    "(argv + holes) whose holes say what each argument is (a location, a regex, "
+                    "atoms, or any = true)",
+                )
+            entry = {k: v for k, v in entry.items() if k not in _RETIRED_PROGRAM_KEYS}
         t = loader.table(path, entry, _PROGRAM_KEYS)
         name = loader.required_str(path, t, "name")
         cwd = loader.location_slot(path, t, "cwd")
         yields = _source_atom(loader, path, t, "source", declared, pure_names)
         effect_free, net_flag, write_flag, writes = _media_keys(loader, path, t, regions)
         if "argv" in t:
-            # a templated form (TEMPLATES.md): the shape is argv + holes, and the flat rule's
-            # keys have no place on it
-            legacy = sorted(_LEGACY_PROGRAM_KEYS & t.keys())
+            # a templated form (TEMPLATES.md): the shape is argv + holes; its leading words are
+            # the argv's literal head, so a subcommand has no place on it
+            legacy = "subcommand" in t
             if legacy:
-                loader.error(
-                    path, f"a templated rule carries no {', '.join(legacy)}; constrain the holes instead"
-                )
+                loader.error(path, "a templated rule carries no subcommand; its leading words are the argv's literal head")
             pieces = _pieces(loader, path, loader.str_list(path, t, "argv"))
             holes_table = t.get("holes", {})
             if not isinstance(holes_table, dict):
@@ -1149,10 +1171,7 @@ def _programs(
                     name,
                     cwd=cwd,
                     subcommand=loader.field(path, t, "subcommand", str) or (),
-                    unknown_arguments=loader.field(path, t, "unknown-arguments", bool) or False,
-                    argument_locations=loader.locations(path, t, "argument-locations"),
                     requires=loader.atom_names(path, t, "requires", declared),
-                    argument_atoms=loader.atom_names(path, t, "argument-atoms", declared),
                     origin=origin,
                     source=yields,
                     effect_free=effect_free,

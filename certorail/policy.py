@@ -13,8 +13,12 @@ thing::
         write=[markers.within("repos")],
         listing=[markers.within("repos")],
         programs=[
-            program("git", cwd=markers.within("repos"), requires=["org-checkout"]),
-            program("gh", cwd=".", unknown_arguments=True),
+            program("git", cwd=markers.within("repos"), subcommand="status", requires=["org-checkout"]),
+            program(
+                "gh", cwd=".",
+                argv=["gh", "api", hole("ENDPOINT"), splice("FLAGS")],
+                holes={"ENDPOINT": Token(constraint(matches=r"/[a-z/]+")), "FLAGS": Flags(flagset(any=True))},
+            ),
         ],
         validations=[
             validation(
@@ -106,6 +110,8 @@ from .templates import (
     hole_failures,
     instantiate,
     matches_leading,
+    may_start_with_dash,
+    NOT_OPTION,
 )
 from .enforcement import (
     CheckSignature,
@@ -120,6 +126,8 @@ from .enforcement import (
     WriteTable,
     host_matches,
 )
+from . import footprints
+from .footprints import Footprint
 from .walker import Report
 
 # ---------------------------------------------------------------------------
@@ -190,7 +198,7 @@ def location_of(where: Where) -> LocationFact:
             else:
                 prefix_components = _components_of(prefix)
             if leaf is None:
-                return DirSplat(prefix_components, ANY_NAME, absolute)
+                return DirSplat(prefix_components, None, absolute)
             leaf_components = _components_of(leaf)
             if len(leaf_components) != 1:
                 raise ValueError("within(leaf=...) must be a single component")
@@ -202,8 +210,8 @@ def _locations(wheres: Iterable[Where]) -> tuple[LocationFact, ...]:
 
 
 def _one_or_many(where: Where | Iterable[Where]) -> tuple[LocationFact, ...]:
-    """A location *slot* (``Program.cwd``, ``Validation.cwd``): one spelling, or several meaning
-    any-of -- the same reading filesystem grants and ``argument_locations`` have always had."""
+    """A location *slot* (``Program.cwd``, ``Validation.cwd``, a hole's ``location``): one
+    spelling, or several meaning any-of -- the reading filesystem grants have always had."""
     if isinstance(where, (str, markers.Within, markers.Exactly, StaticPath, DirSplat)):
         return (location_of(where),)
     out = tuple(location_of(w) for w in where)
@@ -382,12 +390,6 @@ class Program:
 
     name: ProgramName
     cwd: tuple[LocationFact, ...]  # the exec's cwd must lie within one of these
-    # may the arguments include values the analysis cannot vouch for (URLs, JSON fields)?
-    # Vouched-for means exactly-known text or a proven path; a computed str is unknown even
-    # when it is tracked as a fact
-    unknown_arguments: bool = True
-    # located arguments must lie within one of these; empty means anywhere proven
-    argument_locations: tuple[LocationFact, ...] = ()
     # validation atoms the cwd must carry, live, at the exec (established by certora.check)
     requires: frozenset[AtomId] = frozenset()
     # the leading literal arguments this rule governs ("push origin"). Once any rule for a
@@ -395,12 +397,9 @@ class Program:
     # subcommand -- unlisted, or computed -- is denied. Prefix-freedom (checked in allow())
     # makes the applicable rule unique.
     subcommand: tuple[str, ...] = ()
-    # atoms every argument after the subcommand must satisfy: by a live check, or -- for a
-    # defined atom -- by its known text (saturate)
-    argument_atoms: frozenset[AtomId] = frozenset()
-    # the command-line shape (TEMPLATES.md). None for the flat rule above, which is the template
-    # [name, *subcommand, ${REST...}] in disguise: a trailing each hole taking any statically
-    # known text (or anything, with unknown_arguments)
+    # the command-line shape (TEMPLATES.md). None for the flat rule: exactly the words
+    # [name, *subcommand] and nothing after them -- a template with no holes. Any argument
+    # beyond the words needs a template that says what it is.
     template: Template | None = None
     # provenance for reports: the ruleset (and bindings) this rule came from, None for a rule
     # the root policy wrote itself
@@ -433,11 +432,7 @@ def program(
     *,
     cwd: Where | Iterable[Where],
     subcommand: str | Iterable[str] = (),
-    # None: not given, meaning False -- as in the data format, looseness is opted into explicitly
-    unknown_arguments: bool | None = None,
-    argument_locations: Iterable[Where] = (),
     requires: Iterable[str] = (),
-    argument_atoms: Iterable[str] = (),
     argv: Iterable[Piece] | None = None,
     holes: Mapping[str, Hole] | None = None,
     origin: str | None = None,
@@ -455,47 +450,38 @@ def program(
     if argv is not None or holes is not None:
         if argv is None or holes is None:
             raise ValueError(f"program {name!r}: argv and holes go together")
-        if (
-            words
-            or unknown_arguments is not None
-            or tuple(argument_locations)
-            or tuple(argument_atoms)
-        ):
+        if words:
             raise ValueError(
-                f"program {name!r}: a templated rule carries no subcommand or argument keys; "
-                "constrain the holes instead"
+                f"program {name!r}: a templated rule carries no subcommand; its leading words are "
+                "the argv's literal head"
             )
         template = Template(tuple(argv), {HoleName(k): h for k, h in holes.items()})
         if template.program != name:
             raise ValueError(f"program {name!r}: its template begins with {template.program!r}")
     writes_e = None if writes is None else effects_of(writes)
-    if writes_e is not None:
+    if writes_e is not None and template is not None:
         # a claim about what the tool writes presupposes knowing what the tool is told to do:
         # nothing may reach it as text it could read as an option or a subcommand
-        if template is None and unknown_arguments:
-            raise ValueError(
-                f"program {name!r}: a rule with unknown arguments cannot say what it writes; "
-                "constrain the arguments first"
-            )
-        if template is not None:
-            for hname, h in template.holes.items():
-                if (
-                    isinstance(h, (Token, Each))
-                    and h.constraint.any
-                    and not template.dash_exempt(hname)
-                ):
-                    raise ValueError(
-                        f"program {name!r}: hole {hname!r} admits anything where the tool could "
-                        "read it as an option, so the rule cannot say what it writes"
-                    )
+        for hname, h in template.holes.items():
+            if isinstance(h, Flags) and h.flagset.any:
+                raise ValueError(
+                    f"program {name!r}: hole {hname!r} admits any flag, so the rule cannot say "
+                    "what it writes"
+                )
+            if (
+                isinstance(h, (Token, Each))
+                and h.constraint.any
+                and not template.dash_exempt(hname)
+            ):
+                raise ValueError(
+                    f"program {name!r}: hole {hname!r} admits anything where the tool could "
+                    "read it as an option, so the rule cannot say what it writes"
+                )
     return Program(
         ProgramName(name),
         _one_or_many(cwd),
-        bool(unknown_arguments),
-        _locations(argument_locations),
         frozenset(AtomId(a) for a in requires),
         words,
-        frozenset(AtomId(a) for a in argument_atoms),
         template,
         origin,
         None if source is None else AtomId(source),
@@ -542,9 +528,11 @@ def constraint(
     )
 
 
-def flagset(bare: Iterable[str] = (), valued: Mapping[str, Constraint] | None = None) -> Flagset:
+def flagset(
+    bare: Iterable[str] = (), valued: Mapping[str, Constraint] | None = None, *, any: bool = False
+) -> Flagset:
     return Flagset(
-        frozenset(FlagName(b) for b in bare), {FlagName(k): c for k, c in (valued or {}).items()}
+        frozenset(FlagName(b) for b in bare), {FlagName(k): c for k, c in (valued or {}).items()}, any
     )
 
 
@@ -869,6 +857,8 @@ class Policy:
         defined_names = frozenset(a.name for a in atoms_t)
         if len(defined_names) != len(atoms_t):
             raise ValueError("defined atom names must be unique")
+        if NOT_OPTION in defined_names:
+            raise ValueError(f"atom {NOT_OPTION!r} is built in (the value does not begin with '-') and cannot be declared")
         progs = tuple(programs)
         srcs = tuple(sources)
         net_in = tuple(network)
@@ -907,14 +897,16 @@ class Policy:
                             f"{' '.join(b.leading_words)!r} overlap; the applicable rule must be unique"
                         )
         # an atom means one thing: pure in one declaration and environmental in another is a bug.
-        # A defined atom is pure by construction, however it is established.
-        pure_names = {a for v in vals for a in v.pure_atoms} | defined_names
+        # A defined atom is pure by construction, however it is established; so is the built-in
+        # not-option (a property of the text's first character), which a checker may establish
+        # without wrapping it in pure()
+        pure_names = {a for v in vals for a in v.pure_atoms} | defined_names | {NOT_OPTION}
         conflicted = {
             a
             for v in vals
             for established in v.establishes.values()
             for a in established
-            if a not in defined_names and (a in pure_names) != (a in v.pure_atoms)
+            if a not in defined_names and a != NOT_OPTION and (a in pure_names) != (a in v.pure_atoms)
         }
         if conflicted:
             raise ValueError(f"atoms declared both pure and environmental: {sorted(conflicted)}")
@@ -972,7 +964,7 @@ class Policy:
         # atom (defined, or with a literal checker: an effect-free single-input validation)
         # defaults to being re-checked by the broker on every hop; anything else defaults to
         # refusing hops. Only an *explicit* recheck of a non-textual atom is an error.
-        recheckable = defined_names | {
+        recheckable = defined_names | {NOT_OPTION} | {
             a
             for v in vals
             for established in v.establishes.values()
@@ -1047,7 +1039,8 @@ class Policy:
             },
             pure_atoms=frozenset(a for v in self.validations for a in v.pure_atoms)
             | frozenset(a.name for a in self.atoms)
-            | self.source_atoms,
+            | self.source_atoms
+            | {NOT_OPTION},
             defined={a.name: a.regex for a in self.atoms},
             sources=SourceTable(
                 exec=tuple(
@@ -1066,7 +1059,36 @@ class Policy:
                 network=tuple((r.host, r.methods, self.write_set(r)) for r in self.network),
             ),
             medium_of=self.medium_of,
+            footprints=self.footprints(),
         )
+
+    def footprints(self) -> dict[AtomId, tuple[Footprint, ...]]:
+        """Per environmental atom with declared ``reads``, the instantiated footprints of the
+        filesystem regions it reads (EFFECTS.md, "File writes: derived"): each region's
+        footprint joined onto each cwd of each validation that establishes the atom -- the
+        place the check observes from -- flattened into one any-of list. An absolute footprint
+        takes no base. A relative footprint under a validation with no cwd has no place; it is
+        taken to lie anywhere, so any file write kills the atom."""
+        by_name = {r.name: r for r in self.regions}
+        out: dict[AtomId, tuple[Footprint, ...]] = {}
+        for atom_name, reads in self.reads.items():
+            regions = [by_name[r] for r in reads.regions if by_name[r].medium == "fs"]
+            if not regions:
+                continue
+            found: list[Footprint] = []
+            for v in self.validations:
+                if not any(atom_name in atoms for atoms in v.establishes.values()):
+                    continue
+                for r in regions:
+                    for f in r.footprint:
+                        if f.absolute:
+                            found.append(footprints.instantiate(None, f))
+                        elif v.cwd is None:
+                            found.extend(footprints.ANYWHERE)
+                        else:
+                            found.extend(footprints.instantiate(c, f) for c in v.cwd)
+            out[atom_name] = tuple(found)
+        return out
 
     @property
     def _defined(self) -> dict[AtomId, PseudoRegex]:
@@ -1083,8 +1105,8 @@ class Policy:
         """The broker's re-check of one concrete exec, and the argv to spawn for it.
 
         Necessarily incomplete against the full rules -- runtime strings carry no provenance,
-        so environmental atoms and the flat rule's ``unknown_arguments``/``argument_*`` are the
-        static analysis' alone. What IS decidable on concrete values is decided: the program is
+        so environmental atoms and source atoms are the static analysis' alone. What IS
+        decidable on concrete values is decided: the program is
         permitted, its leading words select a declared form (fail closed), the cwd lies within
         the rule's locations, and for a templated form the same ``bind`` and hole checks the
         analysis ran -- flag vocabulary and arity, regexes, lexical locations, the leading-dash
@@ -1287,12 +1309,15 @@ class Policy:
         discharge: Discharge | None,
     ) -> frozenset[AtomId]:
         """The required atoms *value* does not carry, after saturation (regex-defined atoms on
-        known text) and after running literal checkers on exactly-known text."""
+        known text; the built-in ``not-option`` on any value whose structure shows its head is
+        not ``-``) and after running literal checkers on exactly-known text."""
         if not required:
             return required
         sat = saturate(value, self._defined)
         have = frozenset() if sat is None or isinstance(sat, str) else sat.checks
         missing = required - have
+        if NOT_OPTION in missing and not may_start_with_dash(value):
+            missing -= {NOT_OPTION}
         if missing and discharge is not None and (text := known_text(value)) is not None:
             missing = frozenset(a for a in missing if not discharge(a, text))
         return missing
@@ -1335,33 +1360,16 @@ class Policy:
         arguments: tuple,
         discharge: Discharge | None = None,
     ) -> str | None:
-        """The flat form. *arguments* excludes the matched subcommand words, if any."""
+        """The flat form: exactly its words. *arguments* excludes the matched subcommand words,
+        so anything left is one argument too many -- a template says what an argument is."""
         reason = self._cwd_mismatch(rule, cwd, discharge)
         if reason is not None:
             return reason
-        if not rule.unknown_arguments:
-            for i, a in enumerate(arguments):
-                # vouched-for means exactly-known text or a proven path: a computed str
-                # (f-string, .strip()) is a StrFact, not None, but is still unknown
-                if known_text(a) is None and not isinstance(a, Located):
-                    return (
-                        f"argument {i + len(rule.subcommand) + 1} is of unknown provenance "
-                        "(neither statically known text nor a proven path)"
-                    )
-        if rule.argument_locations:
-            for a in arguments:
-                if isinstance(a, Located) and not any(
-                    location_le(a.location, allowed) for allowed in rule.argument_locations
-                ):
-                    return f"argument at {pretty_location(a.location)} is outside the permitted locations"
-        if rule.argument_atoms:
-            for i, a in enumerate(arguments):
-                missing = self._missing_atoms(a, rule.argument_atoms, discharge)
-                if missing:
-                    return (
-                        f"argument {i + len(rule.subcommand) + 1} is not validated by: "
-                        f"{', '.join(sorted(missing))}"
-                    )
+        if arguments:
+            return (
+                f"{' '.join(rule.leading_words)!r} takes no arguments beyond its words "
+                f"({len(arguments)} given); a rule that takes arguments is a template (argv + holes)"
+            )
         return None
 
 
