@@ -77,7 +77,10 @@ class ExecResult(subprocess.CompletedProcess[bytes]):
 CalledProcessError = subprocess.CalledProcessError
 
 
-def exec(*cmd: str, cwd: pathlib.Path | str, **holes: str | Sequence[str]) -> ExecResult:
+type Word = str | os.PathLike[str]  # one command word: text, or a path standing for its text
+
+
+def exec(*cmd: Word, cwd: pathlib.Path | str, **holes: Word | Sequence[Word]) -> ExecResult:
     """The only way to run a subprocess: tunneled to the host's broker, which re-checks the
     decidable half of the exec rules (program, fail-closed subcommand, cwd containment --
     defense in depth; the full rules were enforced statically), spawns the child outside the
@@ -87,8 +90,8 @@ def exec(*cmd: str, cwd: pathlib.Path | str, **holes: str | Sequence[str]) -> Ex
     non-zero exit.
 
     Keywords other than ``cwd`` bind the *holes* of the policy's command template for the
-    program (TEMPLATES.md): a string for a token hole, a list of strings for a splice. The
-    broker binds the call like a signature and composes the argv itself.
+    program (TEMPLATES.md): a string or a path for a token hole, a list of them for a splice.
+    The broker binds the call like a signature and composes the argv itself.
 
     This is the runtime half. The static half (``walker``) additionally requires the program to
     be a string literal, refuses ``*args``/``**kwargs``, and treats ``cwd`` as a sink whose
@@ -96,20 +99,21 @@ def exec(*cmd: str, cwd: pathlib.Path | str, **holes: str | Sequence[str]) -> Ex
     """
     if not cmd:
         raise ValueError("exec: no program given")
-    if not all(isinstance(part, str) for part in cmd):
-        raise TypeError("exec: every part of the command must be a str")
+    # a command word is a str or a path (``os.fspath`` yields exactly the text the analysis
+    # reasoned about for a located value); anything else -- a list, a number, an object -- is
+    # not a word, and the static side let it through only as an unknown value under a rule
+    # that admits those, so this is the backstop
+    words = [_word(part, "every part of the command") for part in cmd]
     bindings: dict[str, str | list[str]] = {}
     for name, value in holes.items():
-        if isinstance(value, str):
-            bindings[name] = value
-        elif isinstance(value, (list, tuple)) and all(isinstance(v, str) for v in value):
-            bindings[name] = list(value)
+        if isinstance(value, (list, tuple)):
+            bindings[name] = [_word(v, f"every element of {name}=") for v in value]
         else:
-            raise TypeError(f"exec: {name}= must be a str or a list of str")
+            bindings[name] = _word(value, f"{name}=")
     socket_path = os.environ.get("CERTORAIL_BROKER_SOCKET")
     if socket_path is None:
         raise ExecFailed("no broker: the policy permits no programs")
-    program, *arguments = cmd
+    program, *arguments = words
     try:
         reply = _broker_roundtrip(
             socket_path,
@@ -122,11 +126,22 @@ def exec(*cmd: str, cwd: pathlib.Path | str, **holes: str | Sequence[str]) -> Ex
     if not reply.get("ok"):
         raise ExecFailed(f"{reply.get('error', 'error')}: {reply.get('detail', '')}")
     return ExecResult(
-        args=list(cmd),
+        args=words,
         returncode=int(reply["returncode"]),
         stdout=base64.b64decode(reply.get("stdout_b64", "")),
         stderr=base64.b64decode(reply.get("stderr_b64", "")),
     )
+
+
+def _word(value: object, what: str) -> str:
+    """One command word: a ``str`` as is, a path as its text."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, os.PathLike):
+        text = os.fspath(value)
+        if isinstance(text, str):
+            return text
+    raise TypeError(f"exec: {what} must be a str or a path")
 
 
 class CheckFailed(Exception):

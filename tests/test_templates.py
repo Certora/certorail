@@ -400,8 +400,8 @@ class TestBind(unittest.TestCase):
     def test_leading_words_and_keyword_only(self) -> None:
         self.assertEqual(GREP.leading_words, ("grep",))
         self.assertEqual(GREP.keyword_only, ("FLAGS", "PATTERN", "FILES"))
-        self.assertTrue(GREP.dash_exempt("PATTERN"))
-        self.assertFalse(GREP.dash_exempt("FLAGS"))
+        self.assertTrue(GREP.dash_exempt(HoleName("PATTERN")))
+        self.assertFalse(GREP.dash_exempt(HoleName("FLAGS")))
 
     def test_instantiate_emits_interior_literals(self) -> None:
         bound = bind(GREP, [], {"FLAGS": Many(("-r",)), "PATTERN": "x", "FILES": Many(("repos/a",))})

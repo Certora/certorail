@@ -14,13 +14,13 @@ import unittest
 from certorail import markers
 from certorail.broker import build_server
 from certorail.analysis import RegexLit, checks_of
-from certorail.effects import NOTHING
+from certorail.effects import EVERYTHING, NOTHING
 from certorail.host import Accepted, Rejected
 from certorail.host import check as host_check
 from certorail.markers import CheckFailed
 from certorail.policy import Policy, atom, param, program, pure, validation
-from certorail.ids import AtomId, ParamName, ValidationName
-from certorail.walker import CheckSignature, CheckSite, ExecSite, Report, Vocabulary, analyze
+from certorail.ids import AtomId, ParamName, ProgramName, ValidationName
+from certorail.walker import CheckSignature, CheckSite, ExecSite, Report, Vocabulary, WriteTable, analyze
 
 CWD = ParamName("cwd")
 VOCAB = Vocabulary(
@@ -246,6 +246,8 @@ class TestPolicy(unittest.TestCase):
                     )
                 },
                 pure_atoms=frozenset(),
+                # the one exec rule declares no media, so it writes everything (EFFECTS.md)
+                writes=WriteTable(exec=((ProgramName("git"), (), EVERYTHING),)),
             ),
         )
 

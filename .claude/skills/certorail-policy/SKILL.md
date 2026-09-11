@@ -60,7 +60,10 @@ interrogating further:
 6. **Preconditions.** What must be true before a dangerous action ("only push to org repos",
    "never touch the prod database", "tree must be clean", "branch name is not a flag")? These
    become atoms and validations.
-7. **Placement.** One policy passed with `--policy`, or ambient for the root so `certorail` finds
+7. **Effects.** For each tool: does it reach the network, does it write the filesystem, and
+   which state does it change (the remote, the refs, the index, the working tree)? Which of the
+   preconditions depend on which of that state? These become regions, media and `writes`.
+8. **Placement.** One policy passed with `--policy`, or ambient for the root so `certorail` finds
    it on its own?
 
 ## Step 2: map needs to grants
@@ -71,7 +74,7 @@ interrogating further:
 | only certain file types | a regex leaf: `reports/**/<\w+\.json>` |
 | a directory outside the root | a leading-`/` location (`/srv/data/**`); absolute and relative grants never relate |
 | run a program with fixed words and a few literal arguments | a flat `[[program]]` per (name, subcommand) with the narrowest `cwd` |
-| run a tool with flags and paths (`find`, `grep`, `rg`, `ls`, `tar`) | a **template**: `argv` with holes, a flagset listing exactly the permitted flags; see `reference.md`. Never `unknown-arguments = true` for these |
+| run a tool with flags and paths (`find`, `grep`, `rg`, `ls`, `tar`) | a **template**: `argv` with holes, a flagset listing exactly the permitted flags. Put the variadic hole last when you can (the program spells a plain positional call); a variadic hole that is not last makes it and everything after it keyword-only. See "Calling a template" in `reference.md`. Never `unknown-arguments = true` for these |
 | the same tools under several roots, or across policies | a **ruleset** in `~/.certorail/rulesets/`, applied with `[[apply]] ruleset = "unix.toml" where = ["repos", "/srv/data"]` |
 | program takes paths | `argument-locations` on a flat rule, or `location` on the hole |
 | program takes opaque arguments (`gh api -f q=...`) | `unknown-arguments = true` on that flat rule only, or `any = true` on that one hole |
@@ -80,6 +83,8 @@ interrogating further:
 | an action only on what a trusted query returned (terminate the runners the inventory listed, push to branches the API listed, email the on-call roster) | mark the query's rule `source = "atom"` (or a `[[source]]` location) and put `atoms = ["atom"]` on the hole: only a value extracted unmodified from that result satisfies it. Identifiers all look alike; which query said so is the whole property |
 | talk to an API | one `[[network]]` per host: `methods`, default `https`, default port; `allow-nonpublic` only for loopback/private targets |
 | gate an action on a property | atoms + validations (step 3), consumed by `requires` / `argument-atoms` / `[[network]].requires` |
+| a check that must survive an intervening command (check the checkout, then commit, then push) | regions: `writes` on the command, `reads` on the atom (step 3b). Without them every command kills every environmental fact |
+| a tool that never touches the network, or never writes files | `network = false` / `write = false` on its rule: a claim that bounds what it can kill with no region named; `effect-free = true` for both |
 
 Subcommand rules for one program are prefix-free, cannot mix with a bare rule for that program,
 and **fail closed**: an unlisted or computed subcommand is denied.
@@ -102,10 +107,11 @@ analysis time on constants, so literal arguments need no `certora.check`; the br
 dynamic values. It also qualifies for `on-redirect = "recheck"`.
 
 **C. The state of a place decides it** (cwd is an org checkout, working tree is clean, on branch
-`main`) → an *environmental atom* `org-checkout = {}` plus a validation with `cwd = <location>`,
-usually no `params`, `establishes = { cwd = ["org-checkout"] }`. The checker inspects its working
-directory. Consumed by `[[program]].requires`. It dies at every effectful call, so programs must
-check immediately before the use; say so in the note.
+`main`) → an *environmental atom* plus a validation with `cwd = <location>`, usually no
+`params`, `establishes = { cwd = ["org-checkout"] }`. The checker inspects its working
+directory. Consumed by `[[program]].requires`. It dies at every call that may change what it
+depends on: everything, for `org-checkout = {}`; only what writes `git.config`, for
+`org-checkout = { reads = ["git.config"] }` (step 3b).
 
 **D. The state of the world decides something about a value** (URL host is not in the live prod
 inventory, repo exists on the remote) → an environmental atom plus a validation with `params`,
@@ -121,6 +127,39 @@ Honesty rules:
 - `matches` is the atom's *definition*: anything matching the regex has the property. If a
   matching string could lack the property, it is not a defined atom.
 - A defined atom cannot also be established by an environmental route; it is pure by construction.
+
+## Step 3b: regions, media and `writes`
+
+By default every command kills every environmental fact, so a program must check immediately
+before each use and can never batch: check, act, check, act. Regions make the kill precise
+(EFFECTS.md): a rule declares what it **writes**, an atom what it **reads**, and the fact dies
+only where the two meet. Skip this step when the tasks are check-then-act pairs; do it when a
+checked fact must outlive an intervening command, or when the same fact gates several commands.
+
+1. **Name the state.** One `[regions]` entry per piece of state a checker can observe and a
+   command can change, each with one medium: a `footprint` (where it lives, relative to the
+   checking validation's cwd, that path and everything below: `.git/config`, `.git/refs`, `.`
+   for the whole working tree) or `network = true`. Give each an `about` line; `--describe`
+   prints it. Reuse a shipped vocabulary when one exists (the git pack's `git.*` regions) rather
+   than coining a second name for the same state: two names for one piece of state is a missed
+   kill.
+2. **Say what each atom depends on.** `reads` on every environmental atom, as a property of
+   what the atom *asserts*, whatever the checker does: "origin belongs to the org" reads
+   `git.config`; "the remote branch is unprotected" reads `network`. An atom without `reads`
+   depends on everything.
+3. **Bound each tool by medium.** `network = false` on local tools, `write = false` on query
+   tools, `effect-free = true` on pure queries. These need no knowledge of regions and already
+   preserve the other medium's facts wholesale.
+4. **Narrow within the medium** only where the batch needs it: `writes = ["git.refs",
+   "git.index"]` on `git commit` is what lets a commit sit between the org check and the push.
+   `writes` is admissible only on a rule whose arguments cannot smuggle an option past the shape
+   (no `unknown-arguments`, no `any` hole outside a flag value or after `--`).
+
+Honesty rules, in addition to the ones above: `writes` is complete when it names every declared
+region the tool can change, not every file it touches (`cargo build` writes registries and
+caches nobody declared; its write set is `["git.worktree"]` or nothing); `network = false` is a
+promise about the tool, not about this invocation. Both are trusted like the rest of the policy.
+Read the `dies on:` line `--describe` computes for each atom and confirm it says what you meant.
 
 ## Step 4: author the checkers
 
@@ -201,7 +240,9 @@ A trivial text predicate can be a `test` one-liner with no script at all:
    `certorail probe.py --check --policy policy.toml --root ROOT`. The accepted report lists every
    sink with its proven location: read it. Then write one probe that oversteps each grant and
    confirm the `denied:` line. Literal checkers run during `--check` under `--root`, so the root
-   and any directory a cwd-slot checker names must exist.
+   and any directory a cwd-slot checker names must exist. If the policy declares regions, one
+   probe should be the batch they exist for (check, then the preserving commands, then the
+   gated one) and one its rejection (check, a killing command, the gated one).
 4. **Install.** The config directory is `$CERTORAIL_CONFIG_DIR`, else
    `$XDG_CONFIG_HOME/certorail`, else `~/.certorail`. Checkers go in `checkers/` under it.
    Policies go in `policy/<munged root>/`, the root with `/` turned into `-`
@@ -234,13 +275,23 @@ A trivial text predicate can be a `test` one-liner with no script at all:
   error.
 - A guarantee from a contracted function lands only when the call is the whole right side of an
   assignment; probes that inline the call (`base / f(x)`) see an unknown value.
+- A template with a variadic hole that is not last binds by keyword: the program spells
+  `certora.exec("tar", FLAGS=[...], FILES=[...], cwd=root)`, not a positional list. Put the
+  variadic hole last when the tool allows it.
+- Regions are declared once in `[regions]`; a `writes` or `reads` naming an undeclared region is
+  an error, and so is a `writes` outside the rule's media, or on a rule with
+  `unknown-arguments = true` / an unguarded `any` hole.
+- A validation without `cwd` cannot establish an atom that reads a filesystem region.
+- The program's own file writes still kill every environmental atom that reads any filesystem
+  region; only exec, network and check rules have precise write sets today.
 
 ## Worked example
 
-Need: scripts clone repositories under `repos/`, inspect them, write reports, push to branches
-whose names come from the command line, but only to certora-org checkouts and never with a
-flag-shaped branch argument; they read the GitHub API. Sandbox root `/srv/work/audit`, so the
-file is `~/.certorail/policy/-srv-work-audit/audit.toml` and the checker is
+Need: scripts clone repositories under `repos/`, inspect them, write reports, commit and push
+to branches whose names come from the command line, but only to certora-org checkouts and never
+with a flag-shaped branch argument; they read the GitHub API. Commit-then-push must work
+without re-checking in between. Sandbox root `/srv/work/audit`, so the file is
+`~/.certorail/policy/-srv-work-audit/audit.toml` and the checker is
 `~/.certorail/checkers/org-checkout`.
 
 ```toml
@@ -252,8 +303,14 @@ read  = ["repos/**", "reports/**"]           # inspect clones, re-read earlier r
 write = ["repos/**", 'reports/**/<\w+\.md>'] # clones + markdown reports only
 list  = ["repos/**", "reports/**"]
 
+[regions]                                    # step 3b: the state the checks depend on
+git.config = { footprint = ".git/config", about = "remotes, hooks: everything git reads from config" }
+git.refs   = { footprint = [".git/refs", ".git/packed-refs"], about = "local and remote-tracking refs" }
+git.index  = { footprint = ".git/index",  about = "the staging area" }
+git.remote = { network = true, about = "the remote repository" }
+
 [atoms]
-org-checkout = {}                            # C: state of the cwd; dies at effectful calls
+org-checkout = { reads = ["git.config"] }    # C: dies only when git.config may have changed
 no-flag      = { matches = '[^-].*' }        # A: a branch argument is not an option
 
 [[validation]]
@@ -267,12 +324,27 @@ establishes = { cwd = ["org-checkout"] }
 name       = "git"
 subcommand = "clone"
 cwd        = "repos"
-unknown-arguments = true                     # clone URLs come from the API
+unknown-arguments = true                     # clone URLs come from the API; so no `writes`
+
+[[program]]
+name        = "git"
+subcommand  = "log"
+cwd         = "repos/**"
+effect-free = true
+
+[[program]]                                  # local: no network, and within the fs only these
+name       = "git"
+subcommand = "add"
+cwd        = "repos/**"
+network    = false
+writes     = ["git.index"]
 
 [[program]]
 name       = "git"
-subcommand = "log"
+subcommand = "commit"
 cwd        = "repos/**"
+network    = false
+writes     = ["git.refs", "git.index"]       # not git.config: a commit preserves org-checkout
 
 [[program]]                                  # a template: the shape, with the branch a hole
 name         = "git"
@@ -280,22 +352,26 @@ cwd          = "repos/**"
 requires     = ["org-checkout"]
 argv         = ["git", "push", "origin", "${BRANCH}"]
 holes.BRANCH = { atoms = ["no-flag"] }       # certora.exec("git", "push", "origin", branch, cwd=repo)
+writes       = ["git.remote", "git.refs"]
 
 [[program]]                                  # find, with exactly these flags and nothing else
 name  = "find"
 cwd   = "."
-argv  = ["find", "${WHERE}", "${FLAGS...}"]
+argv  = ["find", "${WHERE}", "${FLAGS...}"]  # certora.exec("find", where, "-name", "*.md", "-print", cwd=root)
 holes.WHERE = { location = "repos/**" }
 holes.FLAGS = { kind = "flags", bare = ["-print"], "-name" = { matches = '[^/]+' }, "-maxdepth" = { matches = '\d+' } }
+effect-free = true
 
 [[network]]
 host    = "api.github.com"
-methods = ["GET"]
+methods = ["GET"]                            # GET/HEAD only: writes nothing by default
 ```
 
-Program-author note to append to their prompt: *"Validations: `certora.check("org-repo",
-cwd=<path under repos/>)` establishes `org-checkout` on the cwd; call it immediately before
-`git push`. Atom `no-flag` is `[^-].*`: guard branch names with
-`assert re.fullmatch(r"[^-].*", branch)`. Allowed: `git clone` (cwd `repos`), `git log`,
-`git push origin <branch>` (cwd under `repos/`); `GET` on `api.github.com`; reads/lists under
-`repos/` and `reports/`; writes under `repos/` and `reports/**/*.md`."*
+`--describe` then reports, for `org-checkout`, `depends on git.config; dies on: git clone; file
+writes under .git/config (below the check's cwd)`: the commit and the push are not on the list,
+so `check("org-repo")`, `git add`, `git commit`, `git push` is one accepted sequence.
+
+Program-author note to append to their prompt (the rest is `--describe`'s output): *"Call
+`certora.check("org-repo", cwd=<path under repos/>)` once per repository before the git
+sequence; `git add`/`commit` preserve it, `git clone` and any file write do not. Atom
+`no-flag` is `[^-].*`: guard branch names with `assert re.fullmatch(r"[^-].*", branch)`."*

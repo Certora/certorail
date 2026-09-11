@@ -147,12 +147,18 @@ def _srt_settings(
     # The deny lists are required by sandbox-runtime's schema even when they are empty, and it
     # refuses the whole configuration without them rather than defaulting: leaving them out
     # makes every jailed run die before the program starts.
+    #
+    # Unix sockets: ``allowUnixSockets`` (a path allowlist) is honoured on macOS only; on Linux
+    # srt denies socket() outright, and the only carve-out is ``allowAllUnixSockets``. The
+    # broker socket lives in a per-run private tempdir, so the wider allowance costs little
+    # here; a jail-independent transport (an inherited fd) is the proper fix, see JAILS.md.
     return {
         "network": {
             "allowedDomains": [],
             "deniedDomains": [],
             "allowLocalBinding": False,
             "allowUnixSockets": [str(socket_path)] if socket_path is not None else [],
+            "allowAllUnixSockets": socket_path is not None,
         },
         "filesystem": {
             "allowWrite": _jail_write_paths(policy, root, tmp),
@@ -220,10 +226,12 @@ def run(
                     json.dumps(_srt_settings(policy, root, tmpdir, socket_path), indent=2),
                     encoding="utf-8",
                 )
-                # srt takes the command as its own argv, not as one shell-quoted string: a
-                # joined string arrives as a single argv[0] and fails as "No such file or
-                # directory". Passing the pieces through also means no quoting to get wrong.
-                command = [srt, "--settings", str(settings), *command]
+                # srt's option parser re-serialises the command it parsed and runs it through a
+                # shell -- a piece with a space is split, a piece beginning with ``-`` is read as
+                # an srt option -- unless ``--`` ends its parsing, after which the pieces arrive
+                # verbatim. Nothing after it needs quoting: every piece is a host-chosen path or
+                # flag, except the program's own arguments, which srt now passes through as is.
+                command = [srt, "--settings", str(settings), "--", *command]
         try:
             return subprocess.run(command, cwd=root, env=env, check=False)
         finally:

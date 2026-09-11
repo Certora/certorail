@@ -44,17 +44,13 @@ from .analysis import (
     Std,
     StrFact,
     UrlString,
+    Interpreter,
+    StateMap,
     ValidationFact,
     destructure,
-    entry_of,
     inert,
-    interpret_expr,
-    is_inert,
     is_path_typed,
-    iteration_bindings,
-    operand_value,
     resolve_callee,
-    std_of,
 )
 from .annotations import Contract, bind_arguments, default_of, is_plain_type, parse_annotation
 from .dangerous import CHECK_CALLEE, EXEC_CALLEE, EXTRACT_ALL_CALLEE, LINES_CALLEE
@@ -90,6 +86,7 @@ from .guards import apply, recognize
 from .markers import NAMESPACE
 from .safepy import (
     ClassAnalysis,
+    ContainerClosureAnalysis,
     FunctionAnalysis,
     ImportAnalysis,
     InheritanceAnalysis,
@@ -382,8 +379,8 @@ class ValidationWalker(ast.NodeVisitor):
             vocabulary if vocabulary is not None else Vocabulary(), discharge, self.modules
         )
         # facts for module-level constants, computed by visit_Module and seeded into function
-        # bodies. Scalars only: containers are never module constants, and a standard value only
-        # when nothing can open it.
+        # bodies. Scalars only: containers are never module constants (and may not be closed
+        # over), and a standard value only when nothing can open it.
         self.module_constants: dict[str, ValidationFact | Std] = {}
         # ast.Name occurrences (by id) in container-roster positions; any other Load of a
         # tracked container is its escape. Filled once per module by visit_Module.
@@ -416,6 +413,13 @@ class ValidationWalker(ast.NodeVisitor):
         for s in stmts:
             self.visit(s)
 
+    def _interpreter(self, st: StateMap | None = None) -> Interpreter:
+        """The expression semantics against *st* -- the current state unless another is given
+        (a comprehension's scope, a seed) -- under this program's module names. The current
+        state is copied: the interpreter answers for it as it was when asked for, however the
+        walk mutates the live one afterwards. An explicitly passed *st* is the caller's own."""
+        return Interpreter(dict(self.state) if st is None else st, self.modules)
+
     def _refine(self, st: State, cond: ast.expr) -> State:
         """*st* with everything *cond* being true establishes."""
         out = dict(st)
@@ -445,19 +449,21 @@ class ValidationWalker(ast.NodeVisitor):
         callee = resolve_callee(call.func)
         assert callee is not None, "visit_Call refuses computed callees before digesting"
 
+        semantics = self._interpreter(st)
+
         def value(e: ast.expr) -> Binding:
             return None if isinstance(e, ast.Starred) else self._binding(e, st)
 
         receiver: ValidationFact | Container | Data | Std | None = None
         if isinstance(call.func, ast.Attribute):
-            receiver = entry_of(call.func.value, st, self.modules)
+            receiver = semantics.interpret(call.func.value)
 
         # the argument conditions of the callee analysis: plain positionals, ``*xs`` (the
         # inertness of xs), ``name=value``, ``**m`` (the inertness of m)
-        plain = [is_inert(a, st, self.modules) for a in call.args if not isinstance(a, ast.Starred)]
-        starred = [is_inert(a, st, self.modules) for a in call.args if isinstance(a, ast.Starred)]
-        named = [is_inert(k.value, st, self.modules) for k in call.keywords if k.arg is not None]
-        double = [is_inert(k.value, st, self.modules) for k in call.keywords if k.arg is None]
+        plain = [semantics.is_inert(a) for a in call.args if not isinstance(a, ast.Starred)]
+        starred = [semantics.is_inert(a) for a in call.args if isinstance(a, ast.Starred)]
+        named = [semantics.is_inert(k.value) for k in call.keywords if k.arg is not None]
+        double = [semantics.is_inert(k.value) for k in call.keywords if k.arg is None]
         inert_keywords = all(named)
         inert_splats = all(starred) and all(double)
 
@@ -505,13 +511,14 @@ class ValidationWalker(ast.NodeVisitor):
     def _binding(self, expr: ast.expr, st: State) -> Binding:
         """An argument as the policy will bind it: a display is the sequence of its elements, a
         tracked container its element fact, anything else a value."""
+        semantics = self._interpreter(st)
         match expr:
             case ast.List(elts=elts) | ast.Tuple(elts=elts):
-                return Many(tuple(operand_value(e, st) for e in elts))
+                return Many(tuple(semantics.operand(e) for e in elts))
             case ast.Name(id=name) if isinstance(container := st.get(name), Container):
                 return Elements(container.elem)
             case _:
-                return operand_value(expr, st)
+                return semantics.operand(expr)
 
     def _sources_of(self, expr: ast.expr) -> frozenset[str] | None:
         """The sources behind an extractor's argument: a name bound to a handle, or a source call
@@ -651,13 +658,14 @@ class ValidationWalker(ast.NodeVisitor):
         or possibly a program object."""
         if value is None:
             return Std("none")
-        if interpret_expr(value, self.state) is not None:
-            return Std()  # text or a path: inert, its kind not one Std names
-        std = std_of(value, self.state, self.modules)
-        if std is not None:
-            return std
-        # a call the expression semantics do not know: a module-level function's own result
-        return self._maybe_call(value, self._call_result)
+        match self._interpreter().interpret(value):
+            case Std() as std:
+                return std
+            case None:
+                # a call the expression semantics do not know: a module-level function's own result
+                return self._maybe_call(value, self._call_result)
+            case _:
+                return Std()  # text, a path, a container of facts, a handle: inert
 
     def _call_result(self, call: ast.Call) -> Result:
         verdict = self.enforcement.kill_of(self._digest(call, self.state))
@@ -767,13 +775,13 @@ class ValidationWalker(ast.NodeVisitor):
                 if fact is None:
                     fact = self.enforcement.extract_fact(site)
             if fact is None:
-                fact = interpret_expr(value, self.state)
+                fact = self._interpreter().interpret(value)
+                if isinstance(fact, Container):
+                    fact = None  # ``y = xs`` aliases a tracked container: its escape, visit_Name's
             if fact is None:
                 fact = self._guaranteed(value)
             if fact is None and site is not None:
                 fact = self.enforcement.check_single_fact(site)
-            if fact is None:
-                fact = std_of(value, self.state, self.modules)  # coarsest last: a standard value
             if fact is None:
                 # a module-level function's summary result: a standard value, or nothing known
                 result = self._maybe_call(value, self._call_result)
@@ -790,9 +798,9 @@ class ValidationWalker(ast.NodeVisitor):
             self._container_store(target.value.id, target, value, c)
         elif isinstance(target, ast.Subscript):
             self.visit(target)
-            if not is_inert(value, self.state, self.modules):
+            if not self._interpreter().is_inert(value):
                 self._kill_state(OPENING)  # ``d[k] = gen``: into some standard value
-        elif isinstance(target, (ast.Tuple, ast.List)) and is_inert(value, self.state, self.modules):
+        elif isinstance(target, (ast.Tuple, ast.List)) and self._interpreter().is_inert(value):
             self.visit(target)  # the rebinding kills, then each name is an element of an inert value
             self.state.update(destructure(target, Std()))
         else:
@@ -810,7 +818,7 @@ class ValidationWalker(ast.NodeVisitor):
             self._escape(target, name, c)
             return
         self.visit(target.slice)
-        if not self.enforcement.establishes(operand_value(value, self.state), c.elem):
+        if not self.enforcement.establishes(self._interpreter().operand(value), c.elem):
             self._unvouched_write(value, name, c, "the assigned element does not establish")
 
     def visit_Assign(self, node: ast.Assign) -> Any:
@@ -942,14 +950,14 @@ class ValidationWalker(ast.NodeVisitor):
             n.id for n in ast.walk(gen.target) if isinstance(n, ast.Name)
         }
         inner: State = {k: v for k, v in self.state.items() if k not in targets}
-        inner.update(iteration_bindings(gen.target, gen.iter, self.state, self.modules))
+        inner.update(self._interpreter().iteration_bindings(gen.target, gen.iter))
         for cond in gen.ifs:
             inner = self._refine(inner, cond)
         fact = self._maybe_call(
             elt, lambda c: self.enforcement.check_single_fact(self._digest(c, inner))
         )
         if fact is None:
-            fact = operand_value(elt, inner)
+            fact = self._interpreter(inner).operand(elt)
         if fact is not None and not isinstance(fact, str):
             # what any iteration may do, rehearsed from the state after the comprehension ran
             # (the comprehension's own walk already answers for every iteration)
@@ -965,9 +973,10 @@ class ValidationWalker(ast.NodeVisitor):
 
     def _elements_establish(self, elts: Sequence[ast.expr], elem: ValidationFact) -> bool:
         ok = True
+        semantics = self._interpreter()
         for i, e in enumerate(elts):
             if isinstance(e, ast.Starred) or not self.enforcement.establishes(
-                operand_value(e, self.state), elem
+                semantics.operand(e), elem
             ):
                 self._violation(e, f"element {i + 1} does not establish {describe_value(elem)}")
                 ok = False
@@ -992,13 +1001,13 @@ class ValidationWalker(ast.NodeVisitor):
                 ast.BinOp(left=ast.Name(id=target.id, ctx=ast.Load()), op=node.op, right=node.value),
                 node,
             )
-            fact = interpret_expr(combined, self.state) or std_of(combined, self.state, self.modules)
+            fact = self._interpreter().interpret(combined)
             self.visit(target)  # the rebinding kill
             if fact is not None:
                 self.state[target.id] = fact
         else:
             self.visit(target)  # a subscript or attribute target: the store lands in some value
-        if not is_inert(node.value, self.state, self.modules):
+        if not self._interpreter().is_inert(node.value):
             self._kill_state(OPENING)  # ``lst += [f]``: a program object may now sit in it
 
     def visit_Attribute(self, node: ast.Attribute) -> Any:
@@ -1013,14 +1022,24 @@ class ValidationWalker(ast.NodeVisitor):
             receiver = node.value
             if isinstance(receiver, ast.Name) and receiver.id in self.modules:
                 return
-            if not inert(entry_of(receiver, self.state, self.modules)):
+            if not inert(self._interpreter().interpret(receiver)):
                 self._kill_state(OPAQUE)
 
     def visit_Lambda(self, node: ast.Lambda) -> Any:
-        # the defaults are evaluated now; the body only when the lambda is called, which havocs
+        # the defaults are evaluated now. The body runs only when the lambda is called, which
+        # havocs, so its kills do not count here; but its sinks and its roster obligations (a
+        # write to a container it closes over) are audited now, in a scope of its own with the
+        # parameters unknown
         for d in [*node.args.defaults, *node.args.kw_defaults]:
             if d is not None:
                 self.visit(d)
+        a = node.args
+        params = [p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)]
+        params += [extra.arg for extra in (a.vararg, a.kwarg) if extra is not None]
+        with self.state_snapshot(), self._measuring(counted=False):
+            for name in params:
+                self.state.pop(name, None)
+            self.visit(node.body)
 
     # -- comprehensions: their own scope, eager --------------------------------------------------
 
@@ -1044,7 +1063,7 @@ class ValidationWalker(ast.NodeVisitor):
                 bound.update(names)
                 for name in names:
                     self.state.pop(name, None)
-                self.state.update(iteration_bindings(gen.target, gen.iter, self.state, self.modules))
+                self.state.update(self._interpreter().iteration_bindings(gen.target, gen.iter))
                 for cond in gen.ifs:
                     self.visit(cond)
                     self.state = self._refine(self.state, cond)
@@ -1094,9 +1113,10 @@ class ValidationWalker(ast.NodeVisitor):
                 )
 
     def _elements_ok(self, elts: Sequence[ast.expr], elem: ValidationFact) -> bool:
+        semantics = self._interpreter()
         return all(
             not isinstance(e, ast.Starred)
-            and self.enforcement.establishes(operand_value(e, self.state), elem)
+            and self.enforcement.establishes(semantics.operand(e), elem)
             for e in elts
         )
 
@@ -1161,7 +1181,7 @@ class ValidationWalker(ast.NodeVisitor):
     def _container_call(self, node: ast.Call) -> None:
         """The roster methods on a tracked container: obligations for the writes, kind
         conformance, and the Sequence read-only rule. Pure reads need nothing here --
-        ``interpret_expr`` knows ``pop`` and subscripts -- and an off-roster method is an
+        the ``Interpreter`` knows ``pop`` and subscripts -- and an off-roster method is an
         escape, via ``visit_Name`` and the blessing pass."""
         match node.func:
             case ast.Attribute(value=ast.Name(id=name), attr=method):
@@ -1178,12 +1198,12 @@ class ValidationWalker(ast.NodeVisitor):
             self._violation(node, f"a {c.kind} has no {method}()")
             return
         if method in ("append", "add") and len(node.args) == 1:
-            if not self.enforcement.establishes(operand_value(node.args[0], self.state), c.elem):
+            if not self.enforcement.establishes(self._interpreter().operand(node.args[0]), c.elem):
                 self._unvouched_write(
                     node.args[0], name, c, "the appended element does not establish"
                 )
         elif method == "insert" and len(node.args) == 2:
-            if not self.enforcement.establishes(operand_value(node.args[1], self.state), c.elem):
+            if not self.enforcement.establishes(self._interpreter().operand(node.args[1]), c.elem):
                 self._unvouched_write(
                     node.args[1], name, c, "the inserted element does not establish"
                 )
@@ -1208,7 +1228,7 @@ class ValidationWalker(ast.NodeVisitor):
                 default = default_of(fdef, param)
                 if default is None:
                     continue  # unbound without a default: bind() would have failed
-                arguments[param] = Argument(node, operand_value(default, {}), defaulted=True)
+                arguments[param] = Argument(node, self._interpreter({}).operand(default), defaulted=True)
             elif not isinstance(supplied, ast.expr):
                 arguments[param] = Argument(node, None, starred=True)
             else:
@@ -1216,7 +1236,7 @@ class ValidationWalker(ast.NodeVisitor):
                 entry = self.state.get(var) if var is not None else None
                 arguments[param] = Argument(
                     supplied,
-                    operand_value(supplied, self.state),
+                    self._interpreter().operand(supplied),
                     entry if isinstance(entry, Container) else None,
                     var,
                 )
@@ -1291,7 +1311,7 @@ class ValidationWalker(ast.NodeVisitor):
         for name, bound in bindings.items():
             self.state[name] = bound
         if isinstance(node, ast.For) and any(isinstance(b, Std) for b in bindings.values()):
-            fresh = iteration_bindings(node.target, node.iter, self.state, self.modules)
+            fresh = self._interpreter().iteration_bindings(node.target, node.iter)
             for name, bound in bindings.items():
                 if isinstance(bound, Std):
                     now = fresh.get(name)
@@ -1306,7 +1326,7 @@ class ValidationWalker(ast.NodeVisitor):
         # ``for x[0] in ...`` is the container escape it deserves to be
         self.visit(node.target)
         # the iterable is evaluated once, before the loop, in the pre-loop state
-        self._loop(node, None, iteration_bindings(node.target, node.iter, self.state, self.modules))
+        self._loop(node, None, self._interpreter().iteration_bindings(node.target, node.iter))
 
     def visit_While(self, node: ast.While) -> Any:
         self.visit(node.test)
@@ -1326,7 +1346,7 @@ class ValidationWalker(ast.NodeVisitor):
             case Call(("contextlib", "redirect_stdout" | "redirect_stderr" | "nullcontext" | "closing"), _, _):
                 return True
             case Method(recv, "open", _, _):
-                return is_path_typed(interpret_expr(recv.node, self.state))  # Path.open
+                return is_path_typed(self._interpreter().expr(recv.node))  # Path.open
             case _:
                 return False
 
@@ -1437,6 +1457,9 @@ class ValidationWalker(ast.NodeVisitor):
         self.generic_visit(node)
 
     def _module_constants(self, module: ast.Module) -> dict[str, ValidationFact | Std]:
+        """The module-level constants every function body may rely on: a name bound by exactly
+        one unconditional top-level assignment, to a value nothing can change. Scalars only: a
+        container is mutable, and a body may not close over one at all (``safepy``, CONTAINERS.md)."""
         counts = _module_scope_binds(module.body)
         state: dict[str, ValidationFact | Std] = {}
         for s in module.body:
@@ -1449,20 +1472,22 @@ class ValidationWalker(ast.NodeVisitor):
             if counts.get(name, 0) != 1:
                 continue  # bound more than once at module scope: not a constant
             try:
-                fact: ValidationFact | Container | Std | None
-                fact = interpret_expr(value, state)  # earlier constants are in scope for later ones
+                # earlier constants are in scope for later ones
+                fact = self._interpreter(state).interpret(value)
                 if fact is None:
                     fact = self._guaranteed(value)
-                if fact is None:
-                    # a number, a bytes literal, ...: immutable, so it holds everywhere; a
-                    # list or a dict does not -- some function may have opened it by the time
-                    # another runs
-                    std = std_of(value, state, self.modules)
-                    fact = std if std is not None and not std.openable else None
             except InvalidProgram:
                 continue  # a malformed value; the main walk reports it
-            if isinstance(fact, (StrFact, PathFact, Located, Std)):
-                state[name] = fact
+            match fact:
+                case StrFact() | PathFact() | Located():
+                    state[name] = fact
+                case Std(openable=False):
+                    # a number, a bytes literal, ...: immutable, so it holds everywhere; a list
+                    # or a dict does not -- some function may have opened it by the time
+                    # another runs
+                    state[name] = fact
+                case _:
+                    pass
         return state
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> Any:
@@ -1504,7 +1529,7 @@ class ValidationWalker(ast.NodeVisitor):
                 "return does not establish the container guarantee (return a tracked local)",
             )
             return
-        if value is None or not self.enforcement.establishes(operand_value(value, self.state), guarantee):
+        if value is None or not self.enforcement.establishes(self._interpreter().operand(value), guarantee):
             self._violation(node, f"return does not establish the guarantee {describe_value(guarantee)}")
 
     def _return_container(self, node: ast.Return, name: str, c: Container) -> None:
@@ -1602,6 +1627,11 @@ def analyze(
     lexical.visit(tree)
     if lexical.violations:
         return Report(violations=list(lexical.violations))
+
+    closures = ContainerClosureAnalysis()
+    closures.visit(tree)
+    if closures.violations:
+        return Report(violations=list(closures.violations))
 
     walker = ValidationWalker(imports.imports, functions.contracts, vocabulary, discharge)
     try:

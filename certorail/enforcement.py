@@ -57,6 +57,7 @@ from .analysis import (
     pretty_location,
     pretty_regex,
     saturate,
+    scalar,
     url_of,
 )
 from .annotations import Contract, is_plain_type
@@ -440,11 +441,6 @@ def _at_sink(value: Value) -> ValidationFact | None:
     return fact if located is None else located
 
 
-def _scalar(value: ValidationFact | Container | Data | Std | None) -> ValidationFact | None:
-    """A state entry as a fact: containers, handles and standard values have no scalar reading."""
-    return None if isinstance(value, (Container, Data, Std)) else value
-
-
 def _open_kind(mode: str | None) -> AccessKind:
     """What an ``open`` does, from its mode; an unknown mode is taken as a write."""
     if mode is None:
@@ -717,7 +713,7 @@ class Enforcement:
         assert method is not None
         receiver = site.receiver
         if method in PATH_SINK_METHODS:
-            if not is_path_typed(_scalar(receiver)):
+            if not is_path_typed(scalar(receiver)):
                 return OPAQUE  # a sink's name on something not proven a path: unknown code
             if method == "open":
                 bound = _bind(PathOpenCall, site)
@@ -846,7 +842,7 @@ class Enforcement:
         if site.args and any(callee.matches(*NETWORK_NAMESPACE, m) for m in NETWORK_METHODS):
             return Data(self._network_sources(_as_fact(site.args[0])))
         if site.method in ("read_text", "read_bytes") and not site.args:
-            sources = self._read_sources(_scalar(site.receiver))
+            sources = self._read_sources(scalar(site.receiver))
             return None if sources is None else Data(sources)
         if site.method == "read" and not site.args and isinstance(site.receiver, Data):
             return site.receiver  # text = f.read(): the text is the handle's
@@ -865,7 +861,7 @@ class Enforcement:
             method = _bind(PathOpenCall, site)
             if method is None:
                 return None
-            path, mode = _scalar(site.receiver), method.mode
+            path, mode = scalar(site.receiver), method.mode
         else:
             return None
         if _open_kind(_mode_text(mode, "r")) != "read":
@@ -1156,7 +1152,7 @@ class Enforcement:
         # an unknown receiver is unproven, not "probably not a Path" -- but a receiver KNOWN to
         # be a str is no Path at all (str subclasses are banned), and its `.replace` is
         # str.replace, not the rename sink
-        receiver = _scalar(site.receiver)
+        receiver = scalar(site.receiver)
         match receiver:
             case StrFact() | UrlString() | Located(repr="str"):
                 return Audit()

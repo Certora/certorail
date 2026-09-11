@@ -1,4 +1,5 @@
 import ast
+from collections.abc import Iterable, Sequence
 from enum import StrEnum
 from opcode import hasconst
 from typing import Any, cast
@@ -7,8 +8,10 @@ import builtins
 
 from certorail.terms import lower, Var, Dotted
 
-from .annotations import Contract, InvalidAnnotation, parse_function
+from .annotations import Contract, InvalidAnnotation, parse_annotation, parse_function
 from .analysis import (
+    Container,
+    InvalidProgram,
     NameAccess,
     is_dunder,
     is_prefix,
@@ -193,6 +196,126 @@ class InheritanceAnalysis(_LexicalAnalysis):
             if kw.arg is None or kw.arg in FORBIDDEN_CLASS_KEYWORDS:
                 self._violation(kw, f"class keyword {kw.arg or '**'} is forbidden")
         self.generic_visit(node)
+
+class ContainerClosureAnalysis(_LexicalAnalysis):
+    """A tracked container may not be closed over (CONTAINERS.md): a ``def`` or ``lambda`` that
+    names a typed container declared in an enclosing scope -- without binding that name itself
+    -- is a violation, whatever it does with it. The walker analyses a body from its parameters
+    and the module constants; a container reached through a closure would be an untracked name
+    there, and a write to it would break the invariant every other use relies on. Pass it as a
+    parameter instead: the contract carries the obligation.
+
+    Purely syntactic. A scope is the module, a function, a lambda or a class body; a
+    comprehension is transparent (the walker walks it inline) except that its targets shadow.
+    A name bound in a scope -- a parameter, an assignment, a def -- is that scope's own, so
+    ``xs = []`` inside the body makes ``xs`` local as Python does."""
+
+    def visit_Module(self, node: ast.Module) -> Any:
+        self._scope(node.body, bound=set(), closable=frozenset())
+
+    def _scope(self, body: Sequence[ast.stmt], *, bound: set[str], closable: frozenset[str]) -> None:
+        """Walk one scope's statements. *closable* is every container an enclosing scope
+        declared; those the scope binds itself are its own. Its own container declarations
+        join *closable* for the scopes nested in it."""
+        bound |= _scope_binds(body)
+        visible = closable - bound
+        declared = frozenset(self._declared_containers(body))
+        self._walk(body, visible, visible | declared)
+
+    def _walk(self, nodes: Iterable[ast.AST], visible: frozenset[str], inner: frozenset[str]) -> None:
+        """*visible*: names that, read here, close over a container. *inner*: what a scope
+        nested here may close over."""
+        stack: list[ast.AST] = list(nodes)
+        while stack:
+            n = stack.pop()
+            match n:
+                case ast.Name(id=name) if name in visible:
+                    self._violation(
+                        n,
+                        f"{name!r} is a typed container of an enclosing scope: a container may not "
+                        "be closed over; pass it as a parameter",
+                    )
+                case ast.FunctionDef() | ast.AsyncFunctionDef():
+                    # decorators, defaults and annotations are evaluated here; the body is a scope
+                    stack.extend(n.decorator_list)
+                    stack.extend(d for d in (*n.args.defaults, *n.args.kw_defaults) if d is not None)
+                    stack.extend(a.annotation for a in _parameters(n.args) if a.annotation is not None)
+                    if n.returns is not None:
+                        stack.append(n.returns)
+                    self._scope(n.body, bound={a.arg for a in _parameters(n.args)}, closable=inner)
+                case ast.Lambda():
+                    stack.extend(d for d in (*n.args.defaults, *n.args.kw_defaults) if d is not None)
+                    params = {a.arg for a in _parameters(n.args)}
+                    self._walk([n.body], inner - params, inner - params)
+                case ast.ClassDef():
+                    # a class body is a scope of its own whose names methods cannot close over,
+                    # so its declarations are not offered to them either
+                    stack.extend(n.decorator_list)
+                    stack.extend(n.bases)
+                    stack.extend(k.value for k in n.keywords)
+                    self._walk(n.body, inner - _scope_binds(n.body), inner)
+                case ast.ListComp(generators=gens) | ast.SetComp(generators=gens) | ast.GeneratorExp(generators=gens) | ast.DictComp(generators=gens):
+                    targets = {t.id for g in gens for t in ast.walk(g.target) if isinstance(t, ast.Name)}
+                    self._walk(ast.iter_child_nodes(n), visible - targets, inner - targets)
+                case _:
+                    stack.extend(ast.iter_child_nodes(n))
+
+    @staticmethod
+    def _declared_containers(body: Iterable[ast.stmt]) -> list[str]:
+        """The typed containers a scope declares: ``x: list[Annotated[...]] = ...`` at any depth
+        of its own statements (not inside nested scopes)."""
+        out: list[str] = []
+        stack: list[ast.AST] = list(body)
+        while stack:
+            n = stack.pop()
+            match n:
+                case ast.FunctionDef() | ast.AsyncFunctionDef() | ast.Lambda() | ast.ClassDef():
+                    continue
+                case ast.AnnAssign(target=ast.Name(id=name), annotation=annotation):
+                    try:
+                        if isinstance(parse_annotation(annotation), Container):
+                            out.append(name)
+                    except InvalidProgram:
+                        pass  # FunctionAnalysis' report
+                case _:
+                    pass
+            stack.extend(ast.iter_child_nodes(n))
+        return out
+
+
+def _parameters(args: ast.arguments) -> list[ast.arg]:
+    params = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+    for extra in (args.vararg, args.kwarg):
+        if extra is not None:
+            params.append(extra)
+    return params
+
+
+def _scope_binds(body: Iterable[ast.stmt]) -> set[str]:
+    """Every name a scope binds in its own statements: assignments, defs and classes by name,
+    loop and ``with`` targets, except-clause names, imports. Not descending into nested scopes;
+    comprehension targets are the comprehension's own."""
+    out: set[str] = set()
+    stack: list[ast.AST] = list(body)
+    while stack:
+        n = stack.pop()
+        match n:
+            case ast.FunctionDef(name=name) | ast.AsyncFunctionDef(name=name) | ast.ClassDef(name=name):
+                out.add(name)
+                continue
+            case ast.Lambda() | ast.ListComp() | ast.SetComp() | ast.DictComp() | ast.GeneratorExp():
+                continue
+            case ast.Name(id=name, ctx=ast.Store() | ast.Del()):
+                out.add(name)
+            case ast.ExceptHandler(name=str() as name):
+                out.add(name)
+            case ast.Import(names=aliases) | ast.ImportFrom(names=aliases):
+                out.update((a.asname or a.name).split(".")[0] for a in aliases)
+            case _:
+                pass
+        stack.extend(ast.iter_child_nodes(n))
+    return out
+
 
 class ValidationAnalysis(_LexicalAnalysis):
     def __init__(

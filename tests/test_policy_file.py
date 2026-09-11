@@ -20,7 +20,7 @@ from certorail.analysis import (
     pretty_location,
 )
 from certorail.host import load_policy
-from certorail.ids import ValidationName
+from certorail.ids import AtomId, ValidationName
 from certorail.policy import (
     Policy,
     RequiredAtom,
@@ -265,7 +265,7 @@ class TestNetworkTables(unittest.TestCase):
         (rule,) = pol.network
         self.assertEqual(
             rule.requires,
-            frozenset({RequiredAtom("not-prod", "recheck"), RequiredAtom("vetted", "waive")}),
+            frozenset({RequiredAtom(AtomId("not-prod"), "recheck"), RequiredAtom(AtomId("vetted"), "waive")}),
         )
 
     def test_a_bad_redirect_mode_is_an_error(self) -> None:
