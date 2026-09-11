@@ -13,7 +13,7 @@ the runtime re-check is the same check: ``bind`` and the constraint, flag and da
 functions below take either.
 """
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final
 
@@ -70,6 +70,8 @@ type Piece = str | HoleRef
 # vouch for text it has inspected. No policy declares it, and none may.
 NOT_OPTION: Final = AtomId("not-option")
 
+CWD = "cwd"  # reserved: never a hole name; the target of a demand on the exec's cwd
+
 
 @dataclass(frozen=True)
 class Constraint:
@@ -109,22 +111,35 @@ class Each:
     min: int = 0
 
 
+# what a flag demands when present: atoms of the exec's cwd (under ``CWD``) or of another hole's
+# value, by hole name
+type Demands = Mapping[str, frozenset[AtomId]]
+
+
 @dataclass(frozen=True)
 class Flagset:
     """A flag vocabulary: the bare flags, and the valued ones with the constraint on their
     value. Every flag name begins with ``-``. ``any`` is the open vocabulary -- any flag, any
     value, unknown values included -- for a tool the deployment trusts wholesale (under a jail,
     say) and does not care to enumerate; it stands alone, and a rule carrying it cannot say
-    what it writes, since anything may reach the tool as an option."""
+    what it writes, since anything may reach the tool as an option.
+
+    A flag may carry ``requires``: atoms demanded, when the flag is present, of the exec's cwd
+    or of another hole's value (``--force`` requires ``not-default-branch`` of ``BRANCH``), on
+    top of what the rule and that hole already ask. ``holes`` is a named flagset's contract with
+    the templates that use it: the holes its demands reach, which every such template must
+    have; an inline vocabulary names its own template's holes directly."""
 
     bare: frozenset[FlagName] = frozenset()
     valued: Mapping[FlagName, Constraint] = field(default_factory=dict)
     any: bool = False
+    requires: Mapping[FlagName, Demands] = field(default_factory=dict)
+    holes: frozenset[HoleName] = frozenset()
 
     def __post_init__(self) -> None:
         names = set(self.bare) | set(self.valued)
         if self.any:
-            if names:
+            if names or self.requires or self.holes:
                 raise ValueError("an open flag vocabulary (any = true) lists no flags")
             return
         if not names:
@@ -135,6 +150,25 @@ class Flagset:
         both = self.bare & self.valued.keys()
         if both:
             raise ValueError(f"flags both bare and valued: {sorted(both)}")
+        if CWD in self.holes:
+            raise ValueError(f"{CWD!r} is reserved and cannot be a hole")
+        for flag, demands in self.requires.items():
+            if flag not in names:
+                raise ValueError(f"requires on {flag!r}, which is not a flag of the vocabulary")
+            for target in demands:
+                if target != CWD and self.holes and target not in self.holes:
+                    raise ValueError(
+                        f"flag {flag!r} requires atoms of {target!r}, which is not among the "
+                        f"flagset's holes ({', '.join(sorted(self.holes))})"
+                    )
+
+    def demands_of(self, present: Iterable[FlagName]) -> dict[str, frozenset[AtomId]]:
+        """What the *present* flags demand, by target, unioned."""
+        out: dict[str, frozenset[AtomId]] = {}
+        for flag in present:
+            for target, atoms in self.requires.get(flag, {}).items():
+                out[target] = out.get(target, frozenset()) | atoms
+        return out
 
 
 @dataclass(frozen=True)
@@ -143,8 +177,6 @@ class Flags:
 
 
 type Hole = Token | Each | Flags
-
-CWD = "cwd"  # reserved: never a hole name
 
 
 @dataclass(frozen=True)
@@ -174,6 +206,19 @@ class Template:
         for name in self.holes:
             if name not in names:
                 raise ValueError(f"hole {name!r} is declared but not used")
+        # a flag's demands reach the cwd or a token/each hole of this template: a named flagset
+        # declares the holes it reaches (its contract), an inline vocabulary names them directly
+        for name, hole in self.holes.items():
+            if not isinstance(hole, Flags):
+                continue
+            fs = hole.flagset
+            reached = set(fs.holes) | {t for d in fs.requires.values() for t in d if t != CWD}
+            for target in sorted(reached):
+                if not isinstance(self.holes.get(HoleName(target)), (Token, Each)):
+                    raise ValueError(
+                        f"the flags of {name!r} require atoms of hole {target!r}, which this "
+                        "template does not have (a token or each hole of that name)"
+                    )
 
     @property
     def program(self) -> str:
@@ -509,8 +554,59 @@ def option_shaped(value: Value, atoms_missing: AtomsMissing) -> bool:
     return NOT_OPTION in atoms_missing(value, frozenset({NOT_OPTION}))
 
 
-def hole_failures(bound: Bound, atoms_missing: AtomsMissing) -> list[str]:
-    """Every way the bound values fall short of their holes, each naming the hole."""
+# atoms of *required* that the exec's cwd does not carry
+type CwdMissing = Callable[[frozenset[AtomId]], frozenset[AtomId]]
+
+
+def present_flags(fs: Flagset, elements: Sequence[Value]) -> list[FlagName]:
+    """The flags a well-formed (``flags_failure`` is None) flags list names."""
+    out: list[FlagName] = []
+    i = 0
+    while i < len(elements):
+        text = known_text(elements[i])
+        if text is None:
+            break
+        name = FlagName(text)
+        out.append(name)
+        i += 1 if name in fs.bare else 2
+    return out
+
+
+def _demand_failures(bound: Bound, atoms_missing: AtomsMissing, cwd_missing: CwdMissing) -> list[str]:
+    """What the present flags demand of the cwd and of other holes, and is not carried."""
+    out: list[str] = []
+    for name, hole in bound.template.holes.items():
+        if not isinstance(hole, Flags):
+            continue
+        value = bound.bindings[name]
+        if not isinstance(value, Many) or hole.flagset.any:
+            continue
+        flags = present_flags(hole.flagset, value.elements)
+        for target, atoms in sorted(hole.flagset.demands_of(flags).items()):
+            demanding = ", ".join(f for f in flags if target in hole.flagset.requires.get(f, {}))
+            if target == CWD:
+                missing = cwd_missing(atoms)
+                if missing:
+                    out.append(f"{demanding} requires the cwd validated by: {', '.join(sorted(missing))}")
+                continue
+            target_value = bound.bindings[HoleName(target)]
+            missing = frozenset()
+            match target_value:
+                case Many(elements=elements):
+                    for e in elements:
+                        missing |= atoms_missing(e, atoms)
+                case Elements(elem=elem):
+                    missing = atoms_missing(elem, atoms)
+                case _:
+                    missing = atoms_missing(target_value, atoms)
+            if missing:
+                out.append(f"{demanding} requires {target} validated by: {', '.join(sorted(missing))}")
+    return out
+
+
+def hole_failures(bound: Bound, atoms_missing: AtomsMissing, cwd_missing: CwdMissing) -> list[str]:
+    """Every way the bound values fall short of their holes, each naming the hole; then what
+    the present flags demand of the cwd and of other holes."""
     out: list[str] = []
     template = bound.template
     for name, hole in template.holes.items():
@@ -551,6 +647,8 @@ def hole_failures(bound: Bound, atoms_missing: AtomsMissing) -> list[str]:
                             out.append(f"{name}: {reason}")
                     case _:
                         out.append(f"{name} takes a display of flags, not a container")
+    if not out:
+        out = _demand_failures(bound, atoms_missing, cwd_missing)
     return out
 
 

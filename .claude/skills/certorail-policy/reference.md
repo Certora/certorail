@@ -178,7 +178,8 @@ the same program. `cwd` is a location *slot* on both: one location or a list mea
 |---|---|---|
 | `name` | string, required | the executable, as programs spell it in `certora.exec(name, …)` |
 | `cwd` | location or list, required | the exec's `cwd=` must be proven within one of them |
-| `requires` | list of atoms | the cwd must carry these, live, at the exec |
+| `requires` | list of atoms, or a table `{ cwd = [...], HOLE = [...] }` | the cwd must carry these, live, at the exec; a hole entry demands atoms of that hole's value, folded into its constraint (into `any` it leaves an atoms-only constraint) |
+| `when` | `true`/`false`, or `"${flag}"` in a ruleset | false drops the rule at load |
 | `source` | atom name | the rule's output yields this pure atom on extraction (Sources, below) |
 | `effect-free`, `network`, `write`, `writes` | | the write set (Media and `writes`, above) |
 | `argv` | list of words | templated form: literal words, `${X}` (one token), `${X...}` (a splice); the first is the program |
@@ -219,12 +220,20 @@ command: only a database the program itself named, of the dev shape.
 **`[[flagset]]`**: `name`, `bare = [...]` (flags taking no value), and `"-x" = { constraint }`
 for each valued flag. `{}` is not a bare flag. A flag both bare and valued is an error.
 
+A flag entry may also be `{ value = false }` (a bare flag in table form) and either form may
+carry `requires = { cwd = [...], HOLE = [...] }`: atoms demanded of the cwd or of another hole's
+value **while the flag is present**, on top of what the hole asks (`--force` requires
+`not-default-branch` of `BRANCH`). A named flagset lists the holes its demands reach as
+`holes = ["BRANCH"]`; a template using it must have a token or each hole of each name. In a
+ruleset a flag entry may carry `when = "${flag}"` (below).
+
 ```toml
 [[flagset]]
 name = "find-ro"
 bare = ["-print"]
 "-mindepth" = { matches = '\d+' }
 "-newer"    = { location = "repos/**" }
+"-delete"   = { value = false, requires = { cwd = ["scratch-tree"] } }   # only where a check said so
 
 [[program]]
 name = "find"
@@ -294,16 +303,25 @@ applies it:
 
 ```toml
 [[apply]]
-ruleset = "unix.toml"
-where   = ["repos", "/srv/data"]      # a directory parameter is set-valued
-org     = "org-checkout"              # an atom parameter names an atom the root declares
+ruleset    = "git.toml"
+where      = ["repos", "/srv/data"]   # directory: set-valued
+branch     = { atoms = ["my-branch"] } # constraint: any table a hole accepts ({ any = true }, { one-of = [...] }, ...)
+push-gate  = ["org-checkout"]         # atom list; [] is "no gate", said in the root's own hand
+force      = true                     # bool; unbound means false
+force-gate = ["not-default-branch"]   # needed only because force = true enables the flag that uses it
 ```
 
-`[params] where = { kind = "directory" }` binds one directory or a list (plain paths, no `**`);
-the ruleset writes `${where}` for the directory and `${where}/**` for its subtree, and every
-location slot so written becomes a one-of list over the bound directories. `kind = "atom"`
-parameters are substituted whole into atom lists (`requires`, a hole's `atoms`,
-`establishes`). A ruleset is applied at most once; two applications with different bindings is
+`[params] x = { kind = "directory" | "atom" | "constraint" | "bool" }`. A **directory** binds one
+directory or a list (plain paths, no `**`); the ruleset writes `${where}` for the directory and
+`${where}/**` for its subtree, and every location slot so written becomes a one-of list over the
+bound directories. An **atom** list is spliced where it stands in an atom list (`requires`, a
+hole's `atoms`, `establishes`, a flag's `requires`). A **constraint** is a whole hole
+(`holes.BRANCH = "${branch}"`), checked where it lands. A **bool** is read by `when` on a
+`[[program]]`, an `[[apply]]` or a flag entry: false drops the piece before substitution, so a
+parameter referenced only from dropped pieces needs no binding. **No parameter has a default**
+except that an unbound bool is false; every other parameter a surviving piece references must be
+bound, and the error names it. A ruleset applied by another passes bindings down whole
+(`force = "${force}"`), each kind as its value. A ruleset is applied at most once; two applications with different bindings is
 an error (apply it once with the union), the same application reached twice through nested
 rulesets is one document. Atom and validation names are unique across the whole composition
 (namespace by convention: `unix.no-flag`); region names are shared on purpose, identical
@@ -311,7 +329,8 @@ declarations merging; flagsets are private to their file. A ruleset's validation
 `${checkers}/<name>` or `test`. Denials name the ruleset and bindings a rule came from.
 
 The `rulesets/` directory of the certorail repository holds the git pack (`git.md` describes
-it); read its status note before relying on it, since parts of its syntax are ahead of the loader.
+it); read its status note before relying on it, since parts of its syntax (`[[deny]]`,
+`override`) are still ahead of the loader.
 
 ## `[[network]]`
 

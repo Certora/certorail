@@ -75,7 +75,8 @@ interrogating further:
 | a directory outside the root | a leading-`/` location (`/srv/data/**`); absolute and relative grants never relate |
 | run a program with fixed words and no arguments | a flat `[[program]]` per (name, subcommand) with the narrowest `cwd`; anything after the words needs a template |
 | run a tool with flags and paths (`find`, `grep`, `rg`, `ls`, `tar`) | a **template**: `argv` with holes, a flagset listing exactly the permitted flags. Put the variadic hole last when you can (the program spells a plain positional call); a variadic hole that is not last makes it and everything after it keyword-only. See "Calling a template" in `reference.md` |
-| the same tools under several roots, or across policies | a **ruleset** in `~/.certorail/rulesets/`, applied with `[[apply]] ruleset = "unix.toml" where = ["repos", "/srv/data"]` |
+| the same tools under several roots, or across policies | a **ruleset** in `~/.certorail/rulesets/`, applied with `[[apply]] ruleset = "unix.toml" where = ["repos", "/srv/data"]`. Its parameters are the root's decisions: bind every atom list (`[]` for none) and constraint a rung you enable reaches; bools are off unless you say `= true`. Nothing has a default |
+| a flag that is fine only in a vouched-for state (`--force` on a non-default branch, `-delete` under a scratch tree) | a flag entry with `requires = { HOLE = [...] }` or `{ cwd = [...] }`: demanded only while the flag is present; `value = false` spells a bare flag in table form |
 | program takes paths | `location` on the hole |
 | program takes opaque arguments (`gh api -f q=...`) | `any = true` on that one hole, or an open flag vocabulary (`holes.FLAGS = { kind = "flags", any = true }`) for a tool trusted with all its options |
 | program takes runtime-checked values (a checked branch name) | a hole with `atoms = [...]`; have the checker also establish the built-in `not-option`, or the dash guard denies text whose head it cannot see |

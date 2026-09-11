@@ -13,7 +13,7 @@ from certorail.host import check as host_check
 from certorail.ids import HoleName
 from certorail.policy import Policy
 from certorail.policyfile import PolicyFileError, from_data
-from certorail.templates import Each, Flags, Token
+from certorail.templates import Constraint, Each, Flags, Token
 
 UNIX = """
 ruleset-version = 1
@@ -66,7 +66,7 @@ requires = ["${org}"]
 holes.BRANCH = { atoms = ["unix.no-flag"] }
 """
 
-HEADER = "import pathlib\n"
+HEADER = "import pathlib\nimport sys\n"
 
 
 class RulesetCase(unittest.TestCase):
@@ -269,6 +269,203 @@ class TestRulesetWellFormedness(RulesetCase):
                 }],
             ))
         self.assertIn("flagset 'grep-ro' is not declared", str(cm.exception))
+
+
+# A push rung in the shape of rulesets/git-remote.toml: every parameter kind, a bool-gated flag
+# whose demand reaches another hole, a bool-gated rule, and a rule-level requires table that
+# conjoins the pack's own atom with whatever constraint the root bound.
+PUSH = """
+ruleset-version = 1
+
+[params]
+where      = { kind = "directory" }
+remote     = { kind = "constraint" }
+branch     = { kind = "constraint" }
+push-gate  = { kind = "atom" }
+force      = { kind = "bool" }
+force-gate = { kind = "atom" }
+history    = { kind = "bool" }
+
+[atoms]
+"push.ref-name" = { matches = '[A-Za-z][A-Za-z0-9/_-]*' }
+"push.feature"  = { matches = 'feature/.*' }
+
+[[flagset]]
+name  = "push"
+holes = ["BRANCH"]
+bare  = ["-u"]
+"--force" = { value = false, when = "${force}", requires = { BRANCH = ["${force-gate}"] } }
+"-o"      = { any = true }
+
+[[program]]
+name = "git"
+argv = ["git", "push", "${REMOTE}", "${BRANCH}", "${FLAGS...}"]
+cwd  = "${where}/**"
+holes.REMOTE = "${remote}"
+holes.BRANCH = "${branch}"
+holes.FLAGS  = { kind = "flags", flagset = "push" }
+requires = { cwd = ["${push-gate}"], REMOTE = ["push.ref-name"], BRANCH = ["push.ref-name"] }
+
+[[program]]
+name = "git"
+when = "${history}"
+argv = ["git", "log", "${FLAGS...}"]
+cwd  = "${where}/**"
+holes.FLAGS = { kind = "flags", bare = ["--oneline"] }
+"""
+
+UMBRELLA = """
+ruleset-version = 1
+
+[params]
+where      = { kind = "directory" }
+branch     = { kind = "constraint" }
+force      = { kind = "bool" }
+force-gate = { kind = "atom" }
+
+[[apply]]
+ruleset    = "push.toml"
+where      = "${where}"
+remote     = { one-of = ["origin"] }
+branch     = "${branch}"
+push-gate  = []
+force      = "${force}"
+force-gate = "${force-gate}"
+"""
+
+REPO = 'repo = pathlib.Path("repos") / "x"\n'
+
+
+class TestParameterKinds(RulesetCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.ruleset("push.toml", PUSH)
+        self.ruleset("umbrella.toml", UMBRELLA)
+
+    BASE = {
+        "ruleset": "push.toml", "where": "repos",
+        "remote": {"one-of": ["origin"]}, "branch": {"matches": "[a-z/]+"}, "push-gate": [],
+    }
+
+    def push(self, args: str, policy: Policy, prelude: str = "") -> object:
+        return host_check(HEADER + REPO + prelude + f'certora.exec("git", "push", {args}, cwd=repo)\n', "<t>", policy)
+
+    def accept(self, args: str, policy: Policy, prelude: str = "") -> None:
+        result = self.push(args, policy, prelude)
+        if isinstance(result, Rejected):
+            self.fail("\n".join(result.describe("<t>")))
+
+    def denial(self, args: str, policy: Policy, prelude: str = "") -> str:
+        result = self.push(args, policy, prelude)
+        assert isinstance(result, Rejected), "expected a rejection"
+        return result.denials[0].reason
+
+    def test_an_unbound_bool_is_false(self) -> None:
+        # history and force unbound: no log rule, no --force flag, and force-gate -- referenced
+        # only from the dropped flag -- needs no binding
+        policy = from_data(self.root(self.BASE))
+        self.assertEqual([p.leading_words for p in policy.programs], [("git", "push")])
+        self.accept('"origin", "feature/x", "-u"', policy)
+        self.assertIn("'--force' is not a declared flag", self.denial('"origin", "feature/x", "--force"', policy))
+        self.assertIn("force=false", policy.programs[0].origin or "")
+
+    def test_a_bool_enables_a_flag_and_a_rule(self) -> None:
+        policy = from_data(self.root({
+            **self.BASE, "force": True, "force-gate": ["push.feature"], "history": True,
+        }))
+        self.assertEqual([p.leading_words for p in policy.programs], [("git", "push"), ("git", "log")])
+        self.accept('"origin", "feature/x", "--force"', policy)
+        self.accept('"origin", "main"', policy)
+        self.assertIn(
+            "--force requires BRANCH validated by: push.feature",
+            self.denial('"origin", "main", "--force"', policy),
+        )
+
+    def test_an_enabled_flag_needs_its_bindings(self) -> None:
+        with self.assertRaises(PolicyFileError) as cm:
+            from_data(self.root({**self.BASE, "force": True}))
+        self.assertIn("parameter 'force-gate' is not bound", str(cm.exception))
+
+    def test_an_atom_list_splices_into_requires(self) -> None:
+        policy = from_data(self.root(
+            {**self.BASE, "push-gate": ["org-checkout"]},
+            atoms={"org-checkout": {}},
+            validation=[{"name": "org-repo", "argv": ["true"], "cwd": "repos/**",
+                         "establishes": {"cwd": ["org-checkout"]}}],
+        ))
+        self.assertEqual(policy.programs[0].requires, frozenset({"org-checkout"}))
+        self.assertIn("cwd is not validated by: org-checkout", self.denial('"origin", "feature/x"', policy))
+        self.accept('"origin", "feature/x"', policy, 'certora.check("org-repo", cwd=repo)\n')
+
+    def test_a_constraint_binding_is_conjoined_with_the_pack_requirement(self) -> None:
+        # the root says anything; the pack still insists a branch is a ref name, not a refspec
+        policy = from_data(self.root({**self.BASE, "branch": {"any": True}}))
+        assert policy.programs[0].template is not None
+        branch = policy.programs[0].template.holes[HoleName("BRANCH")]
+        assert isinstance(branch, Token)
+        self.assertEqual(branch.constraint, Constraint(atoms=frozenset({"push.ref-name"})))
+        self.accept('"origin", "feature/x"', policy)
+        self.assertIn("not validated by: push.ref-name", self.denial('"origin", "feature:main"', policy))
+        # and a binding with its own shape keeps it, the pack's atom added
+        policy = from_data(self.root({**self.BASE, "branch": {"matches": "feature/.*", "literal": True}}))
+        assert policy.programs[0].template is not None
+        branch = policy.programs[0].template.holes[HoleName("BRANCH")]
+        assert isinstance(branch, Token)
+        self.assertTrue(branch.constraint.literal)
+        self.assertIsNotNone(branch.constraint.regex)
+        self.assertEqual(branch.constraint.atoms, frozenset({"push.ref-name"}))
+        self.assertIn("BRANCH", self.denial('"origin", sys.argv[1]', policy))
+
+    def test_bindings_pass_through_an_umbrella(self) -> None:
+        policy = from_data(self.root({
+            "ruleset": "umbrella.toml", "where": "repos", "branch": {"matches": "[a-z/]+"},
+            "force": True, "force-gate": ["push.feature"],
+        }))
+        self.accept('"origin", "feature/x", "--force"', policy)
+        self.assertIn("push.toml (", policy.programs[0].origin or "")
+        # an unbound bool passes down as false
+        policy = from_data(self.root({"ruleset": "umbrella.toml", "where": "repos", "branch": {"any": True}}))
+        self.assertIn("not a declared flag", self.denial('"origin", "feature/x", "--force"', policy))
+
+    def test_binding_errors(self) -> None:
+        cases = [
+            ({**self.BASE, "force": "yes"}, "expected true or false"),
+            ({**self.BASE, "branch": "any"}, "expected a constraint table"),
+            ({**self.BASE, "push-gate": 3}, "expected an atom name or a list"),
+            ({**self.BASE, "branch": {"any": True, "atoms": ["push.feature"]}}, "combines with nothing"),
+            ({k: v for k, v in self.BASE.items() if k != "branch"}, "parameter 'branch' is not bound"),
+        ]
+        for apply, expected in cases:
+            with self.subTest(expected=expected), self.assertRaises(PolicyFileError) as cm:
+                from_data(self.root(apply))
+            self.assertIn(expected, str(cm.exception))
+
+    def test_when_is_a_bool_parameter_or_a_literal(self) -> None:
+        def load(text: str) -> None:
+            self.ruleset("w.toml", 'ruleset-version = 1\n[params]\nwhere = { kind = "directory" }\n' + text)
+            from_data(self.root({"ruleset": "w.toml", "where": "repos"}))
+
+        with self.assertRaises(PolicyFileError) as cm:
+            load('[[program]]\nname = "x"\ncwd = "."\nwhen = "${where}"\n')
+        self.assertIn("'where' is not a bool parameter", str(cm.exception))
+        with self.assertRaises(PolicyFileError) as cm:
+            load('[[program]]\nname = "x"\ncwd = "."\nwhen = "maybe"\n')
+        self.assertIn("expected true, false, or a bool parameter", str(cm.exception))
+        # a root file toggles with a literal
+        policy = from_data(self.root(program=[
+            {"name": "x", "cwd": ".", "when": False},
+            {"name": "y", "cwd": ".", "when": True},
+        ]))
+        self.assertEqual([p.name for p in policy.programs], ["y"])
+        with self.assertRaises(PolicyFileError) as cm:
+            from_data(self.root(program=[{"name": "x", "cwd": ".", "when": "${x}"}]))
+        self.assertIn("'x' is not a parameter", str(cm.exception))
+
+    def test_parameters_have_no_defaults(self) -> None:
+        self.ruleset("d.toml", 'ruleset-version = 1\n[params]\nforce = { kind = "bool", default = true }\n')
+        with self.assertRaises(PolicyFileError) as cm:
+            from_data(self.root({"ruleset": "d.toml"}))
+        self.assertIn("params.force: unknown key 'default'", str(cm.exception))
 
 
 if __name__ == "__main__":

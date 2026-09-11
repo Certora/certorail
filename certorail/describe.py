@@ -16,9 +16,9 @@ from collections.abc import Iterable
 
 from .analysis import pretty_location, pretty_regex
 from .effects import EVERYTHING, Effects
-from .ids import AtomId
+from .ids import AtomId, FlagName
 from .policy import NetworkRule, Policy, Program, Validation, pretty_locations
-from .templates import NOT_OPTION, Constraint, Each, Flags, Flagset, Template, Token
+from .templates import CWD, NOT_OPTION, Constraint, Each, Flags, Flagset, Template, Token
 
 NOTATION = (
     "Notation: <...> marks a value the program supplies. </re/> text known to match the regex "
@@ -50,14 +50,29 @@ def _constraint(c: Constraint) -> str:
     return "<" + " ".join(parts) + ">"
 
 
+def _demands(fs: Flagset, flag: FlagName) -> str:
+    """What a flag demands while present, as a suffix; empty when nothing."""
+    demands = fs.requires.get(flag)
+    if not demands:
+        return ""
+    parts = [
+        f"{'the cwd' if target == CWD else target} validated by {', '.join(sorted(atoms))}"
+        for target, atoms in sorted(demands.items())
+    ]
+    return " (requires " + "; ".join(parts) + ")"
+
+
 def _flagset(fs: Flagset) -> list[str]:
     if fs.any:
         return ["any flag, any value: the tool is trusted with its own options"]
     out: list[str] = []
-    if fs.bare:
-        out.append("bare: " + " ".join(sorted(fs.bare)))
+    plain = sorted(f for f in fs.bare if f not in fs.requires)
+    if plain:
+        out.append("bare: " + " ".join(plain))
+    for name in sorted(f for f in fs.bare if f in fs.requires):
+        out.append(f"{name}{_demands(fs, name)}")
     for name, c in fs.valued.items():  # declaration order: the author's grouping
-        out.append(f"{name} {_constraint(c)}")
+        out.append(f"{name} {_constraint(c)}{_demands(fs, name)}")
     return out
 
 

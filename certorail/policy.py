@@ -427,12 +427,20 @@ class Program:
         return (self.name, *self.subcommand)
 
 
+def _demanded(c: Constraint, atoms: frozenset[AtomId]) -> Constraint:
+    """*c* with *atoms* also required. A requirement stays a requirement: folded into ``any``
+    (a root's binding, say) it leaves an atoms-only constraint."""
+    if c.any:
+        return Constraint(atoms=atoms)
+    return replace(c, atoms=c.atoms | atoms)
+
+
 def program(
     name: str,
     *,
     cwd: Where | Iterable[Where],
     subcommand: str | Iterable[str] = (),
-    requires: Iterable[str] = (),
+    requires: Iterable[str] | Mapping[str, Iterable[str]] = (),
     argv: Iterable[Piece] | None = None,
     holes: Mapping[str, Hole] | None = None,
     origin: str | None = None,
@@ -442,10 +450,18 @@ def program(
     write: bool | None = None,
     writes: Iterable[str] | None = None,
 ) -> Program:
+    """*requires* is the atoms the cwd must carry, or a table ``{cwd: [...], HOLE: [...]}``
+    that also demands atoms of a hole's value, folded into that hole's constraint."""
     network_b, write_b = _media(f"program {name!r}", effect_free, network, write)
     words = tuple(subcommand.split()) if isinstance(subcommand, str) else tuple(subcommand)
     if not all(isinstance(w, str) and w for w in words):
         raise ValueError(f"program {name!r}: subcommand words must be non-empty strings")
+    if isinstance(requires, Mapping):
+        cwd_atoms = frozenset(AtomId(a) for a in requires.get(CWD, ()))
+        hole_atoms = {HoleName(k): frozenset(AtomId(a) for a in v) for k, v in requires.items() if k != CWD}
+    else:
+        cwd_atoms = frozenset(AtomId(a) for a in requires)
+        hole_atoms = {}
     template = None
     if argv is not None or holes is not None:
         if argv is None or holes is None:
@@ -455,9 +471,24 @@ def program(
                 f"program {name!r}: a templated rule carries no subcommand; its leading words are "
                 "the argv's literal head"
             )
-        template = Template(tuple(argv), {HoleName(k): h for k, h in holes.items()})
+        shaped: dict[HoleName, Hole] = {HoleName(k): h for k, h in holes.items()}
+        for hname, atoms in hole_atoms.items():
+            h = shaped.get(hname)
+            match h:
+                case Token(constraint=c):
+                    shaped[hname] = Token(_demanded(c, atoms))
+                case Each(constraint=c, min=minimum):
+                    shaped[hname] = Each(_demanded(c, atoms), minimum)
+                case _:
+                    raise ValueError(
+                        f"program {name!r}: requires names {hname!r}, which is not a token or "
+                        "each hole of the template"
+                    )
+        template = Template(tuple(argv), shaped)
         if template.program != name:
             raise ValueError(f"program {name!r}: its template begins with {template.program!r}")
+    elif hole_atoms:
+        raise ValueError(f"program {name!r}: requires names holes, but the rule has no template")
     writes_e = None if writes is None else effects_of(writes)
     if writes_e is not None and template is not None:
         # a claim about what the tool writes presupposes knowing what the tool is told to do:
@@ -480,7 +511,7 @@ def program(
     return Program(
         ProgramName(name),
         _one_or_many(cwd),
-        frozenset(AtomId(a) for a in requires),
+        cwd_atoms,
         words,
         template,
         origin,
@@ -529,10 +560,24 @@ def constraint(
 
 
 def flagset(
-    bare: Iterable[str] = (), valued: Mapping[str, Constraint] | None = None, *, any: bool = False
+    bare: Iterable[str] = (),
+    valued: Mapping[str, Constraint] | None = None,
+    *,
+    any: bool = False,
+    requires: Mapping[str, Mapping[str, Iterable[str]]] | None = None,
+    holes: Iterable[str] = (),
 ) -> Flagset:
+    """*requires* maps a flag to what it demands while present: atoms of ``cwd`` or of a hole,
+    by name; *holes* is a named flagset's contract, the holes those demands may reach."""
     return Flagset(
-        frozenset(FlagName(b) for b in bare), {FlagName(k): c for k, c in (valued or {}).items()}, any
+        frozenset(FlagName(b) for b in bare),
+        {FlagName(k): c for k, c in (valued or {}).items()},
+        any,
+        {
+            FlagName(f): {t: frozenset(AtomId(a) for a in atoms) for t, atoms in d.items()}
+            for f, d in (requires or {}).items()
+        },
+        frozenset(HoleName(h) for h in holes),
     )
 
 
@@ -1140,7 +1185,9 @@ class Policy:
         # the source atoms (provenance is not a property of text), were the static check's
         textual = self.vocabulary().pure_atoms - self.source_atoms
         failures = hole_failures(
-            bound, lambda value, atoms: self._missing_atoms(value, atoms & textual, discharge)
+            bound,
+            lambda value, atoms: self._missing_atoms(value, atoms & textual, discharge),
+            lambda atoms: self._missing_atoms(Located(cwd_loc, "path"), atoms & textual, discharge),
         )
         if failures:
             return Refusal("; ".join(failures))
@@ -1349,7 +1396,9 @@ class Policy:
         if isinstance(bound, BindError):
             return "; ".join(bound.reasons)
         failures = hole_failures(
-            bound, lambda value, atoms: self._missing_atoms(value, atoms, discharge)
+            bound,
+            lambda value, atoms: self._missing_atoms(value, atoms, discharge),
+            lambda atoms: self._missing_atoms(cwd, atoms, discharge),
         )
         return "; ".join(failures) if failures else None
 

@@ -12,7 +12,7 @@ from certorail.broker import build_server, exec_request
 from certorail.host import Accepted, Rejected
 from certorail.host import check as host_check
 from certorail.ids import HoleName
-from certorail.policy import Policy, Refusal, atom, constraint, flagset, hole, program, splice
+from certorail.policy import Policy, Refusal, atom, constraint, flagset, hole, program, splice, validation
 from certorail.policyfile import PolicyFileError, from_data
 from certorail.templates import (
     BindError,
@@ -396,6 +396,110 @@ class TestTemplateWellFormedness(unittest.TestCase):
             ])
 
 
+PUSH_FLAGS = flagset(
+    bare=["-u", "--force"],
+    valued={"-o": constraint(any=True)},
+    requires={"--force": {"BRANCH": ["feature"], "cwd": ["org-checkout"]}},
+    holes=["BRANCH"],
+)
+
+class TestFlagRequires(unittest.TestCase):
+    """A flag's demands (TEMPLATES.md): atoms required of another hole or of the cwd while the
+    flag is present, on top of what the hole and the rule ask."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.policy = Policy.allow(
+            read=[markers.within(".")],
+            write=[markers.within(".")],
+            listing=[markers.within(".")],
+            atoms=[atom("feature", markers.matches(r"feature/.*"))],
+            validations=[
+                validation("org-repo", argv=("true",), cwd=REPOS, establishes={"cwd": ["org-checkout"]}),
+            ],
+            programs=[
+                program(
+                    "git", cwd=REPOS, argv=["git", "push", "origin", hole("BRANCH"), splice("FLAGS")],
+                    holes={"BRANCH": Token(constraint(matches="[a-z/]+")), "FLAGS": Flags(PUSH_FLAGS)},
+                ),
+                # the rule-level table: a demand on a hole, unconditionally
+                program(
+                    "git", cwd=REPOS, argv=["git", "switch", hole("BRANCH")],
+                    holes={"BRANCH": Token(constraint(any=True))},
+                    requires={"BRANCH": ["feature"]},
+                ),
+            ],
+        )
+
+    def run_(self, body: str):
+        return host_check(HEADER + REPO + body, "<t>", self.policy)
+
+    def accept(self, body: str) -> None:
+        result = self.run_(body)
+        if isinstance(result, Rejected):
+            self.fail("\n".join(result.describe("<t>")))
+
+    def denial(self, body: str) -> str:
+        result = self.run_(body)
+        assert isinstance(result, Rejected), "expected a rejection"
+        return result.denials[0].reason
+
+    def test_absent_the_flag_demands_nothing(self) -> None:
+        self.accept('certora.exec("git", "push", "origin", "main", "-u", cwd=repo)\n')
+
+    def test_a_present_flag_demands_of_the_hole_and_the_cwd(self) -> None:
+        checked = 'certora.check("org-repo", cwd=repo)\n'
+        self.accept(checked + 'certora.exec("git", "push", "origin", "feature/x", "--force", cwd=repo)\n')
+        self.assertIn(
+            "--force requires BRANCH validated by: feature",
+            self.denial(checked + 'certora.exec("git", "push", "origin", "main", "--force", cwd=repo)\n'),
+        )
+        self.assertIn(
+            "--force requires the cwd validated by: org-checkout",
+            self.denial('certora.exec("git", "push", "origin", "feature/x", "--force", cwd=repo)\n'),
+        )
+
+    def test_the_rule_level_table_folds_into_the_hole(self) -> None:
+        switch = next(p for p in self.policy.programs if p.leading_words == ("git", "switch"))
+        assert switch.template is not None
+        branch = switch.template.holes[HoleName("BRANCH")]
+        assert isinstance(branch, Token)
+        self.assertEqual(branch.constraint, Constraint(atoms=frozenset({"feature"})))  # any, folded away
+        self.accept('certora.exec("git", "switch", "feature/x", cwd=repo)\n')
+        self.assertIn("not validated by: feature", self.denial('certora.exec("git", "switch", "main", cwd=repo)\n'))
+
+    def test_the_broker_rechecks_textual_demands(self) -> None:
+        self.assertEqual(
+            self.policy.exec_command("git", ["push", "origin", "feature/x", "--force"], {}, "repos/x"),
+            ["git", "push", "origin", "feature/x", "--force"],
+        )
+        result = self.policy.exec_command("git", ["push", "origin", "main", "--force"], {}, "repos/x")
+        assert isinstance(result, Refusal)
+        self.assertIn("--force requires BRANCH validated by: feature", result.reason)
+
+    def test_describe_renders_the_demands(self) -> None:
+        from certorail.describe import describe
+
+        text = describe(self.policy, "p.toml", "/srv")
+        self.assertIn("--force (requires BRANCH validated by feature; the cwd validated by org-checkout)", text)
+        self.assertIn("bare: -u", text)
+
+    def test_well_formedness(self) -> None:
+        with self.assertRaises(ValueError):  # requires on a flag the vocabulary lacks
+            flagset(bare=["-u"], requires={"--force": {"BRANCH": ["feature"]}})
+        with self.assertRaises(ValueError):  # outside the declared contract
+            flagset(bare=["--force"], requires={"--force": {"OTHER": ["feature"]}}, holes=["BRANCH"])
+        with self.assertRaises(ValueError):  # the template lacks the hole the contract names
+            program("git", cwd=".", argv=["git", splice("FLAGS")], holes={"FLAGS": Flags(PUSH_FLAGS)})
+        with self.assertRaises(ValueError):  # a rule-level demand on a hole that is not there
+            program("git", cwd=".", argv=["git", hole("A")], holes={"A": Token(constraint(any=True))}, requires={"B": ["feature"]})
+        with self.assertRaises(ValueError):  # ... or on a flat rule
+            program("git", cwd=".", subcommand="log", requires={"A": ["feature"]})
+        # the cwd entry of the table is the plain requires
+        p = program("git", cwd=".", subcommand="log", requires={"cwd": ["feature"]})
+        self.assertEqual(p.requires, frozenset({"feature"}))
+
+
 GREP = POLICY.programs[4].template
 assert GREP is not None
 
@@ -561,6 +665,19 @@ class TestDataFormat(unittest.TestCase):
             (rule(holes={"A": {"any": True}}), "need an argv template"),
             (rule(argv=["x", "${A}"], holes={"A": {"kind": "each", "any": True}}), "disagrees with its kind"),
             (rule(argv=["x", "${A}"], holes={"A": {"any": True, "min": 1}}), "min applies to each"),
+            # flag entries: value = false is the table form of a bare flag; requires reaches holes
+            (rule(argv=["x", "${A...}"], holes={"A": {"kind": "flags", "-q": {"value": True}}}), "expected false"),
+            (rule(argv=["x", "${A...}"], holes={"A": {"kind": "flags", "-q": {"value": False, "any": True}}}), "takes no constraint"),
+            (rule(argv=["x", "${A...}"], holes={"A": {"kind": "flags", "-q": {"requires": {"cwd": []}}}}), "a constraint on its value, or value = false"),
+            (rule(argv=["x", "${A...}"], holes={"A": {"kind": "flags", "-q": {"value": False, "requires": {"B": ["not-option"]}}}}), "which this template does not have"),
+            (rule(argv=["x", "${A...}"], holes={"A": {"kind": "flags", "-q": {"value": False, "requires": ["not-option"]}}}), "expected a table"),
+            (rule(argv=["x", "${A}"], holes={"A": {"any": True}}, requires={"B": ["not-option"]}), "not a token or each hole"),
+            (rule(subcommand="y", requires={"A": ["not-option"]}), "no template"),
+            (rule(argv=["x", "${A}"], holes={"A": "${p}"}), "a constraint parameter"),
+            (rule(when="${p}"), "'p' is not a parameter"),
+            ({"policy-version": 1, "flagset": [{"name": "f", "bare": ["-q"], "holes": ["B"],
+                                                "-f": {"value": False, "requires": {"C": ["not-option"]}}}]},
+             "not among the flagset's holes"),
         ]
         for data, expected in cases:
             with self.subTest(expected=expected), self.assertRaises(PolicyFileError) as cm:
