@@ -98,8 +98,8 @@ class TestEverythingElse(unittest.TestCase):
         self.assertIn("org-checkout", reason)
         self.assertIn("unprotected", reason)
 
-    def test_a_program_call_still_kills_everything(self) -> None:
-        reason = denied_atoms(between("def helper():\n    return 1\nhelper()\n"))
+    def test_an_instantiation_still_kills_everything(self) -> None:
+        reason = denied_atoms(between("class Box:\n    pass\nBox()\n"))
         self.assertIn("org-checkout", reason)
         self.assertIn("unprotected", reason)
 

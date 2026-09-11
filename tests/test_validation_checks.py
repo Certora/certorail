@@ -95,8 +95,8 @@ class TestGen(unittest.TestCase):
 
 
 class TestKill(unittest.TestCase):
-    def test_a_program_call_kills_environment_atoms(self) -> None:
-        report = run("def helper():\n    return 1\n" + REPO + CHECK + "helper()\n" + EXEC)
+    def test_an_instantiation_kills_environment_atoms(self) -> None:
+        report = run("class Box:\n    pass\n" + REPO + CHECK + "Box()\n" + EXEC)
         (site,) = exec_sites(report)
         self.assertEqual(checks_of(site.cwd), frozenset())
 

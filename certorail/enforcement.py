@@ -136,6 +136,15 @@ OPENING = Kill(NOTHING, opens=True)  # a store that may put a program object int
 OPAQUE = Kill(EVERYTHING, opens=True)  # program code may run: anything may happen
 
 
+@dataclass(frozen=True)
+class ProgramCall:
+    """A call of a bare name that is no builtin: a function or a class this program defines,
+    or a variable holding a callable. What it does is the program's business -- the walker
+    resolves it to a summary (``summaries.py``) or to havoc -- not the policy's."""
+
+    name: str
+
+
 # ---------------------------------------------------------------------------
 # sites: what the policy evaluates
 # ---------------------------------------------------------------------------
@@ -661,7 +670,7 @@ class Enforcement:
 
     # -- the kill (EFFECTS.md) ----------------------------------------------------------------
 
-    def kill_of(self, site: Callsite) -> Kill:
+    def kill_of(self, site: Callsite) -> Kill | ProgramCall:
         """What this call does to the state (EFFECTS.md, the callee analysis).
 
         The ``certora`` calls and the file sinks are effects with a known medium that run no
@@ -671,10 +680,10 @@ class Enforcement:
         satisfied (``dangerous.INERT_CALLEES``: every argument inert, or only the keywords and
         the splats) and a method on an inert receiver with inert arguments are the interpreter's
         own code over inert values: no kill. The hash-and-identity methods need no inert
-        arguments, but storing a non-inert value opens the state. Anything else -- a program
-        function, a class, a lambda held in a variable, a method on an unknown receiver, a roster
-        call handed a program object -- may run program code: it writes everything and opens
-        everything."""
+        arguments, but storing a non-inert value opens the state. A bare name off the roster is
+        a ``ProgramCall``, the walker's to resolve. Anything else -- a module function off the
+        roster, a method on an unknown receiver or on a program object, a roster call handed a
+        program object -- may run program code: it writes everything and opens everything."""
         callee = site.callee
         if callee.is_var_base:
             full = callee.full_path
@@ -697,8 +706,10 @@ class Enforcement:
                     else site.inert_keywords and site.inert_splats
                 )
                 return NO_KILL if satisfied else OPAQUE
-            if len(full) == 1 or full[0] in self.modules:
-                return OPAQUE  # a program function or class; a module function off the roster
+            if len(full) == 1:
+                return ProgramCall(full[0])
+            if full[0] in self.modules:
+                return OPAQUE  # a module function off the roster
         elif callee.computed_base is None:
             return OPAQUE  # ``super().m()``: a program method
         # a method call, on a variable or on a computed receiver: the receiver's entry decides

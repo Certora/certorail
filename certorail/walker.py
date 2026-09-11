@@ -16,13 +16,15 @@ The walker owns the program: its syntax, its state and its control flow. What th
 say about a call -- is it a site, what does it write, what does it yield, does a value establish
 what is demanded -- is ``enforcement.Enforcement``'s. The walker digests each call into a
 ``Callsite`` (values, not syntax) and applies what comes back: sites and violations into the
-report, the kill onto the state, a check's atoms onto the variables it named.
+report, the kill onto the state, a check's atoms onto the variables it named. What a call to one
+of the program's own module-level functions does is a ``summaries.Summary``, computed by the
+walker as a fixpoint before the walk (EFFECTS.md, the callee analysis).
 
 Kept apart from ``analysis`` (the domain and the expression semantics) so that this module can
 import ``guards``, ``annotations`` and ``safepy`` -- which themselves import ``analysis`` -- without
 a cycle:
 
-    analysis  <-  terms, guards, annotations, safepy, enforcement  <-  walker
+    analysis  <-  terms, guards, annotations, safepy, enforcement  <-  summaries  <-  walker
 """
 import argparse
 import ast
@@ -74,6 +76,7 @@ from .enforcement import (
     ExecSite,
     Kill,
     NetworkSite,
+    ProgramCall,
     SinkSite,
     Site,
     SourceTable,
@@ -92,6 +95,17 @@ from .safepy import (
     InheritanceAnalysis,
     ValidationAnalysis,
 )
+from .summaries import (
+    BOTTOM,
+    HAVOC,
+    NEVER,
+    Result,
+    Summary,
+    is_generator,
+    join_result,
+    module_functions,
+    property_names,
+)
 from .templates import Binding, Elements, Many
 from .terms import Call, Method, lower
 
@@ -103,6 +117,15 @@ __all__ = [
 ]
 
 type State = dict[str, ValidationFact | Container | Data | Std]
+
+
+@dataclass
+class _Frame:
+    """What a scoped block did, read after its scope closes: the kill it applied, and -- for a
+    function body -- what it returned."""
+
+    kill: Kill = NO_KILL
+    result: Result = NEVER
 
 
 def _roster_blessings(
@@ -365,10 +388,18 @@ class ValidationWalker(ast.NodeVisitor):
         # ast.Name occurrences (by id) in container-roster positions; any other Load of a
         # tracked container is its escape. Filled once per module by visit_Module.
         self._blessed: set[int] = set()
-        # what the walk has done to the state since the innermost ``_measure`` began: the kills
-        # of one loop iteration, one comprehension, one try body -- the boundaries the walk does
-        # not pass through are computed from it (see ``_iteration_kill``)
+        # what the walk has done to the state since the innermost ``_measuring`` began: the kills
+        # of one loop iteration, one comprehension, one try body, one function body -- the
+        # boundaries the walk does not pass through, and the summaries, are computed from it
         self._seen: Kill = NO_KILL
+        # the callee analysis' second half (summaries.py): the module-level functions and what
+        # one call of each does, computed by visit_Module before the walk; the names defined
+        # as properties anywhere, whose read is an unknown call
+        self.functions: dict[str, ast.FunctionDef] = {}
+        self.summaries: dict[str, Summary] = {}
+        self.property_names: frozenset[str] = frozenset()
+        # what the function body being walked has been seen to return (joined over its returns)
+        self._result: Result = NEVER
 
     def _violation(self, node: ast.AST, what: str) -> None:
         self.violations.append((node, what))
@@ -529,44 +560,159 @@ class ValidationWalker(ast.NodeVisitor):
         self.state = self._killed(self.state, kill)
         self._seen = self._seen | kill
 
+    # -- scopes: the walk's registers, saved and restored as blocks ----------------------------
+    #
+    # Beside the state, the walk keeps three registers: what has been done to the state since
+    # the innermost measure began (``_seen``), and -- for the function body being walked -- its
+    # guarantee and what it has been seen to return. Each is scoped by a context manager below;
+    # nothing saves or restores one by hand.
+
+    @contextmanager
+    def _measuring(self, *, counted: bool = True):
+        """Measure what the block does to the state. The frame's ``kill`` is filled on exit.
+        *counted*: the enclosing measure keeps counting it -- not for a rehearsal or a function
+        body, which do not run here."""
+        outer, self._seen = self._seen, NO_KILL
+        frame = _Frame()
+        try:
+            yield frame
+        finally:
+            frame.kill = self._seen
+            self._seen = outer | frame.kill if counted else outer
+
+    @contextmanager
+    def _unrecorded(self):
+        """Walk for the verdicts alone: no site and no violation the block reports is kept."""
+        sinks, violations = list(self.sinks), list(self.violations)
+        try:
+            yield
+        finally:
+            self.sinks, self.violations = sinks, violations
+
+    @contextmanager
+    def _function_scope(self, guarantee: ValidationFact | Container | None, seed: State):
+        """A function body's own scope: it starts from *seed*, its returns are checked against
+        *guarantee*, and what it does and returns is its own -- the frame's ``kill`` and
+        ``result`` on exit -- not the enclosing walk's, which did not run it."""
+        saved = self._guarantee, self._result
+        self._guarantee, self._result = guarantee, NEVER
+        try:
+            with self.state_snapshot(), self._measuring(counted=False) as frame:
+                self.state = seed
+                yield frame
+                frame.result = self._result
+        finally:
+            self._guarantee, self._result = saved
+
     def _measure(self, walk: Callable[[], None]) -> Kill:
         """Run *walk* and answer what it did to the state; the enclosing measure keeps counting."""
-        outer = self._seen
-        self._seen = NO_KILL
-        try:
+        with self._measuring() as frame:
             walk()
-            return self._seen
-        finally:
-            self._seen = outer | self._seen
+        return frame.kill
 
     def _rehearse(self, walk: Callable[[], None], state: State) -> Kill:
         """Walk once from *state* for the verdicts alone -- what the calls and stores of *walk*
         do to the state -- recording nothing and leaving the state as it was. For the states the
         walk does not otherwise pass through: a loop's later iterations."""
-        seen = self._seen
-        sinks_prev = list(self.sinks)
-        violations_prev = list(self.violations)
-        self._seen = NO_KILL
-        try:
-            with self.state_snapshot():
-                self.state = dict(state)
-                walk()
-                return self._seen
-        finally:
-            self.sinks = sinks_prev
-            self.violations = violations_prev
-            self._seen = seen
+        with self._unrecorded(), self.state_snapshot(), self._measuring(counted=False) as frame:
+            self.state = dict(state)
+            walk()
+        return frame.kill
 
-    @staticmethod
-    def _iteration_kill(once: Kill) -> Kill:
-        """What every iteration of a body may do, given what one iteration from the boundary
-        state did. A verdict depends on what the receiver and the arguments *are* -- their
-        types and closedness -- never on the atoms they carry, and the names an iteration
-        assigns are already unknown at the boundary, so a body that opens nothing has the same
-        verdicts every time round. A body that opens something may find, next time round, an
-        opened value where it found a closed one, and then any of its calls may run program
-        code: it is taken as doing anything."""
-        return OPAQUE if once.opens else once
+    def _every_iteration(self, iteration: Callable[[], None], boundary: State) -> Kill:
+        """What every iteration of a body may do, from the state at the iteration boundary. A
+        verdict depends on what the receiver and the arguments *are* -- their types and
+        closedness -- never on the atoms they carry, and the names an iteration assigns are
+        already unknown at the boundary, so one rehearsal answers for every iteration of a body
+        that opens nothing. A body that opens something may find, next time round, an opened
+        value where it found a closed one; a second rehearsal from the opened boundary answers
+        for those iterations, and no third can differ: closedness has two points and opening is
+        state-wide."""
+        once = self._rehearse(iteration, boundary)
+        if once.opens:
+            once = once | self._rehearse(iteration, self._killed(boundary, once))
+        return once
+
+    # -- the callee analysis: summaries (summaries.py) ------------------------------------------
+
+    def _kill_of(self, site: Callsite) -> Kill:
+        """What a call does to the state: the enforcement's verdict, or -- for a call of a bare
+        name that is no builtin -- the callee's summary. Only a module-level function has one
+        (its name is bound once and never rebound, so the call is that function's); a class
+        instantiated, a nested function, a lambda or a parameter called havocs the world."""
+        verdict = self.enforcement.kill_of(site)
+        return verdict if isinstance(verdict, Kill) else self._program_summary(verdict).kill
+
+    def _program_summary(self, call: ProgramCall) -> Summary:
+        return self.summaries.get(call.name, HAVOC)
+
+    def _result_of(self, value: ast.expr | None) -> Result:
+        """What a ``return`` hands back, as far as the callee analysis cares: a standard value,
+        or possibly a program object."""
+        if value is None:
+            return Std("none")
+        if interpret_expr(value, self.state) is not None:
+            return Std()  # text or a path: inert, its kind not one Std names
+        std = std_of(value, self.state, self.modules)
+        if std is not None:
+            return std
+        # a call the expression semantics do not know: a module-level function's own result
+        return self._maybe_call(value, self._call_result)
+
+    def _call_result(self, call: ast.Call) -> Result:
+        verdict = self.enforcement.kill_of(self._digest(call, self.state))
+        return self._program_summary(verdict).result if isinstance(verdict, ProgramCall) else None
+
+    def _seed(self, node: ast.FunctionDef) -> State:
+        """The state a function body starts from: the module constants it does not shadow -- a
+        constant's location (and any pure atom: the value is immutable) holds everywhere, an
+        environment check is anchored to a program point and does not survive into an arbitrary
+        call; a standard constant is seeded only when nothing can open it -- and the rely of its
+        contract, for the parameters."""
+        entry = self.contracts.get(node.name)
+        contract = entry[1] if entry is not None and entry[0] is node else None
+        a = node.args
+        local = {p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
+        for extra in (a.vararg, a.kwarg):
+            if extra is not None:
+                local.add(extra.arg)
+        local |= _assigned_names(node.body)
+        seed: State = {
+            k: v if isinstance(v, Std) else self.enforcement.forget(v, EVERYTHING)
+            for k, v in self.module_constants.items()
+            if k not in local
+        }
+        if contract is not None:
+            for k, v in contract.params.items():
+                # a container parameter arrives with param provenance: its escape is an error
+                seed[k] = replace(v, param=True) if isinstance(v, Container) else v
+        return seed
+
+    def _summarize(self, node: ast.FunctionDef) -> Summary:
+        """What one call of the module-level function *node* does, walked from its seed with the
+        summaries as they stand: the kill its body applies, and what it returns -- ``None`` when
+        it falls off the end, never inert for a generator function (the body's kill is applied
+        at creation, the generator is a program object)."""
+        with self._unrecorded(), self._function_scope(None, self._seed(node)) as frame:
+            self._block(node.body)
+            if _falls_through(node.body):
+                self._result = join_result(self._result, Std("none"))
+        return Summary(frame.kill, None if is_generator(node) else frame.result)
+
+    def _compute_summaries(self) -> None:
+        """The summaries of the module-level functions, as a fixpoint: every summary starts at
+        the bottom (a call does nothing, returns nowhere) and each round re-summarizes every
+        body against the current summaries, joining onto the old one, until nothing grows.
+        Terminates: the lattice is finite and the join only ascends."""
+        self.summaries = {name: BOTTOM for name in self.functions}
+        changed = True
+        while changed:
+            changed = False
+            for name, node in self.functions.items():
+                grown = self.summaries[name] | self._summarize(node)
+                if grown != self.summaries[name]:
+                    self.summaries[name] = grown
+                    changed = True
 
     # -- simple statements --------------------------------------------------------------------
 
@@ -628,6 +774,10 @@ class ValidationWalker(ast.NodeVisitor):
                 fact = self.enforcement.check_single_fact(site)
             if fact is None:
                 fact = std_of(value, self.state, self.modules)  # coarsest last: a standard value
+            if fact is None:
+                # a module-level function's summary result: a standard value, or nothing known
+                result = self._maybe_call(value, self._call_result)
+                fact = result if isinstance(result, Std) else None
             if fact is None:
                 self.state.pop(target.id, None)
             else:
@@ -802,8 +952,9 @@ class ValidationWalker(ast.NodeVisitor):
             fact = operand_value(elt, inner)
         if fact is not None and not isinstance(fact, str):
             # what any iteration may do, rehearsed from the state after the comprehension ran
-            once = self._rehearse(lambda: self.visit(comp), self.state)
-            fact = self.enforcement.forget(fact, self._iteration_kill(once).writes)
+            # (the comprehension's own walk already answers for every iteration)
+            every = self._rehearse(lambda: self.visit(comp), self.state)
+            fact = self.enforcement.forget(fact, every.writes)
         if not self.enforcement.establishes(fact, declared.elem):
             self._violation(
                 elt,
@@ -856,6 +1007,20 @@ class ValidationWalker(ast.NodeVisitor):
             # a store through an attribute may register a program object with a standard value
             # or a handle -- the receiver, or anything aliasing it -- so the state is opened
             self._kill_state(OPENING)
+        elif isinstance(node.ctx, ast.Load) and node.attr in self.property_names:
+            # a read by a name some class defines as a property may run that getter (EFFECTS.md):
+            # program code, unless the receiver is known to be no program object
+            receiver = node.value
+            if isinstance(receiver, ast.Name) and receiver.id in self.modules:
+                return
+            if not inert(entry_of(receiver, self.state, self.modules)):
+                self._kill_state(OPAQUE)
+
+    def visit_Lambda(self, node: ast.Lambda) -> Any:
+        # the defaults are evaluated now; the body only when the lambda is called, which havocs
+        for d in [*node.args.defaults, *node.args.kw_defaults]:
+            if d is not None:
+                self.visit(d)
 
     # -- comprehensions: their own scope, eager --------------------------------------------------
 
@@ -867,7 +1032,7 @@ class ValidationWalker(ast.NodeVisitor):
         inside sees what its receiver is (``[x.strip() for x in lines]``). Eager for a generator
         expression too: its body's kills are applied at creation (EFFECTS.md). The scope's names
         return to their outer values afterwards, and the state takes what every iteration may
-        do (``_iteration_kill``)."""
+        do (``_every_iteration``)."""
         outer = self.state
         self.state = dict(outer)
         bound: set[str] = set()
@@ -887,10 +1052,13 @@ class ValidationWalker(ast.NodeVisitor):
                 self.visit(e)
 
         once = self._measure(iteration)
+        if once.opens:
+            # the first iteration is the walked one; the later ones start from what it opened
+            once = once | self._rehearse(iteration, self._killed(dict(outer), once))
         self.state = {k: v for k, v in self.state.items() if k not in bound} | {
             k: v for k, v in outer.items() if k in bound
         }
-        self._kill_state(self._iteration_kill(once))
+        self._kill_state(once)
 
     def visit_ListComp(self, node: ast.ListComp) -> Any:
         self._comprehension(node.generators, [node.elt])
@@ -957,7 +1125,7 @@ class ValidationWalker(ast.NodeVisitor):
                 audit = self.enforcement.audit(site)
                 self._record(audit)
                 # the evaluator is a subprocess like any other call: it kills first ...
-                self._kill_state(self.enforcement.kill_of(site))
+                self._kill_state(self._kill_of(site))
                 # ... and its success -- the only way past this statement -- establishes
                 self._establish(audit.establishes)
             case _:
@@ -968,7 +1136,15 @@ class ValidationWalker(ast.NodeVisitor):
         if callee is None:
             raise InvalidProgram(node.func, "computed callee")  # f()(): no name to reason about
         self._container_call(node)
-        self.generic_visit(node)  # children first: an inner call's effects precede the outer one
+        # children first: an inner call's effects precede the outer one. The receiver of a
+        # method call is visited, the method name itself is not a read (a property called is
+        # program code either way: the receiver is no standard value, so the call havocs)
+        if isinstance(node.func, ast.Attribute):
+            self.visit(node.func.value)
+        for a in node.args:
+            self.visit(a)
+        for k in node.keywords:
+            self.visit(k.value)
         site = self._digest(node, self.state)
         if callee.matches(*CHECK_CALLEE):
             # only the statement form (visit_Expr) has a program point whose fall-through the
@@ -980,7 +1156,7 @@ class ValidationWalker(ast.NodeVisitor):
             self._check_rely(node, node.func.id)
         # the kill: the site's facts were read above, so check-then-use survives;
         # check-call-then-use does not
-        self._kill_state(self.enforcement.kill_of(site))
+        self._kill_state(self._kill_of(site))
 
     def _container_call(self, node: ast.Call) -> None:
         """The roster methods on a tracked container: obligations for the writes, kind
@@ -1089,14 +1265,12 @@ class ValidationWalker(ast.NodeVisitor):
                 if header:
                     self.visit(test)  # a ``while`` header re-runs every time round
                 self.state = self._refine(self.state, test)
-            self.state.update(bindings or {})
+            self._bind_iteration(node, bindings or {})
             self._block(node.body)
 
         # some iteration (or the header itself) may run an effectful call: nothing it reaches
-        # survives an iteration boundary, so it neither enters the body nor survives the loop.
-        # One rehearsal from the boundary state says what any iteration may do.
-        once = self._rehearse(lambda: iteration(header=True), killed)
-        killed = self._killed(killed, self._iteration_kill(once))
+        # survives an iteration boundary, so it neither enters the body nor survives the loop
+        killed = self._killed(killed, self._every_iteration(lambda: iteration(header=True), killed))
         with self.state_snapshot():
             self.state = dict(killed)
             iteration(header=False)  # the header's first run was visited by the caller
@@ -1105,6 +1279,26 @@ class ValidationWalker(ast.NodeVisitor):
             self._block(node.orelse)  # runs only when the loop was not left by ``break``
             orelse_end = self.state
         self.state = _join(orelse_end, killed) if _may_break(node.body) else orelse_end
+
+    def _bind_iteration(
+        self, node: ast.For | ast.While, bindings: Mapping[str, ValidationFact | Std]
+    ) -> None:
+        """Bind the loop target at the start of an iteration. A fact binding was read off the
+        iterable in the pre-loop state and holds for every iteration: the iterator was made
+        from that value. A standard-value binding says the iterable was inert *then*; the
+        iterator walks the live object, which an iteration may have opened (``for x in xs:
+        xs.append(f)``), so it is re-read from the state of this iteration."""
+        for name, bound in bindings.items():
+            self.state[name] = bound
+        if isinstance(node, ast.For) and any(isinstance(b, Std) for b in bindings.values()):
+            fresh = iteration_bindings(node.target, node.iter, self.state, self.modules)
+            for name, bound in bindings.items():
+                if isinstance(bound, Std):
+                    now = fresh.get(name)
+                    if now is None:
+                        self.state.pop(name, None)
+                    else:
+                        self.state[name] = now
 
     def visit_For(self, node: ast.For) -> Any:
         self.visit(node.iter)
@@ -1235,6 +1429,11 @@ class ValidationWalker(ast.NodeVisitor):
         # is immutable: module-level reassignment is forbidden and `global` is banned, so no code
         # can rebind it. Its fact therefore holds in every function body and may seed it.
         self.module_constants = self._module_constants(node)
+        # the callee analysis' summaries, before any call is walked: a module-level function may
+        # be called before its definition is reached
+        self.functions = module_functions(node)
+        self.property_names = property_names(node)
+        self._compute_summaries()
         self.generic_visit(node)
 
     def _module_constants(self, module: ast.Module) -> dict[str, ValidationFact | Std]:
@@ -1278,42 +1477,11 @@ class ValidationWalker(ast.NodeVisitor):
         # nested function or method -- even one sharing the name -- starts from nothing
         entry = self.contracts.get(node.name)
         contract = entry[1] if entry is not None and entry[0] is node else None
-        rely: State = {}
-        if contract is not None:
-            for k, v in contract.params.items():
-                # a container parameter arrives with param provenance: its escape is an error
-                rely[k] = replace(v, param=True) if isinstance(v, Container) else v
-        # seed the module constants the body may read. Exclude any name the function binds itself:
-        # in Python such a name is local throughout the body (it shadows the module name), and the
-        # rely then supplies the facts for the parameters.
-        a = node.args
-        local = {p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
-        for extra in (a.vararg, a.kwarg):
-            if extra is not None:
-                local.add(extra.arg)
-        local |= _assigned_names(node.body)
-        # a constant's location (and any pure atom: the value is immutable) holds everywhere; an
-        # environment check is anchored to a program point and does not survive into an arbitrary
-        # call of the function. A standard constant is seeded only when nothing can open it.
-        seed: State = {
-            k: v if isinstance(v, Std) else self.enforcement.forget(v, EVERYTHING)
-            for k, v in self.module_constants.items()
-            if k not in local
-        }
-        seed.update(rely)
         guarantee = None if contract is None else contract.returns
-        outer = self._guarantee
-        self._guarantee = guarantee
-        seen = self._seen  # the body does not run here: what it does is not the definition's
-        try:
-            with self.state_snapshot():
-                self.state = seed
-                self._block(node.body)
-                if guarantee is not None and not is_plain_type(guarantee) and _falls_through(node.body):
-                    self._violation(node, f"{node.name} may fall off its end without establishing its guarantee")
-        finally:
-            self._guarantee = outer
-            self._seen = seen
+        with self._function_scope(guarantee, self._seed(node)):
+            self._block(node.body)
+            if guarantee is not None and not is_plain_type(guarantee) and _falls_through(node.body):
+                self._violation(node, f"{node.name} may fall off its end without establishing its guarantee")
         self.state.pop(node.name, None)
 
     def visit_Return(self, node: ast.Return) -> Any:
@@ -1321,10 +1489,12 @@ class ValidationWalker(ast.NodeVisitor):
         if isinstance(value, ast.Name) and isinstance(
             (c := self.state.get(value.id)), Container
         ):
+            self._result = join_result(self._result, Std())  # a container of facts: inert
             self._return_container(node, value.id, c)
             return
         if value is not None:
             self.visit(value)
+        self._result = join_result(self._result, self._result_of(value))
         guarantee = self._guarantee
         if guarantee is None or is_plain_type(guarantee):
             return  # a plain return type is the type checker's business

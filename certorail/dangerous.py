@@ -459,6 +459,10 @@ INERT_CALLEES: dict[tuple[str, ...], ArgumentCondition] = {
     ("re", "split"): "keywords-and-splats", ("re", "escape"): "keywords-and-splats",
     ("re", "sub"): "all", ("re", "subn"): "all",
     ("json", "loads"): "keywords-and-splats", ("json", "dumps"): "all",
+    # decorators applied with arguments (``@dataclasses.dataclass(frozen=True)``) and a
+    # dataclass field: they store what they are given and run nothing
+    ("dataclasses", "dataclass"): "keywords-and-splats", ("dataclasses", "field"): "keywords-and-splats",
+    ("functools", "cache"): "keywords-and-splats", ("functools", "lru_cache"): "keywords-and-splats",
     # the extractors (PROVENANCE.md) and the location guard: the host's own code, over a handle
     # or text the program already holds -- reached by name (``read``, ``split``), hence inert
     (NAMESPACE, "extract"): "all", (NAMESPACE, "extract_all"): "all",

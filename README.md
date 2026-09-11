@@ -31,11 +31,12 @@ denylists.
 
 `certorail program.py` (the `certorail.host` entry point) is a four-step pipeline:
 
-1. **Analyse** (`safepy.py`, `walker.py`, `enforcement.py`): the lexical subset rules, then a
-   dataflow over an abstract domain of paths and strings — each variable carries facts about
-   where it can point — with every policy-facing verdict about a call (is it a site, what does it
-   write, what does it yield, does a value establish what is demanded) in `enforcement.py`.
-   Any violation, or any sink whose location is not proven, rejects the program.
+1. **Analyse** (`safepy.py`, `walker.py`, `enforcement.py`, `summaries.py`): the lexical subset
+   rules, then a dataflow over an abstract domain of paths and strings — each variable carries
+   facts about where it can point — with every policy-facing verdict about a call (is it a site,
+   what does it write, what does it yield, does a value establish what is demanded) in
+   `enforcement.py`, and what a call to one of the program's own functions does in
+   `summaries.py`. Any violation, or any sink whose location is not proven, rejects the program.
 2. **Policy** (`policy.py`): every proven filesystem site (read / write / list, with its
    location) and every `certora.exec` site (program, cwd, arguments) is evaluated against the
    policy. Any denial rejects the program.

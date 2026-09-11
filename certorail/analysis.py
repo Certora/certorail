@@ -946,9 +946,10 @@ class Std:
 # what the expression semantics read facts from: the walker's state. A Mapping, not a dict,
 # both because these functions only ever read it and because covariance then lets a plain
 # dict[str, ValidationFact] (tests, sub-states) flow in despite dict's invariance.
-type StateMap = Mapping[str, ValidationFact | Container | Data | Std]
+type Entry = ValidationFact | Container | Data | Std
+type StateMap = Mapping[str, Entry]
 
-def inert(entry: ValidationFact | Container | Data | Std | None) -> bool:
+def inert(entry: Entry | None) -> bool:
     """Is a state entry an inert value (EFFECTS.md)? A str or path fact and a tracked container
     (of facts) always; a standard value and a source handle while closed; an unknown value
     never."""
@@ -960,7 +961,7 @@ def inert(entry: ValidationFact | Container | Data | Std | None) -> bool:
         case _:
             return True
 
-def inert_receiver(entry: ValidationFact | Container | Data | Std | None) -> bool:
+def inert_receiver(entry: Entry | None) -> bool:
     """Does the receiver's entry make a method call the interpreter's own code? An inert value,
     of course; also a standard value of *known* kind even when opened -- a C type's methods
     never dispatch to the contents beyond the fixed dunders (``lst.sort()`` compares with
@@ -1666,9 +1667,7 @@ _METHOD_RESULT_KINDS: dict[str, StdKind | Literal["same"]] = {
     "partition": "tuple", "rpartition": "tuple", "encode": "bytes", "copy": "same",
 }
 
-def entry_of(
-    recv: ast.expr, st: StateMap, modules: frozenset[str] = frozenset()
-) -> ValidationFact | Container | Data | Std | None:
+def entry_of(recv: ast.expr, st: StateMap, modules: frozenset[str] = frozenset()) -> Entry | None:
     """What the state knows about a receiver expression: a name's entry, or the value of a
     computed receiver (``line.strip().split()``, ``"".join``)."""
     if isinstance(recv, ast.Name):
@@ -1709,7 +1708,7 @@ def _comprehension_inert(
 ) -> bool:
     """Are the elements a comprehension builds inert? The element expressions, under the
     iteration bindings (an ``if`` clause refines nothing about inertness)."""
-    inner: dict[str, ValidationFact | Container | Data | Std] = dict(st)
+    inner: dict[str, Entry] = dict(st)
     for gen in generators:
         if gen.is_async:
             return False

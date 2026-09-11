@@ -19,6 +19,8 @@ VOCAB = Vocabulary(
     defined={},
 )
 
+# ``helper`` is a module-level function whose summary is nothing (phase 2): calling it is not
+# program code the analysis fears, passing it is. ``Sink()`` -- an instantiation -- havocs.
 HEADER = (
     "import json\n"
     "import pathlib\n"
@@ -108,7 +110,8 @@ class TestProgramCodeKills(unittest.TestCase):
             'list(g for g in ["a"])\n',
             '"{0}".format(sink)\n',
             "json.dumps(sink)\n",
-            "helper()\n",
+            "Sink()\n",
+            "sink.write(\"x\")\n",
         ):
             with self.subTest(call=call):
                 self.assertEqual(atoms_at_exec(call), DEAD)
@@ -143,14 +146,26 @@ class TestOpening(unittest.TestCase):
             atoms_at_exec("xs = [1]\nxs.append(helper)\nxs = [2]\nsorted(xs)\n"), LIVE
         )
 
-    def test_a_loop_body_that_opens_is_taken_as_doing_anything(self) -> None:
-        # one iteration: append (no kill, opens), pop (no kill); the next iteration may find an
-        # opened value where this one found a closed one
+    def test_a_loop_body_that_opens_is_rehearsed_twice(self) -> None:
+        # one iteration: append (no kill, opens), pop (no kill); the next iteration finds the
+        # list opened -- still a list, so its methods are still the interpreter's: no writes
         self.assertEqual(
             atoms_at_exec('lst = [1]\nfor w in ["a"]:\n    lst.append(helper)\n    lst.pop()\n'),
+            LIVE,
+        )
+        # ... but an element read out of it is no longer inert on the second time round
+        self.assertEqual(
+            atoms_at_exec('lst = [1]\nfor w in ["a"]:\n    lst.append(helper)\n    "".join(lst[0])\n'),
             DEAD,
         )
-        self.assertEqual(atoms_at_exec('for w in ["a"]:\n    w.strip()\n    helper()\n'), DEAD)
+        self.assertEqual(atoms_at_exec('for w in ["a"]:\n    w.strip()\n    Sink()\n'), DEAD)
+
+    def test_the_loop_variable_follows_the_opening(self) -> None:
+        # ``for x in xs`` walks the live list: after an iteration appends a program object, the
+        # next iteration's x may be it
+        self.assertEqual(
+            atoms_at_exec('xs = ["a"]\nfor x in xs:\n    xs.append(helper)\n    "".join(x)\n'), DEAD
+        )
 
 
 POLICY = from_data({
@@ -177,7 +192,7 @@ class TestSubprocessesDoNotOpen(unittest.TestCase):
     def program(self, middle: str) -> str:
         return (
             "import pathlib\n"
-            "def helper():\n    return 1\n"
+            "class Box:\n    pass\n"
             'repo = pathlib.Path("repos") / "x"\n'
             'lines = "a b".split()\n'
             + middle
@@ -193,7 +208,7 @@ class TestSubprocessesDoNotOpen(unittest.TestCase):
         self.assertIsInstance(outcome, Accepted)
 
     def test_program_code_opens_them(self) -> None:
-        outcome = host_check(self.program("helper()\n"), "<t>", POLICY)
+        outcome = host_check(self.program("Box()\n"), "<t>", POLICY)
         assert isinstance(outcome, Rejected), outcome
         self.assertIn("org-checkout", "\n".join(d.reason for d in outcome.denials))
 
