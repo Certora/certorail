@@ -1261,6 +1261,13 @@ def locate(fact: ValidationFact | None) -> Located | None:
             if isinstance(fact, StrFact) and isinstance(fact.regex, Exact):
                 loc = _literal_location(fact.regex.exact_str)
                 return None if loc is None else Located(loc, rp, kept)
+            if isinstance(fact, StrFact) and isinstance(fact.regex, Alternation) and all(
+                isinstance(b, Exact) for b in fact.regex.any_of
+            ):
+                # one of several literals (a constant collection, iterated): each is located and
+                # the locations joined; none if any literal is not a safe path or anchors mix
+                loc = _literal_locations_joined([b.exact_str for b in fact.regex.any_of if isinstance(b, Exact)])
+                return None if loc is None else Located(loc, rp, kept)
             if (comp := as_component(fact)) is not None:
                 return Located(StaticPath((comp,)), rp, kept)
             if "no-parent-traversal" in fact and "not-absolute" in fact:
@@ -1268,6 +1275,20 @@ def locate(fact: ValidationFact | None) -> Located | None:
             return None
         case UrlString():
             return None  # a URL is not a filesystem path
+
+
+def _literal_locations_joined(texts: Sequence[str]) -> LocationFact | None:
+    """The one location covering every literal in *texts* (``join_loc`` folded), or None when
+    some literal is not a safe path or the literals mix anchors."""
+    joined: LocationFact | None = None
+    for text in texts:
+        loc = _literal_location(text)
+        if loc is None:
+            return None
+        joined = loc if joined is None else join_loc(joined, loc)
+        if joined is None:
+            return None
+    return joined
 
 
 def url_of(value: str | ValidationFact | None) -> UrlString | None:
@@ -2102,6 +2123,22 @@ class Interpreter:
                 # ``for line in f`` over a source handle: each line is something the source
                 # produced, unmodified (PROVENANCE.md) -- ``certora.lines`` spelled the stdlib way
                 return StrFact(atoms=frozenset(handle.sources))
+            case (ast.List(elts=elts) | ast.Tuple(elts=elts) | ast.Set(elts=elts)) if elts and not any(
+                isinstance(e, ast.Starred) for e in elts
+            ):
+                # a constant collection: the element is one of the values, so its fact is the one
+                # covering all of them -- one fold over the display (``join_fact``); an element the
+                # interpreter cannot read, or a pair with no covering fact, yields nothing
+                joined: ValidationFact | None = None
+                for e in elts:
+                    v = self.operand(e)
+                    if v is None:
+                        return None
+                    fact = as_fact(v)
+                    joined = fact if joined is None else join_fact(joined, fact)
+                    if joined is None:
+                        return None
+                return joined
             case _:
                 return None
 
@@ -2230,22 +2267,32 @@ def join_loc(
     left: LocationFact,
     right: LocationFact
 ) -> LocationFact | None:
+    """The location covering every path *left* or *right* denotes: pointwise where the two
+    agree in shape, degrading to a splat where they do not. Total on one anchor -- ``**`` (or
+    ``/**``) covers every path of an anchor, so the only None is a mix of anchors, which no
+    location relates.
+
+    Used to abstract a *constant collection* of literals as one fact (``for f in ["a/x", "a/y"]``,
+    ``locate`` of an alternation of exact texts): a finite one-shot fold. Deliberately NOT the
+    walker's control-flow join, which does not merge two located values (see the join decision
+    recorded with the design notes): no lattice iteration is implied anywhere."""
     if left.absolute != right.absolute:
         return None  # anchors never relate: there is no location covering both
     match left, right:
-        case (DirSplat(static_prefix=dir_prefix) as splat, StaticPath(path_components=known_path) as _static) | \
-             (StaticPath(path_components=known_path) as _static, DirSplat(static_prefix=dir_prefix) as splat):
-            if len(dir_prefix) > len(known_path):
-                return None
-            for (splat_comp, static_comp) in zip(dir_prefix, known_path[:-1]):
-                if not subsumes(splat_comp, static_comp):
-                    return None
-            if len(dir_prefix) == len(known_path):
-                # the static path is the splat's prefix itself: only the reflexive form covers it
-                return splat if splat.final_component is None else splat.to_splat(None)
-            if splat.final_component is not None and not subsumes(splat.final_component, known_path[-1]):
-                return None
-            return splat
+        case (DirSplat(static_prefix=dir_prefix) as splat, StaticPath(path_components=known_path)) | \
+             (StaticPath(path_components=known_path), DirSplat(static_prefix=dir_prefix) as splat):
+            # the prefix the two agree on pointwise, over the components both have
+            shared = min(len(dir_prefix), len(known_path))
+            prefix = tuple(join_component(a, b) for a, b in zip(dir_prefix[:shared], known_path[:shared]))
+            below = known_path[shared:]  # the static path's components past the splat's prefix
+            if len(dir_prefix) > len(known_path) or not below:
+                # the static path ends at or inside the (joined) prefix: only the reflexive form
+                # denotes the prefix itself
+                return DirSplat(prefix, None, left.absolute)
+            if splat.final_component is None:
+                return DirSplat(prefix, None, left.absolute)
+            # the static path lies strictly below: a strict splat with a leaf covering both
+            return DirSplat(prefix, join_component(splat.final_component, below[-1]), left.absolute)
         case (StaticPath(path_components=p1), StaticPath(path_components=p2)):
             if len(p1) == len(p2):
                 paths = tuple(join_component(
@@ -2273,6 +2320,25 @@ def join_regex(
     right: PseudoRegex
 ) -> PseudoRegex:
     return alternation(left, right)
+
+
+def join_fact(left: ValidationFact, right: ValidationFact) -> ValidationFact | None:
+    """The fact covering a value that is *left* or *right*, for abstracting a constant
+    collection of literals as one element fact. Two text facts join to the alternation of their
+    regexes and the atoms both carry; two located values of one spelling to the location covering
+    both (``join_loc``); anything else -- different readings, unrelated anchors -- has no single
+    fact, and the caller knows nothing. A one-shot fold over a finite display, never the
+    walker's control-flow join."""
+    match left, right:
+        case StrFact(regex=r1, atoms=a1), StrFact(regex=r2, atoms=a2):
+            return StrFact(regex=alternation(r1, r2), atoms=a1 & a2)
+        case PathFact(atoms=a1), PathFact(atoms=a2):
+            return PathFact(atoms=a1 & a2)
+        case Located(location=l1, repr=rp1, atoms=a1), Located(location=l2, repr=rp2, atoms=a2) if rp1 == rp2:
+            loc = join_loc(l1, l2)
+            return None if loc is None else Located(loc, rp1, a1 & a2)
+        case _:
+            return None
 
 def widen_regex(
     prev: PseudoRegex,
