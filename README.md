@@ -73,7 +73,7 @@ fact a hole can demand, so a program acts only on what a trusted query returned;
 [`PROVENANCE.md`](PROVENANCE.md).
 
 The policy is **trusted**. It is normally a TOML document ([`examples/policy.toml`](examples/policy.toml);
-the schema is documented in [`certorail/policyfile.py`](certorail/policyfile.py)), passed with
+the schema is [`certorail/schema.py`](certorail/schema.py), the loader [`certorail/policyfile.py`](certorail/policyfile.py)), passed with
 `--policy` or discovered ambiently under `~/.certorail/policy/` for the sandbox root, with the
 checker programs its validations run kept beside it under `~/.certorail/checkers/`. The
 [`certorail-policy`](.claude/skills/certorail-policy/SKILL.md) skill walks a Claude Code session

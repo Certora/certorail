@@ -46,9 +46,13 @@ from .analysis import (
     StrFact,
     UrlString,
     ValidationFact,
+    as_fact,
+    as_text,
+    atoms_of,
     bind_values,
-    checks_of,
+    carried,
     entails,
+    holds,
     inert_receiver,
     is_path_typed,
     known_text,
@@ -56,9 +60,9 @@ from .analysis import (
     location_le,
     pretty_location,
     pretty_regex,
-    saturate,
     scalar,
     url_of,
+    _regex_subsumes,
 )
 from .annotations import Contract, is_plain_type
 from .dangerous import (
@@ -83,7 +87,7 @@ from .dangerous import (
 )
 from .effects import EVERYTHING, NOTHING, Effects, Medium
 from .footprints import Footprint, overlaps
-from .ids import AtomId, ParamName, ProgramName, RegionId, ValidationName
+from .ids import BUILTIN_ATOMS, Atom, CheckId, ParamName, ProgramName, RegionId, SourceId, ValidationName
 from .locations import parse_location
 from .templates import Binding, Elements, Many, Value, matches_leading
 
@@ -262,7 +266,7 @@ class CheckSignature:
 
     name: ValidationName
     params: tuple[ParamName, ...]
-    establishes: dict[ParamName, frozenset[AtomId]]  # parameter name, or "cwd" -> validation atoms
+    establishes: dict[ParamName, frozenset[Atom]]  # parameter name, or "cwd" -> validation atoms
     # what the evaluator's own run writes (EFFECTS.md): NOTHING for an effect-free check, the
     # whole media it reaches when the policy declared no regions
     writes: Effects = EVERYTHING
@@ -298,44 +302,16 @@ class SourceTable:
     handle: an exec by program and leading words, a network request by host pattern, a file
     read by location."""
 
-    exec: tuple[tuple[ProgramName, tuple[str, ...], AtomId], ...] = ()
+    exec: tuple[tuple[ProgramName, tuple[str, ...], SourceId], ...] = ()
     # (host pattern, permitted URL paths -- empty: any, atom)
-    network: tuple[tuple[str, tuple[LocationFact, ...], AtomId], ...] = ()
-    read: tuple[tuple[LocationFact, AtomId], ...] = ()
+    network: tuple[tuple[str, tuple[LocationFact, ...], SourceId], ...] = ()
+    read: tuple[tuple[LocationFact, SourceId], ...] = ()
 
     @property
-    def atoms(self) -> frozenset[AtomId]:
+    def atoms(self) -> frozenset[SourceId]:
         return frozenset(
             [a for _, _, a in self.exec] + [a for _, _, a in self.network] + [a for _, a in self.read]
         )
-
-
-@dataclass(frozen=True)
-class Vocabulary:
-    """The policy's validations as the analysis sees them: the check signatures, plus which atoms
-    are *pure*. A pure atom is true of the value's text alone, so no effect can invalidate it --
-    it dies only with the value. An environment atom is about the world at a location, and dies
-    at every call that may change what it depends on."""
-
-    signatures: dict[ValidationName, CheckSignature] = field(default_factory=dict)
-    pure_atoms: frozenset[AtomId] = frozenset()
-    # *defined* atoms: name -> the text property that is its meaning. The analysis establishes
-    # one directly (``saturate``) on any value whose known text entails it -- a literal needs no
-    # runtime check -- and it is pure by construction (a subset of ``pure_atoms``).
-    defined: dict[AtomId, PseudoRegex] = field(default_factory=dict)
-    # source atoms and the rules that yield them (also a subset of ``pure_atoms``)
-    sources: SourceTable = field(default_factory=SourceTable)
-    # EFFECTS.md, for the kill by intersection: per environmental atom the state it depends on
-    # (an atom absent here depends on everything), per rule what it writes, and each declared
-    # region's medium
-    reads: Mapping[AtomId, Effects] = field(default_factory=dict)
-    writes: WriteTable = field(default_factory=WriteTable)
-    medium_of: Mapping[RegionId, Medium] = field(default_factory=dict)
-    # per environmental atom, the instantiated footprints of the filesystem regions it reads:
-    # each region's footprint joined onto the cwd of each validation establishing the atom (an
-    # atom absent here reads no filesystem region by name; ``ANYWHERE`` when a footprint has no
-    # cwd to anchor it)
-    footprints: Mapping[AtomId, tuple[Footprint, ...]] = field(default_factory=dict)
 
 
 class Discharge(Protocol):
@@ -345,7 +321,97 @@ class Discharge(Protocol):
     elements on statically-known text, so a constant needs neither a ``certora.check`` nor a
     regex definition."""
 
-    def __call__(self, atom: AtomId, text: str) -> bool: ...
+    def __call__(self, atom: Atom, text: str) -> bool: ...
+
+
+@dataclass(frozen=True)
+class Vocabulary:
+    """The policy's atoms as the analysis sees them (ATOMS.md): the check signatures, and the
+    kind table -- which atoms are *pure* (true of the value's text alone, so no effect can
+    invalidate them: they die only with the value; an environmental atom is about the world at
+    a location and dies at every call that may change what it depends on), which of the pure
+    ones a regex defines or a literal checker decides, which are sources. ``missing`` is the one
+    place "does this value carry X" is answered from all of it."""
+
+    signatures: dict[ValidationName, CheckSignature] = field(default_factory=dict)
+    # every pure atom: the built-ins, the defined and checker-established check atoms, the sources
+    pure_atoms: frozenset[Atom] = frozenset()
+    # *defined* atoms: name -> the text property that is its meaning. The analysis establishes
+    # one directly on any value whose known text entails it -- a literal needs no runtime check
+    # -- and it is pure by construction (a subset of ``pure_atoms``).
+    defined: dict[CheckId, PseudoRegex] = field(default_factory=dict)
+    # pure check atoms some effect-free single-input validation establishes: a literal checker
+    # can decide them on exactly-known text (a subset of ``pure_atoms``)
+    checkable: frozenset[CheckId] = frozenset()
+    # source atoms and the rules that yield them (also a subset of ``pure_atoms``)
+    sources: SourceTable = field(default_factory=SourceTable)
+    # EFFECTS.md, for the kill by intersection: per environmental atom the state it depends on
+    # (an atom absent here depends on everything), per rule what it writes, and each declared
+    # region's medium
+    reads: Mapping[Atom, Effects] = field(default_factory=dict)
+    writes: WriteTable = field(default_factory=WriteTable)
+    medium_of: Mapping[RegionId, Medium] = field(default_factory=dict)
+    # per environmental atom, the instantiated footprints of the filesystem regions it reads:
+    # each region's footprint joined onto the cwd of each validation establishing the atom (an
+    # atom absent here reads no filesystem region by name; ``ANYWHERE`` when a footprint has no
+    # cwd to anchor it)
+    footprints: Mapping[Atom, tuple[Footprint, ...]] = field(default_factory=dict)
+
+    def decidable_from_text(self) -> frozenset[Atom]:
+        """The atoms a string alone can be shown to carry, by kind: the built-ins (structure),
+        the defined ones (their regex), the checkable ones (a literal checker). Not the
+        environmental ones (a check at a place and time) and not the sources (provenance is not
+        a property of text): what the broker's re-check of a templated exec may ask about."""
+        return frozenset(BUILTIN_ATOMS.values()) | frozenset(self.defined) | self.checkable
+
+    def missing(
+        self,
+        value: str | ValidationFact | None,
+        required: frozenset[Atom],
+        discharge: Discharge | None = None,
+    ) -> frozenset[Atom]:
+        """The atoms of *required* that *value* does not carry. An atom the fact states is
+        carried; otherwise its kind says how it could still be: a built-in by structure
+        (``holds``: the fact's regex and the implication table, a located value's head); a
+        defined atom by its regex subsuming the known text; a checkable atom by the literal
+        checker, when a *discharge* is given and the text is exactly known. Nothing else --
+        an environmental atom, a source -- is ever inferred. Without a discharger the answer is
+        weaker, never wrong: the checkable atoms stay missing."""
+        if not required:
+            return required
+        if value is None:
+            return required
+        fact = as_fact(value)
+        out: set[Atom] = set()
+        text: str | None | bool = False  # unknown until needed
+        for atom in required:
+            if atom in fact.atoms:
+                continue
+            if atom in BUILTIN_ATOMS:
+                if holds(BUILTIN_ATOMS[atom], fact):
+                    continue
+            elif atom in self.defined:
+                if _regex_subsumes(self.defined[CheckId(atom)], as_text(fact).regex):
+                    continue
+            elif discharge is not None and atom in self.checkable:
+                if text is False:
+                    text = known_text(fact)
+                if isinstance(text, str) and discharge(atom, text):
+                    continue
+            out.add(atom)
+        return frozenset(out)
+
+    def annotation_problem(self, fact: ValidationFact) -> str | None:
+        """A contract's spelling disagrees with the kind: ``certora.source(x)`` names no source
+        atom of this policy, or ``certora.validated(x)`` names one. The annotation parser marks
+        the kind it was spelled with; the policy's kind table decides."""
+        sources = self.sources.atoms
+        for a in sorted(fact.atoms):
+            if isinstance(a, SourceId) and a not in sources:
+                return f"certora.source({a!r}): no rule of the policy yields that source atom"
+            if isinstance(a, CheckId) and a in sources:
+                return f"certora.validated({a!r}): {a!r} is a source atom; spell it certora.source({a!r})"
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +495,7 @@ class Audit:
 
     sites: tuple[Site, ...] = ()
     violations: tuple[tuple[ast.AST, str], ...] = ()
-    establishes: Mapping[str, frozenset[AtomId]] = field(default_factory=dict)
+    establishes: Mapping[str, frozenset[Atom]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -607,25 +673,12 @@ class Enforcement:
     # -- entailment ---------------------------------------------------------------------------
 
     def establishes(self, value: Value, required: ValidationFact) -> bool:
-        """Does *value* establish *required*? ``entails`` after saturation, plus -- for a value
-        whose exact text is known -- running literal checkers for the atoms still missing."""
-        actual = saturate(value, self.vocabulary.defined)
-        if isinstance(actual, str):
-            actual = StrFact(regex=Exact(actual))
-        if entails(actual, required):
-            return True
-        if self._discharge is None or actual is None:
-            return False
-        text = known_text(actual)
-        if text is None:
-            return False
-        # entailment fails on shape (regex, location) or on atoms, and a checker can only supply
-        # atoms: first ask whether the shape would entail with every missing atom granted, and
-        # only then spend the subprocess runs asking the checkers for each of them
-        missing = required.checks - actual.checks
-        if not missing or not entails(replace(actual, checks=actual.checks | missing), required):
-            return False
-        return all(self._discharge(AtomId(a), text) for a in missing)
+        """Does *value* establish *required*? ``entails``, with the atoms decided by
+        ``Vocabulary.missing`` -- structure, regex definitions, literal checkers on
+        exactly-known text -- rather than by structure alone."""
+        return entails(
+            value, required, lambda fact, atoms: self.vocabulary.missing(fact, atoms, self._discharge)
+        )
 
     def rely_failures(
         self, fname: str, contract: Contract, arguments: Mapping[str, Argument]
@@ -786,19 +839,19 @@ class Enforcement:
             return self._file_write(path)
         return NO_KILL
 
-    def survivors(self, atoms: frozenset[str], kill: Kill) -> frozenset[str]:
-        """The atoms of *atoms* that outlive *kill*: every pure atom, and every environmental
-        atom whose state the kill misses. An atom the policy gave no ``reads`` depends on
-        everything, so any effect kills it; one reading the whole filesystem dies at any file
-        write; one reading named filesystem regions dies at a file write that can lie at or
-        below a footprint instantiated for it."""
+    def survivors(self, atoms: frozenset[Atom], kill: Kill) -> frozenset[Atom]:
+        """The atoms of *atoms* that outlive *kill*: every built-in (a property of the text),
+        every pure atom, and every environmental atom whose state the kill misses. An atom the
+        policy gave no ``reads`` depends on everything, so any effect kills it; one reading the
+        whole filesystem dies at any file write; one reading named filesystem regions dies at a
+        file write that can lie at or below a footprint instantiated for it."""
         if kill.writes.empty and not kill.file_writes:
             return atoms
         vocabulary = self.vocabulary
         pure = vocabulary.pure_atoms
 
-        def dies(a: str) -> bool:
-            reads = vocabulary.reads.get(AtomId(a))
+        def dies(a: Atom) -> bool:
+            reads = vocabulary.reads.get(a)
             if reads is None:
                 return True  # depends on everything: any effect
             if kill.writes.meets(reads, vocabulary.medium_of):
@@ -807,15 +860,15 @@ class Enforcement:
                 return False
             if "fs" in reads.media:
                 return True
-            footprints = vocabulary.footprints.get(AtomId(a), ())
+            footprints = vocabulary.footprints.get(a, ())
             return any(overlaps(w, fp) for w in kill.file_writes for fp in footprints)
 
-        return frozenset(a for a in atoms if a in pure or not dies(a))
+        return frozenset(a for a in atoms if a in BUILTIN_ATOMS or a in pure or not dies(a))
 
     def forget(self, fact: ValidationFact, kill: Kill) -> ValidationFact:
         """*fact* after *kill*."""
-        kept = self.survivors(fact.checks, kill)
-        return fact if kept == fact.checks else replace(fact, checks=kept)
+        kept = self.survivors(fact.atoms, kill)
+        return fact if kept == fact.atoms else replace(fact, atoms=kept)
 
     def _file_write(self, *paths: Value) -> Kill:
         """The kill of the program's own write to *paths*: derived from the proven locations,
@@ -873,13 +926,13 @@ class Enforcement:
 
     # -- provenance (PROVENANCE.md) -----------------------------------------------------------
 
-    def _exec_sources(self, program: str, arguments: Sequence[Value]) -> frozenset[AtomId]:
+    def _exec_sources(self, program: str, arguments: Sequence[Value]) -> frozenset[SourceId]:
         for name, words, atom in self.vocabulary.sources.exec:
             if name == program and matches_leading(words, arguments):
                 return frozenset({atom})
         return frozenset()
 
-    def _network_sources(self, url: ValidationFact | None) -> frozenset[AtomId]:
+    def _network_sources(self, url: ValidationFact | None) -> frozenset[SourceId]:
         """The source atoms of the rule(s) a proven URL's host falls under: every host the netloc
         may denote must match, or the response vouches for nothing."""
         lifted = url_of(url)
@@ -894,7 +947,7 @@ class Enforcement:
             and (not paths or (path is not None and any(location_le(path, p) for p in paths)))
         )
 
-    def _read_sources(self, path: ValidationFact | None) -> frozenset[AtomId] | None:
+    def _read_sources(self, path: ValidationFact | None) -> frozenset[SourceId] | None:
         """The source atoms of the ``[[source]]`` locations a proven path lies within; None when
         the path is not proven at all (then there is no handle, and the read is unconfined
         anyway)."""
@@ -958,12 +1011,12 @@ class Enforcement:
         callee = site.callee
         if callee.matches(*EXTRACT_CALLEE) and _bind(ExtractCall, site) is not None:
             source = site.handle_for(0, "x")
-            return None if source is None else StrFact(checks=source.sources)
+            return None if source is None else StrFact(atoms=frozenset(source.sources))
         if callee.matches(*FIELD_CALLEE) and (bound := _bind(FieldCall, site)) is not None:
             fact = _as_fact(bound.line)
             if fact is None:
                 return StrFact()
-            return StrFact(checks=checks_of(fact) & self.vocabulary.sources.atoms)
+            return StrFact(atoms=atoms_of(fact) & self.vocabulary.sources.atoms)
         return None
 
     def check_single_fact(self, site: Callsite) -> ValidationFact | None:
@@ -986,7 +1039,7 @@ class Enforcement:
         base = _as_fact(site.args[1])
         if base is None:
             base = StrFact()
-        return replace(base, checks=base.checks | atoms)
+        return replace(base, atoms=base.atoms | atoms)
 
     # -- sites: the shape audits --------------------------------------------------------------
 
@@ -1083,7 +1136,7 @@ class Enforcement:
         # success -- the only way past the statement -- establishes the atoms, on arguments that
         # are bare names: a fact needs a variable to live on. Anything else is dropped, soundly;
         # checks only ever enable.
-        establishes: dict[str, frozenset[AtomId]] = {}
+        establishes: dict[str, frozenset[Atom]] = {}
         for target, atoms in signature.establishes.items():
             variable = site.keyword_names.get(target)
             if variable is not None:
@@ -1285,8 +1338,13 @@ class Enforcement:
 # ---------------------------------------------------------------------------
 
 
-def _checks_suffix(checks: frozenset[str]) -> str:
-    return f" (validated: {', '.join(sorted(checks))})" if checks else ""
+def _atoms_suffix(atoms: frozenset[Atom]) -> str:
+    """The stated built-ins in brackets, the policy atoms as "validated"."""
+    builtin = sorted(a for a in atoms if a in BUILTIN_ATOMS)
+    policy = sorted(carried(atoms))
+    return (f" [{', '.join(builtin)}]" if builtin else "") + (
+        f" (validated: {', '.join(policy)})" if policy else ""
+    )
 
 
 _STD_NOUNS: dict[str, str] = {
@@ -1307,18 +1365,14 @@ def describe_value(v: Value | Container | Std) -> str:
             return noun + ("" if closed else " that may hold a program object")
         case str():
             return repr(v)
-        case Located(location=loc, repr=rp, checks=checks):
-            return f"{rp} at {pretty_location(loc)}" + _checks_suffix(checks)
-        case StrFact(regex=regex, atoms=atoms, checks=checks):
+        case Located(location=loc, repr=rp, atoms=atoms):
+            return f"{rp} at {pretty_location(loc)}" + _atoms_suffix(atoms)
+        case StrFact(regex=regex, atoms=atoms):
             text = "text" if regex == ANY_STR else f"text matching {pretty_regex(regex)}"
-            return text + (f" [{', '.join(sorted(atoms))}]" if atoms else "") + _checks_suffix(checks)
-        case PathFact(atoms=atoms, checks=checks):
-            return (
-                "path of unknown location"
-                + (f" [{', '.join(sorted(atoms))}]" if atoms else "")
-                + _checks_suffix(checks)
-            )
-        case UrlString(netloc=netloc, path=path, scheme=scheme, checks=checks):
+            return text + _atoms_suffix(atoms)
+        case PathFact(atoms=atoms):
+            return "path of unknown location" + _atoms_suffix(atoms)
+        case UrlString(netloc=netloc, path=path, scheme=scheme, atoms=atoms):
             claims = ", ".join(
                 bit
                 for bit in (
@@ -1328,7 +1382,7 @@ def describe_value(v: Value | Container | Std) -> str:
                 )
                 if bit is not None
             )
-            return f"url ({claims or 'nothing known'})" + _checks_suffix(checks)
+            return f"url ({claims or 'nothing known'})" + _atoms_suffix(atoms)
 
 
 def _describe_binding(value: Binding) -> str:

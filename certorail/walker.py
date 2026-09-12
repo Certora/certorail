@@ -54,6 +54,7 @@ from .analysis import (
     resolve_callee,
 )
 from .annotations import Contract, bind_arguments, default_of, is_plain_type, parse_annotation
+from .ids import Atom, SourceId
 from .dangerous import CHECK_CALLEE, EXEC_CALLEE, EXTRACT_ALL_CALLEE, LINES_CALLEE
 from .enforcement import (
     CONTAINER_METHODS,
@@ -315,10 +316,10 @@ def _join(a: State, b: State) -> State:
             continue
         elif isinstance(v, Std) or isinstance(other, Std):
             out[k] = Std(None, inert(v) and inert(other))
-        elif replace(v, checks=frozenset()) == replace(other, checks=frozenset()):
-            # the same fact, differently checked: a check died on one path (an effect there),
+        elif replace(v, atoms=frozenset()) == replace(other, atoms=frozenset()):
+            # the same fact, differently attested: an atom died on one path (an effect there),
             # or was established on one path only -- what both paths carry survives
-            out[k] = replace(v, checks=v.checks & other.checks)
+            out[k] = replace(v, atoms=v.atoms & other.atoms)
         else:
             out[k] = Std(None, True)  # two facts of different shape: text or a path either way
     return out
@@ -536,7 +537,7 @@ class ValidationWalker(ast.NodeVisitor):
             case _:
                 return semantics.operand(expr)
 
-    def _sources_of(self, expr: ast.expr) -> frozenset[str] | None:
+    def _sources_of(self, expr: ast.expr) -> frozenset[SourceId] | None:
         """The sources behind an extractor's argument: a name bound to a handle, or a source call
         inline. None: not a source."""
         if isinstance(expr, ast.Name):
@@ -551,12 +552,12 @@ class ValidationWalker(ast.NodeVisitor):
         self.sinks.extend(audit.sites)
         self.violations.extend(audit.violations)
 
-    def _establish(self, atoms_by_name: Mapping[str, frozenset[str]]) -> None:
+    def _establish(self, atoms_by_name: Mapping[str, frozenset[Atom]]) -> None:
         """A check's success, on the variables it named: a fact needs a variable to live on."""
         for name, atoms in atoms_by_name.items():
             fact = self.state.get(name)
             if fact is not None and not isinstance(fact, (Container, Data, Std)):
-                self.state[name] = replace(fact, checks=fact.checks | atoms)
+                self.state[name] = replace(fact, atoms=fact.atoms | atoms)
 
     def _killed(self, st: State, kill: Kill) -> State:
         """*st* after a call: every atom the write set reaches dies, on every variable and on
@@ -941,11 +942,11 @@ class ValidationWalker(ast.NodeVisitor):
                 return False
 
     def _extracted_conforms(
-        self, node: ast.expr, sources: frozenset[str] | None, declared: Container
+        self, node: ast.expr, sources: frozenset[SourceId] | None, declared: Container
     ) -> bool:
         if sources is None:
             return False  # the extractor's audit reported the non-source
-        if not self.enforcement.establishes(StrFact(checks=sources), declared.elem):
+        if not self.enforcement.establishes(StrFact(atoms=frozenset(sources)), declared.elem):
             self._violation(
                 node, f"the extracted elements do not establish {describe_value(declared.elem)}"
             )
@@ -1626,6 +1627,18 @@ def analyze(
     functions.visit(tree)
     if functions.violations:
         return Report(violations=list(functions.violations))
+    if vocabulary is not None:
+        # a contract's atoms are spelled by kind (certora.validated / certora.source); the
+        # policy's kind table holds the author to it (ATOMS.md)
+        problems: list[tuple[ast.AST, str]] = []
+        for fdef, contract in functions.contracts.values():
+            for declared in (*contract.params.values(), contract.returns):
+                fact = declared.elem if isinstance(declared, Container) else declared
+                problem = None if fact is None else vocabulary.annotation_problem(fact)
+                if problem is not None:
+                    problems.append((fdef, f"{fdef.name}: {problem}"))
+        if problems:
+            return Report(violations=problems)
 
     # the injected namespace is a module root like any import: its members may only be applied
     module_roots = imports.import_roots | {NAMESPACE}

@@ -4,7 +4,7 @@ splat -- that is not inert (``json.loads(object_hook=f)``, ``json.dumps(default=
 environmental atoms like any other. Inert spellings keep their exemption."""
 import unittest
 
-from certorail.analysis import checks_of
+from certorail.analysis import atoms_of
 from certorail.ids import AtomId, ParamName, ValidationName
 from certorail.walker import CheckSignature, ExecSite, Report, Vocabulary, analyze
 
@@ -38,7 +38,7 @@ def atoms_at_exec(between: str) -> frozenset[str]:
     report: Report = analyze(HEADER + between + EXEC, vocabulary=VOCAB)
     assert report.violations == [], report.violations
     (site,) = [s for s in report.sinks if isinstance(s, ExecSite)]
-    return checks_of(site.cwd)
+    return atoms_of(site.cwd)
 
 
 LIVE = frozenset({"org-checkout"})

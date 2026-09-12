@@ -265,8 +265,11 @@ A trivial text predicate can be a `test` one-liner with no script at all:
   A hole with `location` denies a computed argument — an f-string, `.strip()` — since that is no
   proven path; a hole with `atoms` denies a value nothing checked.
 - Atoms are declared once in `[atoms]`; a name used in `establishes`, `requires`, a hole's
-  `atoms` or `[[network]].requires` without a declaration is an error. `not-option` is built in
-  and may not be declared.
+  `atoms` or `[[network]].requires` without a declaration is an error. The five built-ins
+  (`not-option`, `no-slash`, `no-parent-traversal`, `not-absolute`, `not-dot-dot`) may be named
+  anywhere an atom may and may not be declared.
+- A program spells provenance as `certora.source("x")`, a checked property as
+  `certora.validated("x")`; mixing them up is a contract error the report names.
 - A cwd-free validation cannot establish atoms on `cwd`; a validation with `cwd` requires the
   program to pass a proven `cwd=`.
 - `certora.check_single` needs a validation with exactly one parameter; inside a comprehension

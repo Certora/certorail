@@ -177,7 +177,9 @@ Rules of use:
   `certora.exactly("a/b", …)` (components: literals, `certora.matches(r)`, `certora.one_of("a", "b")`),
   `certora.matches(r"…")`, `certora.one_of("a", "b")`, `certora.seq("pre-", certora.matches(r"\d+"))`,
   `certora.no_slash`, `certora.no_parent_traversal`, `certora.not_absolute`, `certora.not_dot_dot`,
+  `certora.not_option` (the text does not begin with `-`; `assert not s.startswith("-")` establishes it),
   `certora.validated("atom", …)` (the value carries the named policy facts — see validations),
+  `certora.source("atom", …)` (the value came, unmodified, from the source that yields the atom — see provenance),
   `certora.url(scheme="https", netloc="api.github.com", path_within="/repos")` (the value is a URL with these
   components; each keyword is optional and claims only what it names — see network).
   A location marker (`within`/`exactly`) does not combine with text markers; constrain the file name with
@@ -315,7 +317,8 @@ slugs: list[typing.Annotated[str, certora.no_slash, certora.not_dot_dot]] = []
   `lines`. The path is a string literal in a small jq subset: `.key`, `."quoted key"`, `[0]`,
   `[]`; no pipes or filters. Scalars come back as text; `null`, a missing path and non-scalars raise.
 - The result of `extract_all` / `lines` / `readlines` is a typed container: annotate it,
-  `xs: list[typing.Annotated[str, certora.validated("gh-api")]] = certora.extract_all(...)`.
+  `xs: list[typing.Annotated[str, certora.source("gh-api")]] = certora.extract_all(...)`
+  (`certora.source`, not `certora.validated`: provenance is spelled as what it is).
 - Any string operation (`strip`, `+`, f-strings, `split`) drops the fact, as does `json.loads`
   followed by indexing; guards (`assert re.fullmatch(...)`) keep it. A literal never has it.
   Where a hole or contract demands a source fact, the extractor is the only spelling that works.

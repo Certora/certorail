@@ -16,17 +16,18 @@ from collections.abc import Iterable
 
 from .analysis import pretty_location, pretty_regex
 from .effects import EVERYTHING, Effects
-from .ids import AtomId, FlagName
+from .ids import BUILTIN_ATOMS, NOT_OPTION, Atom, FlagName, SourceId
 from .policy import NetworkRule, Policy, Program, Validation, pretty_locations
-from .templates import CWD, NOT_OPTION, Constraint, Each, Flags, Flagset, Template, Token
+from .templates import CWD, Constraint, Each, Flags, Flagset, Template, Token
 
 NOTATION = (
     "Notation: <...> marks a value the program supplies. </re/> text known to match the regex "
     "(a literal, or a variable guarded by re.fullmatch with that regex); <(a|b)> one of; "
     "<path within L, M> a proven path within one of the locations; <literal> text the program "
     "itself names (a literal or a constant), never a value read from a file, argv or an API; "
-    "<any> anything, unknown values included; <... validated X> also carries the validation "
-    "fact X. Claims combine: </dev-\\w+/ literal> is a named database of that shape. NAME... "
+    "<any> anything, unknown values included; <... validated X> also carries the atom X (a "
+    "check, a guard, or a built-in property of the text); <... from S> came, unmodified, from "
+    "the source S. Claims combine: </dev-\\w+/ literal> is a named database of that shape. NAME... "
     "takes a list. A flags list is flag names in order, each valued flag followed by its value; "
     "only the flags listed exist. Locations are spelled repos/** (at or below), repos/*/x (one "
     "arbitrary component), <re> (a component matching re), {a,b} (one of), a leading / for the "
@@ -35,7 +36,7 @@ NOTATION = (
 )
 
 
-def _constraint(c: Constraint) -> str:
+def _constraint(c: Constraint, sources: frozenset[SourceId]) -> str:
     if c.any:
         return "<any>"
     parts: list[str] = []
@@ -45,8 +46,12 @@ def _constraint(c: Constraint) -> str:
         parts.append(pretty_regex(c.regex))
     if c.literal:
         parts.append("literal")
-    if c.atoms:
-        parts.append("validated " + ", ".join(sorted(c.atoms)))
+    validated = sorted(a for a in c.atoms if a not in sources)
+    provenance = sorted(a for a in c.atoms if a in sources)
+    if validated:
+        parts.append("validated " + ", ".join(validated))
+    if provenance:
+        parts.append("from " + ", ".join(provenance))
     return "<" + " ".join(parts) + ">"
 
 
@@ -62,7 +67,7 @@ def _demands(fs: Flagset, flag: FlagName) -> str:
     return " (requires " + "; ".join(parts) + ")"
 
 
-def _flagset(fs: Flagset) -> list[str]:
+def _flagset(fs: Flagset, sources: frozenset[SourceId]) -> list[str]:
     if fs.any:
         return ["any flag, any value: the tool is trusted with its own options"]
     out: list[str] = []
@@ -72,7 +77,7 @@ def _flagset(fs: Flagset) -> list[str]:
     for name in sorted(f for f in fs.bare if f in fs.requires):
         out.append(f"{name}{_demands(fs, name)}")
     for name, c in fs.valued.items():  # declaration order: the author's grouping
-        out.append(f"{name} {_constraint(c)}{_demands(fs, name)}")
+        out.append(f"{name} {_constraint(c, sources)}{_demands(fs, name)}")
     return out
 
 
@@ -125,7 +130,7 @@ def _effects_line(policy: Policy, rule: Program | Validation) -> str:
     return text + (f" ({'; '.join(notes)})" if notes else "")
 
 
-def _dies_on(policy: Policy, atom_name: AtomId) -> str:
+def _dies_on(policy: Policy, atom_name: Atom) -> str:
     """Every declared operation whose write set meets the atom's read set, computed."""
     hits: list[str] = []
     for p in policy.programs:
@@ -197,27 +202,28 @@ def _program(p: Program, policy: Policy) -> list[str]:
     interior = [piece for piece in t.pieces[len(t.leading_words):] if isinstance(piece, str)]
     if interior:
         out.append(f"    inserted by the host, do not spell: {' '.join(interior)}")
+    sources = policy.source_atoms
     for name, hole in t.holes.items():
         match hole:
             case Token(constraint=c):
-                out.append(f"    {name}: {_constraint(c)}")
+                out.append(f"    {name}: {_constraint(c, sources)}")
             case Each(constraint=c, min=minimum):
                 need = f", at least {minimum}" if minimum else ""
-                out.append(f"    {name}...: each {_constraint(c)}{need}")
+                out.append(f"    {name}...: each {_constraint(c, sources)}{need}")
             case Flags(flagset=fs):
                 out.append(f"    {name}...: a list of flags --")
-                out.extend(f"        {line}" for line in _flagset(fs))
+                out.extend(f"        {line}" for line in _flagset(fs, sources))
     return out
 
 
-def _validation(v: Validation, policy: Policy, defined: frozenset[AtomId]) -> list[str]:
+def _validation(v: Validation, policy: Policy, defined: frozenset[Atom]) -> list[str]:
     params = ", ".join(f"{p}=<str>" for p in v.params)
     cwd = "" if v.cwd is None else f"cwd=<path within {', '.join(pretty_location(l) for l in v.cwd)}>"
     call = ", ".join(x for x in (f'"{v.name}"', params, cwd) if x)
     out = [f"- certora.check({call})"]
     for key, atoms in v.establishes.items():
         kinds = ", ".join(
-            f"{a} ({'defined' if a in defined else 'pure' if a in v.pure_atoms else 'environmental'})"
+            f"{a} ({'built in' if a in BUILTIN_ATOMS else 'defined' if a in defined else 'pure' if a in v.pure_atoms else 'environmental'})"
             for a in sorted(atoms)
         )
         out.append(f"    establishes on {key}: {kinds}")
@@ -227,26 +233,35 @@ def _validation(v: Validation, policy: Policy, defined: frozenset[AtomId]) -> li
     return out
 
 
+_BUILTIN_MEANING = {
+    "no-slash": "the text has no '/': a single path component",
+    "no-parent-traversal": "the text has no '..' component",
+    "not-absolute": "the text does not begin with '/'",
+    "not-dot-dot": "the text is not '..'",
+    "not-option": "the text does not begin with '-', so no tool reads it as an option. Every hole not preceded by a spelled '--' requires it",
+}
+
+
 def _atoms(policy: Policy) -> list[str]:
     defined = {a.name: a.regex for a in policy.atoms}
-    pure: set[AtomId] = set()
-    environmental: set[AtomId] = set()
+    pure: set[Atom] = set()
+    environmental: set[Atom] = set()
     for v in policy.validations:
         for atoms in v.establishes.values():
             for a in atoms:
-                if a in defined:
+                if a in defined or a in BUILTIN_ATOMS:
                     continue
                 (pure if a in v.pure_atoms else environmental).add(a)
     out: list[str] = []
     for name in sorted(defined):
         out.append(f"- {name}: <{pretty_regex(defined[name])}> -- a literal has it; so does a variable after "
                    "assert re.fullmatch with that exact regex")
-    for name in sorted(pure - {NOT_OPTION}):
+    for name in sorted(pure):
         out.append(f"- {name}: a property of the value's text, established by a check; survives calls")
     out.append(
-        f"- {NOT_OPTION}: built in -- the text does not begin with '-'. A literal, a regex with a "
-        "fixed head and a path under a named directory have it; a check may establish it on other "
-        "text. Every hole not preceded by a spelled '--' requires it"
+        "- built in (every policy; a literal or a guard such as assert not s.startswith('-') "
+        "establishes them, and a check may vouch for one): "
+        + "; ".join(f"{name}: {_BUILTIN_MEANING[name]}" for name in BUILTIN_ATOMS)
     )
     for name in sorted(environmental):
         state = policy.read_set(name)

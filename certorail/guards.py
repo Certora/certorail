@@ -22,10 +22,11 @@ from dataclasses import dataclass, replace
 from typing import Literal, Sequence
 
 from .analysis import (
-    ALL_ATOMS,
     ANY_STR,
+    PATH_ATOMS,
     Alternation,
     AtomicFact,
+    carried,
     DirSplat,
     Exact,
     Located,
@@ -47,6 +48,7 @@ from .analysis import (
     location_of,
     splat_under,
 )
+from .ids import NO_PARENT_TRAVERSAL, NO_SLASH, NOT_ABSOLUTE, NOT_DOT_DOT, NOT_OPTION, Atom, AtomId
 from .locations import parse_location
 from .markers import NAMESPACE
 from .terms import (
@@ -75,7 +77,7 @@ class Refinement:
     """What one recognized guard establishes about its subject. Every field is a conjunct."""
 
     type_info: TypeInfo | None = None
-    atoms: frozenset[AtomicFact] = frozenset()
+    atoms: frozenset[Atom] = frozenset()
     regex: PseudoRegex | None = None  # None: the guard says nothing about the regex
     containment: LocationFact | None = None
     # Atoms that must already hold on the subject for ``containment`` (and a ``url`` claim
@@ -83,7 +85,7 @@ class Refinement:
     # ``x.startswith("data/")``, ``urlsplit(x).path.startswith("/v1/")``) only amount to
     # containment once ".." components are excluded; resolving checks (``p.resolve()...``)
     # need nothing.
-    containment_requires: frozenset[AtomicFact] = frozenset()
+    containment_requires: frozenset[AtomId] = frozenset()
     # claims about the subject's urlsplit reading (``urlsplit(x).netloc == "api.github.com"``)
     url: UrlString | None = None
 
@@ -133,7 +135,7 @@ def _merge_url(cur: UrlString, new: UrlString) -> UrlString:
         netloc=new.netloc if cur.netloc is None else _meet_regex(cur.netloc, new.netloc),
         path=_prefer_containment(cur.path, new.path),
         scheme=cur.scheme if cur.scheme is not None else new.scheme,
-        checks=cur.checks,
+        atoms=cur.atoms,
     )
 
 
@@ -160,11 +162,11 @@ def apply(fact: ValidationFact | None, r: Refinement) -> ValidationFact | None:
 
     refined: StrFact | PathFact
     match fact:
-        case Located(location=loc, repr=rp, checks=checks):
+        case Located(location=loc, repr=rp, atoms=atoms):
             # nothing is tracked about a located value's text, so text refinements are moot; only
             # an unconditional (resolving) containment can sharpen where it points
             if r.containment is not None and not r.containment_requires:
-                return Located(_prefer_containment(loc, r.containment) or loc, rp, checks)
+                return Located(_prefer_containment(loc, r.containment) or loc, rp, atoms)
             return fact
         case UrlString():
             # likewise textless; another URL claim merges, unless it is requires-gated (a
@@ -172,18 +174,19 @@ def apply(fact: ValidationFact | None, r: Refinement) -> ValidationFact | None:
             if r.url is not None and not r.containment_requires:
                 return _merge_url(fact, r.url)
             return fact
-        case StrFact(regex=regex, atoms=atoms, checks=checks):
-            refined = StrFact(regex=_meet_regex(regex, r.regex), atoms=atoms | r.atoms, checks=checks)
-        case PathFact(atoms=atoms, checks=checks):
-            refined = PathFact(atoms=atoms | r.atoms, checks=checks)
+        case StrFact(regex=regex, atoms=atoms):
+            refined = StrFact(regex=_meet_regex(regex, r.regex), atoms=atoms | r.atoms)
+        case PathFact(atoms=atoms):
+            refined = PathFact(atoms=atoms | r.atoms)
 
     if (
         r.url is not None
         and isinstance(refined, StrFact)
         and all(a in refined for a in r.containment_requires)
     ):
-        # the value gains its URL reading; the text reading is given up (as with containment)
-        return UrlString(r.url.netloc, r.url.path, r.url.scheme, refined.checks)
+        # the value gains its URL reading; the text reading is given up (as with containment),
+        # and with it the built-ins that were about the text
+        return UrlString(r.url.netloc, r.url.path, r.url.scheme, carried(refined.atoms))
 
     if r.containment is not None and all(a in refined for a in r.containment_requires):
         # the value gains its path reading; if its text already located it somewhere sharper
@@ -191,7 +194,7 @@ def apply(fact: ValidationFact | None, r: Refinement) -> ValidationFact | None:
         own = locate(refined)
         loc = _prefer_containment(None if own is None else own.location, r.containment)
         assert loc is not None
-        return Located(loc, "str" if isinstance(refined, StrFact) else "path", refined.checks)
+        return Located(loc, "str" if isinstance(refined, StrFact) else "path", carried(refined.atoms))
     return refined
 
 
@@ -367,7 +370,7 @@ def _within(loc: LocationFact) -> Refinement:
     """Containment at or below *loc*, as established by a *lexical* check: trusted only once ".."
     is excluded. (``_guard`` drops the requirement again for resolving subjects.)"""
     return Refinement(
-        containment=splat_under(loc), containment_requires=frozenset({"no-parent-traversal"})
+        containment=splat_under(loc), containment_requires=frozenset({NO_PARENT_TRAVERSAL})
     )
 
 
@@ -454,13 +457,15 @@ _IS_PREDICATES: dict[str, PseudoRegex | None] = {
     "isnumeric": None,
 }
 
-NO_SLASH = Refinement(atoms=frozenset({"no-slash"}))
-NO_PARENT = Refinement(atoms=frozenset({"no-parent-traversal"}))
-NOT_ABSOLUTE = Refinement(atoms=frozenset({"not-absolute"}))
-NOT_DOT_DOT = Refinement(atoms=frozenset({"not-dot-dot"}))
+NO_SLASH_REF = Refinement(atoms=frozenset({NO_SLASH}))
+NO_PARENT_REF = Refinement(atoms=frozenset({NO_PARENT_TRAVERSAL}))
+NOT_ABSOLUTE_REF = Refinement(atoms=frozenset({NOT_ABSOLUTE}))
+NOT_DOT_DOT_REF = Refinement(atoms=frozenset({NOT_DOT_DOT}))
+# not x.startswith("-") ; x[0] != "-" ; x[:1] != "-": the text does not begin with "-"
+NOT_OPTION_REF = Refinement(atoms=frozenset({NOT_OPTION}))
 # basename(x) == x, dirname(x) == "", PurePath(x).name == x: no separator anywhere, hence not
 # absolute either; ".." itself passes all three, so nothing about parent traversal.
-BARE_NAME = Refinement(atoms=frozenset({"no-slash", "not-absolute"}))
+BARE_NAME = Refinement(atoms=frozenset({NO_SLASH, NOT_ABSOLUTE}))
 
 
 def recognize(cond: ast.expr | Term, st: StateMap) -> list[Guard]:
@@ -546,20 +551,20 @@ def _probe_compare(left: Term, op: type[ast.cmpop], right: Term) -> list[Guard] 
         or (op is ast.Lt and n == missing + 1)
         or (op is ast.LtE and n == missing)
     )
-    return _guard(sub, NO_SLASH) if hit else []
+    return _guard(sub, NO_SLASH_REF) if hit else []
 
 
 def _not_in(left: Term, right: Term) -> list[Guard]:
     # "/" not in x ; os.sep not in x
     if _is_sep(left):
-        return _guard(subject_of(right), NO_SLASH)
+        return _guard(subject_of(right), NO_SLASH_REF)
     # ".." not in x (substring: over-strict but sound) ; ".." not in x.split("/") ; ".." not in p.parts
     if left.as_str() == "..":
-        return _guard(_components_of(right) or subject_of(right), NO_PARENT)
+        return _guard(_components_of(right) or subject_of(right), NO_PARENT_REF)
     # x not in (".", "..")
     lits = right.str_items()
     if lits is not None and ".." in lits:
-        return _guard(subject_of(left), NOT_DOT_DOT)
+        return _guard(subject_of(left), NOT_DOT_DOT_REF)
     return []
 
 
@@ -648,11 +653,13 @@ def _neq(a: Term, b: Term) -> list[Guard]:
     """``a != b``; called in both orientations."""
     # x != ".."
     if b.as_str() == "..":
-        return _guard(subject_of(a), NOT_DOT_DOT)
-    # x[0] != "/" ; x[:1] != "/"
+        return _guard(subject_of(a), NOT_DOT_DOT_REF)
+    # x[0] != "/" ; x[:1] != "/" ; x[0] != "-" ; x[:1] != "-"
     match a:
         case Subscript(inner, index) if _is_sep(b) and _is_head_slice(index):
-            return _guard(subject_of(inner), NOT_ABSOLUTE)
+            return _guard(subject_of(inner), NOT_ABSOLUTE_REF)
+        case Subscript(inner, index) if b.as_str() == "-" and _is_head_slice(index):
+            return _guard(subject_of(inner), NOT_OPTION_REF)
         case _:
             return []
 
@@ -685,7 +692,7 @@ def _call(t: Term, positive: bool, st: StateMap) -> list[Guard]:
             return [] if r is None else _guard(subject_of(x), Refinement(type_info="str", regex=r))
         # not os.path.isabs(x)
         case Call(("os", "path", "isabs"), (x,), ()) if not positive:
-            return _guard(subject_of(x), NOT_ABSOLUTE)
+            return _guard(subject_of(x), NOT_ABSOLUTE_REF)
         # certora.pathmatch(x, "<location>"): the policy's own spelling as a guard
         case Call((ns, "pathmatch"), (x, spec), ()) if positive and ns == NAMESPACE:
             return _pathmatch(x, spec)
@@ -755,7 +762,7 @@ def _method(
             Refinement(
                 type_info="str",
                 url=UrlString(path=splat_under(loc)),
-                containment_requires=frozenset({"no-parent-traversal"}),
+                containment_requires=frozenset({NO_PARENT_TRAVERSAL}),
             ),
         )
 
@@ -765,10 +772,13 @@ def _method(
     match name, args:
         # not p.is_absolute()
         case "is_absolute", () if not positive:
-            return _guard(sub, NOT_ABSOLUTE)
+            return _guard(sub, NOT_ABSOLUTE_REF)
         # not x.startswith("/")
         case "startswith", (arg,) if not positive and _is_sep(arg):
-            return _guard(sub, NOT_ABSOLUTE)
+            return _guard(sub, NOT_ABSOLUTE_REF)
+        # not x.startswith("-")
+        case "startswith", (arg,) if not positive and arg.as_str() == "-":
+            return _guard(sub, NOT_OPTION_REF)
         # x.startswith("pre") ; x.startswith(("a", "b")) ; x.startswith("data/") ; x.startswith(str(BASE) + "/")
         case "startswith", (arg,) if positive:
             return _startswith(sub, arg, st)
@@ -785,10 +795,10 @@ def _method(
         case "is_relative_to", (base,) if positive:
             loc = _location_of(base, st)
             return [] if loc is None else _guard(sub, replace(_within(loc), type_info="path"))
-        # x.isalnum() and friends
+        # x.isalnum() and friends: no "/" or "." anywhere, and no "-" either
         case m, () if positive and m in _IS_PREDICATES:
             return _guard(
-                sub, Refinement(type_info="str", atoms=ALL_ATOMS, regex=_IS_PREDICATES[m])
+                sub, Refinement(type_info="str", atoms=PATH_ATOMS | {NOT_OPTION}, regex=_IS_PREDICATES[m])
             )
         case _:
             return []

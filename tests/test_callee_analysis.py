@@ -5,7 +5,7 @@ values and a closedness bit on them and on handles. Anything that may run progra
 everything and *opens* the standard values, so that a later call on an alias cannot be exempt."""
 import unittest
 
-from certorail.analysis import checks_of
+from certorail.analysis import atoms_of
 from certorail.host import Accepted, Rejected
 from certorail.host import check as host_check
 from certorail.ids import AtomId, ParamName, ValidationName
@@ -48,7 +48,7 @@ def atoms_at_exec(between: str) -> frozenset[str]:
     report: Report = analyze(HEADER + between + EXEC, vocabulary=VOCAB)
     assert report.violations == [], report.violations
     execs = [s for s in report.sinks if isinstance(s, ExecSite)]
-    return checks_of(execs[-1].cwd)
+    return atoms_of(execs[-1].cwd)
 
 
 class TestInertCallsDoNotKill(unittest.TestCase):

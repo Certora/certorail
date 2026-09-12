@@ -49,6 +49,7 @@ from .analysis import (
     is_safe_name,
     splat_under,
 )
+from .ids import NOT_OPTION, Atom, AtomId, SourceId, spelled
 from .markers import NAMESPACE
 from .terms import Call, Dotted, Items, Subscript, Term, Var, lower
 
@@ -104,12 +105,13 @@ def is_plain_type(fact: ValidationFact | Container | None) -> bool:
 # markers
 # ---------------------------------------------------------------------------
 
-# ``certora.<attr>`` atoms; must agree with the constants in ``markers.py``.
-_ATOMS: dict[str, AtomicFact] = {
-    "no_slash": "no-slash",
-    "no_parent_traversal": "no-parent-traversal",
-    "not_absolute": "not-absolute",
-    "not_dot_dot": "not-dot-dot",
+# ``certora.<attr>`` built-in atoms; must agree with the constants in ``markers.py``.
+_ATOMS: dict[str, AtomId] = {
+    "no_slash": AtomId("no-slash"),
+    "no_parent_traversal": AtomId("no-parent-traversal"),
+    "not_absolute": AtomId("not-absolute"),
+    "not_dot_dot": AtomId("not-dot-dot"),
+    "not_option": NOT_OPTION,
 }
 _REGEX_MARKERS = ("matches", "one_of", "seq")
 _LOCATION_MARKERS = ("within", "exactly")
@@ -302,8 +304,8 @@ def _annotated(base: Term, metadata: Sequence[Term]) -> ValidationFact:
     if not isinstance(fact, (StrFact, PathFact)):
         raise _err(base, "markers apply to str and pathlib paths only")
 
-    atoms: set[AtomicFact] = set()
-    checks: set[str] = set()
+    atoms: set[AtomId] = set()
+    checks: set[Atom] = set()  # the policy atoms: validated(...) as check ids, source(...) as source ids
     regex: PseudoRegex | None = None
     containment: LocationFact | None = None
     located_by: Term | None = None
@@ -323,8 +325,13 @@ def _annotated(base: Term, metadata: Sequence[Term]) -> ValidationFact:
             raise _err(m, f"expected a certora marker, got {type(m).__name__}")
         name, args, kwargs = call
         if name == "validated":
-            # policy validations the value has passed; combines with location AND text markers
-            checks.update(_str_args(m, args, kwargs, "validated"))
+            # policy atoms the value has been checked to carry; combines with location AND text
+            # markers. Spelled as check ids: naming a source atom here is a contract error the
+            # policy's kind table reports (Vocabulary.annotation_problem)
+            checks.update(spelled(a) for a in _str_args(m, args, kwargs, "validated"))
+        elif name == "source":
+            # provenance: the value came, unmodified, from the rule that yields the atom
+            checks.update(SourceId(a) for a in _str_args(m, args, kwargs, "source"))
         elif name == "url":
             if url_fact is not None:
                 raise _err(m, "at most one url()")
@@ -353,7 +360,7 @@ def _annotated(base: Term, metadata: Sequence[Term]) -> ValidationFact:
         # combine with url()
         if regex is not None or atoms or containment is not None:
             raise _err(url_by, "url() does not combine with text or location markers")
-        return replace(url_fact, checks=frozenset(checks))
+        return replace(url_fact, atoms=frozenset(checks))
     if containment is not None and located_by is not None:
         # a located value is read as a path, not as text: text facts do not combine with it
         if regex is not None or atoms:
@@ -364,8 +371,8 @@ def _annotated(base: Term, metadata: Sequence[Term]) -> ValidationFact:
             )
         return Located(containment, "str" if isinstance(fact, StrFact) else "path", frozenset(checks))
     if isinstance(fact, StrFact):
-        return StrFact(regex=ANY_STR if regex is None else regex, atoms=frozenset(atoms), checks=frozenset(checks))
-    return PathFact(atoms=frozenset(atoms), checks=frozenset(checks))
+        return StrFact(regex=ANY_STR if regex is None else regex, atoms=frozenset(atoms) | frozenset(checks))
+    return PathFact(atoms=frozenset(atoms) | frozenset(checks))
 
 
 def _parse(t: Term) -> ValidationFact | Container | None:

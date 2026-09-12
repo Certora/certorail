@@ -12,38 +12,27 @@ Shared by the analysis (values are facts) and the broker (values are the concret
 the runtime re-check is the same check: ``bind`` and the constraint, flag and dash-guard
 functions below take either.
 """
-import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Final
 
 from .analysis import (
-    Alternation,
-    Both,
-    Concat,
-    DirSplat,
     Exact,
-    Located,
     LocationFact,
-    Named,
-    OneOf,
-    PathFact,
     PseudoRegex,
     RegexLit,
-    AnyStr,
-    StaticPath,
     StrFact,
-    UrlString,
     ValidationFact,
-    concat,
     entails,
     known_text,
     locate,
     location_le,
+    may_start_with_dash,
     pretty_location,
     pretty_regex,
 )
-from .ids import AtomId, FlagName, HoleName
+from .ids import NOT_OPTION, Atom, FlagName, HoleName
+
+__all__ = ["NOT_OPTION", "may_start_with_dash"]  # re-exported for their old importers
 
 # ---------------------------------------------------------------------------
 # the vocabulary
@@ -63,13 +52,6 @@ class HoleRef:
 type Piece = str | HoleRef
 
 
-# The one atom certorail declares itself: the value does not begin with "-", so a tool cannot
-# read it as an option. Every token or each hole not preceded by a literal "--" requires it. A
-# literal, a regex with a fixed head, a located value under a named directory or an absolute
-# one carry it by structure (``may_start_with_dash``); a checker lists it in ``establishes`` to
-# vouch for text it has inspected. No policy declares it, and none may.
-NOT_OPTION: Final = AtomId("not-option")
-
 CWD = "cwd"  # reserved: never a hole name; the target of a demand on the exec's cwd
 
 
@@ -87,7 +69,7 @@ class Constraint:
 
     locations: tuple[LocationFact, ...] = ()
     regex: PseudoRegex | None = None
-    atoms: frozenset[AtomId] = frozenset()
+    atoms: frozenset[Atom] = frozenset()
     literal: bool = False
     any: bool = False
 
@@ -113,7 +95,7 @@ class Each:
 
 # what a flag demands when present: atoms of the exec's cwd (under ``CWD``) or of another hole's
 # value, by hole name
-type Demands = Mapping[str, frozenset[AtomId]]
+type Demands = Mapping[str, frozenset[Atom]]
 
 
 @dataclass(frozen=True)
@@ -162,9 +144,9 @@ class Flagset:
                         f"flagset's holes ({', '.join(sorted(self.holes))})"
                     )
 
-    def demands_of(self, present: Iterable[FlagName]) -> dict[str, frozenset[AtomId]]:
+    def demands_of(self, present: Iterable[FlagName]) -> dict[str, frozenset[Atom]]:
         """What the *present* flags demand, by target, unioned."""
-        out: dict[str, frozenset[AtomId]] = {}
+        out: dict[str, frozenset[Atom]] = {}
         for flag in present:
             for target, atoms in self.requires.get(flag, {}).items():
                 out[target] = out.get(target, frozenset()) | atoms
@@ -356,9 +338,9 @@ def bind(
 # checking a bound template
 # ---------------------------------------------------------------------------
 
-# atoms of *required* that *value* does not carry (the policy supplies this: saturation and
-# literal checkers live there)
-type AtomsMissing = Callable[[Value, frozenset[AtomId]], frozenset[AtomId]]
+# atoms of *required* that *value* does not carry (``Vocabulary.missing``, partially applied:
+# structure, regex definitions and literal checkers live there)
+type AtomsMissing = Callable[[Value, frozenset[Atom]], frozenset[Atom]]
 
 
 def _as_fact(value: str | ValidationFact) -> ValidationFact:
@@ -387,137 +369,14 @@ def constraint_failure(c: Constraint, value: Value, atoms_missing: AtomsMissing)
     return None
 
 
-# The regex parser behind ``re.compile`` (``sre_parse`` of old). Private, so reached by name and
-# typed Any; it is the one parser whose reading of a pattern is the reading that will be enforced.
-_RE_PARSER: Any = getattr(re, "_parser")
-_RE_CONSTANTS: Any = getattr(re, "_constants")
-_DASH = ord("-")
-
-
-def _charset_has_dash(items: Any) -> bool:
-    """Does a bracket class (the ``IN`` operand) admit ``-``? Literals, ranges and the ``\\d``,
-    ``\\w``, ``\\s`` categories (their negations admit it), under an optional ``NEGATE``."""
-    negate = False
-    hit = False
-    for op, av in items:
-        if op is _RE_CONSTANTS.NEGATE:
-            negate = True
-        elif op is _RE_CONSTANTS.LITERAL:
-            hit = hit or av == _DASH
-        elif op is _RE_CONSTANTS.RANGE:
-            lo, hi = av
-            hit = hit or lo <= _DASH <= hi
-        elif op is _RE_CONSTANTS.CATEGORY:
-            hit = hit or "NOT" in str(av)  # \D \W \S match "-"; \d \w \s do not
-        else:
-            return True  # anything unforeseen: may
-    return hit != negate
-
-
-def _first(sub: Any) -> tuple[bool, bool]:
-    """Of a parsed (sub)pattern: (may its first matched character be ``-``, can it match the
-    empty string). A sequence's first character comes from its first non-nullable item and
-    everything nullable before it."""
-    may = False
-    for op, av in sub:
-        item_may, item_nullable = _first_item(op, av)
-        may = may or item_may
-        if not item_nullable:
-            return may, False
-    return may, True
-
-
-def _first_item(op: Any, av: Any) -> tuple[bool, bool]:
-    c = _RE_CONSTANTS
-    if op is c.LITERAL:
-        return av == _DASH, False
-    if op is c.NOT_LITERAL:
-        return av != _DASH, False
-    if op is c.ANY:
-        return True, False
-    if op is c.IN:
-        return _charset_has_dash(av), False
-    if op is c.AT or op is c.ASSERT or op is c.ASSERT_NOT:
-        return False, True  # zero-width; ignoring a lookaround only widens "may": sound
-    if op is c.SUBPATTERN:
-        return _first(av[3])
-    if op is c.ATOMIC_GROUP:
-        return _first(av)
-    if op is c.BRANCH:
-        results = [_first(b) for b in av[1]]
-        return any(m for m, _ in results), any(n for _, n in results)
-    if op in (c.MAX_REPEAT, c.MIN_REPEAT, c.POSSESSIVE_REPEAT):
-        lo, _, body = av
-        body_may, body_nullable = _first(body)
-        return body_may, lo == 0 or body_nullable
-    if op is c.GROUPREF_EXISTS:
-        _, yes, no = av
-        yes_may, yes_nullable = _first(yes)
-        no_may, no_nullable = _first(no) if no is not None else (False, True)
-        return yes_may or no_may, yes_nullable or no_nullable
-    return True, True  # GROUPREF and anything unforeseen: may, and may be empty
-
-
-def _literal_regex_may_start_with_dash(reg: str) -> bool:
-    """Could a string this regex fullmatches begin with ``-``? Decided on the parse tree the
-    ``re`` module itself builds; an unparsable pattern is "may"."""
-    try:
-        parsed = _RE_PARSER.parse(reg)
-    except re.error:
-        return True
-    may, _ = _first(parsed)
-    return may
-
-
-def _regex_may_start_with_dash(r: PseudoRegex) -> bool:
-    match r:
-        case Exact(exact_str=s):
-            return s.startswith("-")
-        case Alternation(any_of=branches):
-            return any(_regex_may_start_with_dash(b) for b in branches)
-        case Concat(seq=pieces):
-            head = pieces[0]
-            if head == Exact(""):
-                return _regex_may_start_with_dash(concat(*pieces[1:])) if len(pieces) > 1 else False
-            return _regex_may_start_with_dash(head)
-        case Both(all_of=parts):
-            return all(_regex_may_start_with_dash(p) for p in parts)
-        case RegexLit(reg=reg):
-            return _literal_regex_may_start_with_dash(reg)
-        case AnyStr():
-            return True
-
-
-def may_start_with_dash(value: Value) -> bool:
-    """Could this token's text begin with ``-``, and so be read by a tool as an option? True
-    unless the value's known text, regex head, or location's first component rules it out."""
-    match value:
-        case str():
-            return value.startswith("-")
-        case None | PathFact() | UrlString():
-            return True
-        case Located(location=loc):
-            if loc.absolute:
-                return False  # begins with "/"
-            components = loc.path_components if isinstance(loc, StaticPath) else loc.static_prefix
-            if not components:
-                # "." itself for a StaticPath; for a DirSplat the first component is unknown
-                return isinstance(loc, DirSplat)
-            match components[0]:
-                case Named(name=n):
-                    return n.startswith("-")
-                case OneOf(names=ns):
-                    return any(n.startswith("-") for n in ns)
-                case _:
-                    return True
-        case StrFact(regex=regex):
-            return _regex_may_start_with_dash(regex)
-
-
+# The leading-dash guard (TEMPLATES.md): a token or each hole not preceded by a literal "--"
+# requires the built-in ``not-option``, asked of the value like any other atom -- structure
+# (``analysis.holds``), or a checker's ``establishes`` -- and denied with this reason
 DASH_REASON = (
     "may begin with '-' and be read as an option (it lacks not-option): confine it under a named "
     "directory, guard its text, or have a checker that establishes not-option vouch for it"
 )
+_NOT_OPTION_ONLY: frozenset[Atom] = frozenset({NOT_OPTION})
 
 
 def flags_failure(fs: Flagset, elements: Sequence[Value], atoms_missing: AtomsMissing) -> str | None:
@@ -546,16 +405,13 @@ def flags_failure(fs: Flagset, elements: Sequence[Value], atoms_missing: AtomsMi
 
 
 def option_shaped(value: Value, atoms_missing: AtomsMissing) -> bool:
-    """The leading-dash guard: may the tool read *value* as an option? Not when its structure
-    shows a fixed head other than ``-`` (``may_start_with_dash``), and not when it carries the
-    ``not-option`` atom -- a checker vouched for text the analysis cannot see the head of."""
-    if not may_start_with_dash(value):
-        return False
-    return NOT_OPTION in atoms_missing(value, frozenset({NOT_OPTION}))
+    """The leading-dash guard: may the tool read *value* as an option? Only while it lacks
+    ``not-option``."""
+    return bool(atoms_missing(value, _NOT_OPTION_ONLY))
 
 
 # atoms of *required* that the exec's cwd does not carry
-type CwdMissing = Callable[[frozenset[AtomId]], frozenset[AtomId]]
+type CwdMissing = Callable[[frozenset[Atom]], frozenset[Atom]]
 
 
 def present_flags(fs: Flagset, elements: Sequence[Value]) -> list[FlagName]:

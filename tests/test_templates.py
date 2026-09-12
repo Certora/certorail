@@ -656,19 +656,19 @@ class TestDataFormat(unittest.TestCase):
             (rule(argv=["x", "${A}"], holes={}), "used but not declared"),
             (rule(argv=["x"], holes={"A": {"any": True}}), "declared but not used"),
             (rule(argv=["x", "${A...}"], holes={"A": {"any": True}}), "disagrees with its kind"),
-            (rule(argv=["x", "${A}"], holes={"A": {"kind": "flags", "flagset": "nope"}}), "not declared"),
-            (rule(argv=["x", "${A...}"], holes={"A": {"kind": "flags", "bare": ["-q"], "flagset": "f"}}), "exclude each other"),
+            (rule(argv=["x", "${A...}"], holes={"A": {"kind": "flags", "flagset": "nope"}}), "not declared"),
+            (rule(argv=["x", "${A...}"], holes={"A": {"kind": "flags", "bare": ["-q"], "flagset": "f"}}), "unknown key 'bare'"),
             (rule(argv=["x", "${A...}"], holes={"A": {"kind": "flags", "-q": {}}}), "not a bare flag"),
             (rule(argv=["x", "${A}"], holes={"A": {}}), "says nothing"),
             (rule(argv=["x", "${A}"], holes={"A": {"location": "**", "matches": "x"}}), "textless"),
             (rule(argv=["x", "a${A}"], holes={"A": {"any": True}}), "whole words"),
             (rule(holes={"A": {"any": True}}), "need an argv template"),
             (rule(argv=["x", "${A}"], holes={"A": {"kind": "each", "any": True}}), "disagrees with its kind"),
-            (rule(argv=["x", "${A}"], holes={"A": {"any": True, "min": 1}}), "min applies to each"),
+            (rule(argv=["x", "${A}"], holes={"A": {"any": True, "min": 1}}), "holes.A: unknown key 'min'"),  # a token hole has no min
             # flag entries: value = false is the table form of a bare flag; requires reaches holes
             (rule(argv=["x", "${A...}"], holes={"A": {"kind": "flags", "-q": {"value": True}}}), "expected false"),
             (rule(argv=["x", "${A...}"], holes={"A": {"kind": "flags", "-q": {"value": False, "any": True}}}), "takes no constraint"),
-            (rule(argv=["x", "${A...}"], holes={"A": {"kind": "flags", "-q": {"requires": {"cwd": []}}}}), "a constraint on its value, or value = false"),
+            (rule(argv=["x", "${A...}"], holes={"A": {"kind": "flags", "-q": {"requires": {"cwd": []}}}}), "not a bare flag"),  # requires alone says nothing about the value
             (rule(argv=["x", "${A...}"], holes={"A": {"kind": "flags", "-q": {"value": False, "requires": {"B": ["not-option"]}}}}), "which this template does not have"),
             (rule(argv=["x", "${A...}"], holes={"A": {"kind": "flags", "-q": {"value": False, "requires": ["not-option"]}}}), "expected a table"),
             (rule(argv=["x", "${A}"], holes={"A": {"any": True}}, requires={"B": ["not-option"]}), "not a token or each hole"),

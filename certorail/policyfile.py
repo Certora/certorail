@@ -1,115 +1,43 @@
-"""The TOML/JSON policy format: the object model of ``policy.py`` as reviewable data.
+"""The policy loader: from a TOML/JSON document to a ``Policy``.
 
-    policy-version = 1
+The format itself -- which sections exist, which keys each table takes, the local invariants --
+is ``schema``, a pydantic schema that decides the *shape* of a document and stops there.
+Everything that needs to look at more than one table -- or outside the document -- is here, as
+a short sequence of passes over typed values, each doing one thing:
 
-    [filesystem]
-    read  = ["**"]
-    write = ["repos/**"]
-    list  = ["repos/**"]
+1. **Composition** (``_compose``): the root and every ruleset it ``[[apply]]``-es, depth-first.
+   A ruleset is parsed, its parameters bound from the application, ``when`` resolved, the
+   parameters substituted (``_Instantiator``), and the result read like any other document. An
+   application is identified by (file, hash, bindings): reached twice identically it is one
+   document, differently an error.
+2. **Declarations** (``_declare``): regions merge across documents (one name, one region);
+   atoms are declared once across the composition and given their kind -- a ``SourceId`` where
+   some rule yields the name, a ``CheckId`` otherwise -- beside the built-ins nothing declares.
+3. **Rules** (``_rules``): each document's flagsets (private to it), validations (a ruleset's
+   restricted to ``${checkers}/<name>`` and the stock predicates), programs and sources, each
+   name resolved through the declaration table, each checker resolved against the config
+   directory, each built with the ``policy`` constructors.
+4. ``Policy.allow`` does the cross-rule checks it always did.
 
-    [regions]
-    git.config = { footprint = ".git/config", about = "remotes and everything else git reads from config" }
-    git.remote = { network = true, about = "the remote repository" }
-
-    [atoms]
-    org-checkout = { reads = ["git.config"] }  # environmental: dies when git.config is written
-    not-force    = { pure = true }             # pure, established by a checker
-    no-flag      = { matches = '[^-].*' }      # defined: the regex is its meaning (pure)
-
-    [[validation]]
-    name        = "not-force-check"
-    params      = ["value"]
-    argv        = ["test", "${value}", "!=", "--force"]
-    cwd         = "**"
-    effect-free = true
-    establishes = { value = ["not-force"] }
-
-    [[program]]
-    name         = "git"
-    argv         = ["git", "push", "origin", "${BRANCH}"]
-    cwd          = "repos/**"
-    requires     = ["org-checkout"]
-    holes.BRANCH = { atoms = ["not-force"] }
-    writes       = ["git.remote"]
-
-    [[network]]
-    host    = "api.github.com"
-    methods = ["GET"]
-
-Locations are the compact spelling the reports use (``pretty_location``): components separated
-by "/", each a literal name, ``*`` (any one name), ``{a,b}`` (one of), or ``<regex>`` (a
-fullmatch, spelled raw -- the one place this syntax and the reports diverge); a trailing ``**``
-means "at or below", optionally followed by one leaf component (``repos/**/<\\w+\\.tar>``);
-``.`` is the root. A leading ``/`` anchors the location at the *filesystem* root instead of the
-sandbox root (``/srv/checkouts/**``); the two anchors never relate, so an absolute allowance
-says nothing about sandbox-relative paths and vice versa. A rule's or a validation's ``cwd`` is
-a location *slot*: one spelling, or a list of them meaning any-of. Argv pieces are literals,
-except a whole-token ``${param}``, which substitutes the named parameter, and
-``${checkers}/<name>`` heading ``argv[0]``, which names the executable ``<name>`` in the config
-directory's ``checkers/`` (resolved at load; it must exist). Atoms are declared once, centrally:
-purity and any text meaning live in ``[atoms]``, and ``establishes``/``requires``/a hole's
-``atoms`` refer to them by name. One atom is built in and may not be declared: ``not-option``,
-the value does not begin with ``-``; a checker may list it in ``establishes``.
-A ``[[program]]`` rule is either its words alone (``name`` plus ``subcommand``: exactly those,
-no arguments) or a template (``argv`` with ``${HOLE}`` pieces and a ``holes`` table saying what
-each hole is); there is no third form that takes arguments it does not describe. A flags hole
-may carry ``any = true``, the open vocabulary, for a tool trusted with its own options.
-A validation's ``cwd`` is optional: omitted, the check does not care where it runs --
-``certora.check`` may then be called without ``cwd=`` -- and it may not establish atoms on cwd.
-``[[network]]`` rules govern the program's own requests (``certora.network``), enforced
-statically at every call site and again by the broker at runtime, on every redirect hop:
-``schemes`` defaults to https only, an empty ``ports`` means the scheme's default port, an
-empty ``methods`` any method. A rule's ``requires`` names atoms the URL value must carry at
-the call site -- established by a live ``certora.check``, or discharged from an exactly-known
-URL's text. Each entry is an atom name, or ``{ atom = "...", on-redirect = "..." }`` choosing
-what a redirect hop -- a URL the analysis never saw -- owes the atom: ``recheck`` (the broker
-re-establishes it from the hop URL's text; textual atoms only), ``stop`` (the rule refuses to
-authorize hops), or ``waive`` (the atom speaks about the original request only). A bare name
-defaults to recheck when the atom is textual, stop otherwise. Network rules say nothing about
-exec'd programs, whose network access is folded into their ``[[program]]`` grant.
-``[regions]`` (EFFECTS.md) names the state checks depend on and commands change, each with one
-medium: a ``footprint`` -- locations relative to the cwd of the check whose atom depends on it,
-or absolute, each meaning that path and everything below -- or ``network = true``. A rule or a
-validation may claim the media it reaches (``network = false``, ``write = false``;
-``effect-free = true`` is neither) and what it ``writes`` within them, region names or a medium
-name for the whole medium; an environmental atom may say what it ``reads``. Undeclared means
-everything, so a policy that says nothing keeps the crude kill. A rule with an open flag
-vocabulary or an ``any`` hole the tool could read as an option cannot say what it writes.
-
-The schema is strict and fails closed: unknown keys, undeclared atoms, malformed locations and
-mistyped values are all errors, and all of them are reported, not just the first. This is the
-only policy language; the constructors in ``policy`` are the object model it builds.
+Errors are collected, not raised: every problem in every document, each as ``<document>:
+<path>: <what>``, and no ``Policy`` is built if there is one. Substitution happens on typed
+values -- a location spelling, an atom list, a hole -- never on raw tables, so a parser never
+meets ``${…}`` it did not expect.
 """
 import hashlib
 import json
 import os
 import pathlib
-import re
 import tomllib
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from typing import Any, cast
+from dataclasses import dataclass, field
+from typing import Any, Literal, overload
 
 from . import markers
-from .effects import Medium, as_medium
-from .templates import NOT_OPTION
-from .ids import AtomId, FlagName, FlagsetId, HoleName, ParamName, RegionId
+from .analysis import Exact, RegexLit, StaticPath, alternation
+from .docpath import DocPath, Keyed, Path
+from .ids import BUILTIN_ATOMS, Atom, CheckId, FlagName, FlagsetId, HoleName, ParamName, SourceId
 from .locations import parse_location
-from .policydir import config_dir
-from .analysis import (
-    ANY_NAME,
-    Component,
-    DirSplat,
-    Exact,
-    LocationFact,
-    Matching,
-    Named,
-    OneOf,
-    RegexLit,
-    StaticPath,
-    alternation,
-    is_safe_name,
-)
 from .policy import (
     AtomDef,
     NetworkRule,
@@ -125,725 +53,399 @@ from .policy import (
     program,
     pure,
     region,
+    source,
     validation,
 )
+from .policydir import config_dir
+from .schema import (
+    ApplyDecl,
+    AtomDecl,
+    ConstraintFields,
+    EachHole,
+    FlagEntry,
+    FlagsetDecl,
+    FlagsetRef,
+    FlagsHole,
+    FlagVocabulary,
+    FootprintRegion,
+    HoleSpec,
+    NetworkRegion,
+    ParamKind,
+    PolicyDoc,
+    ProgramDecl,
+    RulesetDoc,
+    SchemaError,
+    SourceDecl,
+    TokenHole,
+    ValidationDecl,
+    hole_reference,
+    parse_hole,
+    parse_policy,
+    parse_ruleset,
+    reference,
+)
 from .templates import Constraint, Demands, Each, Flags, Flagset, Hole, HoleRef, Piece, Token
+
+# the location micro-syntax lives in ``locspec`` and ``locations``; ``parse_location`` is
+# re-exported here for its callers
+__all__ = ["PolicyFileError", "from_data", "load_policy_file", "parse_location", "rulesets_dir"]
 
 
 class PolicyFileError(Exception):
     """The policy document does not conform; every problem found, one per line."""
 
 
-# the location micro-syntax lives in ``locspec`` (the grammar, stdlib-only, shared with the
-# runtime's ``certora.pathmatch``) and ``locations`` (the conversion to LocationFact, shared with
-# the analysis' pathmatch guard); ``parse_location`` is re-exported here for its callers
-__all__ = ["PolicyFileError", "from_data", "load_policy_file", "parse_location", "rulesets_dir"]
-
-
-_PARAM_REF = re.compile(r"\$\{(\w+)\}")
-_CHECKERS_VAR = "${checkers}"
-
-
-def _resolve_checker(loader: "_Loader", where: str, piece: str, index: int) -> str | None:
-    """``${checkers}/<name>`` at the head of ``argv[0]``: the executable ``<name>`` in the
-    config directory's ``checkers/`` -- the one audited place for a policy's checkers, spelled
-    without anyone's home directory so validations travel between users. Resolved at load, and
-    the file must exist and be executable, so a policy naming a missing checker fails here
-    rather than at every check. Anywhere else, or bare, ``${checkers}`` is an error."""
-    prefix = _CHECKERS_VAR + "/"
-    if index != 0 or not piece.startswith(prefix) or len(piece) == len(prefix):
-        loader.error(where, f"{_CHECKERS_VAR} may only head argv[0], as {_CHECKERS_VAR}/<name>")
-        return None
-    rel = pathlib.PurePosixPath(piece[len(prefix):])
-    if rel.is_absolute() or ".." in rel.parts:
-        loader.error(where, f"the checker name must be a relative path without '..': {piece!r}")
-        return None
-    checkers = config_dir() / "checkers"
-    resolved = checkers / rel
-    if not (resolved.is_file() and os.access(resolved, os.X_OK)):
-        loader.error(where, f"checker {rel} is not installed (executable) in {checkers}")
-        return None
-    return str(resolved)
-
-
-def _parse_argv_piece(piece: str) -> str | Param:
-    m = _PARAM_REF.fullmatch(piece)
-    if m is not None:
-        return Param(ParamName(m.group(1)))
-    if "${" in piece:
-        raise ValueError(f"parameter references must be whole arguments: {piece!r}")
-    return piece
-
-
-# ---------------------------------------------------------------------------
-# the strict schema
-# ---------------------------------------------------------------------------
-
-
-class _Loader:
-    """Reads the parsed document, collecting every problem instead of stopping at the first."""
-
-    def __init__(self, where: str, errors: list[str] | None = None):
-        self.where = where
-        # shared across the documents of one composition (the root and its applied rulesets),
-        # so every problem in every file is reported at once
-        self.errors: list[str] = [] if errors is None else errors
-
-    def error(self, path: str, what: str) -> None:
-        self.errors.append(f"{self.where}: {path}: {what}")
-
-    def table(self, path: str, value: Any, known: frozenset[str]) -> dict[str, Any]:
-        if not isinstance(value, dict):
-            self.error(path, "expected a table")
-            return {}
-        for key in sorted(value.keys() - known):
-            self.error(path, f"unknown key {key!r}")
-        return value
-
-    def field[T](self, path: str, table: dict[str, Any], key: str, t: type[T]) -> T | None:
-        value = table.get(key)
-        if value is None:
-            return None
-        if isinstance(value, bool) and t is not bool or not isinstance(value, t):
-            self.error(f"{path}.{key}", f"expected {t.__name__}")
-            return None
-        to_ret = value
-        assert isinstance(to_ret, t)
-        return cast(T, value)
-
-    def required_str(self, path: str, table: dict[str, Any], key: str) -> str | None:
-        if key not in table:
-            self.error(path, f"{key} is required")
-            return None
-        return self.field(path, table, key, str)
-
-    def str_list(self, path: str, table: dict[str, Any], key: str) -> list[str]:
-        value = table.get(key)
-        if value is None:
-            return []
-        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
-            self.error(f"{path}.{key}", "expected a list of strings")
-            return []
-        return value
-
-    def int_list(self, path: str, table: dict[str, Any], key: str) -> list[int]:
-        value = table.get(key)
-        if value is None:
-            return []
-        if not isinstance(value, list) or any(
-            isinstance(v, bool) or not isinstance(v, int) for v in value
-        ):
-            self.error(f"{path}.{key}", "expected a list of integers")
-            return []
-        return value
-
-    def number(self, path: str, table: dict[str, Any], key: str) -> float | None:
-        value = table.get(key)
-        if value is None:
-            return None
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            self.error(f"{path}.{key}", "expected a number")
-            return None
-        return float(value)
-
-    def location(self, path: str, table: dict[str, Any], key: str) -> LocationFact | None:
-        text = self.required_str(path, table, key)
-        if text is None:
-            return None
-        try:
-            return parse_location(text)
-        except ValueError as e:
-            self.error(f"{path}.{key}", str(e))
-            return None
-
-    def location_slot(
-        self, path: str, table: dict[str, Any], key: str
-    ) -> tuple[LocationFact, ...] | None:
-        """A required location *slot* (a rule's or a validation's ``cwd``): one spelling or a
-        non-empty list of them, meaning any-of. None when absent or malformed (reported)."""
-        value = table.get(key)
-        if value is None:
-            self.error(path, f"{key} is required")
-            return None
-        texts = value if isinstance(value, list) else [value]
-        if not texts or not all(isinstance(v, str) for v in texts):
-            self.error(f"{path}.{key}", "expected a location or a non-empty list of locations")
-            return None
-        out: list[LocationFact] = []
-        for i, text in enumerate(texts):
-            try:
-                out.append(parse_location(text))
-            except ValueError as e:
-                where = f"{path}.{key}[{i}]" if isinstance(value, list) else f"{path}.{key}"
-                self.error(where, str(e))
-        return tuple(out) if len(out) == len(texts) else None
-
-    def locations(self, path: str, table: dict[str, Any], key: str) -> list[LocationFact]:
-        out: list[LocationFact] = []
-        for i, text in enumerate(self.str_list(path, table, key)):
-            try:
-                out.append(parse_location(text))
-            except ValueError as e:
-                self.error(f"{path}.{key}[{i}]", str(e))
-        return out
-
-    def atom_names(
-        self, path: str, table: dict[str, Any], key: str, declared: frozenset[AtomId]
-    ) -> list[AtomId]:
-        names = self.str_list(path, table, key)
-        for n in names:
-            if n not in declared and n != NOT_OPTION:
-                self.error(f"{path}.{key}", f"atom {n!r} is not declared in [atoms]")
-        return [AtomId(n) for n in names]
-
-    def required_atoms(
-        self, path: str, table: dict[str, Any], key: str, declared: frozenset[AtomId]
-    ) -> list[str | RequiredAtom]:
-        """A network rule's ``requires``: each entry an atom name (redirect treatment decided
-        by the atom's textuality), or ``{ atom = "...", on-redirect = "..." }``."""
-        value = table.get(key)
-        if value is None:
-            return []
-        if not isinstance(value, list):
-            self.error(f"{path}.{key}", "expected a list")
-            return []
-        out: list[str | RequiredAtom] = []
-        for j, entry in enumerate(value):
-            where = f"{path}.{key}[{j}]"
-            mode = None
-            if isinstance(entry, str):
-                name = entry
-            elif isinstance(entry, dict):
-                sub = self.table(where, entry, frozenset({"atom", "on-redirect"}))
-                name = self.required_str(where, sub, "atom")
-                mode = self.field(where, sub, "on-redirect", str)
-                if mode is not None and mode not in ("recheck", "stop", "waive"):
-                    self.error(f"{where}.on-redirect", "expected recheck, stop or waive")
-                    mode = None
-                if name is None:
-                    continue
-            else:
-                self.error(
-                    where, 'expected an atom name or { atom = "...", on-redirect = "..." }'
-                )
-                continue
-            if name not in declared and name != NOT_OPTION:
-                self.error(where, f"atom {name!r} is not declared in [atoms]")
-            out.append(name if mode is None else RequiredAtom(AtomId(name), mode))
-        return out
-
-    def region_names(
-        self, path: str, table: dict[str, Any], key: str, regions: Mapping[RegionId, Medium]
-    ) -> list[str] | None:
-        """A list of regions under *key* (``writes``, ``reads``): declared region names, or a
-        medium name (``fs``, ``network``) for the whole medium. None when absent -- undeclared --
-        or malformed (reported); an empty list is a declaration of nothing."""
-        if key not in table:
-            return None
-        names = self.str_list(path, table, key)
-        ok = isinstance(table.get(key), list)
-        for n in names:
-            if RegionId(n) not in regions and as_medium(n) is None:
-                self.error(f"{path}.{key}", f"region {n!r} is not declared in [regions]")
-                ok = False
-        return names if ok else None
-
-    def entries(self, key: str, data: dict[str, Any]) -> list[Any]:
-        value = data.get(key)
-        if value is None:
-            return []
-        if not isinstance(value, list):
-            self.error(key, "expected an array of tables")
-            return []
-        return value
-
-
-_TOP_KEYS = frozenset({
-    "policy-version", "root", "filesystem", "regions", "atoms", "flagset", "validation",
-    "program", "network", "apply", "source",
-})
-# a ruleset (TEMPLATES.md): exec-side vocabulary only -- no filesystem grants, no network, no root
-_RULESET_TOP_KEYS = frozenset({
-    "ruleset-version", "params", "regions", "atoms", "flagset", "validation", "program", "apply",
-    "source",
-})
-# a region (EFFECTS.md): one medium -- a footprint (fs) or network = true
-_REGION_KEYS = frozenset({"footprint", "network", "about"})
-# the media a grant claims to reach, and what it writes within them
-_MEDIA_KEYS = frozenset({"network", "write", "writes"})
-_SOURCE_KEYS = frozenset({"name", "location"})
-# a ruleset's parameter kinds (TEMPLATES.md): a directory (set-valued) heads location spellings;
-# an atom list is spliced into atom lists; a bool is read by `when`; a constraint is a whole
-# hole. No defaults, except that an unbound bool is false: a default is an opinion the root
-# never reviewed, and false is the tighter policy for a bool that enables something
-_PARAM_KINDS = ("directory", "atom", "bool", "constraint")
-# where a ruleset's parameters may be substituted: location slots (a directory parameter heads
-# the spelling) and atom lists (an atom parameter is spliced in whole)
-_LOCATION_KEYS = frozenset({"cwd", "location"})
-_ATOM_LIST_KEYS = frozenset({"requires", "atoms"})
-type Binding = list[str] | bool | dict[str, Any]  # directory or atom list; bool; constraint
-_HEAD_PARAM = re.compile(r"\$\{([\w-]+)\}(?:/(.+))?")  # parameter names may carry dashes: push-gate
-_WHOLE_PARAM = re.compile(r"\$\{([\w-]+)\}")
 # stock, config-free, non-spawning predicates a ruleset's validation may run besides
 # ${checkers}/<name>: the whole executable surface a shared file can reach
 RULESET_STOCK_CHECKERS: frozenset[str] = frozenset({"test"})
-_ATOM_KEYS = frozenset({"pure", "matches", "reads"})
-_VALIDATION_KEYS = (
-    frozenset({"name", "params", "argv", "cwd", "establishes", "effect-free"}) | _MEDIA_KEYS
-)
-_NETWORK_KEYS = frozenset({
-    "host", "schemes", "ports", "methods", "allow-nonpublic", "requires",
-    "read-timeout", "total-timeout", "max-response-bytes", "source", "path", "writes",
-})
-# the flat rule's argument keys of old: an argument is now a hole of a template, which knows
-# which position it fills. Named here so the error says where the spelling went
-_RETIRED_PROGRAM_KEYS = frozenset({"argument-atoms", "unknown-arguments", "argument-locations"})
-_PROGRAM_KEYS = (
-    frozenset({"name", "cwd", "requires", "argv", "holes", "source", "effect-free", "subcommand"})
-    | _MEDIA_KEYS
-)
-# a constraint table: a token hole, an each hole's elements, a valued flag (TEMPLATES.md)
-_CONSTRAINT_KEYS = frozenset({"location", "matches", "one-of", "atoms", "literal", "any"})
-_HOLE_KEYS = _CONSTRAINT_KEYS | {"kind", "min", "flagset", "bare"}
-_HOLE_KINDS = ("token", "each", "flags")
-_FLAGSET_KEYS = frozenset({"name", "bare", "any", "holes"})
-# a flag entry: a constraint on its value, or `value = false` for a bare flag spelled as a
-# table; either may carry `requires` (demands on the cwd or another hole while the flag is
-# present) and, before instantiation, `when`
-_FLAG_KEYS = _CONSTRAINT_KEYS | {"value", "requires"}
-_HOLE_REF = re.compile(r"\$\{(\w+)(\.\.\.)?\}")
-
-
-# ---------------------------------------------------------------------------
-# command templates (TEMPLATES.md)
-# ---------------------------------------------------------------------------
-
-
-def _open_table(loader: _Loader, path: str, value: Any, known: frozenset[str]) -> dict[str, Any] | None:
-    """A table whose keys are *known* or flag names (``-``-prefixed): hole tables and flagsets."""
-    if not isinstance(value, dict):
-        loader.error(path, "expected a table")
-        return None
-    ok = True
-    for key in sorted(value.keys() - known):
-        if not key.startswith("-"):
-            loader.error(path, f"unknown key {key!r}")
-            ok = False
-    return value if ok else None
-
-
-def _location_list(
-    loader: _Loader, path: str, table: dict[str, Any], key: str
-) -> tuple[LocationFact, ...] | None:
-    """An optional location slot under *key* (a constraint's ``location``, a network rule's
-    ``path``): one spelling or a list (any-of); empty when absent, None when malformed."""
-    value = table.get(key)
-    if value is None:
-        return ()
-    texts = value if isinstance(value, list) else [value]
-    if not texts or not all(isinstance(v, str) for v in texts):
-        loader.error(f"{path}.{key}", "expected a location or a non-empty list of locations")
-        return None
-    out: list[LocationFact] = []
-    for i, text in enumerate(texts):
-        try:
-            out.append(parse_location(text))
-        except ValueError as e:
-            loader.error(f"{path}.{key}[{i}]", str(e))
-    return tuple(out) if len(out) == len(texts) else None
-
-
-def _constraint(
-    loader: _Loader, path: str, table: dict[str, Any], declared: frozenset[AtomId]
-) -> Constraint | None:
-    locations = _location_list(loader, path, table, "location")
-    matches = loader.field(path, table, "matches", str)
-    one_of = loader.str_list(path, table, "one-of")
-    atoms = loader.atom_names(path, table, "atoms", declared)
-    literal = loader.field(path, table, "literal", bool) or False
-    anything = loader.field(path, table, "any", bool) or False
-    if locations is None:
-        return None
-    regex = None
-    if matches is not None:
-        try:
-            re.compile(matches)
-        except re.error as e:
-            loader.error(f"{path}.matches", f"bad regex: {e}")
-            return None
-        regex = RegexLit(matches)
-    if one_of:
-        if regex is not None:
-            loader.error(path, "matches and one-of exclude each other")
-            return None
-        regex = alternation(*(Exact(n) for n in one_of))
-    try:
-        return Constraint(locations, regex, frozenset(atoms), literal, anything)
-    except ValueError as e:
-        loader.error(path, str(e))
-        return None
-
-
-def _flag_vocabulary(
-    loader: _Loader,
-    path: str,
-    table: dict[str, Any],
-    declared: frozenset[AtomId],
-    reserved: frozenset[str],
-    holes: Sequence[str] = (),
-) -> Flagset | None:
-    """``bare`` plus every ``-``-keyed flag entry (a constraint on its value, or ``value =
-    false``), or ``any = true`` alone -- the open vocabulary; *reserved* are the table's own
-    keys; *holes* a named flagset's contract, the holes its flags' demands may reach."""
-    if loader.field(path, table, "any", bool):
-        listed = sorted(k for k in table if k == "bare" or k.startswith("-"))
-        if listed:
-            loader.error(path, f"an open flag vocabulary (any = true) lists no flags: {', '.join(listed)}")
-            return None
-        if holes:
-            loader.error(path, "an open flag vocabulary (any = true) reaches no holes")
-            return None
-        return Flagset(any=True)
-    bare = set(loader.str_list(path, table, "bare"))
-    valued: dict[FlagName, Constraint] = {}
-    requires: dict[FlagName, Demands] = {}
-    ok = True
-    for key, spec in table.items():
-        if key in reserved:
-            continue
-        where = f"{path}.{key}"
-        if not isinstance(spec, dict):
-            loader.error(where, "expected a constraint table")
-            ok = False
-            continue
-        if not spec:
-            loader.error(where, "an empty table is not a bare flag: list bare flags under `bare`")
-            ok = False
-            continue
-        for k in sorted(spec.keys() - _FLAG_KEYS):
-            loader.error(where, f"unknown key {k!r}")
-            ok = False
-        if "requires" in spec:
-            demands = _demands(loader, where, spec["requires"], declared)
-            if demands is None:
-                ok = False
-            else:
-                requires[FlagName(key)] = demands
-        if "value" in spec:
-            if spec["value"] is not False:
-                loader.error(f"{where}.value", "expected false: the table form of a bare flag")
-                ok = False
-            if spec.keys() & _CONSTRAINT_KEYS:
-                loader.error(where, "value = false takes no constraint: a bare flag has no value")
-                ok = False
-            bare.add(key)
-            continue
-        if not spec.keys() & _CONSTRAINT_KEYS:
-            loader.error(where, "a flag entry is a constraint on its value, or value = false")
-            ok = False
-            continue
-        c = _constraint(loader, where, spec, declared)
-        if c is None:
-            ok = False
-        else:
-            valued[FlagName(key)] = c
-    if not ok:
-        return None
-    try:
-        return Flagset(
-            frozenset(FlagName(b) for b in bare), valued, requires=requires,
-            holes=frozenset(HoleName(h) for h in holes),
-        )
-    except ValueError as e:
-        loader.error(path, str(e))
-        return None
-
-
-def _demands(
-    loader: _Loader, path: str, value: Any, declared: frozenset[AtomId]
-) -> Demands | None:
-    """A ``requires`` table: atoms demanded of ``cwd`` or of a hole, by name."""
-    if not isinstance(value, dict):
-        loader.error(f"{path}.requires", "expected a table: { cwd = [...], HOLE = [...] }")
-        return None
-    out: dict[str, frozenset[AtomId]] = {}
-    for target in value:
-        if not isinstance(value[target], list):
-            loader.error(f"{path}.requires.{target}", "expected a list of atoms")
-            return None
-        atoms = loader.atom_names(f"{path}.requires", value, target, declared)
-        if atoms:  # an empty list -- a ruleset's `[]`-bound gate -- demands nothing
-            out[target] = frozenset(atoms)
-    return out
-
-
-def _hole(
-    loader: _Loader,
-    path: str,
-    table: dict[str, Any],
-    flagsets: Mapping[FlagsetId, Flagset],
-    declared: frozenset[AtomId],
-) -> Hole | None:
-    kind = loader.field(path, table, "kind", str) or "token"
-    if kind not in _HOLE_KINDS:
-        loader.error(f"{path}.kind", f"expected one of {', '.join(_HOLE_KINDS)}")
-        return None
-    # `any` is a vocabulary only on a flags hole (the open vocabulary); on a token or each hole
-    # it is the constraint
-    inline = "bare" in table or (kind == "flags" and "any" in table) or any(k.startswith("-") for k in table)
-    if kind == "flags":
-        ref = loader.field(path, table, "flagset", str)
-        for k in sorted(((_CONSTRAINT_KEYS - {"any"}) | {"min"}) & table.keys()):
-            loader.error(path, f"a flags hole carries a vocabulary, not {k!r}")
-            return None
-        if ref is not None and inline:
-            loader.error(path, "flagset and an inline vocabulary exclude each other")
-            return None
-        if ref is not None:
-            fs = flagsets.get(FlagsetId(ref))
-            if fs is None:
-                loader.error(f"{path}.flagset", f"flagset {ref!r} is not declared")
-                return None
-            return Flags(fs)
-        if not inline:
-            loader.error(path, "a flags hole needs a flagset or an inline vocabulary")
-            return None
-        fs = _flag_vocabulary(loader, path, table, declared, _HOLE_KEYS)
-        return None if fs is None else Flags(fs)
-    if inline or "flagset" in table:
-        loader.error(path, f"a {kind} hole carries a constraint, not a flag vocabulary")
-        return None
-    c = _constraint(loader, path, table, declared)
-    if c is None:
-        return None
-    if kind == "token":
-        if "min" in table:
-            loader.error(path, "min applies to each holes only")
-            return None
-        return Token(c)
-    minimum = loader.field(path, table, "min", int)
-    return Each(c, 0 if minimum is None else minimum)
-
-
-def _source_atom(
-    loader: _Loader,
-    path: str,
-    table: dict[str, Any],
-    key: str,
-    declared: frozenset[AtomId],
-    pure_names: frozenset[AtomId],
-) -> AtomId | None:
-    """A source atom (PROVENANCE.md) named under *key*: declared, and *pure*."""
-    name = loader.field(path, table, key, str)
-    if name is None:
-        return None
-    if name not in declared:
-        loader.error(f"{path}.{key}", f"atom {name!r} is not declared in [atoms]")
-        return None
-    if name not in pure_names:
-        loader.error(f"{path}.{key}", f"a source atom is pure: declare {name!r} with pure = true")
-        return None
-    return AtomId(name)
-
-
-def _sources(
-    loader: _Loader, top: dict[str, Any], declared: frozenset[AtomId], pure_names: frozenset[AtomId]
-) -> list[Source]:
-    """``[[source]]``: read locations whose contents yield an atom."""
-    out: list[Source] = []
-    for i, entry in enumerate(loader.entries("source", top)):
-        path = f"source[{i}]"
-        t = loader.table(path, entry, _SOURCE_KEYS)
-        if "name" not in t:
-            loader.error(path, "name is required")
-            continue
-        name = _source_atom(loader, path, t, "name", declared, pure_names)
-        locations = loader.location_slot(path, t, "location")
-        if name is None or locations is None:
-            continue
-        out.append(Source(name, locations))
-    return out
-
-
-def _pieces(loader: _Loader, path: str, words: list[str]) -> tuple[Piece, ...] | None:
-    out: list[Piece] = []
-    ok = True
-    for i, word in enumerate(words):
-        m = _HOLE_REF.fullmatch(word)
-        if m is not None:
-            out.append(HoleRef(HoleName(m.group(1)), m.group(2) is not None))
-        elif "${" in word:
-            loader.error(f"{path}.argv[{i}]", f"hole references are whole words: {word!r}")
-            ok = False
-        else:
-            out.append(word)
-    return tuple(out) if ok else None
-
-
-# ---------------------------------------------------------------------------
-# rulesets and [[apply]] (TEMPLATES.md)
-# ---------------------------------------------------------------------------
+_CHECKERS = "${checkers}"
+_CWD = "cwd"
 
 
 def rulesets_dir() -> pathlib.Path:
     return config_dir() / "rulesets"
 
-
-@dataclass
-class _Document:
-    """One document of a composition: the root policy, or one instantiated ruleset."""
-
-    top: dict[str, Any]
-    label: str            # how messages name it: "unix.toml (where=repos, /srv/data)"
-    origin: str | None    # provenance on the rules it contributes; None for the root
-    restricted: bool      # a ruleset: restricted validation argv
+# ---------------------------------------------------------------------------
+# errors: collected, located
+# ---------------------------------------------------------------------------
 
 
-def _ruleset_params(loader: _Loader, top: dict[str, Any]) -> dict[str, str]:
-    """``[params]``: name -> kind."""
-    table = top.get("params", {})
-    if not isinstance(table, dict):
-        loader.error("params", "expected a table")
-        return {}
-    out: dict[str, str] = {}
-    for name, spec in table.items():
-        path = f"params.{name}"
-        s = loader.table(path, spec, frozenset({"kind"}))
-        kind = loader.field(path, s, "kind", str)
-        if kind is None or kind not in _PARAM_KINDS:
-            loader.error(path, f"kind must be one of {', '.join(_PARAM_KINDS)}")
-            continue
-        out[name] = kind
-    return out
+class _Errors:
+    """Every problem of a composition, in order found. One list shared by every pass."""
+
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+
+    def add(self, where: str, path: DocPath, what: str) -> None:
+        self.lines.append(f"{where}: {path}: {what}" if path else f"{where}: {what}")
+
+    def schema(self, e: SchemaError) -> None:
+        self.lines.extend(f"{e.where}: {p}" for p in e.problems)
+
+    def raise_if_any(self) -> None:
+        if self.lines:
+            raise PolicyFileError("\n".join(self.lines))
 
 
-def _bindings(
-    loader: _Loader, path: str, table: dict[str, Any], params: Mapping[str, str]
-) -> dict[str, Binding] | None:
-    """The ``[[apply]]`` entry's bindings, checked against the ruleset's parameters: a directory
-    parameter takes one directory or a non-empty list of them (a StaticPath: no splat, no regex);
-    an atom parameter one atom name or a list of them (``[]``: none); a bool ``true``/``false``;
-    a constraint an inline constraint table, checked where it lands. A parameter left unbound is
-    absent here (a bool reads as false): whether that is an error depends on whether anything
-    surviving ``when`` still references it (``_instantiate``)."""
-    out: dict[str, Binding] = {}
+# ---------------------------------------------------------------------------
+# 1. composition: rulesets, bindings, when, substitution
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Dirs:
+    """A directory parameter's binding: one or more plain directories (any-of)."""
+
+    paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Atoms:
+    """An atom-list parameter's binding: names spliced where the list stands; may be empty."""
+
+    names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Toggle:
+    """A bool parameter's binding; unbound is ``False``."""
+
+    value: bool
+
+
+@dataclass(frozen=True)
+class Shape:
+    """A constraint parameter's binding: the token hole its table spells, checked where the
+    root wrote it."""
+
+    hole: TokenHole
+
+
+type Bound = Dirs | Atoms | Toggle | Shape
+
+
+def _bind(
+    apply: ApplyDecl, ruleset: RulesetDoc, where: str, path: Path, errors: _Errors
+) -> dict[str, Bound] | None:
+    """The application's bindings, typed by the parameter kinds the ruleset declares. A
+    parameter left unbound is absent (a bool is ``Toggle(False)``); whether that is an error
+    depends on whether anything surviving ``when`` still references it."""
+    out: dict[str, Bound] = {}
     ok = True
-    for name, kind in params.items():
-        if name not in table:
+    for name, raw in apply.bindings.items():
+        decl = ruleset.params.get(name)
+        at = path.key(name)  # a binding is a key of the [[apply]] table itself
+        if decl is None:
+            errors.add(where, path, f"{name!r} is not a parameter of the ruleset")
+            ok = False
             continue
-        value = table[name]
-        where = f"{path}.{name}"
-        if kind == "directory":
-            texts = value if isinstance(value, list) else [value]
-            if not texts or not all(isinstance(t, str) for t in texts):
-                loader.error(where, "expected a directory or a non-empty list of them")
-                ok = False
-                continue
-            for text in texts:
-                try:
-                    loc = parse_location(text)
-                except ValueError as e:
-                    loader.error(where, str(e))
+        match decl.kind, raw:
+            case "directory", str() | list() if all(isinstance(t, str) for t in ([raw] if isinstance(raw, str) else raw)):
+                texts: list[str] = [raw] if isinstance(raw, str) else list(raw)
+                if not texts:
+                    errors.add(where, at, "expected a directory or a non-empty list of them")
                     ok = False
                     continue
-                if not isinstance(loc, StaticPath):
-                    loader.error(where, f"{text!r} is not a directory (no '**' or regex components)")
+                for text in texts:
+                    try:
+                        loc = parse_location(text)
+                    except ValueError as e:
+                        errors.add(where, at, str(e))
+                        ok = False
+                        continue
+                    if not isinstance(loc, StaticPath):
+                        errors.add(where, at, f"{text!r} is not a directory (no '**' or regex components)")
+                        ok = False
+                out[name] = Dirs(tuple(texts))
+            case "atom", str() | list() if all(isinstance(t, str) for t in ([raw] if isinstance(raw, str) else raw)):
+                out[name] = Atoms((raw,) if isinstance(raw, str) else tuple(raw))
+            case "bool", bool():
+                out[name] = Toggle(raw)
+            case "constraint", dict():
+                try:
+                    out[name] = Shape(parse_hole(raw, where))
+                except SchemaError as e:
+                    for problem in e.problems:
+                        errors.add(where, at, problem)
                     ok = False
-            out[name] = list(texts)
-        elif kind == "atom":
-            texts = value if isinstance(value, list) else [value]
-            if not all(isinstance(t, str) for t in texts):
-                loader.error(where, "expected an atom name or a list of them")
+            case kind, _:
+                expected = {
+                    "directory": "a directory or a non-empty list of them",
+                    "atom": "an atom name or a list of them",
+                    "bool": "true or false",
+                    "constraint": "a constraint table ({ atoms = [...] }, { any = true }, ...)",
+                }[kind]
+                errors.add(where, at, f"expected {expected}")
                 ok = False
-                continue
-            out[name] = list(texts)
-        elif kind == "bool":
-            if not isinstance(value, bool):
-                loader.error(where, "expected true or false")
-                ok = False
-                continue
-            out[name] = value
-        else:
-            if not isinstance(value, dict):
-                loader.error(where, "expected a constraint table ({ atoms = [...] }, { any = true }, ...)")
-                ok = False
-                continue
-            out[name] = dict(value)
-    for key in sorted(table.keys() - params.keys() - {"ruleset", "when"}):
-        loader.error(path, f"{key!r} is not a parameter of the ruleset")
-        ok = False
-    for name, kind in params.items():
-        if kind == "bool" and name not in out:
-            out[name] = False  # canonical: an application with an unbound bool is the false one
+    for name, decl in ruleset.params.items():
+        if decl.kind == "bool" and name not in out:
+            out[name] = Toggle(False)  # canonical: an application with an unbound bool is the false one
     return out if ok else None
 
 
-def _when(
-    loader: _Loader, where: str, value: Any, params: Mapping[str, str], bindings: Mapping[str, Binding]
-) -> bool:
-    """A ``when``: ``true``/``false``, or ``"${flag}"`` naming a bool parameter, false when
-    unbound. Malformed reads as false: the piece is dropped, and the error is reported."""
-    if isinstance(value, bool):
-        return value
-    m = _WHOLE_PARAM.fullmatch(value) if isinstance(value, str) else None
-    if m is None:
-        loader.error(f"{where}.when", "expected true, false, or a bool parameter (\"${flag}\")")
-        return False
-    name = m.group(1)
-    if params.get(name) != "bool":
-        what = "not a parameter of this ruleset" if name not in params else "not a bool parameter"
-        loader.error(f"{where}.when", f"{name!r} is {what}")
-        return False
-    bound = bindings.get(name, False)
-    assert isinstance(bound, bool)
-    return bound
+def _show(b: Bound) -> str:
+    match b:
+        case Dirs(paths=ps) | Atoms(names=ps):
+            return ",".join(ps) if ps else "[]"
+        case Toggle(value=v):
+            return "true" if v else "false"
+        case Shape(hole=h):
+            return json.dumps(_table_of(h), sort_keys=True, separators=(",", ":"))
 
 
-def _enable(
-    loader: _Loader, top: dict[str, Any], params: Mapping[str, str], bindings: Mapping[str, Binding]
-) -> dict[str, Any]:
-    """Resolve every ``when`` -- on a ``[[program]]``, an ``[[apply]]``, and a flag entry of a
-    ``[[flagset]]`` or an inline vocabulary -- dropping what it disables and stripping the key
-    from what survives. Runs before substitution, so a parameter referenced only from a dropped
-    piece needs no binding. In a root document (no parameters) only literal bools are allowed."""
+def _table_of(hole: TokenHole) -> dict[str, Any]:
+    """The constraint table as the root spelled it, for labels and for passing down."""
+    return hole.model_dump(by_alias=True, exclude_defaults=True, exclude={"kind"})
 
-    def enabled(node: Any, where: str) -> bool:
-        return not (isinstance(node, dict) and "when" in node) or _when(loader, where, node["when"], params, bindings)
 
-    def stripped(node: Any) -> Any:
-        return {k: v for k, v in node.items() if k != "when"} if isinstance(node, dict) else node
+def _canonical(bindings: Mapping[str, Bound]) -> str:
+    return json.dumps({k: _show(v) for k, v in sorted(bindings.items())})
 
-    def flags(table: Any, where: str) -> Any:
-        """A table with flag entries (``-``-keyed): drop the disabled ones."""
-        if not isinstance(table, dict):
-            return table
-        return {
-            k: (stripped(v) if k.startswith("-") else v)
-            for k, v in table.items()
-            if not k.startswith("-") or enabled(v, f"{where}.{k}")
+
+class _Instantiator:
+    """Substitutes one ruleset's parameters into its typed tables. Every method takes a typed
+    value and returns one of the same type with references resolved; a reference to an unbound
+    or wrong-kind parameter is reported at *path* and the value is returned as it was (the load
+    fails anyway). ``when`` is resolved first, so a parameter referenced only from dropped
+    pieces needs no binding. With no parameters (the root document) only literal ``when``s are
+    admissible."""
+
+    def __init__(self, ruleset: RulesetDoc | None, bindings: Mapping[str, Bound], where: str, errors: _Errors) -> None:
+        self.params = {} if ruleset is None else ruleset.params
+        self.restricted = ruleset is not None
+        self.bindings = bindings
+        self.where = where
+        self.errors = errors
+
+    # -- references --------------------------------------------------------------------------
+
+    @overload
+    def _bound(self, name: str, kind: Literal["directory"], path: DocPath) -> Dirs | None: ...
+    @overload
+    def _bound(self, name: str, kind: Literal["atom"], path: DocPath) -> Atoms | None: ...
+    @overload
+    def _bound(self, name: str, kind: Literal["bool"], path: DocPath) -> Toggle | None: ...
+    @overload
+    def _bound(self, name: str, kind: Literal["constraint"], path: DocPath) -> Shape | None: ...
+
+    def _bound(self, name: str, kind: ParamKind, path: DocPath) -> Bound | None:
+        """The binding of *name*, which must be a *kind* parameter; None (reported) otherwise.
+        The kind fixes the binding's type: ``_bind`` built the table that way."""
+        decl = self.params.get(name)
+        if decl is None:
+            self.errors.add(self.where, path, f"{name!r} is not a parameter of this ruleset")
+            return None
+        if decl.kind != kind:
+            self.errors.add(self.where, path, f"{name!r} is not a {kind} parameter")
+            return None
+        b = self.bindings.get(name)
+        if b is None:
+            self.errors.add(self.where, path, f"parameter {name!r} is not bound")
+        return b
+
+    def when(self, value: bool | str | None, path: Path) -> bool:
+        """Is the piece enabled? Absent: yes."""
+        if value is None or isinstance(value, bool):
+            return value is not False
+        name = reference(value)
+        assert name is not None  # the schema admitted only a reference
+        b = self._bound(name, "bool", path.when)
+        return b is not None and b.value
+
+    def locations(self, slot: list[str], path: DocPath) -> list[str]:
+        """A location slot: a directory parameter at the head maps over its directories. A
+        ruleset spells no absolute location of its own; those enter through the root's bindings."""
+        out: list[str] = []
+        for text in slot:
+            ref, rest = _split_head(text)
+            if ref is None:
+                if self.restricted and text.startswith("/"):
+                    self.errors.add(self.where, path, f"a ruleset names no absolute locations: {text!r}")
+                out.append(text)
+                continue
+            b = self._bound(ref, "directory", path)
+            if b is None:
+                out.append(text)
+            else:
+                out.extend(_join_dir(base, rest) for base in b.paths)
+        return out
+
+    def atoms(self, names: Sequence[str], path: DocPath) -> list[str]:
+        """An atom list: an atom parameter is spliced where it stands."""
+        out: list[str] = []
+        for text in names:
+            name = reference(text)
+            if name is None:
+                out.append(text)
+                continue
+            b = self._bound(name, "atom", path)
+            out.extend([text] if b is None else b.names)
+        return out
+
+    # -- tables ------------------------------------------------------------------------------
+
+    def constraint[C: ConstraintFields](self, c: C, path: Path) -> C:
+        update: dict[str, Any] = {}
+        if c.location is not None:
+            update["location"] = self.locations(c.location, path.location)
+        if c.atoms is not None:
+            update["atoms"] = self.atoms(c.atoms, path.atoms)
+        return c.model_copy(update=update) if update else c
+
+    def demands(self, d: Mapping[str, list[str]], path: Keyed) -> dict[str, list[str]]:
+        return {k: self.atoms(v, path[k]) for k, v in d.items()}
+
+    def entry(self, e: FlagEntry, path: Path) -> FlagEntry:
+        """A surviving flag entry: its constraint and demands substituted, its ``when`` --
+        already decided by the caller -- cleared, so the instantiated document carries no
+        reference that is not resolved."""
+        e = self.constraint(e, path)
+        update: dict[str, Any] = {"when": None}
+        if e.requires is not None:
+            update["requires"] = self.demands(e.requires, path.requires)
+        return e.model_copy(update=update)
+
+    def vocabulary[V: FlagVocabulary](self, v: V, path: Path) -> V:
+        # a flag entry is a key of the vocabulary's own table in the document ("-k" = {...})
+        flags = {
+            name: self.entry(e, path.key(name))
+            for name, e in v.flags.items()
+            if self.when(e.when, path.key(name))
         }
+        return v.model_copy(update={"flags": flags})
 
-    def rule(entry: Any, where: str) -> Any:
-        """A surviving ``[[program]]``: its inline vocabularies' flags may carry ``when`` too."""
-        entry = stripped(entry)
-        if isinstance(entry, dict) and isinstance(entry.get("holes"), dict):
-            holes = {h: flags(spec, f"{where}.holes.{h}") for h, spec in entry["holes"].items()}
-            return {**entry, "holes": holes}
-        return entry
+    def hole(self, spec: HoleSpec, path: Path) -> HoleSpec:
+        """A hole with its parameters substituted; a hole that *is* a constraint parameter
+        becomes the token hole the root bound."""
+        match spec:
+            case str():
+                name = reference(spec)
+                assert name is not None  # the schema admitted only a reference
+                b = self._bound(name, "constraint", path)
+                return spec if b is None else b.hole
+            case TokenHole() | EachHole():
+                return self.constraint(spec, path)
+            case FlagsHole():
+                return self.vocabulary(spec, path)
+            case FlagsetRef():
+                return spec
 
-    out = dict(top)
-    programs = top.get("program")
-    if isinstance(programs, list):
-        out["program"] = [
-            rule(e, f"program[{i}]") for i, e in enumerate(programs) if enabled(e, f"program[{i}]")
+    def program(self, p: ProgramDecl, path: Path) -> ProgramDecl:
+        update: dict[str, Any] = {"when": None, "cwd": self.locations(p.cwd, path.cwd)}
+        if p.holes is not None:
+            update["holes"] = {h: self.hole(spec, path.holes[h]) for h, spec in p.holes.items()}
+        if isinstance(p.requires, dict):
+            update["requires"] = self.demands(p.requires, path.requires)
+        elif p.requires is not None:
+            update["requires"] = self.atoms(p.requires, path.requires)
+        return p.model_copy(update=update)
+
+    def validation(self, v: ValidationDecl, path: Path) -> ValidationDecl:
+        update: dict[str, Any] = {
+            "establishes": {k: self.atoms(a, path.establishes[k]) for k, a in v.establishes.items()}
+        }
+        if v.cwd is not None:
+            update["cwd"] = self.locations(v.cwd, path.cwd)
+        return v.model_copy(update=update)
+
+    def flagset(self, f: FlagsetDecl, path: Path) -> FlagsetDecl:
+        return self.vocabulary(f, path)
+
+    def source(self, s: SourceDecl, path: Path) -> SourceDecl:
+        return s.model_copy(update={"location": self.locations(s.location, path.location)})
+
+    def apply(self, a: ApplyDecl, path: Path) -> ApplyDecl:
+        """A nested application: bindings may pass this ruleset's parameters down whole; an
+        unbound one is left unbound below, for the applied ruleset to judge."""
+        bindings: dict[str, Any] = {}
+        for k, v in a.bindings.items():
+            name = reference(v) if isinstance(v, str) else None
+            if name is None:
+                if isinstance(v, str) and "${" in v:
+                    self.errors.add(self.where, path.key(k), f"a parameter is passed down whole: {v!r}")
+                bindings[k] = v
+                continue
+            if name not in self.params:
+                self.errors.add(self.where, path.key(k), f"{name!r} is not a parameter of this ruleset")
+                bindings[k] = v
+                continue
+            b = self.bindings.get(name)
+            match b:
+                case None:
+                    continue
+                case Dirs(paths=ps) | Atoms(names=ps):
+                    bindings[k] = list(ps)
+                case Toggle(value=t):
+                    bindings[k] = t
+                case Shape(hole=h):
+                    bindings[k] = _table_of(h)
+        return a.model_copy(update={"bindings": bindings, "when": None})
+
+    def document[D: PolicyDoc | RulesetDoc](self, doc: D) -> D:
+        """The whole document with ``when`` resolved and parameters substituted."""
+        root = Path()
+        programs = [
+            self.program(p, root.program(i)) for i, p in enumerate(doc.program) if self.when(p.when, root.program(i))
         ]
-    applies = top.get("apply")
-    if isinstance(applies, list):
-        out["apply"] = [stripped(e) for i, e in enumerate(applies) if enabled(e, f"apply[{i}]")]
-    flagsets = top.get("flagset")
-    if isinstance(flagsets, list):
-        out["flagset"] = [flags(f, f"flagset[{i}]") for i, f in enumerate(flagsets)]
-    return out
+        applies = [
+            self.apply(a, root.apply(i)) for i, a in enumerate(doc.apply) if self.when(a.when, root.apply(i))
+        ]
+        return doc.model_copy(update={
+            "program": programs,
+            "apply": applies,
+            "flagset": [self.flagset(f, root.flagset(i)) for i, f in enumerate(doc.flagset)],
+            "validation": [self.validation(v, root.validation(i)) for i, v in enumerate(doc.validation)],
+            "source": [self.source(s, root.source(i)) for i, s in enumerate(doc.source)],
+        })
+
+
+def _split_head(text: str) -> tuple[str | None, str | None]:
+    """``${where}/rest`` -> (``where``, ``rest``); ``${where}`` -> (``where``, None); a spelling
+    with no parameter head -> (None, None). The schema admitted nothing else."""
+    if not text.startswith("${"):
+        return None, None
+    end = text.index("}")
+    return text[2:end], text[end + 2 :] if len(text) > end + 1 else None
 
 
 def _join_dir(base: str, rest: str | None) -> str:
@@ -854,618 +456,450 @@ def _join_dir(base: str, rest: str | None) -> str:
     return base.rstrip("/") + "/" + rest if base.rstrip("/") else "/" + rest
 
 
-def _instantiate(
-    loader: _Loader, top: dict[str, Any], params: Mapping[str, str], bindings: Mapping[str, Binding]
-) -> dict[str, Any]:
-    """Resolve ``when`` (``_enable``), then substitute the parameters into what survives. A
-    directory parameter heads a location spelling and maps over its bound directories
-    (``${where}/**`` with two directories is two locations: any-of); an atom parameter is
-    spliced into an atom list where it stands (``[]`` contributes nothing); a constraint
-    parameter is a whole hole (``holes.BRANCH = "${branch}"``), a token hole of the bound
-    constraint; a bool is read by ``when`` only. A surviving reference to an unbound parameter
-    is an error. Everything else the parser will see is checked to contain no stray reference
-    and no absolute location."""
-    top = _enable(loader, top, params, bindings)
+@dataclass(frozen=True)
+class _Document:
+    """One document of a composition: the root policy, or one instantiated ruleset."""
 
-    def bound(name: str, kind: str, where: str) -> Binding | None:
-        """The binding of *name*, which must be a *kind* parameter; None (reported) otherwise."""
-        if params.get(name) != kind:
-            what = "not a parameter of this ruleset" if name not in params else f"not a {kind} parameter"
-            loader.error(where, f"{name!r} is {what}")
-            return None
-        if name not in bindings:
-            loader.error(where, f"parameter {name!r} is not bound")
-            return None
-        return bindings[name]
+    body: PolicyDoc | RulesetDoc
+    label: str            # how messages name it: "unix.toml (where=repos,/srv/data)"
+    origin: str | None    # provenance on the rules it contributes; None for the root
 
-    def locations(value: Any, where: str) -> Any:
-        texts = value if isinstance(value, list) else [value]
-        if not all(isinstance(t, str) for t in texts):
-            return value  # the parser reports the type
-        out: list[str] = []
-        for text in texts:
-            if text.startswith("/"):
-                loader.error(where, f"a ruleset names no absolute locations: {text!r}")
-            m = _HEAD_PARAM.fullmatch(text)
-            if m is None:
-                if "${" in text:
-                    loader.error(where, f"a parameter may only head a location: {text!r}")
-                out.append(text)
-                continue
-            name, rest = m.group(1), m.group(2)
-            dirs = bound(name, "directory", where)
-            if not isinstance(dirs, list):
-                out.append(text)
-                continue
-            out.extend(_join_dir(base, rest) for base in dirs)
-        if isinstance(value, list) or len(out) != 1:
-            return out
-        return out[0]
-
-    def atoms(value: Any, where: str) -> Any:
-        texts = value if isinstance(value, list) else [value]
-        if not all(isinstance(t, str) for t in texts):
-            return value
-        out: list[str] = []
-        for text in texts:
-            m = _WHOLE_PARAM.fullmatch(text)
-            if m is None:
-                if "${" in text:
-                    loader.error(where, f"a parameter is a whole atom entry: {text!r}")
-                out.append(text)
-                continue
-            names = bound(m.group(1), "atom", where)
-            if not isinstance(names, list):
-                out.append(text)
-                continue
-            out.extend(names)
-        # a spliced list is a list, whatever the ruleset wrote; a lone name stays a name
-        return out if isinstance(value, list) or len(out) != 1 else out[0]
-
-    def requires(node: Any, where: str) -> Any:
-        """A rule's or a flag's ``requires``: an atom list, or a table of them by target."""
-        if isinstance(node, dict):
-            return {k: atoms(v, f"{where}.{k}") for k, v in node.items()}
-        return atoms(node, where)
-
-    def hole(spec: Any, where: str) -> Any:
-        if isinstance(spec, str):
-            m = _WHOLE_PARAM.fullmatch(spec)
-            if m is None:
-                loader.error(where, "a hole is a table, or a constraint parameter (\"${name}\")")
-                return spec
-            c = bound(m.group(1), "constraint", where)
-            return spec if c is None else c
-        return walk(spec, "hole", where)
-
-    def walk(node: Any, key: str, where: str) -> Any:
-        if key in _LOCATION_KEYS:
-            return locations(node, where)
-        if key == "atoms":
-            return atoms(node, where)
-        if key == "requires":
-            return requires(node, where)
-        if key == "establishes" and isinstance(node, dict):
-            return {k: atoms(v, f"{where}.{k}") for k, v in node.items()}
-        if key == "holes" and isinstance(node, dict):
-            return {h: hole(spec, f"{where}.{h}") for h, spec in node.items()}
-        if isinstance(node, dict):
-            return {k: walk(v, k, f"{where}.{k}") for k, v in node.items()}
-        if isinstance(node, list) and all(isinstance(x, dict) for x in node):
-            return [walk(x, key, f"{where}[{i}]") for i, x in enumerate(node)]
-        return node
-
-    def apply_entry(entry: Any, where: str) -> Any:
-        """A nested ``[[apply]]``: its bindings may pass this ruleset's parameters down whole
-        (``branch = "${branch}"``), each kind as its bound value. Passing an unbound parameter
-        leaves it unbound below: whether that matters is the applied ruleset's to decide, by
-        what survives its own ``when``."""
-        if not isinstance(entry, dict):
-            return entry
-        out: dict[str, Any] = {}
-        for k, v in entry.items():
-            m = _WHOLE_PARAM.fullmatch(v) if isinstance(v, str) else None
-            if k == "ruleset" or m is None:
-                if isinstance(v, str) and "${" in v:
-                    loader.error(f"{where}.{k}", f"a parameter is passed down whole: {v!r}")
-                out[k] = v
-                continue
-            name = m.group(1)
-            if name not in params:
-                loader.error(f"{where}.{k}", f"{name!r} is not a parameter of this ruleset")
-                out[k] = v
-            elif name in bindings:
-                out[k] = bindings[name]
-        return out
-
-    result = dict(top)
-    for section in ("program", "validation", "flagset", "source"):
-        if section in top:
-            result[section] = walk(top[section], section, section)
-    applies = top.get("apply")
-    if isinstance(applies, list):
-        result["apply"] = [apply_entry(e, f"apply[{i}]") for i, e in enumerate(applies)]
-    return result
+    @property
+    def restricted(self) -> bool:
+        return isinstance(self.body, RulesetDoc)
 
 
-def _show_binding(v: Binding) -> str:
-    """A binding as the provenance label spells it."""
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    if isinstance(v, list):
-        return ",".join(v) if v else "[]"
-    return json.dumps(v, sort_keys=True, separators=(",", ":"))
+def _compose(root: PolicyDoc, where: str, errors: _Errors) -> list[_Document]:
+    """The root (its literal ``when``s resolved) and every ruleset it applies, instantiated."""
+    top = _Instantiator(None, {}, where, errors).document(root)
+    out = [_Document(top, where, None)]
+    _apply_all(top, where, (), {}, out, errors)
+    return out
 
 
 def _apply_all(
-    loader: _Loader,
-    top: dict[str, Any],
+    doc: PolicyDoc | RulesetDoc,
+    where: str,
     chain: tuple[str, ...],
     seen: dict[tuple[str, str], tuple[str, str]],
     out: list[_Document],
+    errors: _Errors,
 ) -> None:
-    """Resolve the ``[[apply]]`` entries of *top* -- a root or a ruleset -- depth-first into
-    *out*. An application is identified by (realpath, hash, bindings): reached twice with the
-    same bindings (a composition diamond) it is one document; with different bindings it is an
-    error -- lift it to the root with the union. A ruleset is applied at most once."""
-    for i, entry in enumerate(loader.entries("apply", top)):
-        path = f"apply[{i}]"
-        if not isinstance(entry, dict):
-            loader.error(path, "expected a table")
-            continue
-        name = loader.required_str(path, entry, "ruleset")
-        if name is None:
-            continue
-        if "/" in name or name in (".", "..") or not name.endswith(".toml"):
-            loader.error(f"{path}.ruleset", f"expected the name of a .toml file in {rulesets_dir()}")
-            continue
-        file = rulesets_dir() / name
+    for i, entry in enumerate(doc.apply):
+        path = Path().apply(i)
+        file = rulesets_dir() / entry.ruleset
         try:
             text = file.read_text(encoding="utf-8")
             real = str(file.resolve())
         except OSError as e:
-            loader.error(f"{path}.ruleset", f"cannot read ruleset {name}: {e}")
+            errors.add(where, path.ruleset, f"cannot read ruleset {entry.ruleset}: {e}")
             continue
         if real in chain:
-            loader.error(f"{path}.ruleset", f"ruleset {name} applies itself (via {' -> '.join(chain)})")
+            errors.add(where, path.ruleset, f"ruleset {entry.ruleset} applies itself (via {' -> '.join(chain)})")
             continue
         try:
-            data: object = tomllib.loads(text)
+            ruleset = parse_ruleset(tomllib.loads(text), entry.ruleset)
         except tomllib.TOMLDecodeError as e:
-            loader.error(f"{path}.ruleset", f"{name}: {e}")
+            errors.add(where, path.ruleset, f"{entry.ruleset}: {e}")
             continue
-        sub = _Loader(name, loader.errors)
-        rtop = sub.table("ruleset", data, _RULESET_TOP_KEYS)
-        if "ruleset-version" not in rtop:
-            sub.error("ruleset", "ruleset-version = 1 is required")
-        elif sub.field("ruleset", rtop, "ruleset-version", int) not in (None, 1):
-            sub.error("ruleset", "unsupported ruleset-version")
-        params = _ruleset_params(sub, rtop)
-        bindings = _bindings(loader, path, entry, params)
+        except SchemaError as e:
+            errors.schema(e)
+            continue
+        bindings = _bind(entry, ruleset, where, path, errors)
         if bindings is None:
             continue
-        canonical = json.dumps(bindings, sort_keys=True)
-        route = f"{loader.where} {path}"
-        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        key = (real, digest)
+        canonical = _canonical(bindings)
+        key = (real, hashlib.sha256(text.encode("utf-8")).hexdigest())
         if key in seen:
             previous, previous_route = seen[key]
             if previous != canonical:
-                loader.error(
-                    path,
-                    f"ruleset {name} is applied with different bindings here and at "
+                errors.add(
+                    where, path,
+                    f"ruleset {entry.ruleset} is applied with different bindings here and at "
                     f"{previous_route}; apply it once, at the root, with the union",
                 )
             continue  # the same application again: one document
-        seen[key] = (canonical, route)
-        shown = ", ".join(f"{k}={_show_binding(v)}" for k, v in sorted(bindings.items()))
-        label = f"{name} ({shown})" if shown else name
-        instantiated = _instantiate(sub, rtop, params, bindings)
-        out.append(_Document(instantiated, label, label, True))
-        _apply_all(_Loader(label, loader.errors), instantiated, (*chain, real), seen, out)
+        seen[key] = (canonical, f"{where} {path}")
+        shown = ", ".join(f"{k}={_show(v)}" for k, v in sorted(bindings.items()))
+        label = f"{entry.ruleset} ({shown})" if shown else entry.ruleset
+        instantiated = _Instantiator(ruleset, bindings, label, errors).document(ruleset)
+        out.append(_Document(instantiated, label, label))
+        _apply_all(instantiated, label, (*chain, real), seen, out, errors)
 
 
 # ---------------------------------------------------------------------------
-# the per-document parsers
+# 2. declarations: regions and atoms across the composition
 # ---------------------------------------------------------------------------
 
 
-def _declare_regions(
-    loader: _Loader, documents: Sequence[_Document]
-) -> tuple[list[Region], dict[RegionId, Medium]]:
-    """``[regions]`` across the composition (EFFECTS.md): the state vocabulary. Two files
-    declaring the same name mean the same region -- the vocabulary is the shared thing -- so
-    identical declarations merge and differing ones are an error. A footprint is relative (to
-    the cwd of the check whose atom depends on the region) or absolute; a ruleset's footprints
-    are relative only, like its other locations."""
-    out: dict[RegionId, Region] = {}
-    declared_by: dict[RegionId, str] = {}
-    for doc in documents:
-        dl = _Loader(doc.label, loader.errors)
-        table = doc.top.get("regions", {})
-        if not isinstance(table, dict):
-            dl.error("regions", "expected a table")
-            continue
-        for name, spec_data in table.items():
-            path = f"regions.{name}"
-            spec = dl.table(path, spec_data, _REGION_KEYS)
-            is_network = dl.field(path, spec, "network", bool) or False
-            about = dl.field(path, spec, "about", str) or ""
-            footprint = _location_list(dl, path, spec, "footprint") if "footprint" in spec else None
-            if "footprint" in spec and not footprint:
-                continue  # malformed or empty: reported by _location_list
-            if doc.restricted and footprint and any(loc.absolute for loc in footprint):
-                dl.error(f"{path}.footprint", "a ruleset names no absolute locations")
-                continue
-            try:
-                r = region(name, footprint=footprint, network=is_network, about=about)
-            except ValueError as e:
-                dl.error(path, str(e))
-                continue
-            previous = out.get(r.name)
+@dataclass(frozen=True)
+class _Declared:
+    """The composition's vocabulary of names."""
+
+    regions: tuple[Region, ...]
+    atoms: Mapping[str, Atom]        # every nameable atom by spelling: built-ins, and each declared name as its kind
+    defined: tuple[AtomDef, ...]
+    pure: frozenset[str]
+    reads: Mapping[str, list[str]]   # environmental atom -> the regions it reads, as spelled
+
+    def atom(self, name: str, where: str, path: DocPath, errors: _Errors) -> Atom | None:
+        a = self.atoms.get(name)
+        if a is None:
+            errors.add(where, path, f"atom {name!r} is not declared in [atoms]")
+        return a
+
+    def atom_list(self, names: Sequence[str], where: str, path: DocPath, errors: _Errors) -> list[Atom]:
+        out = [self.atom(n, where, path, errors) for n in names]
+        return [a for a in out if a is not None]
+
+    def source_atom(self, name: str | None, where: str, path: DocPath, errors: _Errors) -> SourceId | None:
+        """The source atom a rule's ``source`` (or a ``[[source]]``'s ``name``) names: declared,
+        a source by the composition's own rules, and pure."""
+        if name is None:
+            return None
+        a = self.atom(name, where, path, errors)
+        if a is None:
+            return None
+        if not isinstance(a, SourceId):
+            errors.add(where, path, f"a source atom is a declared atom, not the built-in {name!r}")
+            return None
+        if name not in self.pure:
+            errors.add(where, path, f"a source atom is pure: declare {name!r} with pure = true")
+            return None
+        return a
+
+
+def _source_names(documents: Sequence[_Document]) -> frozenset[str]:
+    """Every atom name some rule yields as a source: what makes a declared name a source."""
+    names: set[str] = set()
+    for d in documents:
+        names.update(p.source for p in d.body.program if p.source is not None)
+        names.update(s.name for s in d.body.source)
+        if isinstance(d.body, PolicyDoc):
+            names.update(r.source for r in d.body.network if r.source is not None)
+    return frozenset(names)
+
+
+def _declare(documents: Sequence[_Document], errors: _Errors) -> _Declared:
+    regions: dict[str, Region] = {}
+    declared_by: dict[str, str] = {}
+    for d in documents:
+        for name, spec in d.body.regions.items():
+            path = Path().regions[name]
+            match spec:
+                case FootprintRegion(footprint=slot, about=about):
+                    if d.restricted and any(s.startswith("/") for s in slot):
+                        errors.add(d.label, path.footprint, "a ruleset names no absolute locations")
+                        continue
+                    r = region(name, footprint=[parse_location(s) for s in slot], about=about)
+                case NetworkRegion(about=about):
+                    r = region(name, network=True, about=about)
+            previous = regions.get(name)
             if previous is None:
-                out[r.name] = r
-                declared_by[r.name] = doc.label
+                regions[name] = r
+                declared_by[name] = d.label
             elif (previous.medium, previous.footprint) != (r.medium, r.footprint):
-                dl.error(
-                    path,
-                    f"region {name!r} is declared differently by {declared_by[r.name]}; one name, one region",
-                )
-    return list(out.values()), {r.name: r.medium for r in out.values()}
-
-
-def _declare_atoms(
-    loader: _Loader, documents: Sequence[_Document], regions: Mapping[RegionId, Medium]
-) -> tuple[list[AtomDef], frozenset[AtomId], frozenset[AtomId], dict[str, list[str]]]:
-    """``[atoms]`` across the composition: defined atoms, pure names, all declared names, and
-    what each environmental atom depends on (``reads``, by atom name, as spelled). A name is
-    declared once, whatever file declares it; two files declaring the same name is an error even
-    when the definitions agree (namespace by convention: ``unix.no-arg``)."""
-    atom_defs: list[AtomDef] = []
-    pure_names: set[AtomId] = set()
-    declared_by: dict[AtomId, str] = {}
-    reads_map: dict[str, list[str]] = {}
-    for doc in documents:
-        dl = _Loader(doc.label, loader.errors)
-        atoms_table = doc.top.get("atoms", {})
-        if not isinstance(atoms_table, dict):
-            dl.error("atoms", "expected a table")
-            continue
-        for name, spec_data in atoms_table.items():
-            path = f"atoms.{name}"
-            aid = AtomId(name)
-            if aid == NOT_OPTION:
-                dl.error(path, f"atom {name!r} is built in (the value does not begin with '-') and cannot be declared")
+                errors.add(d.label, path, f"region {name!r} is declared differently by {declared_by[name]}; one name, one region")
+    sources = _source_names(documents)
+    atoms: dict[str, Atom] = dict(BUILTIN_ATOMS)
+    pure_names: set[str] = set(BUILTIN_ATOMS)
+    defined: list[AtomDef] = []
+    reads: dict[str, list[str]] = {}
+    atom_by: dict[str, str] = {}
+    for d in documents:
+        for name, spec in d.body.atoms.items():
+            path = Path().atoms[name]
+            if name in atom_by:
+                errors.add(d.label, path, f"atom {name!r} is also declared by {atom_by[name]}; atom names are unique")
                 continue
-            if aid in declared_by:
-                dl.error(path, f"atom {name!r} is also declared by {declared_by[aid]}; atom names are unique")
-                continue
-            declared_by[aid] = doc.label
-            spec = dl.table(path, spec_data, _ATOM_KEYS)
-            meaning = dl.field(path, spec, "matches", str)
-            pure_flag = dl.field(path, spec, "pure", bool)
-            depends = dl.region_names(path, spec, "reads", regions)
-            if meaning is not None:
-                if pure_flag is False:
-                    dl.error(path, "a defined atom is pure by construction")
-                try:
-                    re.compile(meaning)
-                except re.error as e:
-                    dl.error(f"{path}.matches", f"bad regex: {e}")
-                    continue
-                atom_defs.append(atom(name, markers.matches(meaning)))
-                pure_names.add(aid)
-            elif pure_flag:
-                pure_names.add(aid)
-            if "reads" in spec:
-                if aid in pure_names:
-                    dl.error(f"{path}.reads", "a pure atom depends on no state; reads applies to environmental atoms")
-                elif depends is not None and not depends:
-                    dl.error(f"{path}.reads", "an atom that depends on nothing is pure; say pure = true")
-                elif depends is not None:
-                    reads_map[name] = depends
-    return atom_defs, frozenset(pure_names), frozenset(declared_by), reads_map
+            atom_by[name] = d.label
+            atoms[name] = SourceId(name) if name in sources else CheckId(name)
+            if spec.matches is not None:
+                defined.append(atom(name, markers.matches(spec.matches)))
+                pure_names.add(name)
+            elif spec.pure:
+                pure_names.add(name)
+            if spec.reads is not None:
+                # whether each name is a declared region (or a medium word) is Policy.allow's
+                # check, as for every `writes`: one rule, one place
+                reads[name] = list(spec.reads)
+    return _Declared(tuple(regions.values()), atoms, tuple(defined), frozenset(pure_names), reads)
 
 
-def _media_keys(
-    loader: _Loader, path: str, t: dict[str, Any], regions: Mapping[RegionId, Medium]
-) -> tuple[bool, bool | None, bool | None, list[str] | None]:
-    """A grant's ``effect-free``, ``network``, ``write`` and ``writes`` (EFFECTS.md)."""
-    return (
-        loader.field(path, t, "effect-free", bool) or False,
-        loader.field(path, t, "network", bool),
-        loader.field(path, t, "write", bool),
-        loader.region_names(path, t, "writes", regions),
-    )
+# ---------------------------------------------------------------------------
+# 3. rules: each document's vocabulary, built with the policy constructors
+# ---------------------------------------------------------------------------
 
 
-def _flagsets(
-    loader: _Loader, top: dict[str, Any], declared: frozenset[AtomId]
-) -> dict[FlagsetId, Flagset]:
-    """``[[flagset]]``: private to the document that declares them."""
-    flagsets: dict[FlagsetId, Flagset] = {}
-    for i, entry in enumerate(loader.entries("flagset", top)):
-        path = f"flagset[{i}]"
-        t = _open_table(loader, path, entry, _FLAGSET_KEYS)
-        if t is None:
-            continue
-        fname = loader.required_str(path, t, "name")
-        fs = _flag_vocabulary(loader, path, t, declared, _FLAGSET_KEYS, loader.str_list(path, t, "holes"))
-        if fname is None or fs is None:
-            continue
-        fid = FlagsetId(fname)
-        if fid in flagsets:
-            loader.error(path, f"flagset {fname!r} is declared twice")
-            continue
-        flagsets[fid] = fs
-    return flagsets
+def _resolve_checker(piece: str, where: str, path: DocPath, errors: _Errors) -> str | None:
+    """``${checkers}/<name>``: the executable in the config directory's ``checkers/``, which
+    must exist and be executable, so a policy naming a missing checker fails here."""
+    prefix = _CHECKERS + "/"
+    if not piece.startswith(prefix) or len(piece) == len(prefix):
+        errors.add(where, path, f"{_CHECKERS} may only head argv[0], as {_CHECKERS}/<name>")
+        return None
+    rel = pathlib.PurePosixPath(piece[len(prefix):])
+    if rel.is_absolute() or ".." in rel.parts:
+        errors.add(where, path, f"the checker name must be a relative path without '..': {piece!r}")
+        return None
+    checkers = config_dir() / "checkers"
+    resolved = checkers / rel
+    if not (resolved.is_file() and os.access(resolved, os.X_OK)):
+        errors.add(where, path, f"checker {rel} is not installed (executable) in {checkers}")
+        return None
+    return str(resolved)
 
 
-def _validations(
-    loader: _Loader,
-    top: dict[str, Any],
-    declared: frozenset[AtomId],
-    pure_names: frozenset[AtomId],
-    restricted: bool,
-    regions: Mapping[RegionId, Medium],
-) -> list[Validation]:
-    validations: list[Validation] = []
-    for i, entry in enumerate(loader.entries("validation", top)):
-        path = f"validation[{i}]"
-        t = loader.table(path, entry, _VALIDATION_KEYS)
-        name = loader.required_str(path, t, "name")
-        params = loader.str_list(path, t, "params")
-        if "argv" not in t:
-            loader.error(path, "argv is required")
-        raw_argv = loader.str_list(path, t, "argv")
-        if restricted and raw_argv and not (
-            raw_argv[0].startswith(_CHECKERS_VAR + "/") or raw_argv[0] in RULESET_STOCK_CHECKERS
-        ):
-            loader.error(
-                f"{path}.argv[0]",
-                f"a ruleset's validation runs {_CHECKERS_VAR}/<name> or one of "
-                f"{', '.join(sorted(RULESET_STOCK_CHECKERS))}, not {raw_argv[0]!r}",
-            )
-        argv: list[str | Param] = []
-        for j, piece in enumerate(raw_argv):
-            if _CHECKERS_VAR in piece:
-                resolved = _resolve_checker(loader, f"{path}.argv[{j}]", piece, j)
-                if resolved is not None:
-                    argv.append(resolved)
-                continue
-            try:
-                argv.append(_parse_argv_piece(piece))
-            except ValueError as e:
-                loader.error(f"{path}.argv", str(e))
-        # cwd is optional: omitted, the check does not care where it runs, and certora.check
-        # may be called without cwd=
-        cwd_given = "cwd" in t
-        cwd = loader.location_slot(path, t, "cwd") if cwd_given else None
-        effect_free, net_flag, write_flag, writes = _media_keys(loader, path, t, regions)
-        est_table = loader.table(
-            f"{path}.establishes", t.get("establishes", {}), frozenset(params) | {"cwd"}
-        )
-        establishes = {
-            key: [
-                pure(a) if a in pure_names else a
-                for a in loader.atom_names(f"{path}.establishes", est_table, key, declared)
-            ]
-            for key in est_table.keys() & (frozenset(params) | {"cwd"})
-        }
-        if name is None or (cwd_given and cwd is None) or not argv or len(argv) != len(raw_argv):
-            continue
+def _slot(slot: list[str]) -> list[Any]:
+    return [parse_location(s) for s in slot]
+
+
+class _Rules:
+    """One document's rules, resolved against the composition's declarations."""
+
+    def __init__(self, doc: _Document, declared: _Declared, errors: _Errors) -> None:
+        self.doc = doc
+        self.where = doc.label
+        self.declared = declared
+        self.errors = errors
+        self.flagsets: dict[FlagsetId, Flagset] = {}
+
+    def atoms(self, names: Sequence[str] | None, path: DocPath) -> list[Atom]:
+        return [] if names is None else self.declared.atom_list(names, self.where, path, self.errors)
+
+    def constraint(self, c: ConstraintFields, path: Path) -> Constraint | None:
+        regex = None
+        if c.matches is not None:
+            regex = RegexLit(c.matches)
+        elif c.one_of is not None:
+            regex = alternation(*(Exact(n) for n in c.one_of))
         try:
-            validations.append(
-                validation(
-                    name, argv=argv, cwd=cwd, params=params,
-                    establishes=establishes, effect_free=effect_free,
-                    network=net_flag, write=write_flag, writes=writes,
-                )
+            return Constraint(
+                tuple(_slot(c.location)) if c.location is not None else (),
+                regex,
+                frozenset(self.atoms(c.atoms, path.atoms)),
+                c.literal,
+                c.any,
             )
         except ValueError as e:
-            loader.error(path, str(e))
-    return validations
+            self.errors.add(self.where, path, str(e))
+            return None
 
+    def demands(self, d: Mapping[str, list[str]], path: Keyed) -> Demands:
+        out: dict[str, frozenset[Atom]] = {}
+        for target, names in d.items():
+            atoms = self.atoms(names, path[target])
+            if atoms:  # an empty list -- a ruleset's []-bound gate -- demands nothing
+                out[target] = frozenset(atoms)
+        return out
 
-def _rule_requires(
-    loader: _Loader, path: str, table: dict[str, Any], declared: frozenset[AtomId]
-) -> list[AtomId] | Demands | None:
-    """A rule's ``requires``: atoms of the cwd (a list), or a table ``{ cwd = [...], HOLE =
-    [...] }`` also demanding atoms of a hole's value. None when malformed (reported)."""
-    if isinstance(table.get("requires"), dict):
-        return _demands(loader, path, table["requires"], declared)
-    return loader.atom_names(path, table, "requires", declared)
+    def vocabulary(self, v: FlagVocabulary, path: Path, holes: Sequence[str] = ()) -> Flagset | None:
+        if v.any:
+            return Flagset(any=True)
+        bare = set(v.bare or ())
+        valued: dict[FlagName, Constraint] = {}
+        requires: dict[FlagName, Demands] = {}
+        ok = True
+        for name, e in v.flags.items():
+            at = path.key(name)  # "-k" = {...}: a key of the vocabulary's own table
+            if e.requires is not None:
+                requires[FlagName(name)] = self.demands(e.requires, at.requires)
+            if e.value is False:
+                bare.add(name)
+                continue
+            c = self.constraint(e, at)
+            if c is None:
+                ok = False
+            else:
+                valued[FlagName(name)] = c
+        if not ok:
+            return None
+        try:
+            return Flagset(
+                frozenset(FlagName(b) for b in bare), valued, requires=requires,
+                holes=frozenset(HoleName(h) for h in holes),
+            )
+        except ValueError as e:
+            self.errors.add(self.where, path, str(e))
+            return None
 
+    def declare_flagsets(self) -> None:
+        for i, f in enumerate(self.doc.body.flagset):
+            fs = self.vocabulary(f, Path().flagset(i), f.holes or ())
+            if fs is not None:
+                self.flagsets[FlagsetId(f.name)] = fs
 
-def _programs(
-    loader: _Loader,
-    top: dict[str, Any],
-    declared: frozenset[AtomId],
-    pure_names: frozenset[AtomId],
-    flagsets: Mapping[FlagsetId, Flagset],
-    origin: str | None,
-    regions: Mapping[RegionId, Medium],
-) -> list[Program]:
-    programs: list[Program] = []
-    for i, entry in enumerate(loader.entries("program", top)):
-        path = f"program[{i}]"
-        if isinstance(entry, dict):
-            for k in sorted(_RETIRED_PROGRAM_KEYS & entry.keys()):
-                loader.error(
-                    path,
-                    f"{k!r} is no longer a rule key: a rule is its words alone, or a template "
-                    "(argv + holes) whose holes say what each argument is (a location, a regex, "
-                    "atoms, or any = true)",
+    def hole(self, spec: HoleSpec, path: Path) -> Hole | None:
+        match spec:
+            case str():
+                self.errors.add(self.where, path, 'a hole is a table; a constraint parameter ("${name}") is substituted only inside a ruleset')
+                return None
+            case FlagsetRef(flagset=ref):
+                fs = self.flagsets.get(FlagsetId(ref))
+                if fs is None:
+                    self.errors.add(self.where, path.key("flagset"), f"flagset {ref!r} is not declared")
+                    return None
+                return Flags(fs)
+            case FlagsHole():
+                fs = self.vocabulary(spec, path)
+                return None if fs is None else Flags(fs)
+            case EachHole(min=minimum):
+                c = self.constraint(spec, path)
+                return None if c is None else Each(c, minimum)
+            case TokenHole():
+                c = self.constraint(spec, path)
+                return None if c is None else Token(c)
+
+    def source_atom(self, name: str | None, path: DocPath) -> SourceId | None:
+        return self.declared.source_atom(name, self.where, path, self.errors)
+
+    def validations(self) -> list[Validation]:
+        out: list[Validation] = []
+        for i, v in enumerate(self.doc.body.validation):
+            path = Path().validation(i)
+            if self.doc.restricted and not (v.argv[0].startswith(_CHECKERS + "/") or v.argv[0] in RULESET_STOCK_CHECKERS):
+                self.errors.add(
+                    self.where, path.argv(0),
+                    f"a ruleset's validation runs {_CHECKERS}/<name> or one of "
+                    f"{', '.join(sorted(RULESET_STOCK_CHECKERS))}, not {v.argv[0]!r}",
                 )
-            entry = {k: v for k, v in entry.items() if k not in _RETIRED_PROGRAM_KEYS}
-        t = loader.table(path, entry, _PROGRAM_KEYS)
-        name = loader.required_str(path, t, "name")
-        cwd = loader.location_slot(path, t, "cwd")
-        yields = _source_atom(loader, path, t, "source", declared, pure_names)
-        effect_free, net_flag, write_flag, writes = _media_keys(loader, path, t, regions)
-        if "argv" in t:
-            # a templated form (TEMPLATES.md): the shape is argv + holes; its leading words are
-            # the argv's literal head, so a subcommand has no place on it
-            legacy = "subcommand" in t
-            if legacy:
-                loader.error(path, "a templated rule carries no subcommand; its leading words are the argv's literal head")
-            pieces = _pieces(loader, path, loader.str_list(path, t, "argv"))
-            holes_table = t.get("holes", {})
-            if not isinstance(holes_table, dict):
-                loader.error(f"{path}.holes", "expected a table of holes")
-                holes_table = {}
+            argv: list[str | Param] = []
+            for j, piece in enumerate(v.argv):
+                if piece.startswith(_CHECKERS):
+                    resolved = _resolve_checker(piece, self.where, path.argv(j), self.errors)
+                    if resolved is not None:
+                        argv.append(resolved)
+                    continue
+                # here ${p} names one of the validation's own params (the schema checked the
+                # spelling; `validation()` checks the name is declared)
+                name = reference(piece)
+                argv.append(piece if name is None else Param(ParamName(name)))
+            establishes = {
+                key: [pure(a) if a in self.declared.pure else a for a in self.atoms(names, path.establishes[key])]
+                for key, names in v.establishes.items()
+            }
+            if len(argv) != len(v.argv):
+                continue
+            try:
+                out.append(validation(
+                    v.name, argv=argv, cwd=None if v.cwd is None else _slot(v.cwd), params=v.params,
+                    establishes=establishes, effect_free=v.effect_free, network=v.network, write=v.write,
+                    writes=v.writes,
+                ))
+            except ValueError as e:
+                self.errors.add(self.where, path, str(e))
+        return out
+
+    def programs(self) -> list[Program]:
+        out: list[Program] = []
+        for i, p in enumerate(self.doc.body.program):
+            path = Path().program(i)
+            yields = self.source_atom(p.source, path.key("source"))
+            if isinstance(p.requires, dict):
+                requires: list[Atom] | Demands = self.demands(p.requires, path.requires)
+            else:
+                requires = self.atoms(p.requires, path.requires)
+            pieces: list[Piece] | None = None
             holes: dict[str, Hole] = {}
-            ok = pieces is not None and not legacy
-            for hname, spec in holes_table.items():
-                hpath = f"{path}.holes.{hname}"
-                if isinstance(spec, str):
-                    # a ruleset's `holes.X = "${p}"` was substituted at instantiation; one that
-                    # survives is a reference the root cannot make
-                    loader.error(hpath, "a hole is a table; a constraint parameter (\"${name}\") is substituted only inside a ruleset")
-                    ok = False
+            if p.argv is not None:
+                pieces = [_piece(w) for w in p.argv]
+                ok = True
+                for hname, spec in (p.holes or {}).items():
+                    h = self.hole(spec, path.holes[hname])
+                    if h is None:
+                        ok = False
+                    else:
+                        holes[hname] = h
+                if not ok:
                     continue
-                sub = _open_table(loader, hpath, spec, _HOLE_KEYS)
-                if sub is None:
-                    ok = False
-                    continue
-                h = _hole(loader, hpath, sub, flagsets, declared)
-                if h is None:
-                    ok = False
-                else:
-                    holes[hname] = h
-            if not ok or name is None or cwd is None or pieces is None:
-                continue
-            requires = _rule_requires(loader, path, t, declared)
-            if requires is None:
-                continue
             try:
-                programs.append(
-                    program(
-                        name,
-                        cwd=cwd,
-                        requires=requires,
-                        argv=pieces,
-                        holes=holes,
-                        origin=origin,
-                        source=yields,
-                        effect_free=effect_free,
-                        network=net_flag,
-                        write=write_flag,
-                        writes=writes,
-                    )
-                )
+                out.append(program(
+                    p.name, cwd=_slot(p.cwd), subcommand=p.subcommand or (), requires=requires,
+                    argv=pieces, holes=holes if pieces is not None else None, origin=self.doc.origin,
+                    source=yields, effect_free=p.effect_free, network=p.network, write=p.write, writes=p.writes,
+                ))
             except ValueError as e:
-                loader.error(path, str(e))
-            continue
-        if "holes" in t:
-            loader.error(path, "holes need an argv template")
-            continue
-        requires = _rule_requires(loader, path, t, declared)
-        if name is None or cwd is None or requires is None:
-            continue
+                self.errors.add(self.where, path, str(e))
+        return out
+
+    def sources(self) -> list[Source]:
+        out: list[Source] = []
+        for i, s in enumerate(self.doc.body.source):
+            name = self.source_atom(s.name, Path().source(i).name)
+            if name is not None:
+                out.append(source(name, _slot(s.location)))
+        return out
+
+
+def _piece(word: str) -> Piece:
+    ref = hole_reference(word)
+    return word if ref is None else HoleRef(HoleName(ref[0]), ref[1])
+
+
+def _network(root: PolicyDoc, where: str, declared: _Declared, errors: _Errors) -> list[NetworkRule]:
+    out: list[NetworkRule] = []
+    for i, r in enumerate(root.network):
+        path = Path().network(i)
+        requires: list[str | RequiredAtom] = []
+        for j, entry in enumerate(r.requires or ()):
+            name, mode = (entry, None) if isinstance(entry, str) else (entry.atom, entry.on_redirect)
+            a = declared.atom(name, where, path.requires.at(j), errors)
+            if a is not None:
+                requires.append(RequiredAtom(a, mode))
         try:
-            programs.append(
-                program(
-                    name,
-                    cwd=cwd,
-                    subcommand=loader.field(path, t, "subcommand", str) or (),
-                    requires=requires,
-                    origin=origin,
-                    source=yields,
-                    effect_free=effect_free,
-                    network=net_flag,
-                    write=write_flag,
-                    writes=writes,
-                )
-            )
+            out.append(network(
+                r.host, path=_slot(r.path) if r.path is not None else (), schemes=r.schemes or ("https",),
+                ports=r.ports or (), methods=r.methods or (), allow_nonpublic=r.allow_nonpublic,
+                requires=requires, read_timeout=r.read_timeout, total_timeout=r.total_timeout,
+                max_response_bytes=r.max_response_bytes,
+                source=declared.source_atom(r.source, where, path.key("source"), errors),
+                writes=r.writes,
+            ))
         except ValueError as e:
-            loader.error(path, str(e))
-    return programs
+            errors.add(where, path, str(e))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# entry points
+# ---------------------------------------------------------------------------
 
 
 def from_data(data: object, where: str = "<policy>") -> Policy:
     """The Policy a parsed document (TOML or JSON, as a dict) declares, with every ruleset it
-    applies; raises ``PolicyFileError`` with every problem found in every file. This is also the
-    entry point for machine-synthesized policies, which need never touch a file."""
-    loader = _Loader(where)
-    top = loader.table("policy", data, _TOP_KEYS)
-
-    if "policy-version" not in top:
-        loader.error("policy", "policy-version = 1 is required")
-    else:
-        version = loader.field("policy", top, "policy-version", int)
-        if version is not None and version != 1:
-            loader.error("policy", f"unsupported policy-version {version}")
-
-    # the self-identification for ambiently-discovered policies (policydir): which sandbox
-    # root this document governs. Optional here; the ambient lookup requires and matches it.
-    root_id = loader.field("policy", top, "root", str)
-    if root_id is not None and not root_id.startswith("/"):
-        loader.error("policy.root", "expected an absolute path")
-
-    fs = loader.table("filesystem", top.get("filesystem", {}), frozenset({"read", "write", "list"}))
-    read = loader.locations("filesystem", fs, "read")
-    write = loader.locations("filesystem", fs, "write")
-    listing = loader.locations("filesystem", fs, "list")
-
-    # pass 1: the composition -- the root and every ruleset it applies, instantiated. The root
-    # has no parameters, so its `when`s are literal toggles
-    top = _enable(loader, top, {}, {})
-    documents = [_Document(top, where, None, False)]
-    _apply_all(loader, top, (), {}, documents)
-    # pass 2: regions, then atoms, across the composition, so any document may reference any
-    # other's
-    region_list, regions = _declare_regions(loader, documents)
-    atom_defs, pure_names, declared, reads_map = _declare_atoms(loader, documents, regions)
-    # pass 3: each document's vocabulary; flagsets stay private to their document
+    applies; raises ``PolicyFileError`` with every problem found in every file."""
+    errors = _Errors()
+    try:
+        root = parse_policy(data, where)
+    except SchemaError as e:
+        errors.schema(e)
+        errors.raise_if_any()
+        raise AssertionError("unreachable")
+    documents = _compose(root, where, errors)
+    declared = _declare(documents, errors)
     validations: list[Validation] = []
     programs: list[Program] = []
     sources: list[Source] = []
-    for doc in documents:
-        dl = loader if doc.origin is None else _Loader(doc.label, loader.errors)
-        flagsets = _flagsets(dl, doc.top, declared)
-        validations += _validations(dl, doc.top, declared, pure_names, doc.restricted, regions)
-        programs += _programs(dl, doc.top, declared, pure_names, flagsets, doc.origin, regions)
-        sources += _sources(dl, doc.top, declared, pure_names)
-
-    net_rules: list[NetworkRule] = []
-    for i, entry in enumerate(loader.entries("network", top)):
-        path = f"network[{i}]"
-        t = loader.table(path, entry, _NETWORK_KEYS)
-        host = loader.required_str(path, t, "host")
-        paths = _location_list(loader, path, t, "path")
-        if host is None or paths is None:
-            continue
-        try:
-            net_rules.append(
-                network(
-                    host,
-                    path=paths,
-                    schemes=loader.str_list(path, t, "schemes") or ("https",),
-                    ports=loader.int_list(path, t, "ports"),
-                    methods=loader.str_list(path, t, "methods"),
-                    allow_nonpublic=loader.field(path, t, "allow-nonpublic", bool) or False,
-                    requires=loader.required_atoms(path, t, "requires", declared),
-                    read_timeout=loader.number(path, t, "read-timeout"),
-                    total_timeout=loader.number(path, t, "total-timeout"),
-                    max_response_bytes=loader.field(path, t, "max-response-bytes", int),
-                    source=_source_atom(loader, path, t, "source", declared, pure_names),
-                    writes=loader.region_names(path, t, "writes", regions),
-                )
-            )
-        except ValueError as e:
-            loader.error(path, str(e))
-
-    if loader.errors:
-        raise PolicyFileError("\n".join(loader.errors))
+    for d in documents:
+        rules = _Rules(d, declared, errors)
+        rules.declare_flagsets()
+        validations += rules.validations()
+        programs += rules.programs()
+        sources += rules.sources()
+    top = documents[0].body
+    assert isinstance(top, PolicyDoc)
+    net_rules = _network(top, where, declared, errors)
+    errors.raise_if_any()
     try:
         return Policy.allow(
-            read=read, write=write, listing=listing,
-            programs=programs, validations=validations, atoms=atom_defs,
-            network=net_rules, sources=sources, regions=region_list, reads=reads_map,
+            read=_slot(top.filesystem.read) if top.filesystem.read else [],
+            write=_slot(top.filesystem.write) if top.filesystem.write else [],
+            listing=_slot(top.filesystem.list_) if top.filesystem.list_ else [],
+            programs=programs, validations=validations, atoms=declared.defined,
+            network=net_rules, sources=sources, regions=declared.regions, reads=declared.reads,
         )
     except ValueError as e:
-        raise PolicyFileError(f"{where}: {e}")
+        raise PolicyFileError(f"{where}: {e}") from None
 
 
 def load_policy_file(path: pathlib.Path) -> Policy:
@@ -1476,12 +910,12 @@ def load_policy_file(path: pathlib.Path) -> Policy:
             try:
                 data: object = tomllib.loads(text)
             except tomllib.TOMLDecodeError as e:
-                raise PolicyFileError(f"{path}: {e}")
+                raise PolicyFileError(f"{path}: {e}") from None
         case ".json":
             try:
                 data = json.loads(text)
             except json.JSONDecodeError as e:
-                raise PolicyFileError(f"{path}: {e}")
+                raise PolicyFileError(f"{path}: {e}") from None
         case _:
-            raise PolicyFileError(f"{path}: expected a .toml or .json policy document")
+            raise PolicyFileError(f"{path}: expected a .toml or .json policy file")
     return from_data(data, str(path))

@@ -434,6 +434,7 @@ no_slash = Atom("no-slash")
 no_parent_traversal = Atom("no-parent-traversal")
 not_absolute = Atom("not-absolute")
 not_dot_dot = Atom("not-dot-dot")
+not_option = Atom("not-option")  # the text does not begin with "-": no tool reads it as an option
 
 
 @dataclass(frozen=True)
@@ -487,6 +488,13 @@ class Validated:
 
 
 @dataclass(frozen=True)
+class Source:
+    """The value came, unmodified, from the rule that yields the named source atom(s)
+    (``extract`` and friends): provenance, never established by a check or a literal."""
+    tags: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class Url:
     """The value is a URL: claims about its urlsplit reading (``analysis.UrlString``). Each
     component given is a claim; an omitted one claims nothing."""
@@ -497,6 +505,10 @@ class Url:
 
 def validated(*tags: str) -> Validated:
     return Validated(tags)
+
+
+def source(*tags: str) -> Source:
+    return Source(tags)
 
 
 def url(

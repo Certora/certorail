@@ -12,7 +12,7 @@ authors = [
     {name = "Certora Ltd."}
 ]
 
-dependencies = ["typing-extensions"]
+dependencies = ["typing-extensions", "pyright", "pydantic"]
 
 # `uv tool install .` puts `certorail` on the PATH: analyse, check against the default
 # policy, and run --  `certorail program.py [--root DIR] [--check] [-- ARG ...]`

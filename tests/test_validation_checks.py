@@ -13,13 +13,13 @@ import unittest
 
 from certorail import markers
 from certorail.broker import build_server
-from certorail.analysis import RegexLit, checks_of
+from certorail.analysis import RegexLit, atoms_of
 from certorail.effects import EVERYTHING, NOTHING
 from certorail.host import Accepted, Rejected
 from certorail.host import check as host_check
 from certorail.markers import CheckFailed
 from certorail.policy import Policy, atom, constraint, hole, param, program, pure, splice, validation
-from certorail.ids import AtomId, ParamName, ProgramName, ValidationName
+from certorail.ids import BUILTIN_ATOMS, AtomId, ParamName, ProgramName, ValidationName
 from certorail.templates import Each, Token
 from certorail.walker import CheckSignature, CheckSite, ExecSite, Report, Vocabulary, WriteTable, analyze
 
@@ -68,7 +68,7 @@ class TestGen(unittest.TestCase):
         report = run(REPO + CHECK + EXEC)
         self.assertEqual(report.violations, [])
         (site,) = exec_sites(report)
-        self.assertEqual(checks_of(site.cwd), frozenset({"org-checkout"}))
+        self.assertEqual(atoms_of(site.cwd), frozenset({"org-checkout"}))
 
     def test_the_check_site_itself_is_reported(self) -> None:
         report = run(REPO + CHECK)
@@ -99,47 +99,47 @@ class TestKill(unittest.TestCase):
     def test_an_instantiation_kills_environment_atoms(self) -> None:
         report = run("class Box:\n    pass\n" + REPO + CHECK + "Box()\n" + EXEC)
         (site,) = exec_sites(report)
-        self.assertEqual(checks_of(site.cwd), frozenset())
+        self.assertEqual(atoms_of(site.cwd), frozenset())
 
     def test_effect_free_calls_do_not_kill(self) -> None:
         report = run(REPO + CHECK + "msg = str(repo)\nprint(msg)\nxs = sorted([3, 1])\n" + EXEC)
         (site,) = exec_sites(report)
-        self.assertEqual(checks_of(site.cwd), frozenset({"org-checkout"}))
+        self.assertEqual(atoms_of(site.cwd), frozenset({"org-checkout"}))
 
     def test_effect_free_checkers_stack(self) -> None:
         report = run(REPO + CHECK + 'certora.check("clean-tree", cwd=repo)\n' + EXEC)
         (site,) = exec_sites(report)
-        self.assertEqual(checks_of(site.cwd), frozenset({"org-checkout", "clean"}))
+        self.assertEqual(atoms_of(site.cwd), frozenset({"org-checkout", "clean"}))
 
     def test_an_effectful_checker_kills_prior_environment_atoms(self) -> None:
         report = run(REPO + 'certora.check("clean-tree", cwd=repo)\n' + CHECK + EXEC)
         (site,) = exec_sites(report)
-        self.assertEqual(checks_of(site.cwd), frozenset({"org-checkout"}))
+        self.assertEqual(atoms_of(site.cwd), frozenset({"org-checkout"}))
 
     def test_reassignment_kills(self) -> None:
         report = run(REPO + CHECK + REPO + EXEC)
         (site,) = exec_sites(report)
-        self.assertEqual(checks_of(site.cwd), frozenset())
+        self.assertEqual(atoms_of(site.cwd), frozenset())
 
     def test_loop_boundary_kills_environment_atoms(self) -> None:
         report = run(REPO + CHECK + "for i in [1]:\n    " + EXEC)
         (site,) = exec_sites(report)
-        self.assertEqual(checks_of(site.cwd), frozenset())
+        self.assertEqual(atoms_of(site.cwd), frozenset())
 
     def test_check_inside_the_loop_survives_to_its_use(self) -> None:
         report = run(REPO + "for i in [1]:\n    " + CHECK.replace("\n", "\n    ") + EXEC)
         (site,) = exec_sites(report)
-        self.assertEqual(checks_of(site.cwd), frozenset({"org-checkout"}))
+        self.assertEqual(atoms_of(site.cwd), frozenset({"org-checkout"}))
 
     def test_a_branch_only_check_does_not_survive_the_join(self) -> None:
         report = run(REPO + 'if "a" in "ab":\n    ' + CHECK + EXEC)
         (site,) = exec_sites(report)
-        self.assertEqual(checks_of(site.cwd), frozenset())
+        self.assertEqual(atoms_of(site.cwd), frozenset())
 
     def test_the_handler_does_not_see_the_check(self) -> None:
         report = run(REPO + "try:\n    " + CHECK + "except Exception:\n    " + EXEC)
         (site,) = exec_sites(report)
-        self.assertEqual(checks_of(site.cwd), frozenset())
+        self.assertEqual(atoms_of(site.cwd), frozenset())
 
 
 CLONE = (
@@ -182,7 +182,7 @@ class TestContracts(unittest.TestCase):
     def test_the_rely_seeds_the_body(self) -> None:
         report = run(PUSH + REPO + CHECK + "push(repo)\n")
         self.assertTrue(
-            any(checks_of(s.cwd) == frozenset({"org-checkout"}) for s in exec_sites(report))
+            any(atoms_of(s.cwd) == frozenset({"org-checkout"}) for s in exec_sites(report))
         )
 
     def test_guarantee_established_by_a_check(self) -> None:
@@ -246,7 +246,7 @@ class TestPolicy(unittest.TestCase):
                         ValidationName("org-repo"), (), {CWD: frozenset({AtomId("org-checkout")})}
                     )
                 },
-                pure_atoms=frozenset({AtomId("not-option")}),  # the built-in is always in scope
+                pure_atoms=frozenset(BUILTIN_ATOMS.values()),  # the built-ins are always in scope
                 # the one exec rule declares no media, so it writes everything (EFFECTS.md)
                 writes=WriteTable(exec=((ProgramName("git"), ("log",), EVERYTHING),)),
             ),

@@ -8,7 +8,18 @@ from typing import Any, cast, Callable, Literal, Mapping, Sequence
 from dataclasses import dataclass, is_dataclass, replace
 
 from .dangerous import INERT_BUILTIN_TYPES, INERT_BUILTIN_VALUES, NAMESPACE, inert_condition
-from .ids import AtomId
+from .ids import (
+    BUILTIN_ATOMS,
+    NO_PARENT_TRAVERSAL,
+    NO_SLASH,
+    NOT_ABSOLUTE,
+    NOT_DOT_DOT,
+    NOT_OPTION,
+    Atom,
+    AtomId,
+    AtomIdName,
+    SourceId,
+)
 
 sensitive_builtins = (
     "getattr",
@@ -30,50 +41,8 @@ sensitive_builtins = (
     "slice",
 )
 
-validator_funcs = frozenset([
-    "certora_within",
-    "certora_matches"
-])
-
 def is_dunder(x: str) -> bool:
     return x.startswith("__") and x.endswith("__")
-
-@dataclass
-class RegexMatch:
-    regex: str
-
-@dataclass
-class PathConfinement:
-    confined_path: str
-
-type ContainerSort = Literal["set", "list", "dict_key", "dict_val", "tuple"]
-
-@dataclass
-class ContainerOf:
-    of: "ValidationRule"
-    sort: ContainerSort
-
-
-type ValidationRule = PathConfinement | RegexMatch | ContainerOf
-
-@dataclass
-class ValidatedUsage:
-    ident: str
-    validation_rule: ValidationRule
-
-@dataclass
-class OpenCall:
-    where: ast.AST
-    mode: str
-    target: str | list[ValidationRule]
-
-type AuditEvents = OpenCall
-
-@dataclass
-class Validated:
-    ident: str
-    validations: list[ValidationRule]
-
 
 @dataclass
 class NameAccess:
@@ -728,13 +697,22 @@ def subsumes(general: Component, specific: Component) -> bool:
             return False
 
 
-# "not-dot-dot": the string is not exactly "..". Together with "no-slash" it implies
-# "no-parent-traversal" (a single component traverses upward only if it is exactly "..").
-type AtomicFact = Literal["no-slash", "no-parent-traversal", "not-absolute", "not-dot-dot"]
+# The built-in atoms (ids.BUILTIN_ATOMS, ATOMS.md): structural properties of a value, derived
+# from its text or location by ``holds`` below. "not-dot-dot": the string is not exactly "..".
+# Together with "no-slash" it implies "no-parent-traversal" (a single component traverses upward
+# only if it is exactly ".."). "not-option": the string does not begin with "-".
+type AtomicFact = AtomId
 
-ALL_ATOMS: frozenset[AtomicFact] = frozenset(
-    {"no-slash", "no-parent-traversal", "not-absolute", "not-dot-dot"}
-)
+# the four path atoms: what a listed name (os.listdir, iterdir) or a matched component carries.
+# Not not-option -- "-rf" is a perfectly good file name
+PATH_ATOMS: frozenset[AtomId] = frozenset({NO_SLASH, NO_PARENT_TRAVERSAL, NOT_ABSOLUTE, NOT_DOT_DOT})
+
+
+def carried(atoms: frozenset[Atom]) -> frozenset[Atom]:
+    """*atoms* less the built-ins: what a value keeps when it changes reading (text to path,
+    text to URL). A built-in is a property of the text; the new reading derives its own."""
+    return frozenset(a for a in atoms if a not in BUILTIN_ATOMS)
+
 
 def _explicit_check_no_parent(regex: PseudoRegex) -> bool:
     match regex:
@@ -789,30 +767,188 @@ def _explicit_check_not_dot_dot(regex: PseudoRegex) -> bool:
         case Both(all_of=parts):
             return any(_explicit_check_not_dot_dot(p) for p in parts)
 
-def _explicit_check(other: AtomicFact, regex: PseudoRegex) -> bool:
-    match other:
-        case "no-parent-traversal":
-            return _explicit_check_no_parent(regex)
-        case "no-slash":
-            return _explicit_check_no_slash(regex)
-        case "not-absolute":
-            return _explicit_check_not_absolute(regex)
-        case "not-dot-dot":
-            return _explicit_check_not_dot_dot(regex)
+# The regex parser behind ``re.compile`` (``sre_parse`` of old). Private, so reached by name and
+# typed Any; it is the one parser whose reading of a pattern is the reading that will be enforced.
+_RE_PARSER: Any = getattr(re, "_parser")
+_RE_CONSTANTS: Any = getattr(re, "_constants")
+_DASH = ord("-")
 
-def _holds(atom: AtomicFact, atoms: frozenset[AtomicFact], regex: PseudoRegex) -> bool:
-    """Does *atom* hold, either as stated, as derivable from the regex, or as implied by other atoms?"""
-    if atom in atoms or _explicit_check(atom, regex):
+
+def _charset_has_dash(items: Any) -> bool:
+    """Does a bracket class (the ``IN`` operand) admit ``-``? Literals, ranges and the ``\\d``,
+    ``\\w``, ``\\s`` categories (their negations admit it), under an optional ``NEGATE``."""
+    negate = False
+    hit = False
+    for op, av in items:
+        if op is _RE_CONSTANTS.NEGATE:
+            negate = True
+        elif op is _RE_CONSTANTS.LITERAL:
+            hit = hit or av == _DASH
+        elif op is _RE_CONSTANTS.RANGE:
+            lo, hi = av
+            hit = hit or lo <= _DASH <= hi
+        elif op is _RE_CONSTANTS.CATEGORY:
+            hit = hit or "NOT" in str(av)  # \D \W \S match "-"; \d \w \s do not
+        else:
+            return True  # anything unforeseen: may
+    return hit != negate
+
+
+def _first(sub: Any) -> tuple[bool, bool]:
+    """Of a parsed (sub)pattern: (may its first matched character be ``-``, can it match the
+    empty string). A sequence's first character comes from its first non-nullable item and
+    everything nullable before it."""
+    may = False
+    for op, av in sub:
+        item_may, item_nullable = _first_item(op, av)
+        may = may or item_may
+        if not item_nullable:
+            return may, False
+    return may, True
+
+
+def _first_item(op: Any, av: Any) -> tuple[bool, bool]:
+    c = _RE_CONSTANTS
+    if op is c.LITERAL:
+        return av == _DASH, False
+    if op is c.NOT_LITERAL:
+        return av != _DASH, False
+    if op is c.ANY:
+        return True, False
+    if op is c.IN:
+        return _charset_has_dash(av), False
+    if op is c.AT or op is c.ASSERT or op is c.ASSERT_NOT:
+        return False, True  # zero-width; ignoring a lookaround only widens "may": sound
+    if op is c.SUBPATTERN:
+        return _first(av[3])
+    if op is c.ATOMIC_GROUP:
+        return _first(av)
+    if op is c.BRANCH:
+        results = [_first(b) for b in av[1]]
+        return any(m for m, _ in results), any(n for _, n in results)
+    if op in (c.MAX_REPEAT, c.MIN_REPEAT, c.POSSESSIVE_REPEAT):
+        lo, _, body = av
+        body_may, body_nullable = _first(body)
+        return body_may, lo == 0 or body_nullable
+    if op is c.GROUPREF_EXISTS:
+        _, yes, no = av
+        yes_may, yes_nullable = _first(yes)
+        no_may, no_nullable = _first(no) if no is not None else (False, True)
+        return yes_may or no_may, yes_nullable or no_nullable
+    return True, True  # GROUPREF and anything unforeseen: may, and may be empty
+
+
+def _literal_regex_may_start_with_dash(reg: str) -> bool:
+    """Could a string this regex fullmatches begin with ``-``? Decided on the parse tree the
+    ``re`` module itself builds; an unparsable pattern is "may"."""
+    try:
+        parsed = _RE_PARSER.parse(reg)
+    except re.error:
         return True
-    match atom:
-        case "not-absolute":
-            # a string without "/" cannot start with one
-            return _holds("no-slash", atoms, regex)
-        case "no-parent-traversal":
-            # a single component traverses upward only if it is exactly ".."
-            return _holds("no-slash", atoms, regex) and _holds("not-dot-dot", atoms, regex)
+    may, _ = _first(parsed)
+    return may
+
+
+def _regex_may_start_with_dash(r: PseudoRegex) -> bool:
+    match r:
+        case Exact(exact_str=s):
+            return s.startswith("-")
+        case Alternation(any_of=branches):
+            return any(_regex_may_start_with_dash(b) for b in branches)
+        case Concat(seq=pieces):
+            head = pieces[0]
+            if head == Exact(""):
+                return _regex_may_start_with_dash(concat(*pieces[1:])) if len(pieces) > 1 else False
+            return _regex_may_start_with_dash(head)
+        case Both(all_of=parts):
+            return all(_regex_may_start_with_dash(p) for p in parts)
+        case RegexLit(reg=reg):
+            return _literal_regex_may_start_with_dash(reg)
+        case AnyStr():
+            return True
+
+
+def _explicit_check(other: AtomId, regex: PseudoRegex) -> bool:
+    """Does the text's regex alone establish the built-in *other*?"""
+    if other == NO_PARENT_TRAVERSAL:
+        return _explicit_check_no_parent(regex)
+    if other == NO_SLASH:
+        return _explicit_check_no_slash(regex)
+    if other == NOT_ABSOLUTE:
+        return _explicit_check_not_absolute(regex)
+    if other == NOT_DOT_DOT:
+        return _explicit_check_not_dot_dot(regex)
+    if other == NOT_OPTION:
+        return not _regex_may_start_with_dash(regex)
+    return False
+
+
+def _holds(atom: Atom, atoms: frozenset[Atom], regex: PseudoRegex) -> bool:
+    """Does *atom* hold of a text value: as stated, or -- for a built-in -- as derivable from the
+    regex or implied by other built-ins? A policy atom holds only as stated; whether the
+    vocabulary can supply it from the text is ``Vocabulary.missing``'s question."""
+    if atom in atoms:
+        return True
+    if atom not in BUILTIN_ATOMS:
+        return False
+    if _explicit_check(BUILTIN_ATOMS[atom], regex):
+        return True
+    # the implication table
+    if atom == NOT_ABSOLUTE:
+        # a string without "/" cannot start with one
+        return _holds(NO_SLASH, atoms, regex)
+    if atom == NO_PARENT_TRAVERSAL:
+        # a single component traverses upward only if it is exactly ".."
+        return _holds(NO_SLASH, atoms, regex) and _holds(NOT_DOT_DOT, atoms, regex)
+    if atom == NOT_DOT_DOT:
+        # a string with no ".." part is not the string ".."
+        return NO_PARENT_TRAVERSAL in atoms or _explicit_check_no_parent(regex)
+    return False
+
+
+def holds(atom: Atom, fact: "ValidationFact") -> bool:
+    """Does *atom* hold of *fact*, structurally? Stated atoms hold of every fact; a built-in also
+    by derivation from a text fact's regex and atoms, and -- for ``not-option`` -- from a located
+    value's head: an absolute path begins with "/", a path under a literally named directory
+    with that name. Nothing else is derivable of a located or URL value, whose text is not
+    tracked."""
+    match fact:
+        case StrFact(regex=regex, atoms=atoms):
+            return _holds(atom, atoms, regex)
+        case PathFact(atoms=atoms):
+            return _holds(atom, atoms, ANY_STR)
+        case Located(location=loc, atoms=atoms):
+            if atom in atoms:
+                return True
+            if atom != NOT_OPTION:
+                return False
+            if loc.absolute:
+                return True
+            components = loc.path_components if isinstance(loc, StaticPath) else loc.static_prefix
+            if not components:
+                # "." itself for a StaticPath; for a DirSplat the first component is unknown
+                return isinstance(loc, StaticPath)
+            match components[0]:
+                case Named(name=n):
+                    return not n.startswith("-")
+                case OneOf(names=ns):
+                    return not any(n.startswith("-") for n in ns)
+                case _:
+                    return False
+        case UrlString(atoms=atoms):
+            return atom in atoms
+
+
+def may_start_with_dash(value: "str | ValidationFact | None") -> bool:
+    """Could this token's text begin with ``-``, and so be read by a tool as an option? True
+    unless its structure shows otherwise (``holds`` of ``not-option``)."""
+    match value:
+        case str():
+            return value.startswith("-")
+        case None:
+            return True
         case _:
-            return False
+            return not holds(NOT_OPTION, value)
 
 # ---------------------------------------------------------------------------
 # Facts
@@ -827,23 +963,29 @@ def _holds(atom: AtomicFact, atoms: frozenset[AtomicFact], regex: PseudoRegex) -
 # Going into text is giving up on the path (or URL) reading; the transfer functions stay in
 # path-land for as long as the operation is a path operation.
 #
-# Every fact additionally carries ``checks``: the policy-declared validations (certora.check) this
-# exact value has passed. Checks belong to the value as it was at the check site: they ride along
-# assignment and the same-value respellings (str(), locate), and everything that builds a *new*
-# value -- joins, string methods, concatenation -- starts with none. The walker kills them at
-# every call that may have effects.
+# Every fact additionally carries ``atoms``: the atoms this exact value carries (ATOMS.md), of
+# every kind -- built-ins stated by a guard or an annotation, check atoms established by
+# ``certora.check`` or a guard's regex, source atoms constructed by extraction. Atoms belong to
+# the value as it was when it gained them: they ride along assignment and the same-value
+# respellings (str(), locate), and everything that builds a *new* value -- joins, string methods,
+# concatenation -- starts with none but what its own structure gives. The walker kills the
+# environmental ones at every call that may have effects. Built-ins are not only stated:
+# ``holds`` derives them from a fact's shape, and ``x in fact`` asks it.
 # ---------------------------------------------------------------------------
 
 type Repr = Literal["str", "path"]
+
+type StructuralIdName = AtomId | AtomIdName
 
 @dataclass(frozen=True)
 class StrFact:
     """A ``str`` read as text."""
     regex: PseudoRegex = ANY_STR
-    atoms: frozenset[AtomicFact] = frozenset()
-    checks: frozenset[str] = frozenset()
+    atoms: frozenset[Atom] = frozenset()
 
-    def __contains__(self, atom: AtomicFact) -> bool:
+    def __contains__(self, atom: StructuralIdName) -> bool:
+        if not isinstance(atom, AtomId):
+            atom = AtomId(atom)
         return _holds(atom, self.atoms, self.regex)
 
 @dataclass(frozen=True)
@@ -851,10 +993,11 @@ class PathFact:
     """A ``pathlib.Path`` of unknown location, read as text through ``str(p)``: ``no-slash`` means
     a single relative component, ``not-absolute`` means ``not p.is_absolute()``,
     ``no-parent-traversal`` means no ``..`` part."""
-    atoms: frozenset[AtomicFact] = frozenset()
-    checks: frozenset[str] = frozenset()
+    atoms: frozenset[Atom] = frozenset()
 
-    def __contains__(self, atom: AtomicFact) -> bool:
+    def __contains__(self, atom: StructuralIdName) -> bool:
+        if not isinstance(atom, AtomId):
+            atom = AtomId(atom)
         return _holds(atom, self.atoms, ANY_STR)
 
 @dataclass(frozen=True)
@@ -862,7 +1005,12 @@ class Located:
     """A value read as a path: where it points, spelled as a ``str`` or a ``pathlib.Path``."""
     location: LocationFact
     repr: Repr
-    checks: frozenset[str] = frozenset()
+    atoms: frozenset[Atom] = frozenset()
+
+    def __contains__(self, atom: StructuralIdName) -> bool:
+        if not isinstance(atom, AtomId):
+            atom = AtomId(atom)
+        return holds(atom, self)
 
 @dataclass(frozen=True)
 class UrlString:
@@ -880,7 +1028,10 @@ class UrlString:
     netloc: PseudoRegex | None = None
     path: LocationFact | None = None
     scheme: Literal["http", "https"] | None = None
-    checks: frozenset[str] = frozenset()
+    atoms: frozenset[Atom] = frozenset()
+
+    def __contains__(self, atom: Atom) -> bool:
+        return holds(atom, self)
 
 type ValidationFact = StrFact | PathFact | Located | UrlString
 
@@ -925,7 +1076,7 @@ class Data:
     like ``p.write_text()``. This is what keeps a file object out of the inert set by accident:
     a write-mode ``open`` at an *unproven* location binds no handle at all, so the object is
     unknown and every method on it opaque."""
-    sources: frozenset[str] = frozenset()
+    sources: frozenset[SourceId] = frozenset()
     closed: bool = True
     writes: tuple[LocationFact, ...] | None = None
 
@@ -1007,14 +1158,9 @@ def is_path_typed(fact: ValidationFact | None) -> bool:
 def location_of(fact: ValidationFact | None) -> LocationFact | None:
     return fact.location if isinstance(fact, Located) else None
 
-def checks_of(fact: ValidationFact | None) -> frozenset[str]:
-    return frozenset() if fact is None else fact.checks
-
-def drop_checks(fact: ValidationFact, keep: frozenset[str] = frozenset()) -> ValidationFact:
-    """The value with its environment-dependent checks forgotten (the crude kill). *keep* is the
-    policy's pure atoms -- true of the value's text alone, so no effect can invalidate them."""
-    kept = fact.checks & keep
-    return fact if kept == fact.checks else replace(fact, checks=kept)
+def atoms_of(fact: ValidationFact | None) -> frozenset[Atom]:
+    """The atoms a value states; nothing of an unknown value."""
+    return frozenset() if fact is None else fact.atoms
 
 def known_text(value: "str | ValidationFact | None") -> str | None:
     """The exact text of a statically-known value: a literal, a str fact with an exact regex, or
@@ -1032,22 +1178,9 @@ def known_text(value: "str | ValidationFact | None") -> str | None:
         case _:
             return None
 
-def saturate(
-    value: str | ValidationFact | None, defined: Mapping[AtomId, PseudoRegex]
-) -> "str | ValidationFact | None":
-    """The value with every *defined* atom its known text entails added to ``checks``. A defined
-    atom is a pure text property (the policy's ``atom()``), so establishing it from the text is
-    sound anywhere -- this is how a literal satisfies an atom with no runtime check."""
-    if value is None or not defined:
-        return value
-    fact: ValidationFact = StrFact(regex=Exact(value)) if isinstance(value, str) else value
-    text = as_text(fact).regex
-    gained = frozenset(
-        name
-        for name, meaning in defined.items()
-        if name not in fact.checks and _regex_subsumes(meaning, text)
-    )
-    return fact if not gained else replace(fact, checks=fact.checks | gained)
+def as_fact(value: str | ValidationFact) -> ValidationFact:
+    """A literal as the exactly-known text fact it is; a fact as itself."""
+    return StrFact(regex=Exact(value)) if isinstance(value, str) else value
 
 
 class InvalidProgram(Exception):
@@ -1124,13 +1257,14 @@ def locate(fact: ValidationFact | None) -> Located | None:
             return fact
         case StrFact() | PathFact():
             rp: Repr = "str" if isinstance(fact, StrFact) else "path"
+            kept = carried(fact.atoms)  # the path reading derives its own built-ins
             if isinstance(fact, StrFact) and isinstance(fact.regex, Exact):
                 loc = _literal_location(fact.regex.exact_str)
-                return None if loc is None else Located(loc, rp, fact.checks)
+                return None if loc is None else Located(loc, rp, kept)
             if (comp := as_component(fact)) is not None:
-                return Located(StaticPath((comp,)), rp, fact.checks)
+                return Located(StaticPath((comp,)), rp, kept)
             if "no-parent-traversal" in fact and "not-absolute" in fact:
-                return Located(DirSplat((), None), rp, fact.checks)  # the root, or anywhere below
+                return Located(DirSplat((), None), rp, kept)  # the root, or anywhere below
             return None
         case UrlString():
             return None  # a URL is not a filesystem path
@@ -1154,7 +1288,7 @@ def url_of(value: str | ValidationFact | None) -> UrlString | None:
         netloc=Exact(parts.netloc),
         path=_literal_location(parts.path),
         scheme=scheme,
-        checks=checks_of(value) if not isinstance(value, str) else frozenset(),
+        atoms=carried(atoms_of(value)) if not isinstance(value, str) else frozenset(),
     )
 
 
@@ -1193,13 +1327,30 @@ def location_le(actual: LocationFact, required: LocationFact) -> bool:
                 return True
             return l is not None and subsumes(m, l)
 
-def entails(actual: str | ValidationFact | None, required: ValidationFact) -> bool:
-    """Does what is known of *actual* establish *required*?"""
+# the atoms of *required* a fact does not carry. ``structural_missing`` is the answer the
+# analysis can give alone -- stated atoms, and built-ins by ``holds``; ``Vocabulary.missing``
+# (enforcement) adds the policy's routes: defined regexes and literal checkers.
+type AtomsMissing = Callable[[ValidationFact, frozenset[Atom]], frozenset[Atom]]
+
+
+def structural_missing(fact: ValidationFact, required: frozenset[Atom]) -> frozenset[Atom]:
+    return frozenset(a for a in required if not holds(a, fact))
+
+
+def entails(
+    actual: str | ValidationFact | None,
+    required: ValidationFact,
+    missing: AtomsMissing = structural_missing,
+) -> bool:
+    """Does what is known of *actual* establish *required*? The shape -- regex, location, URL
+    claims -- by the lattice; the atoms by *missing*, which the caller supplies with whatever
+    it has: structure alone here, or the vocabulary's regex definitions and literal checkers
+    (``Vocabulary.missing``, with a discharger)."""
     if actual is None:
         return False
     fact: ValidationFact = StrFact(regex=Exact(actual)) if isinstance(actual, str) else actual
     match required:
-        case UrlString(netloc=netloc, path=path, scheme=scheme, checks=checks):
+        case UrlString(netloc=netloc, path=path, scheme=scheme, atoms=atoms):
             # component-wise: each stated claim must be established; None claims nothing.
             # url_of makes exactly-known text discharge with no guard ceremony.
             got = url_of(fact)
@@ -1213,35 +1364,28 @@ def entails(actual: str | ValidationFact | None, required: ValidationFact) -> bo
                 return False
             if scheme is not None and got.scheme != scheme:
                 return False
-            return checks <= got.checks
-        case Located(location=loc, repr=rp, checks=checks):
+            return not missing(got, atoms)
+        case Located(location=loc, repr=rp, atoms=atoms):
             got = locate(fact)
             return (
                 got is not None
                 and got.repr == rp
                 and location_le(got.location, loc)
-                and checks <= got.checks
+                and not missing(got, atoms)
             )
-        case StrFact(regex=regex, atoms=atoms, checks=checks):
+        case StrFact(regex=regex, atoms=atoms):
             match fact:
                 case StrFact():
-                    return (
-                        _regex_subsumes(regex, fact.regex)
-                        and all(a in fact for a in atoms)
-                        and checks <= fact.checks
-                    )
+                    return _regex_subsumes(regex, fact.regex) and not missing(fact, atoms)
                 case Located(repr="str") | UrlString():
                     # a str, but nothing is tracked about its text
-                    return regex == ANY_STR and not atoms and checks <= fact.checks
+                    return regex == ANY_STR and not missing(fact, atoms)
                 case _:
                     return False
-        case PathFact(atoms=atoms, checks=checks):
+        case PathFact(atoms=atoms):
             match fact:
-                case PathFact():
-                    return all(a in fact for a in atoms) and checks <= fact.checks
-                case Located(repr="path"):
-                    # nothing lexical is tracked about a located value
-                    return not atoms and checks <= fact.checks
+                case PathFact() | Located(repr="path"):
+                    return not missing(fact, atoms)
                 case _:
                     return False
 
@@ -1298,10 +1442,10 @@ def as_str_value(fact: ValidationFact | None) -> ValidationFact | None:
     match fact:
         case None:
             return None
-        case Located(location=loc, checks=checks):
-            return Located(loc, "str", checks)
-        case PathFact(atoms=atoms, checks=checks):
-            return StrFact(atoms=atoms, checks=checks)
+        case Located(location=loc, atoms=atoms):
+            return Located(loc, "str", atoms)
+        case PathFact(atoms=atoms):
+            return StrFact(atoms=atoms)
         case StrFact() | UrlString():
             return fact  # already a str; str() is the identity and every claim survives
 
@@ -1325,11 +1469,11 @@ def _component_token(c: Component) -> _Chunk:
         case Named(name=n):
             return n
         case AnyName():
-            return StrFact(atoms=ALL_ATOMS)
+            return StrFact(atoms=PATH_ATOMS)
         case Matching(regex=r):
-            return StrFact(regex=r, atoms=ALL_ATOMS)
+            return StrFact(regex=r, atoms=PATH_ATOMS)
         case OneOf(names=ns):
-            return StrFact(regex=alternation(*(Exact(n) for n in sorted(ns))), atoms=ALL_ATOMS)
+            return StrFact(regex=alternation(*(Exact(n) for n in sorted(ns))), atoms=PATH_ATOMS)
 
 def _component_of(chunks: Sequence[_Chunk]) -> Component | None:
     """The text of one component as a component, or None if it can't be shown to be one."""
@@ -1495,8 +1639,8 @@ def _text_of_pieces(pieces: Sequence[str | ValidationFact | None]) -> StrFact:
             case _:
                 return False  # unknown, or a located value (a path may well contain "/")
 
-    atoms: frozenset[AtomicFact] = (
-        frozenset({"no-slash"}) if all(slash_free(p) for p in pieces) else frozenset()
+    atoms: frozenset[Atom] = (
+        frozenset({NO_SLASH}) if all(slash_free(p) for p in pieces) else frozenset()
     )
     regexes = [as_text(p).regex for p in pieces]
     return StrFact(regex=concat(*regexes) if regexes else Exact(""), atoms=atoms)
@@ -1615,7 +1759,7 @@ def _module_call(call: NameAccess, modules: frozenset[str], *path: str) -> bool:
     return call.matches(*path) and path[0] in modules
 
 # the names the loop variable can never have from a listing: never ".", never "..", never a "/"
-_LISTED_NAME = StrFact(atoms=ALL_ATOMS)
+_LISTED_NAME = StrFact(atoms=PATH_ATOMS)
 
 _ELEMENT_WRAPPERS = ("sorted", "list", "tuple", "reversed", "iter")
 
@@ -1957,7 +2101,7 @@ class Interpreter:
                 assert isinstance(handle, Data)
                 # ``for line in f`` over a source handle: each line is something the source
                 # produced, unmodified (PROVENANCE.md) -- ``certora.lines`` spelled the stdlib way
-                return StrFact(checks=handle.sources)
+                return StrFact(atoms=frozenset(handle.sources))
             case _:
                 return None
 

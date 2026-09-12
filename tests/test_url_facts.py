@@ -16,6 +16,7 @@ from certorail.analysis import (
     url_of,
 )
 from certorail.guards import apply, recognize
+from certorail.ids import CheckId
 from certorail.walker import analyze
 
 
@@ -76,9 +77,9 @@ class TestUrlGuards(unittest.TestCase):
 
     def test_checks_survive_the_url_reading(self) -> None:
         got = refine(
-            StrFact(checks=frozenset({"c"})), 'urllib.parse.urlsplit(u).netloc == "x"'
+            StrFact(atoms=frozenset({CheckId("c")})), 'urllib.parse.urlsplit(u).netloc == "x"'
         )
-        self.assertEqual(got, UrlString(netloc=Exact("x"), checks=frozenset({"c"})))
+        self.assertEqual(got, UrlString(netloc=Exact("x"), atoms=frozenset({CheckId("c")})))
 
     def test_a_normalizing_view_says_nothing(self) -> None:
         # PurePath rewrites the text ("h://a" becomes "h:/a"): claims about the view are void

@@ -1,28 +1,87 @@
-"""Phantom types for the policy's names.
+"""Names, typed by the domain they belong to.
 
-An atom, a region, a validation, a program, a flagset, a flag, a hole and a check parameter are
-all spelled as strings, and a ``Mapping[str, X]`` says nothing about which. Under the type
-checker each name below is a distinct subclass of ``str``, so a region name cannot be looked up
-in the atom table by accident and a signature says which domain it wants; at runtime each is
-``str`` itself -- no wrapper object, no cost. Convert where a string *enters* a domain -- the
-loader, the factories in ``policy.py``, the walker's lookup of a name the program spelled --
-with ``AtomId(text)``, which is the identity at runtime.
+Atoms come in three kinds and the kind is part of the id (ATOMS.md), so the three are real
+``str`` subclasses: a fact's atom set is a ``frozenset[Atom]`` whose members say what they are,
+a function can ask for a ``SourceId`` where only provenance makes sense, and the type checker
+keeps the kinds apart. They are still strings -- equal to and hashed as their text -- so every
+string-keyed table works and a set holds one member per *name*: the kinds share a namespace
+(built-in names are reserved, a policy declares each of its names once), and where a spelling
+does not carry the kind (``certora.validated("x")`` in a program, ``constraint(atoms=["x"])`` in
+the Python API) the vocabulary's kind table is authoritative.
 
-The runtime branch is a plain alias on purpose: a ``type X = str`` statement produces a
-``TypeAliasType``, which is not callable, and ``AtomId(text)`` has to work.
+- ``AtomId``: a **built-in** atom certorail defines -- ``no-slash``, ``no-parent-traversal``,
+  ``not-absolute``, ``not-dot-dot``, ``not-option``. Structural: derivable from a value's shape.
+  Declared by no file; nameable in any (a hole's ``atoms``, a checker's ``establishes``).
+- ``CheckId``: an atom a policy declares in ``[atoms]`` and establishes by a validation, a
+  regex definition, or a guard. Environmental or pure; the vocabulary knows which.
+- ``SourceId``: an atom a policy declares and only extraction establishes (PROVENANCE.md).
 
-Each type is documented by where its strings come from in a policy document (``policyfile.py``)
-and in a confined program.
+The other names -- regions, validations, programs, flagsets, flags, holes, check parameters --
+are phantom types: distinct ``str`` subclasses under the type checker, ``str`` itself at
+runtime, converted where a string enters the domain with ``RegionId(text)`` (the identity at
+runtime). The runtime branch is a plain alias on purpose: a ``type X = str`` statement produces
+a ``TypeAliasType``, which is not callable.
 """
-from typing import TYPE_CHECKING
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Final, Literal
+
+type AtomIdName = Literal["no-slash", "no-parent-traversal", "not-absolute", "not-dot-dot", "not-option"]
+
+
+class AtomId(str):
+    """A built-in atom: a structural property of a value's text or location, derivable by the
+    analysis (``analysis.holds``) and nameable by a policy but declared by none."""
+
+    if TYPE_CHECKING:
+        def __init__(self, other: AtomIdName):
+            ...
+
+    __slots__ = ()
+
+
+class CheckId(str):
+    """A policy atom established by a check, a regex definition or a guard. Declared as a key of
+    ``[atoms]``; spelled in a validation's ``establishes``, a rule's ``requires``, a constraint's
+    ``atoms``, a network rule's ``requires``; and by a program as ``certora.validated("...")``."""
+
+    __slots__ = ()
+
+
+class SourceId(str):
+    """A policy atom that extraction alone establishes: the ``source`` of a ``[[program]]`` or
+    ``[[network]]`` rule, the ``name`` of a ``[[source]]``; spelled by a program as
+    ``certora.source("...")``."""
+
+    __slots__ = ()
+
+
+type Atom = AtomId | CheckId | SourceId
+
+NO_SLASH: Final = AtomId("no-slash")
+NO_PARENT_TRAVERSAL: Final = AtomId("no-parent-traversal")
+NOT_ABSOLUTE: Final = AtomId("not-absolute")
+NOT_DOT_DOT: Final = AtomId("not-dot-dot")
+# the value does not begin with "-", so a tool cannot read it as an option: what every token or
+# each hole not preceded by a literal "--" requires (TEMPLATES.md, the leading-dash guard)
+NOT_OPTION: Final = AtomId("not-option")
+
+BUILTIN_ATOMS: Final[Mapping[str, AtomId]] = {
+    a: a for a in (NO_SLASH, NO_PARENT_TRAVERSAL, NOT_ABSOLUTE, NOT_DOT_DOT, NOT_OPTION)
+}
+
+
+def spelled(name: str) -> Atom:
+    """An atom as a program or the Python API spells it. An id already carrying its kind is kept
+    (``constraint(atoms=[SourceId("gh-api")])`` demands provenance and says so); a bare name is a
+    built-in by name, otherwise a policy atom labelled ``CheckId`` -- a label, since demands are
+    met by name and the vocabulary's kind table decides whether the name is in fact a source."""
+    if isinstance(name, (AtomId, CheckId, SourceId)):
+        return name
+    builtin = BUILTIN_ATOMS.get(name)
+    return CheckId(name) if builtin is None else builtin
+
 
 if TYPE_CHECKING:
-
-    class AtomId(str):
-        """A validation fact. Declared as a key of ``[atoms]``; spelled in a validation's
-        ``establishes`` values, a rule's ``requires``, a constraint's ``atoms``, a network rule's ``requires`` (bare, or its ``atom =``), the ``source`` of a
-        ``[[program]]`` or ``[[network]]`` rule and the ``name`` of a ``[[source]]``; and by a
-        program as ``certora.validated("...")``."""
 
     class RegionId(str):
         """A piece of state (EFFECTS.md). Declared as a key of ``[regions]``; spelled in the
@@ -59,7 +118,6 @@ if TYPE_CHECKING:
         validation has); spelled by a program as a keyword argument of ``certora.check``."""
 
 else:
-    AtomId = str
     RegionId = str
     ValidationName = str
     ProgramName = str

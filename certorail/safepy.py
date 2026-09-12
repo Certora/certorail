@@ -17,7 +17,6 @@ from .analysis import (
     is_prefix,
     sensitive_builtins,
     unfold_attr,
-    validator_funcs,
 )
 from .dangerous import (
     ALLOWED_BASES,
@@ -532,8 +531,6 @@ class ValidationAnalysis(_LexicalAnalysis):
     def visit_FunctionDef(self, node: ast.FunctionDef) -> Any:
         if is_dunder(node.name) and node.name != "__init__":
             self.violations.append((node, "define dunder"))
-        if node.name in validator_funcs:
-            self._violation(node, "validation alias")
         self._visit_decorators(node.decorator_list)
         for tp in node.type_params:
             self.visit(tp)

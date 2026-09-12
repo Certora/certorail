@@ -273,13 +273,19 @@ every template whose holes are keyword-only.
 **The leading-dash guard.** A value in a token or each hole must carry the built-in atom
 `not-option`, "the text does not begin with `-`". Structure supplies it for a located value
 whose first component is a literal name (`repos/…`) or an absolute path, and for text whose
-known regex begins with a literal that is not `-`; a checker supplies it for text the analysis
-cannot see the head of, by listing `not-option` in `establishes` beside the atom it checks
-(every text checker should). A value known only to lie somewhere under `**`, or unguarded,
-unchecked text, is denied with the fix in the message. Flag *values* are exempt (the flag
-consumed the slot), and so is every hole after a literal `--` in the template, for tools that
-honour it (`argv = ["grep", "--", "${PATTERN}", "${FILES...}"]`). `not-option` may not be
-declared in `[atoms]`.
+known regex cannot begin with `-`; a guard supplies it (`assert not s.startswith("-")`,
+`s[0] != "-"`, `s.isalnum()`, a `re.fullmatch` whose pattern excludes a leading dash); a
+checker supplies it for text the analysis cannot see the head of, by listing `not-option` in
+`establishes` beside the atom it checks (every text checker should). A value known only to lie
+somewhere under `**`, or unguarded, unchecked text, is denied with the fix in the message. Flag
+*values* are exempt (the flag consumed the slot), and so is every hole after a literal `--` in
+the template, for tools that honour it (`argv = ["grep", "--", "${PATTERN}", "${FILES...}"]`).
+
+**Built-in atoms.** `not-option` is one of five certorail defines -- with `no-slash`,
+`no-parent-traversal`, `not-absolute`, `not-dot-dot` -- that no policy declares (an `[atoms]`
+entry is an error) and any policy may name: in a hole's `atoms`, a flag's `requires`, a
+checker's `establishes`. Programs name them as markers (`certora.not_option`) and establish
+them with guards.
 
 ## Sources: `source = "…"` and `[[source]]`
 
@@ -423,7 +429,9 @@ Full rules in `examples/SUBSET_PROMPT.md`. The parts a policy author needs:
 - `certora.network.get/head/delete/post/put/patch(url, headers=…, body=…, timeout=…)`: a
   literal URL, or a variable guarded by `urllib.parse.urlsplit(u).scheme == "https"` and
   `urllib.parse.urlsplit(u).netloc == "host"`.
-- Contracts: `typing.Annotated[pathlib.Path, certora.within("repos"), certora.validated("org-checkout")]`.
+- Contracts: `typing.Annotated[pathlib.Path, certora.within("repos"), certora.validated("org-checkout")]`;
+  a source atom is spelled `certora.source("gh-api")` (naming it with `validated` is a contract
+  error, and vice versa); the built-ins as bare markers (`certora.not_option`).
 
 ## Command line
 

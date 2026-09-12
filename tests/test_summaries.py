@@ -6,7 +6,7 @@ variable, a parameter called) havocs; a read of a name some class defines as a p
 unknown call."""
 import unittest
 
-from certorail.analysis import checks_of
+from certorail.analysis import atoms_of
 from certorail.host import Accepted, Rejected
 from certorail.host import check as host_check
 from certorail.ids import AtomId, ParamName, ValidationName
@@ -36,7 +36,7 @@ def atoms_at_exec(definitions: str, between: str) -> frozenset[str]:
     report: Report = analyze(PRELUDE + definitions + CHECK + between + EXEC, vocabulary=VOCAB)
     assert report.violations == [], report.violations
     execs = [s for s in report.sinks if isinstance(s, ExecSite)]
-    return checks_of(execs[-1].cwd)
+    return atoms_of(execs[-1].cwd)
 
 
 class TestSummaries(unittest.TestCase):
