@@ -200,13 +200,51 @@ class TestKeywordOnlyShapes(Base):
         'FILES=[pathlib.Path("repos") / "a", pathlib.Path("repos") / "b"], cwd=here)\n'
     )
 
-    def test_a_non_last_splice_makes_the_rest_keyword_only(self) -> None:
-        reason = self.denial(
+    def test_a_flags_hole_ends_where_the_flags_end(self) -> None:
+        # tar FLAGS... -f ARCHIVE FILES...: the flags are known text beginning with "-", the
+        # archive is a located value, so the positional spelling is unambiguous
+        self.accept(
+            self.HERE
+            + 'certora.exec("tar", "-c", "-z", pathlib.Path("archives") / "out.tgz", '
+            'pathlib.Path("repos") / "a", pathlib.Path("repos") / "b", cwd=here)\n'
+        )
+        # no flags at all: ARCHIVE begins at once
+        self.accept(
+            self.HERE
+            + 'certora.exec("tar", pathlib.Path("archives") / "out.tgz", pathlib.Path("repos") / "a", cwd=here)\n'
+        )
+        # mixed: the flags positionally, the rest by keyword
+        self.accept(
             self.HERE
             + 'certora.exec("tar", "-c", ARCHIVE=pathlib.Path("archives") / "out.tgz", '
             'FILES=[pathlib.Path("repos") / "a"], cwd=here)\n'
         )
-        self.assertIn("keyword-only", reason)
+
+    def test_a_positional_that_could_be_either_is_rejected_not_guessed(self) -> None:
+        reason = self.denial(
+            self.HERE
+            + 'certora.exec("tar", "-c", sys.argv[1], pathlib.Path("repos") / "a", cwd=here)\n'
+        )
+        self.assertIn("could be a flag of FLAGS or the value of ARCHIVE", reason)
+        self.assertIn("bind by keyword", reason)
+        # a dash-shaped positional that is not a flag: named as such, with the fix
+        reason = self.denial(
+            self.HERE
+            + 'certora.exec("tar", "-c", "-x", pathlib.Path("repos") / "a", cwd=here)\n'
+        )
+        self.assertIn("'-x' is not a flag of FLAGS", reason)
+        self.assertIn("bind ARCHIVE by keyword", reason)
+
+    def test_an_each_hole_that_is_not_last_stays_keyword_only(self) -> None:
+        policy = Policy.allow(
+            programs=[program(
+                "git", cwd=".", argv=["git", "log", splice("REVS"), "--", splice("PATHS")],
+                holes={"REVS": Each(constraint(any=True)), "PATHS": Each(constraint(location=markers.within(".")))},
+            )],
+        )
+        outcome = host_check(HEADER + 'certora.exec("git", "log", "HEAD", cwd=pathlib.Path("."))\n', "<t>", policy)
+        assert isinstance(outcome, Rejected)
+        self.assertIn("keyword-only", outcome.denials[0].reason)
 
     def test_the_keyword_form(self) -> None:
         self.accept(self.HERE + self.TAR_OK)
@@ -233,6 +271,13 @@ class TestKeywordOnlyShapes(Base):
         self.accept(
             REPO + self.HERE
             + 'certora.exec("grep", FLAGS=["-r", "-n"], PATTERN=sys.argv[1], FILES=[repo], cwd=here)\n'
+        )
+        # positionally, the flags end at the literal pattern (the host inserts the "--")
+        self.accept(REPO + self.HERE + 'certora.exec("grep", "-r", "-n", "x", repo, cwd=here)\n')
+        # but an unknown pattern in that position could be a flag: the program must say
+        self.assertIn(
+            "could be a flag of FLAGS or the value of PATTERN",
+            self.denial(REPO + self.HERE + 'certora.exec("grep", "-r", sys.argv[1], repo, cwd=here)\n'),
         )
         self.assertIn(
             "'-R' is not a declared flag",
@@ -507,9 +552,15 @@ assert GREP is not None
 class TestBind(unittest.TestCase):
     def test_leading_words_and_keyword_only(self) -> None:
         self.assertEqual(GREP.leading_words, ("grep",))
-        self.assertEqual(GREP.keyword_only, ("FLAGS", "PATTERN", "FILES"))
+        self.assertEqual(GREP.keyword_only, ())  # its flags hole terminates: nothing is keyword-only
         self.assertTrue(GREP.dash_exempt(HoleName("PATTERN")))
         self.assertFalse(GREP.dash_exempt(HoleName("FLAGS")))
+        # an open vocabulary cannot terminate (which flags take values is unknown)
+        open_flags = Template(
+            ("x", HoleRef(HoleName("F"), True), HoleRef(HoleName("A"))),
+            {HoleName("F"): Flags(Flagset(any=True)), HoleName("A"): Token(constraint(any=True))},
+        )
+        self.assertEqual(open_flags.keyword_only, ("F", "A"))
 
     def test_instantiate_emits_interior_literals(self) -> None:
         bound = bind(GREP, [], {"FLAGS": Many(("-r",)), "PATTERN": "x", "FILES": Many(("repos/a",))})
@@ -521,10 +572,21 @@ class TestBind(unittest.TestCase):
         assert isinstance(bound, Bound)
         self.assertEqual(bound.bindings[HoleName("FLAGS")], Many(()))
 
-    def test_positionals_reaching_keyword_only_holes(self) -> None:
-        result = bind(GREP, ["-r"], {})
-        assert isinstance(result, BindError)
-        self.assertTrue(any("keyword-only" in r for r in result.reasons))
+    def test_a_flags_hole_that_is_not_last_binds_positionally(self) -> None:
+        # grep FLAGS... -- PATTERN FILES...: nothing is keyword-only any more
+        self.assertEqual(GREP.keyword_only, ())
+        bound = bind(GREP, ["-r", "x", "repos/a"], {})
+        assert isinstance(bound, Bound)
+        self.assertEqual(bound.bindings[HoleName("FLAGS")], Many(("-r",)))
+        self.assertEqual(bound.bindings[HoleName("PATTERN")], "x")
+        self.assertEqual(bound.bindings[HoleName("FILES")], Many(("repos/a",)))
+        self.assertEqual(instantiate(bound), ["grep", "-r", "--", "x", "repos/a"])
+        # a valued flag takes the next positional as its value, whatever it looks like
+        found = POLICY.programs[2].template
+        assert found is not None
+        bound = bind(found, ["repos/x", "-mindepth", "1", "-name", "x.py"], {})
+        assert isinstance(bound, Bound)
+        self.assertEqual(bound.bindings[HoleName("FLAGS")], Many(("-mindepth", "1", "-name", "x.py")))
 
 
 class TestRuntime(unittest.TestCase):
@@ -635,7 +697,7 @@ class TestDataFormat(unittest.TestCase):
         assert find.template is not None and git.template is not None and tar.template is not None
         self.assertEqual(find.leading_words, ("find",))
         self.assertEqual(git.leading_words, ("git", "push", "origin"))
-        self.assertEqual(tar.template.keyword_only, ("FLAGS", "ARCHIVE", "FILES"))
+        self.assertEqual(tar.template.keyword_only, ())  # FLAGS terminates at the first non-flag
         flags = find.template.holes[HoleName("FLAGS")]
         assert isinstance(flags, Flags)
         self.assertEqual(flags.flagset.bare, frozenset({"-print"}))

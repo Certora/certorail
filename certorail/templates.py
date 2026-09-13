@@ -221,13 +221,22 @@ class Template:
     def variadic(self, name: HoleName) -> bool:
         return isinstance(self.holes[name], (Each, Flags))
 
+    def terminable(self, name: HoleName) -> bool:
+        """Can a positional tail bound to this variadic hole be ended without a marker? A flags
+        hole with a closed vocabulary can: its elements are flags (known text beginning with
+        ``-``) and their values, so the first positional that carries ``not-option`` is not in it
+        and begins the next hole. An open vocabulary cannot -- which of its flags take a value is
+        unknown -- and neither can an each hole, whose elements have no shape of their own."""
+        hole = self.holes[name]
+        return isinstance(hole, Flags) and not hole.flagset.any
+
     @property
     def keyword_only(self) -> tuple[HoleName, ...]:
-        """The holes from the first non-last variadic hole onward: nothing marks where such a
-        splice would end, so they are bound by name."""
+        """The holes from the first non-last variadic hole that cannot terminate positionally
+        onward: nothing marks where such a splice would end, so they are bound by name."""
         refs = [p for p in self.pieces if isinstance(p, HoleRef)]
         for i, r in enumerate(refs):
-            if r.variadic and r is not self.pieces[-1]:
+            if r.variadic and r is not self.pieces[-1] and not self.terminable(r.name):
                 return tuple(x.name for x in refs[i:])
         return ()
 
@@ -288,22 +297,41 @@ def bind(
 ) -> Bound | BindError:
     """*arguments* are the positionals after the program, leading words included (the caller
     selected the template by them). Positionals fill holes in template order; a trailing
-    variadic takes the rest; a non-last variadic and everything after it is keyword-only;
-    keywords fill by name. Interior literal words are never spelled by the program."""
+    variadic takes the rest; a flags hole that is not last takes the flags and flag values at
+    the head of the remaining positionals and ends at the first that carries ``not-option``
+    (``Template.terminable``) -- a positional that could be either is a binding error, never a
+    guess; any other non-last variadic and everything after it is keyword-only; keywords fill by
+    name. Interior literal words are never spelled by the program."""
     reasons: list[str] = []
     bindings: dict[HoleName, Binding] = {}
     lead = len(template.leading_words) - 1
     positionals = list(arguments[lead:])
     keyword_only = set(template.keyword_only)
-    for piece in template.pieces[len(template.leading_words):]:
-        if isinstance(piece, str) or piece.name in keyword_only:
+    holes = [p for p in template.pieces[len(template.leading_words):] if isinstance(p, HoleRef)]
+    for i, piece in enumerate(holes):
+        if piece.name in keyword_only:
             continue
-        if piece.variadic:  # necessarily the last piece: it takes whatever positionals remain
+        if not piece.variadic:
+            if positionals:
+                bindings[piece.name] = positionals.pop(0)
+            continue
+        if piece is holes[-1] and piece is template.pieces[-1]:
+            # the last piece: it takes whatever positionals remain
             if positionals:
                 bindings[piece.name] = Many(tuple(positionals))
                 positionals = []
-        elif positionals:
-            bindings[piece.name] = positionals.pop(0)
+            continue
+        # a terminable flags hole with holes after it: take the flag-shaped head
+        hole = template.holes[piece.name]
+        assert isinstance(hole, Flags)
+        following = holes[i + 1].name if i + 1 < len(holes) else None
+        taken, problem = _flag_head(hole.flagset, positionals, piece.name, following)
+        if problem is not None:
+            reasons.append(problem)
+            break
+        if taken:  # an empty head leaves the hole to a keyword (or to its default, nothing)
+            bindings[piece.name] = Many(tuple(taken))
+            positionals = positionals[len(taken):]
     if positionals:
         reasons.append(
             f"{len(positionals)} positional argument(s) too many"
@@ -332,6 +360,40 @@ def bind(
             else:
                 reasons.append(f"hole {name!r} is unbound")
     return BindError(tuple(reasons)) if reasons else Bound(template, bindings)
+
+
+def _flag_head(
+    fs: Flagset, positionals: Sequence[Value], name: HoleName, following: HoleName | None
+) -> tuple[list[Value], str | None]:
+    """The prefix of *positionals* a non-last flags hole takes: flags -- known text beginning
+    with ``-`` -- each valued one with the positional after it, up to the first positional that
+    carries ``not-option``, which begins the next hole. A positional that is neither a flag nor
+    shown not to be one is ambiguous, and the answer is a binding error naming the fix rather
+    than a guess. Returns (the elements taken, the problem)."""
+    taken: list[Value] = []
+    i = 0
+    while i < len(positionals):
+        value = positionals[i]
+        text = known_text(value)
+        if text is not None and text.startswith("-"):
+            flag = FlagName(text)
+            if flag not in fs.bare and flag not in fs.valued:
+                hint = f"; if it is the value of {following}, bind {following} by keyword" if following else ""
+                return taken, f"{text!r} is not a flag of {name}{hint}"
+            taken.append(value)
+            i += 1
+            if flag in fs.valued and i < len(positionals):
+                taken.append(positionals[i])  # the flag's value, whatever it is
+                i += 1
+            continue
+        if not may_start_with_dash(value):
+            return taken, None  # shown not to be an option: the next hole begins here
+        where = "the next hole" if following is None else following
+        return taken, (
+            f"positional {len(taken) + 1} after the leading words could be a flag of {name} or the "
+            f"value of {where} (it lacks not-option): bind by keyword to say which"
+        )
+    return taken, None
 
 
 # ---------------------------------------------------------------------------
