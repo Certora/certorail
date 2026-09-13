@@ -18,7 +18,7 @@ from .analysis import pretty_location, pretty_regex
 from .effects import EVERYTHING, Effects
 from .ids import BUILTIN_ATOMS, NOT_OPTION, Atom, FlagName, SourceId
 from .policy import NetworkRule, Policy, Program, Validation, pretty_locations
-from .templates import CWD, Constraint, Each, Flags, Flagset, Template, Token
+from .templates import CWD, Constraint, Each, Flags, Flagset, HoleRef, Template, Token
 
 NOTATION = (
     "Notation: <...> marks a value the program supplies. </re/> text known to match the regex "
@@ -36,7 +36,7 @@ NOTATION = (
 )
 
 
-def _constraint(c: Constraint, sources: frozenset[SourceId]) -> str:
+def constraint_phrase(c: Constraint, sources: frozenset[SourceId]) -> str:
     if c.any:
         return "<any>"
     parts: list[str] = []
@@ -55,7 +55,7 @@ def _constraint(c: Constraint, sources: frozenset[SourceId]) -> str:
     return "<" + " ".join(parts) + ">"
 
 
-def _demands(fs: Flagset, flag: FlagName) -> str:
+def flag_demands(fs: Flagset, flag: FlagName) -> str:
     """What a flag demands while present, as a suffix; empty when nothing."""
     demands = fs.requires.get(flag)
     if not demands:
@@ -67,7 +67,7 @@ def _demands(fs: Flagset, flag: FlagName) -> str:
     return " (requires " + "; ".join(parts) + ")"
 
 
-def _flagset(fs: Flagset, sources: frozenset[SourceId]) -> list[str]:
+def flagset_lines(fs: Flagset, sources: frozenset[SourceId]) -> list[str]:
     if fs.any:
         return ["any flag, any value: the tool is trusted with its own options"]
     out: list[str] = []
@@ -75,13 +75,13 @@ def _flagset(fs: Flagset, sources: frozenset[SourceId]) -> list[str]:
     if plain:
         out.append("bare: " + " ".join(plain))
     for name in sorted(f for f in fs.bare if f in fs.requires):
-        out.append(f"{name}{_demands(fs, name)}")
+        out.append(f"{name}{flag_demands(fs, name)}")
     for name, c in fs.valued.items():  # declaration order: the author's grouping
-        out.append(f"{name} {_constraint(c, sources)}{_demands(fs, name)}")
+        out.append(f"{name} {constraint_phrase(c, sources)}{flag_demands(fs, name)}")
     return out
 
 
-def _signature(t: Template) -> str:
+def signature(t: Template) -> str:
     words: list[str] = []
     for p in t.pieces:
         if isinstance(p, str):
@@ -94,7 +94,7 @@ def _signature(t: Template) -> str:
 # -- effects (EFFECTS.md) -------------------------------------------------------------------
 
 
-def _writes(e: Effects) -> str:
+def writes_phrase(e: Effects) -> str:
     """A write set as a phrase: the regions, and a whole medium as "anything ..."."""
     if e.empty:
         return "none"
@@ -106,7 +106,7 @@ def _writes(e: Effects) -> str:
     return "writes " + ", ".join(parts)
 
 
-def _depends(e: Effects) -> str:
+def depends_phrase(e: Effects) -> str:
     if e == EVERYTHING:
         return "everything"
     parts : list[str] = sorted(e.regions)
@@ -117,7 +117,7 @@ def _depends(e: Effects) -> str:
     return ", ".join(parts)
 
 
-def _effects_line(policy: Policy, rule: Program | Validation) -> str:
+def effects_line(policy: Policy, rule: Program | Validation) -> str:
     """What a grant does to the state atoms depend on, with the media it forgoes."""
     if rule.effect_free:
         return "effects: none (effect-free: kills no facts)"
@@ -126,11 +126,11 @@ def _effects_line(policy: Policy, rule: Program | Validation) -> str:
         notes.append("no network")
     if not rule.write:
         notes.append("no filesystem writes")
-    text = f"effects: {_writes(policy.write_set(rule))}"
+    text = f"effects: {writes_phrase(policy.write_set(rule))}"
     return text + (f" ({'; '.join(notes)})" if notes else "")
 
 
-def _dies_on(policy: Policy, atom_name: Atom) -> str:
+def dies_on(policy: Policy, atom_name: Atom) -> str:
     """Every declared operation whose write set meets the atom's read set, computed."""
     hits: list[str] = []
     for p in policy.programs:
@@ -186,19 +186,27 @@ def _program(p: Program, policy: Policy) -> list[str]:
             out.append(f"    cwd validated by {', '.join(sorted(p.requires))} (check right before)")
         if p.source:
             out.append(f"    yields {p.source}: extract values from the result with certora.extract / extract_all / lines")
-        out.append(f"    {_effects_line(policy, p)}")
+        out.append(f"    {effects_line(policy, p)}")
         out.append("    exactly these words: no further arguments")
         return out
-    out.append("- " + _signature(t) + origin)
+    out.append("- " + signature(t) + origin)
     out.append(f"    cwd within {pretty_locations(p.cwd)}")
     if p.requires:
         out.append(f"    cwd validated by {', '.join(sorted(p.requires))} (check right before)")
     if p.source:
         out.append(f"    yields {p.source}: extract values from the result with certora.extract / extract_all / lines")
-    out.append(f"    {_effects_line(policy, p)}")
+    out.append(f"    {effects_line(policy, p)}")
     keyword_only = t.keyword_only
     if keyword_only:
         out.append(f"    bind by keyword: {', '.join(keyword_only)}")
+    refs = [piece for piece in t.pieces if isinstance(piece, HoleRef)]
+    for i, ref in enumerate(refs):
+        if ref.variadic and ref is not t.pieces[-1] and t.terminable(ref.name) and ref.name not in keyword_only:
+            nxt = refs[i + 1].name if i + 1 < len(refs) else "the end"
+            out.append(
+                f"    {ref.name}... ends at the first positional that is not a flag; {nxt} begins there "
+                "(a value that could be either is rejected: bind by keyword)"
+            )
     interior = [piece for piece in t.pieces[len(t.leading_words):] if isinstance(piece, str)]
     if interior:
         out.append(f"    inserted by the host, do not spell: {' '.join(interior)}")
@@ -206,13 +214,13 @@ def _program(p: Program, policy: Policy) -> list[str]:
     for name, hole in t.holes.items():
         match hole:
             case Token(constraint=c):
-                out.append(f"    {name}: {_constraint(c, sources)}")
+                out.append(f"    {name}: {constraint_phrase(c, sources)}")
             case Each(constraint=c, min=minimum):
                 need = f", at least {minimum}" if minimum else ""
-                out.append(f"    {name}...: each {_constraint(c, sources)}{need}")
+                out.append(f"    {name}...: each {constraint_phrase(c, sources)}{need}")
             case Flags(flagset=fs):
                 out.append(f"    {name}...: a list of flags --")
-                out.extend(f"        {line}" for line in _flagset(fs, sources))
+                out.extend(f"        {line}" for line in flagset_lines(fs, sources))
     return out
 
 
@@ -227,13 +235,13 @@ def _validation(v: Validation, policy: Policy, defined: frozenset[Atom]) -> list
             for a in sorted(atoms)
         )
         out.append(f"    establishes on {key}: {kinds}")
-    out.append(f"    {_effects_line(policy, v)}")
+    out.append(f"    {effects_line(policy, v)}")
     if len(v.params) == 1:
         out.append(f'    also as an expression: certora.check_single("{v.name}", value)')
     return out
 
 
-_BUILTIN_MEANING = {
+BUILTIN_MEANING = {
     "no-slash": "the text has no '/': a single path component",
     "no-parent-traversal": "the text has no '..' component",
     "not-absolute": "the text does not begin with '/'",
@@ -261,7 +269,7 @@ def _atoms(policy: Policy) -> list[str]:
     out.append(
         "- built in (every policy; a literal or a guard such as assert not s.startswith('-') "
         "establishes them, and a check may vouch for one): "
-        + "; ".join(f"{name}: {_BUILTIN_MEANING[name]}" for name in BUILTIN_ATOMS)
+        + "; ".join(f"{name}: {BUILTIN_MEANING[name]}" for name in BUILTIN_ATOMS)
     )
     for name in sorted(environmental):
         state = policy.read_set(name)
@@ -273,7 +281,7 @@ def _atoms(policy: Policy) -> list[str]:
         else:
             out.append(
                 f"- {name}: a property of the environment, established by a check; depends on "
-                f"{_depends(state)}; dies on: {_dies_on(policy, name)}"
+                f"{depends_phrase(state)}; dies on: {dies_on(policy, name)}"
             )
     for name in sorted(policy.source_atoms):
         out.append(
@@ -304,7 +312,7 @@ def _network(r: NetworkRule, policy: Policy) -> str:
         line += f"; yields {r.source}"
     ws = policy.write_set(r)
     if not ws.empty:
-        line += f"; {_writes(ws)}"
+        line += f"; {writes_phrase(ws)}"
     return line
 
 

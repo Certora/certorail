@@ -264,7 +264,7 @@ def load_policy(path: pathlib.Path | None, root: pathlib.Path | None = None) -> 
         raise SystemExit(str(e))
 
 
-def _policy_origin(path: pathlib.Path | None, root: pathlib.Path) -> tuple[str, str | None]:
+def policy_origin(path: pathlib.Path | None, root: pathlib.Path) -> tuple[str, str | None]:
     """Where the policy for this run comes from, and the prefix it governs (ambient only)."""
     if path is not None:
         return str(path), None
@@ -323,7 +323,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if ns.program is not None or ns.command is not None or ns.args:
             parser.error("--describe takes no program")
         root = ns.root.resolve()
-        print(describe(load_policy(ns.policy, root), *_policy_origin(ns.policy, root)))
+        print(describe(load_policy(ns.policy, root), *policy_origin(ns.policy, root)))
         return 0
     if (ns.program is None) == (ns.command is None):
         parser.error("exactly one of PROGRAM or -c SOURCE is required")

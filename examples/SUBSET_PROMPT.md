@@ -237,7 +237,11 @@ slugs: list[typing.Annotated[str, certora.no_slash, certora.not_dot_dot]] = []
   positionally in order — `certora.exec("git", "push", "origin", branch, cwd=repo)`,
   `certora.exec("find", where, "-mindepth", "1", "-name", "*.py", cwd=here)` — or by keyword
   (`BRANCH=branch`). Some holes are keyword-only (the description says which):
-  `certora.exec("tar", FLAGS=["-c", "-z"], ARCHIVE=out, FILES=[a, b], cwd=here)`. A list hole takes a
+  `certora.exec("git", "log", REVS=["main..HEAD"], PATHS=[src], cwd=repo)`. A flags list before
+  other holes ends at the first argument that provably is not a flag (a literal, a path, a guarded
+  string): `certora.exec("tar", "-c", "-z", out, a, b, cwd=here)`. If the next argument could be a
+  flag (text read from a file or `sys.argv`), the call is rejected: name the holes instead,
+  `certora.exec("grep", FLAGS=["-r"], PATTERN=pat, FILES=[repo], cwd=here)`. A list hole takes a
   list display (or a typed container); a flags hole takes a list of flag names with their values
   following, and only the flags the policy lists. Never spell the words the host inserts (`--`,
   `-f`). Every hole is checked like a parameter annotation (a proven path within a location, text

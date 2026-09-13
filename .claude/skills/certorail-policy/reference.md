@@ -248,27 +248,39 @@ holes.FLAGS = { kind = "flags", flagset = "find-ro" }
 A template binds like a Python call, and the confined program spells the call accordingly. The
 leading literal words select the template; positionals then fill holes in template order, a
 token hole taking one, a variadic hole (`each` or `flags`) taking every remaining positional
-**only if it is the last piece**. A variadic hole that is not last, and every hole after it, is
-**keyword-only**: nothing else could mark where it ends. An unbound variadic hole is empty; an
-unbound token hole is a violation. Interior literal words (`--`, `-f`) are emitted by the host
-and never spelled by the program. The three shapes, from the templates they call:
+**only if it is the last piece**. A `flags` hole that is not last takes the flag-shaped head of
+the positionals (flags of its vocabulary, each valued flag with the positional after it) and
+**ends at the first positional that carries `not-option`** (a literal, a located value, a
+guarded variable), which begins the next hole. A positional that could be either, unknown text
+right after the flags, is rejected with the fix named: bind by keyword to say which hole it
+fills. It is never guessed. An `each` hole that is not last, or a flags hole over an open
+vocabulary (`any = true`, so which flags take values is unknown), cannot end on its own: it and
+every hole after it are **keyword-only**. An unbound variadic hole is empty; an unbound token
+hole is a violation. Interior literal words (`--`, `-f`) are emitted by the host and never
+spelled by the program. The shapes, from the templates they call:
 
 ```toml
 argv = ["git", "push", "origin", "${BRANCH}"]           # one token hole
 argv = ["find", "${WHERE}", "${FLAGS...}"]              # a token, then a trailing variadic
-argv = ["tar", "${FLAGS...}", "${ARCHIVE}", "${FILES...}"]  # a variadic not last: everything keyword-only
+argv = ["tar", "${FLAGS...}", "-f", "${ARCHIVE}", "${FILES...}"]  # a closed flags hole not last: ends at the first non-flag
+argv = ["git", "log", "${REVS...}", "--", "${PATHS...}"]  # an each hole not last: REVS and PATHS keyword-only
 ```
 
 ```python
 certora.exec("git", "push", "origin", branch, cwd=repo)
 certora.exec("find", where, "-mindepth", "1", "-name", pattern, cwd=root)   # the tail is the flags display
-certora.exec("tar", FLAGS=["-c", "-z"], ARCHIVE=out, FILES=files, cwd=root)
+certora.exec("tar", "-c", "-z", out, a, b, cwd=root)                        # out is a path: the flags end there
+certora.exec("tar", "-c", ARCHIVE=out, FILES=files, cwd=root)               # mixing is fine
+certora.exec("grep", "-r", pattern, repo, cwd=root)          # rejected if pattern is unknown text: could be a flag
+certora.exec("grep", FLAGS=["-r"], PATTERN=pattern, FILES=[repo], cwd=root) # the fix
+certora.exec("git", "log", REVS=["main..HEAD"], PATHS=[src], cwd=repo)
 ```
 
 A flags display is read left to right: an element in flag position must be a string literal
 naming a flag of the vocabulary (a computed flag is a violation, an unlisted one a denial); a
 valued flag consumes the next element as its value. `--describe` prints `bind by keyword: …` on
-every template whose holes are keyword-only.
+every template with keyword-only holes, and `FLAGS... ends at the first positional that is not
+a flag; ARCHIVE begins there` on every non-last flags hole that binds positionally.
 
 **The leading-dash guard.** A value in a token or each hole must carry the built-in atom
 `not-option`, "the text does not begin with `-`". Structure supplies it for a located value
@@ -419,8 +431,8 @@ kill it.
 Full rules in `examples/SUBSET_PROMPT.md`. The parts a policy author needs:
 
 - `certora.exec(program, *args, cwd=<proven path>, HOLE=value, …)`: literal program name,
-  string arguments, no splats, `cwd` mandatory; keyword arguments bind a template's keyword-only
-  holes. Returns a `CompletedProcess` whose `.stdout_lines()` / `.stdout_string()` (and stderr
+  string arguments, no splats, `cwd` mandatory; keyword arguments bind a template's holes by
+  name (required for keyword-only holes and for a value the positional rule cannot place). Returns a `CompletedProcess` whose `.stdout_lines()` / `.stdout_string()` (and stderr
   twins) raise `certora.CalledProcessError` on a non-zero exit.
 - `certora.check(name, key=var, …, cwd=var)`: bare statement; establishes on the variables
   passed; `cwd=` present iff the validation declares one.

@@ -76,7 +76,7 @@ class TestDescribe(unittest.TestCase):
             "- built in (every policy",
             "not-option: the text does not begin with '-'",
             "- tar FLAGS... -f ARCHIVE FILES...",
-            "bind by keyword: FLAGS, ARCHIVE, FILES",
+            "FLAGS... ends at the first positional that is not a flag; ARCHIVE begins there",
             "inserted by the host, do not spell: -f",
             "bare: -c -z",
             "-C <path within repos/**>",
