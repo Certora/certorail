@@ -31,7 +31,7 @@ import pathlib
 import tomllib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal, overload
+from typing import Any, Literal, TypedDict, overload
 
 from . import markers
 from .analysis import Exact, RegexLit, StaticPath, alternation
@@ -62,6 +62,7 @@ from .schema import (
     AtomDecl,
     ConstraintFields,
     EachHole,
+    ExecDecl,
     FlagEntry,
     FlagsetDecl,
     FlagsetRef,
@@ -783,8 +784,8 @@ class _Rules:
             try:
                 out.append(validation(
                     v.name, argv=argv, cwd=None if v.cwd is None else _slot(v.cwd), params=v.params,
-                    establishes=establishes, effect_free=v.effect_free, network=v.network, write=v.write,
-                    writes=v.writes,
+                    establishes=establishes, network=v.network, write_fs=v.write_fs, writes=v.writes,
+                    **_exec(v.exec_),
                 ))
             except ValueError as e:
                 self.errors.add(self.where, path, str(e))
@@ -816,7 +817,7 @@ class _Rules:
                 out.append(program(
                     p.name, cwd=_slot(p.cwd), subcommand=p.subcommand or (), requires=requires,
                     argv=pieces, holes=holes if pieces is not None else None, origin=self.doc.origin,
-                    source=yields, effect_free=p.effect_free, network=p.network, write=p.write, writes=p.writes,
+                    source=yields, network=p.network, write_fs=p.write_fs, writes=p.writes, **_exec(p.exec_),
                 ))
             except ValueError as e:
                 self.errors.add(self.where, path, str(e))
@@ -834,6 +835,17 @@ class _Rules:
 def _piece(word: str) -> Piece:
     ref = hole_reference(word)
     return word if ref is None else HoleRef(HoleName(ref[0]), ref[1])
+
+
+class _Exec(TypedDict):
+    env: list[str | dict[str, str]] | None
+    spawn: bool
+
+
+def _exec(decl: ExecDecl | None) -> _Exec:
+    """A grant's ``exec`` table as ``program()`` / ``validation()`` keywords; absent, the
+    unjailed baseline."""
+    return _Exec(env=None, spawn=True) if decl is None else _Exec(env=decl.env, spawn=decl.spawn)
 
 
 def _network(root: PolicyDoc, where: str, declared: _Declared, errors: _Errors) -> list[NetworkRule]:

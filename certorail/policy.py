@@ -36,19 +36,20 @@ A ``validation()`` declares a runtime predicate the program may invoke as
 named parameters), where it may run, and which atoms its success establishes on which argument.
 An atom wrapped in ``pure()`` is a property of the value's text alone -- no effect can invalidate
 it -- while a bare atom is about the environment and dies at any potentially-effectful call;
-``effect_free=True`` declares the evaluator itself mutates nothing, so its run kills no atoms
-(without it, two checkers cannot stack environment atoms on one value). Both are trusted
-assertions, like everything in this file. ``program(..., requires=[...])`` consumes atoms: the
-exec's cwd must carry them, live, at the site.
+``writes=[]`` declares the evaluator itself mutates nothing, so its run kills no atoms (without
+it, two checkers cannot stack environment atoms on one value). Both are trusted assertions, like
+everything in this file. ``program(..., requires=[...])`` consumes atoms: the exec's cwd must
+carry them, live, at the site.
 
 *Regions* (EFFECTS.md) make "any potentially-effectful call" precise. ``region()`` names a piece
 of state with one medium -- ``fs``, by a footprint relative to the cwd of a validation whose atom
 depends on it (that path and everything below), or ``network`` -- and rules say what they
-**write** (``writes=[...]``, within the media they claim to reach: ``network=False``,
-``write=False``; ``effect_free`` is neither medium) while environmental atoms say what they
-depend on (``reads={atom: [...]}``). An effect kills an atom exactly when the two sets meet;
-undeclared means everything, so a policy that says nothing keeps today's kill. Whether a grant's
-media are enforced by a jail is JAILS.md's business; here they are claims.
+**write** (``writes=[...]``, within the media they reach: ``network=False``, ``write_fs=False``)
+while environmental atoms say what they depend on (``reads={atom: [...]}``). An effect kills an
+atom exactly when the two sets meet; undeclared means everything, so a policy that says nothing
+keeps today's kill. The media are *enforced*: a grant with ``network=False`` or
+``write_fs=False`` runs its child in a jail that denies the medium (``childjail``, JAILS.md);
+``writes`` stays a claim, since no jail can check regions.
 
 Evaluation presupposes ``Report.ok``: every site already has a proven location. The policy
 decides whether that location is one the host permits.
@@ -88,6 +89,7 @@ from .analysis import (
     url_of,
     ValidationFact
 )
+from .childjail import Environment, Jail, JailUnavailable, confined, environment_spec
 from .effects import EVERYTHING, NOTHING, Effects, Medium, effects_of, whole
 from .ids import (
     BUILTIN_ATOMS,
@@ -264,23 +266,23 @@ def pure(name: str) -> Pure:
 CWD: ParamName = ParamName("cwd")  # the establishes-key for the check's cwd argument
 
 
-def _media(what: str, effect_free: bool, network: bool | None, write: bool | None) -> tuple[bool, bool]:
-    """A grant's media from its keys (EFFECTS.md): ``effect_free`` is neither medium, and
-    disagrees with either one claimed; an unspecified medium is claimed."""
-    if effect_free:
-        if network or write:
-            raise ValueError(f"{what}: effect-free means no network and no writes; it disagrees with network/write = true")
-        return False, False
-    return (True if network is None else network), (True if write is None else write)
-
-
-def _permitted(network: bool, write: bool) -> frozenset[Medium]:
+def _permitted(network: bool, write_fs: bool) -> frozenset[Medium]:
     out: set[Medium] = set()
-    if write:
+    if write_fs:
         out.add("fs")
     if network:
         out.add("network")
     return frozenset(out)
+
+
+def _write_set(network: bool, write_fs: bool, writes: Effects | None) -> Effects:
+    """What a grant writes (EFFECTS.md): its declaration, else every region of the media it
+    reaches."""
+    return whole(_permitted(network, write_fs)) if writes is None else writes
+
+
+def _env(env: Iterable[str | Mapping[str, str]] | None) -> Environment | None:
+    return None if env is None else environment_spec(env)
 
 
 @dataclass(frozen=True)
@@ -319,16 +321,28 @@ class Validation:
     establishes: dict[ParamName, frozenset[Atom]]  # param name or CWD -> atoms
     pure_atoms: frozenset[Atom] = frozenset()  # the established atoms wrapped in pure()
     # the evaluator's media (EFFECTS.md): may it reach the network, may it write the filesystem.
-    # Claims, like everything here; JAILS.md is where they would become facts
+    # Enforced: the broker jails the evaluator out of a medium it does not reach (childjail)
     network: bool = True
-    write: bool = True
+    write_fs: bool = True
     # the regions the evaluator writes, within its media; None: undeclared, every region of them
     writes: Effects | None = None
+    # the rest of the jail (``exec``): the environment (None: the broker's), process creation
+    env: Environment | None = None
+    spawn: bool = True
+
+    @property
+    def write_set(self) -> Effects:
+        return _write_set(self.network, self.write_fs, self.writes)
 
     @property
     def effect_free(self) -> bool:
-        """The evaluator mutates nothing -- neither medium -- so its run kills no atoms."""
-        return not self.network and not self.write
+        """The evaluator's run writes no region, so it kills no atoms."""
+        return self.write_set.empty
+
+    @property
+    def jail(self) -> Jail:
+        """How the broker spawns the evaluator: its media, enforced, and its ``exec`` table."""
+        return Jail(self.env, self.network, self.write_fs, self.spawn)
 
 
 def validation(
@@ -338,12 +352,12 @@ def validation(
     cwd: Where | Iterable[Where] | None = None,
     params: Iterable[str] = (),
     establishes: Mapping[str, Iterable[str | Pure]],
-    effect_free: bool = False,
-    network: bool | None = None,
-    write: bool | None = None,
+    network: bool = True,
+    write_fs: bool = True,
     writes: Iterable[str] | None = None,
+    env: Iterable[str | Mapping[str, str]] | None = None,
+    spawn: bool = True,
 ) -> Validation:
-    network_b, write_b = _media(f"validation {name!r}", effect_free, network, write)
     params_t = tuple(ParamName(p) for p in params)
     if len(set(params_t)) != len(params_t) or CWD in params_t:
         raise ValueError(f"validation {name!r}: parameters must be unique and may not be named {CWD!r}")
@@ -389,7 +403,8 @@ def validation(
         )
     return Validation(
         ValidationName(name), params_t, argv_t, None if cwd is None else _one_or_many(cwd), est,
-        frozenset(pure_set), network_b, write_b, None if writes is None else effects_of(writes),
+        frozenset(pure_set), network, write_fs, None if writes is None else effects_of(writes),
+        _env(env), spawn,
     )
 
 
@@ -421,16 +436,29 @@ class Program:
     # the source atom this rule's results yield (PROVENANCE.md): a value extracted from the
     # exec's output is something this program produced, unmodified
     source: SourceId | None = None
-    # the tool's media (EFFECTS.md): claims that bound its write set without naming a region
+    # the tool's media (EFFECTS.md): they bound its write set without naming a region, and the
+    # broker enforces them -- the tool runs jailed out of a medium it does not reach (childjail)
     network: bool = True
-    write: bool = True
+    write_fs: bool = True
     # the regions the tool writes, within its media; None: undeclared, every region of them
     writes: Effects | None = None
+    # the rest of the jail (``exec``): the environment (None: the broker's), process creation
+    env: Environment | None = None
+    spawn: bool = True
+
+    @property
+    def write_set(self) -> Effects:
+        return _write_set(self.network, self.write_fs, self.writes)
 
     @property
     def effect_free(self) -> bool:
-        """Neither medium: the tool changes nothing an atom could depend on."""
-        return not self.network and not self.write
+        """The tool writes no region: it changes nothing an atom could depend on."""
+        return self.write_set.empty
+
+    @property
+    def jail(self) -> Jail:
+        """How the broker spawns the tool: its media, enforced, and its ``exec`` table."""
+        return Jail(self.env, self.network, self.write_fs, self.spawn)
 
     @property
     def leading_words(self) -> tuple[str, ...]:
@@ -459,14 +487,14 @@ def program(
     holes: Mapping[str, Hole] | None = None,
     origin: str | None = None,
     source: str | None = None,
-    effect_free: bool = False,
-    network: bool | None = None,
-    write: bool | None = None,
+    network: bool = True,
+    write_fs: bool = True,
     writes: Iterable[str] | None = None,
+    env: Iterable[str | Mapping[str, str]] | None = None,
+    spawn: bool = True,
 ) -> Program:
     """*requires* is the atoms the cwd must carry, or a table ``{cwd: [...], HOLE: [...]}``
     that also demands atoms of a hole's value, folded into that hole's constraint."""
-    network_b, write_b = _media(f"program {name!r}", effect_free, network, write)
     words = tuple(subcommand.split()) if isinstance(subcommand, str) else tuple(subcommand)
     if not all(isinstance(w, str) and w for w in words):
         raise ValueError(f"program {name!r}: subcommand words must be non-empty strings")
@@ -530,9 +558,11 @@ def program(
         template,
         origin,
         None if source is None else SourceId(source),
-        network_b,
-        write_b,
+        network,
+        write_fs,
         writes_e,
+        _env(env),
+        spawn,
     )
 
 
@@ -845,9 +875,9 @@ class Refusal:
 
 def _literal_slot(v: Validation, atom_name: Atom) -> str | None:
     """The single input slot through which *v* can establish *atom_name* on a literal, if it is a
-    literal checker at all: effect-free (safe to run at check time), the atom pure (the result
-    stays valid), and exactly one input -- one declared parameter, or none plus cwd -- so the
-    binding of the literal is unambiguous."""
+    literal checker at all: effect-free (an empty write set: safe to run at check time), the atom
+    pure (the result stays valid), and exactly one input -- one declared parameter, or none plus
+    cwd -- so the binding of the literal is unambiguous."""
     if not v.effect_free or atom_name not in v.pure_atoms:
         return None
     if not v.params and atom_name in v.establishes.get(CWD, frozenset()):
@@ -866,10 +896,23 @@ def _run_literal_checker(v: Validation, slot: str, text: str, root: pathlib.Path
     if not cwd.is_dir():
         return False
     try:
-        result = subprocess.run(argv, cwd=cwd, shell=False, capture_output=True, check=False)
-    except OSError:
-        return False
+        with confined(argv, v.jail) as spawn:
+            result = subprocess.run(
+                spawn.argv, cwd=cwd, env=spawn.env, pass_fds=spawn.pass_fds, shell=False,
+                capture_output=True, check=False,
+            )
+    except (OSError, JailUnavailable):
+        return False  # a checker that cannot run vouches for nothing
     return result.returncode == 0
+
+
+@dataclass(frozen=True)
+class Command:
+    """A permitted concrete exec, as the broker spawns it: the composed argv and the rule that
+    admitted it (its jail says how the child is confined)."""
+
+    argv: list[str]
+    rule: Program
 
 
 @dataclass(frozen=True)
@@ -993,10 +1036,10 @@ class Policy:
 
         for p in progs:
             if p.writes is not None:
-                within_media(f"program {p.name!r}", p.writes, _permitted(p.network, p.write))
+                within_media(f"program {p.name!r}", p.writes, _permitted(p.network, p.write_fs))
         for v in vals:
             if v.writes is not None:
-                within_media(f"validation {v.name!r}", v.writes, _permitted(v.network, v.write))
+                within_media(f"validation {v.name!r}", v.writes, _permitted(v.network, v.write_fs))
         for r in net_in:
             if r.writes is not None:
                 within_media(f"network rule {r.host!r}", r.writes, frozenset({"network"}))
@@ -1072,13 +1115,13 @@ class Policy:
         """What *rule* writes (EFFECTS.md): its declaration, else every region of the media it
         reaches. A network rule reaches the network only, and one admitting only GET and HEAD
         writes nothing: a GET that mutates the server is the server's bug."""
-        if rule.writes is not None:
-            return rule.writes
         if isinstance(rule, NetworkRule):
+            if rule.writes is not None:
+                return rule.writes
             if rule.methods and rule.methods <= {"GET", "HEAD"}:
                 return NOTHING
             return whole(["network"])
-        return whole(_permitted(rule.network, rule.write))
+        return rule.write_set
 
     def read_set(self, atom_name: Atom) -> Effects:
         """What *atom_name* depends on: its declaration, else everything."""
@@ -1165,8 +1208,9 @@ class Policy:
         keywords: Mapping[str, str | Sequence[str]],
         cwd: str,
         discharge: Discharge | None = None,
-    ) -> list[str] | Refusal:
-        """The broker's re-check of one concrete exec, and the argv to spawn for it.
+    ) -> "Command | Refusal":
+        """The broker's re-check of one concrete exec, and the command to spawn for it: the
+        argv, and the rule it came from (whose jail says how to spawn it).
 
         Necessarily incomplete against the full rules -- runtime strings carry no provenance,
         so environmental atoms and source atoms are the static analysis' alone. What IS
@@ -1192,7 +1236,7 @@ class Policy:
         if rule.template is None:
             if keywords:
                 return Refusal(f"the rule for {program_name!r} takes no keyword arguments")
-            return [program_name, *arguments]
+            return Command([program_name, *arguments], rule)
         bound = bind(
             rule.template,
             list(arguments),
@@ -1212,7 +1256,7 @@ class Policy:
         )
         if failures:
             return Refusal("; ".join(failures))
-        return instantiate(bound)
+        return Command(instantiate(bound), rule)
 
     def exec_refusal(self, program_name: str, arguments: Sequence[str], cwd: str) -> str | None:
         """``exec_command`` for the flat form: the refusal's reason, or None when permitted."""

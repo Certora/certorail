@@ -55,7 +55,7 @@ org   = { kind = "atom" }
 name        = "org-repo"
 argv        = ["${checkers}/org-checkout"]
 cwd         = "${where}/**"
-effect-free = true
+writes      = []
 establishes = { cwd = ["${org}"] }
 
 [[program]]

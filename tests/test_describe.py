@@ -30,11 +30,11 @@ POLICY = Policy.allow(
     validations=[
         validation(
             "org-repo", argv=("/x/org-checkout",), cwd=markers.within("repos"),
-            establishes={"cwd": ["org-checkout"]}, effect_free=True,
+            establishes={"cwd": ["org-checkout"]}, writes=[],
         ),
         validation(
             "vetted", argv=("test", param("value"), "!=", "x"), params=("value",),
-            establishes={"value": [pure("vetted")]}, effect_free=True,
+            establishes={"value": [pure("vetted")]}, writes=[],
         ),
     ],
     programs=[

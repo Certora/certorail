@@ -120,7 +120,7 @@ class TestMissing(unittest.TestCase):
             atoms=[atom("slug", markers.matches(r"[a-z-]+"))],
             validations=[
                 validation("lower", argv=(str(checker), param("value")), params=("value",),
-                           establishes={"value": [pure("lower")]}, effect_free=True),
+                           establishes={"value": [pure("lower")]}, writes=[]),
                 validation("org-repo", argv=("true",), cwd=markers.within("repos"),
                            establishes={"cwd": ["org-checkout"]}),
             ],
@@ -237,7 +237,7 @@ class TestGuardsEstablishNotOption(unittest.TestCase):
 
 class TestAnnotationKinds(unittest.TestCase):
     POLICY = Policy.allow(
-        validations=[validation("safe", argv=("true",), params=("value",), establishes={"value": [pure("safe")]}, effect_free=True)],
+        validations=[validation("safe", argv=("true",), params=("value",), establishes={"value": [pure("safe")]}, writes=[])],
         programs=[program("gh", cwd=".", subcommand="api", source="gh-api")],
     )
 

@@ -12,7 +12,7 @@ from certorail.broker import build_server, exec_request
 from certorail.host import Accepted, Rejected
 from certorail.host import check as host_check
 from certorail.ids import HoleName
-from certorail.policy import Policy, Refusal, atom, constraint, flagset, hole, program, splice, validation
+from certorail.policy import Command, Policy, Refusal, atom, constraint, flagset, hole, program, splice, validation
 from certorail.policyfile import PolicyFileError, from_data
 from certorail.templates import (
     BindError,
@@ -380,7 +380,9 @@ class TestIntent(Base):
 
     def test_at_runtime_every_string_is_literal(self) -> None:
         # the broker sees text with no provenance: the shape is what it can re-check
-        self.assertEqual(POLICY.exec_command("dropdb", ["dev-x"], {}, "."), ["dropdb", "dev-x"])
+        command = POLICY.exec_command("dropdb", ["dev-x"], {}, ".")
+        assert isinstance(command, Command)
+        self.assertEqual(command.argv, ["dropdb", "dev-x"])
 
 
 class TestTemplateWellFormedness(unittest.TestCase):
@@ -514,10 +516,9 @@ class TestFlagRequires(unittest.TestCase):
         self.assertIn("not validated by: feature", self.denial('certora.exec("git", "switch", "main", cwd=repo)\n'))
 
     def test_the_broker_rechecks_textual_demands(self) -> None:
-        self.assertEqual(
-            self.policy.exec_command("git", ["push", "origin", "feature/x", "--force"], {}, "repos/x"),
-            ["git", "push", "origin", "feature/x", "--force"],
-        )
+        command = self.policy.exec_command("git", ["push", "origin", "feature/x", "--force"], {}, "repos/x")
+        assert isinstance(command, Command)
+        self.assertEqual(command.argv, ["git", "push", "origin", "feature/x", "--force"])
         result = self.policy.exec_command("git", ["push", "origin", "main", "--force"], {}, "repos/x")
         assert isinstance(result, Refusal)
         self.assertIn("--force requires BRANCH validated by: feature", result.reason)
@@ -590,16 +591,21 @@ class TestBind(unittest.TestCase):
 
 
 class TestRuntime(unittest.TestCase):
+    def argv(self, *args) -> list[str]:
+        command = POLICY.exec_command(*args)
+        assert isinstance(command, Command), command
+        return command.argv
+
     def test_the_broker_composes_the_argv(self) -> None:
         self.assertEqual(
-            POLICY.exec_command("grep", [], {"FLAGS": ["-r"], "PATTERN": "x", "FILES": ["repos/a"]}, "."),
+            self.argv("grep", [], {"FLAGS": ["-r"], "PATTERN": "x", "FILES": ["repos/a"]}, "."),
             ["grep", "-r", "--", "x", "repos/a"],
         )
         self.assertEqual(
-            POLICY.exec_command("git", ["push", "origin", "feature"], {}, "repos/x"),
+            self.argv("git", ["push", "origin", "feature"], {}, "repos/x"),
             ["git", "push", "origin", "feature"],
         )
-        self.assertEqual(POLICY.exec_command("git", ["log"], {}, "repos/x"), ["git", "log"])
+        self.assertEqual(self.argv("git", ["log"], {}, "repos/x"), ["git", "log"])
 
     def test_the_same_checks_run_on_strings(self) -> None:
         cases = [

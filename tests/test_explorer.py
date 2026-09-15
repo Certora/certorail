@@ -36,12 +36,12 @@ POLICY: dict[str, object] = {
             "name": "org-repo",
             "argv": ["test", "-d", ".git"],
             "cwd": "repos/**",
-            "effect-free": True,
+            "writes": [],
             "establishes": {"cwd": ["org-checkout"]},
         },
     ],
     "program": [
-        {"name": "git", "subcommand": "log", "cwd": "repos/**", "effect-free": True},
+        {"name": "git", "subcommand": "log", "cwd": "repos/**", "writes": []},
         {
             "name": "git",
             "cwd": "repos/**",

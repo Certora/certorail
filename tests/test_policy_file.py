@@ -99,7 +99,7 @@ name        = "not-force-check"
 params      = ["value"]
 argv        = ["test", "${value}", "!=", "--force"]
 cwd         = "**"
-effect-free = true
+writes      = []
 establishes = { value = ["not-force"] }
 
 [[validation]]
@@ -133,7 +133,7 @@ EXPECTED = Policy.allow(
             cwd=markers.within("."),
             params=("value",),
             establishes={"value": [pure("not-force")]},
-            effect_free=True,
+            writes=[],
         ),
         validation(
             "org-repo",
@@ -294,7 +294,7 @@ class TestCwdFreeValidations(unittest.TestCase):
             name        = "not-force-check"
             params      = ["value"]
             argv        = ["test", "${value}", "!=", "--force"]
-            effect-free = true
+            writes      = []
             establishes = { value = ["not-force"] }
         """)
         (v,) = pol.validations

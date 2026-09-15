@@ -15,7 +15,7 @@ class TestBuilding(unittest.TestCase):
         self.assertEqual(str(Path().validation(2).argv(0)), "validation[2].argv[0]")
         self.assertEqual(str(Path().network(0).requires.at(1)), "network[0].requires[1]")
         self.assertEqual(str(Path().program(0).holes["F"].key("-k").requires["cwd"]), "program[0].holes.F.-k.requires.cwd")
-        self.assertEqual(str(Path().program(3).effect_free), "program[3].effect-free")  # underscores are dashes
+        self.assertEqual(str(Path().program(3).write_fs), "program[3].write-fs")  # underscores are dashes
         self.assertEqual(str(Path()), "")
         self.assertFalse(Path())
 

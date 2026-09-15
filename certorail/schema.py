@@ -42,6 +42,7 @@ from pydantic import (
     model_validator,
 )
 
+from .childjail import environment_spec
 from .docpath import DocPath
 from .effects import as_medium
 from .ids import BUILTIN_ATOMS
@@ -466,20 +467,47 @@ class AtomDecl(_Table):
 # ---------------------------------------------------------------------------
 
 
+class ExecDecl(_Table):
+    """``exec``: the rest of how the grant's child is run (JAILS.md, ``childjail``), beyond the
+    media keys -- the environment (``env``: a list whose strings name variables passed through
+    from the host and whose tables set variables to literal values; absent: the host's whole
+    environment) and whether it may create processes (``spawn``). Enforced by the OS jail; both
+    default to the unjailed baseline."""
+
+    env: list[str | dict[str, str]] | None = None
+    spawn: bool = True
+
+    @field_validator("env")
+    @classmethod
+    def _one_mapping(cls, items: list[str | dict[str, str]] | None) -> list[str | dict[str, str]] | None:
+        if items is not None:
+            environment_spec(items)  # names are names, each mentioned once, none the host's own
+        return items
+
+
+_RETIRED_MEDIA_KEYS = {
+    "effect-free": "'effect-free' is no longer a key: spell writes = [] (the grant writes no region)",
+    "write": "'write' is no longer a key: spell write-fs (the grant reaches the filesystem medium)",
+}
+
+
 class _Media(_Table):
-    """The media a grant claims to reach and what it writes within them (EFFECTS.md).
-    ``effect-free`` is neither medium and disagrees with either claimed."""
+    """The media a grant reaches -- enforced by its jail (``network``, ``write-fs``) -- what it
+    writes within them (``writes``, EFFECTS.md), and the rest of the jail (``exec``)."""
 
-    effect_free: bool = False
-    network: bool | None = None
-    write: bool | None = None
+    network: bool = True
+    write_fs: bool = True
     writes: list[str] | None = None
+    exec_: ExecDecl | None = None
 
-    @model_validator(mode="after")
-    def _media(self) -> "_Media":
-        if self.effect_free and (self.network or self.write):
-            raise ValueError("effect-free means no network and no writes; it disagrees with network/write = true")
-        return self
+    @model_validator(mode="before")
+    @classmethod
+    def _retired_media(cls, data: Any) -> Any:  # a distinct name: ProgramDecl._retired would shadow it
+        if isinstance(data, dict):
+            for key, message in _RETIRED_MEDIA_KEYS.items():
+                if key in data:
+                    raise ValueError(message)
+        return data
 
 
 class ValidationDecl(_Media):

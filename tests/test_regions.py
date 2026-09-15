@@ -41,15 +41,15 @@ def policy_data() -> dict:
             "not-force": {"pure": True},
         },
         "validation": [
-            {"name": "org-repo", "argv": ["true"], "cwd": "repos/**", "effect-free": True,
+            {"name": "org-repo", "argv": ["true"], "cwd": "repos/**", "writes": [],
              "establishes": {"cwd": ["org-checkout"]}},
             {"name": "feature", "argv": ["true"], "cwd": "repos/**", "network": False, "writes": [],
              "establishes": {"cwd": ["on-feature"]}},
-            {"name": "main-unprotected", "argv": ["true"], "cwd": "repos/**", "write": False,
+            {"name": "main-unprotected", "argv": ["true"], "cwd": "repos/**", "write-fs": False,
              "writes": [], "establishes": {"cwd": ["unprotected"]}},
             {"name": "is-clean", "argv": ["true"], "cwd": "repos/**", "establishes": {"cwd": ["clean"]}},
             {"name": "not-force-check", "params": ["value"], "argv": ["test", "${value}", "!=", "--force"],
-             "effect-free": True, "establishes": {"value": ["not-force"]}},
+             "writes": [], "establishes": {"value": ["not-force"]}},
         ],
         "program": [
             {"name": "git", "subcommand": "add", "cwd": "repos/**", "network": False, "writes": ["git.index"]},
@@ -59,10 +59,10 @@ def policy_data() -> dict:
              "writes": ["git.remote", "git.refs"]},
             {"name": "git", "subcommand": "checkout", "cwd": "repos/**", "network": False,
              "writes": ["git.head", "git.index", "git.worktree"]},
-            {"name": "git", "subcommand": "status", "cwd": "repos/**", "effect-free": True},
+            {"name": "git", "subcommand": "status", "cwd": "repos/**", "network": False, "write-fs": False},
             {"name": "cargo", "subcommand": "build", "cwd": "repos/**"},
             {"name": "gh", "cwd": ".", "argv": ["gh", "${FLAGS...}"],
-             "holes": {"FLAGS": {"kind": "flags", "any": True}}, "write": False},
+             "holes": {"FLAGS": {"kind": "flags", "any": True}}, "write-fs": False},
         ],
         "network": [
             {"host": "api.github.com", "methods": ["GET"]},
@@ -103,14 +103,17 @@ class TestWriteSets(unittest.TestCase):
         self.assertEqual(self.policy.write_set(rule(self.policy, "gh")), whole(["network"]))
         self.assertEqual(self.policy.write_set(check(self.policy, "is-clean")), EVERYTHING)
 
-    def test_effect_free_is_no_media(self) -> None:
+    def test_no_media_is_effect_free_and_so_is_an_empty_write_set(self) -> None:
         status = rule(self.policy, "git", "status")
         self.assertFalse(status.network)
-        self.assertFalse(status.write)
+        self.assertFalse(status.write_fs)
         self.assertTrue(status.effect_free)
         self.assertEqual(self.policy.write_set(status), NOTHING)
-        self.assertTrue(check(self.policy, "org-repo").effect_free)
-        self.assertFalse(check(self.policy, "feature").effect_free)  # fs claimed, writes nothing
+        org_repo = check(self.policy, "org-repo")  # writes = []: both media reached, nothing written
+        self.assertTrue(org_repo.effect_free)
+        self.assertTrue(org_repo.network and org_repo.write_fs)
+        self.assertTrue(check(self.policy, "feature").effect_free)  # writes = [] too
+        self.assertFalse(check(self.policy, "is-clean").effect_free)  # undeclared: everything
 
     def test_network_rules(self) -> None:
         self.assertEqual(self.policy.write_set(net(self.policy, "api.github.com")), NOTHING)  # GET only
@@ -179,7 +182,7 @@ class TestLoadErrors(unittest.TestCase):
         data["program"][0]["writes"] = ["git.remote"]  # network = false
         self.rejects(data, "says it writes 'git.remote' (network) but does not reach that medium")
         data = policy_data()
-        data["program"][0]["write"] = False  # git add: neither medium left for a filesystem claim
+        data["program"][0]["write-fs"] = False  # git add: neither medium left for a filesystem claim
         data["program"][0]["writes"] = ["fs"]
         self.rejects(data, "whole fs medium but does not reach it")
 
@@ -219,10 +222,13 @@ class TestLoadErrors(unittest.TestCase):
         data["program"][6]["writes"] = ["git.remote"]  # gh: any flag, any value
         self.rejects(data, "cannot say what it writes")
 
-    def test_effect_free_disagrees_with_a_claimed_medium(self) -> None:
+    def test_the_retired_media_keys_name_their_replacement(self) -> None:
         data = policy_data()
-        data["program"][4]["network"] = True  # git status: effect-free = true
-        self.rejects(data, "effect-free means no network and no writes")
+        data["program"][4]["effect-free"] = True
+        self.rejects(data, "'effect-free' is no longer a key: spell writes = []")
+        data = policy_data()
+        data["program"][6]["write"] = False
+        self.rejects(data, "'write' is no longer a key: spell write-fs")
 
     def test_an_any_hole_the_tool_could_read_as_an_option(self) -> None:
         templated = {
@@ -323,7 +329,7 @@ class TestPythonApi(unittest.TestCase):
             regions=[region("git.config", footprint=".git/config"), region("gh.pr", network=True)],
             reads={"org-checkout": ["git.config"]},
             validations=[validation("org-repo", argv=["true"], cwd="repos/**",
-                                    establishes={"cwd": ["org-checkout"]}, effect_free=True)],
+                                    establishes={"cwd": ["org-checkout"]}, writes=[])],
             programs=[program("git", cwd="repos/**", subcommand="commit", network=False, writes=["fs"])],
         )
         self.assertEqual(policy.write_set(policy.programs[0]), whole(["fs"]))
@@ -333,7 +339,7 @@ class TestPythonApi(unittest.TestCase):
         with self.assertRaises(ValueError):
             region("both", footprint="x", network=True)
         with self.assertRaises(ValueError):
-            program("git", cwd=".", effect_free=True, network=True)
+            Policy.allow(programs=[program("git", cwd=".", network=False, writes=["network"])])
 
 
 if __name__ == "__main__":

@@ -41,7 +41,7 @@ _INTERNAL_SEGMENT = re.compile(
 
 
 def _hyphenated(name: str) -> str:
-    """An attribute spelling to the document's key: ``effect_free`` is ``effect-free``."""
+    """An attribute spelling to the document's key: ``write_fs`` is ``write-fs``."""
     return name.replace("_", "-")
 
 
@@ -113,7 +113,7 @@ type KeyedKey = Literal["holes", "regions", "atoms", "params", "flags", "binding
 type ScalarKey = Literal[
     "policy_version", "ruleset_version", "root", "filesystem", "read", "write", "list",
     "name", "cwd", "when", "kind", "subcommand", "min", "literal", "any", "location", "matches",
-    "one_of", "footprint", "about", "pure", "reads", "writes", "effect_free", "ruleset", "host",
+    "one_of", "footprint", "about", "pure", "reads", "writes", "write_fs", "exec", "env", "spawn", "ruleset", "host",
     "schemes", "ports", "methods", "allow_nonpublic", "read_timeout", "total_timeout",
     "max_response_bytes", "path", "value", "atom", "on_redirect",
 ]
@@ -123,7 +123,7 @@ _KEYED: frozenset[str] = frozenset({"holes", "regions", "atoms", "params", "flag
 _SCALAR: frozenset[str] = frozenset({
     "policy_version", "ruleset_version", "root", "filesystem", "read", "write", "list",
     "name", "cwd", "when", "kind", "subcommand", "min", "literal", "any", "location", "matches",
-    "one_of", "footprint", "about", "pure", "reads", "writes", "effect_free", "ruleset", "host",
+    "one_of", "footprint", "about", "pure", "reads", "writes", "write_fs", "exec", "env", "spawn", "ruleset", "host",
     "schemes", "ports", "methods", "allow_nonpublic", "read_timeout", "total_timeout",
     "max_response_bytes", "path", "value", "atom", "on_redirect",
 })

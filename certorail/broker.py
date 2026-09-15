@@ -4,11 +4,13 @@ The confined program runs jailed -- no network (an empty network namespace on Li
 Seatbelt deny on macOS) and eventually no subprocesses; the broker is the host-side process
 that acts on its behalf, over a Unix socket -- the single, auditable hole in the wall. TLS
 terminates here: the sandboxed program never sees a certificate, a proxy variable, or a DNS
-answer. Exec'd children are spawned here, outside the jail, after re-checking the decidable
+answer. Exec'd children are spawned here, outside the program's jail, after re-checking the decidable
 half of the exec rules (program, fail-closed subcommand, cwd containment -- defense in depth;
 the full validation rules were enforced statically), and their output is drained and returned
-wholesale: ``certora.exec`` keeps its ``CompletedProcess`` contract to the byte. A client
-hangup mid-exec kills the child's whole process group.
+wholesale: ``certora.exec`` keeps its ``CompletedProcess`` contract to the byte. A grant's media
+(``network = false``, ``write-fs = false``) and its ``exec`` table (a scrubbed environment, no
+process creation) put its child in a jail of its own (``childjail``); each is opt-in and
+enforced. A client hangup mid-exec kills the child's whole process group.
 
 One connection carries exactly one request. The client connects, sends one framed request,
 and blocks on the framed response; hanging up is the cancellation protocol. When the client
@@ -67,6 +69,7 @@ import urllib.parse
 from collections.abc import Callable, Sequence
 
 from .analysis import _literal_location, location_le
+from .childjail import Jail, JailUnavailable, confined
 from .enforcement import Discharge
 from .policy import (
     NetworkRule,
@@ -459,37 +462,45 @@ def _resolve(root: pathlib.Path, cwd: str) -> pathlib.Path:
 
 
 def _spawn_drained(
-    client: socket.socket, argv: list[str], workdir: pathlib.Path
+    client: socket.socket, argv: list[str], workdir: pathlib.Path, jail: Jail
 ) -> tuple[int, bytes, bytes]:
-    """Spawn host-side and drain the output wholesale. A client hangup kills the child's
-    whole process group (it gets its own, so descendants die with it)."""
+    """Spawn host-side, under the grant's *jail* (``childjail``: the OS-enforced reach the
+    grant's ``exec`` table allows the child), and drain the output wholesale. A client hangup
+    kills the child's whole process group (it gets its own, so descendants die with it). A jail
+    the platform cannot enforce is a broker error before anything runs."""
     try:
-        proc = subprocess.Popen(
-            argv,
-            cwd=workdir,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-            start_new_session=True,
-        )
-    except OSError as exc:
-        raise BrokerError(f"spawn: {exc}")
+        with confined(argv, jail) as spawn:
+            try:
+                proc = subprocess.Popen(
+                    spawn.argv,
+                    cwd=workdir,
+                    env=spawn.env,
+                    pass_fds=spawn.pass_fds,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    shell=False,
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                raise BrokerError(f"spawn: {exc}")
 
-    def kill_child() -> bool:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass          # already gone
-        return True
+            def kill_child() -> bool:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass          # already gone
+                return True
 
-    with _HangupWatcher(client, kill_child):
-        try:
-            out, err = proc.communicate(timeout=EXEC_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            kill_child()
-            proc.communicate()
-            raise BrokerError(f"timeout ({EXEC_TIMEOUT:g}s) exceeded") from None
+            with _HangupWatcher(client, kill_child):
+                try:
+                    out, err = proc.communicate(timeout=EXEC_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    kill_child()
+                    proc.communicate()
+                    raise BrokerError(f"timeout ({EXEC_TIMEOUT:g}s) exceeded") from None
+    except JailUnavailable as exc:
+        raise BrokerError(f"jail: {exc}")
     if len(out) > MAX_OUTPUT_BYTES or len(err) > MAX_OUTPUT_BYTES:
         raise ResponseTooLarge(f"output exceeds {MAX_OUTPUT_BYTES} bytes per stream")
     return proc.returncode, out, err
@@ -514,9 +525,9 @@ def _run_exec(
         raise PolicyDenied(command.reason)
     if root is None:
         raise BrokerError("exec: the broker was built without a root")
-    returncode, out, err = _spawn_drained(client, command, _resolve(root, cwd))
+    returncode, out, err = _spawn_drained(client, command.argv, _resolve(root, cwd), command.rule.jail)
     log.info("EXEC %s (cwd=%s) -> %d (out %d bytes, err %d bytes)",
-             " ".join(command), cwd, returncode, len(out), len(err))
+             " ".join(command.argv), cwd, returncode, len(out), len(err))
     return {
         "returncode": returncode,
         "stdout_b64": base64.b64encode(out).decode("ascii"),
@@ -574,7 +585,7 @@ def _run_check(
     workdir = root if cwd is None else _resolve(root, cwd)
     argv = [piece if isinstance(piece, str) else params[piece.name]
             for piece in declared.argv]
-    returncode, _, err = _spawn_drained(client, argv, workdir)
+    returncode, _, err = _spawn_drained(client, argv, workdir, declared.jail)
     log.info("CHECK %s (cwd=%s) -> %d", name, cwd if cwd is not None else ".", returncode)
     return {
         "returncode": returncode,

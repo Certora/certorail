@@ -297,7 +297,7 @@ SUB_POLICY = Policy.allow(
             # the checker vouches for the head too: a checked branch name fills a hole that no
             # spelled "--" precedes
             establishes={"value": [pure("not-force"), "not-option"]},
-            effect_free=True,
+            writes=[],
         )
     ],
     programs=[
@@ -388,7 +388,7 @@ class TestSubcommands(unittest.TestCase):
                     argv=("true",),
                     cwd=markers.within("repos"),
                     establishes={"cwd": [pure("org-checkout")]},
-                    effect_free=True,
+                    writes=[],
                 )
             ],
         )
@@ -422,7 +422,7 @@ CWD_FREE_POLICY = Policy.allow(
             argv=("test", param("value"), "!=", "--force"),
             params=("value",),
             establishes={"value": [pure("not-force"), "not-option"]},
-            effect_free=True,
+            writes=[],
         )
     ],
     programs=[

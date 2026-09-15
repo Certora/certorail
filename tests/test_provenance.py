@@ -8,6 +8,7 @@ from certorail.host import Accepted, Rejected
 from certorail.host import check as host_check
 from certorail.markers import ExecResult, ExtractError, NetworkResponse
 from certorail.policy import (
+    Command,
     Policy,
     atom,
     constraint,
@@ -212,10 +213,9 @@ class TestPolicySide(unittest.TestCase):
 
     def test_source_atoms_are_never_textual_at_runtime(self) -> None:
         # the broker cannot see provenance: the hole's source atom is the static check's alone
-        self.assertEqual(
-            POLICY.exec_command("git", ["push", "origin", "feature"], {}, "repos/x"),
-            ["git", "push", "origin", "feature"],
-        )
+        command = POLICY.exec_command("git", ["push", "origin", "feature"], {}, "repos/x")
+        assert isinstance(command, Command)
+        self.assertEqual(command.argv, ["git", "push", "origin", "feature"])
 
     def test_only_extraction_establishes_a_source_atom(self) -> None:
         with self.assertRaises(ValueError):

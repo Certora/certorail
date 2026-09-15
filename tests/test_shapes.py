@@ -98,7 +98,7 @@ NOT_FORCE = validation(
     argv=("test", param("value"), "!=", "--force"),
     params=("value",),
     establishes={"value": [pure("not-force"), "not-option"]},
-    effect_free=True,
+    writes=[],
 )
 
 
@@ -115,7 +115,7 @@ class TestNotOption(unittest.TestCase):
             "atoms": {"not-force": {"pure": True}},
             "validation": [{
                 "name": "not-force-check", "params": ["value"],
-                "argv": ["test", "${value}", "!=", "--force"], "effect-free": True,
+                "argv": ["test", "${value}", "!=", "--force"], "writes": [],
                 "establishes": {"value": ["not-force", "not-option"]},
             }],
             "program": [{

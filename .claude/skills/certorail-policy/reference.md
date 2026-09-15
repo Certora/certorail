@@ -126,42 +126,86 @@ Every fact name used anywhere is declared here, once. A name maps to a table:
 | `argv` | list of strings, required | the checker command; the first piece is a literal program: `${checkers}/<name>` (the executable `<name>` in the config directory's `checkers/`, resolved at load, which must exist), an absolute path, or a name on `PATH`; a piece that is exactly `${param}` is replaced by that argument; `${…}` inside a larger piece is an error |
 | `cwd` | location or list | where the check may run (any of them); programs must pass a proven `cwd=` within one. **Omit** for a check that does not care where it runs: programs then omit `cwd=` and the check cannot establish on `cwd`. A validation without `cwd` cannot establish an atom that reads a filesystem region (the read would have no place) |
 | `establishes` | table: param name or `cwd` → list of atom names | what success establishes on which argument |
-| `effect-free` | bool, default false | the checker changes nothing: it writes no region, so its run kills no environmental atoms. Equivalent to `network = false, write = false` |
-| `network`, `write` | bool, default true | the media the checker reaches (below) |
-| `writes` | list of regions | what the checker's run writes, within its media (below) |
+| `network`, `write-fs` | bool, default true | the media the checker reaches; `false` is **enforced**: the checker runs jailed out of that medium (Media and `writes`, below) |
+| `writes` | list of regions | what the checker's run writes, within its media; `[]` for a checker that changes nothing (below) |
+| `exec` | table | the rest of the jail: `env`, `spawn` (Jailing a grant, below) |
 
-A validation is a **literal checker** when it is effect-free, establishes a pure atom, and has
-exactly one input slot (one param, or no params plus `cwd`). The host then runs it at analysis
-time on statically-known text, so constants carry the atom without any `certora.check` in the
-program (cached per atom and text; for the `cwd` slot the directory `root/<text>` must exist).
+A validation is a **literal checker** when it is effect-free (its write set is empty: `writes =
+[]`, or both media `false`), establishes a pure atom, and has exactly one input slot (one param,
+or no params plus `cwd`). The host then runs it at analysis time on statically-known text, so
+constants carry the atom without any `certora.check` in the program (cached per atom and text;
+for the `cwd` slot the directory `root/<text>` must exist). It runs under the validation's jail.
 
 ## Media and `writes`
 
 The evaluator a validation spawns, the tool a `[[program]]` grant runs and a `[[network]]`
 request are all effects; what each one may change is its **write set**, and it is declared in
-two layers, both trusted like the rest of the policy:
+two layers. The first is enforced, the second trusted like the rest of the policy:
 
-- **Media** (`[[program]]`, `[[validation]]`): `network = false` says the tool never reaches the
-  network, `write = false` that it never writes the filesystem. Each removes every region of
-  that medium from the write set with no region named. `effect-free = true` is both: the empty
-  write set. Local git work is `network = false`; a query tool (`gh pr view`) is `write = false`.
+- **Media** (`[[program]]`, `[[validation]]`): `network = false` says the tool does not reach the
+  network, `write-fs = false` that it does not write the filesystem. Each removes every region of
+  that medium from the write set with no region named, and each is a property of the process:
+  the broker runs the tool in an OS jail that denies the medium (bubblewrap on Linux, Seatbelt on
+  macOS). Local git work is `network = false`; `grep` is both.
 - **`writes = [regions]`** (`[[program]]`, `[[validation]]`, `[[network]]`): the regions the
-  effect may change, within the media. A region outside the declared media is a load error
-  (`git add` cannot write `git.remote` under `network = false`). Undeclared means *every* region
-  of the media, so a bare grant with neither key kills every environmental atom. A medium name
+  effect may change, within the media. A claim, since no jail can see regions. A region outside
+  the declared media is a load error (`git add` cannot write `git.remote` under
+  `network = false`). Undeclared means *every* region of the media, so a bare grant with neither
+  key kills every environmental atom. `writes = []` is the empty write set: the grant reaches its
+  media and changes nothing an atom depends on -- a query tool that phones an API (`gh pr view`),
+  a checker that reads the inventory, `cargo metadata` writing only its caches. A medium name
   stands for the whole medium: `writes = ["network"]`.
+
+There is no key for "changes nothing": a grant is **effect-free** (kills no atoms) when its write
+set is empty, whether by `writes = []` or by reaching neither medium. The retired spellings
+`effect-free = true` and `write = false` are load errors that name their replacements.
 
 Only a rule whose arguments cannot smuggle an option or a subcommand past the shape may declare
 `writes`: no open flag vocabulary (`any = true` on a flags hole), and no `any` hole except where
 the leading-dash guard already exempts it (a flag's value, a hole after a literal `--`). Media
-need no such condition.
+need no such condition: the jail does not depend on the arguments.
 
 A `[[network]]` rule is network medium by construction. Its default write set is every network
 region; a rule whose methods are only `GET` and `HEAD` defaults to writing nothing. The
 program's own file writes are filesystem medium; today they write every filesystem region (the
 footprint-based derivation is not yet in). `--describe` renders the result per rule
-(`effects: writes git.refs (no network)`) and per environmental atom the computed
-`dies on:` list, which is what the program author reads.
+(`effects: writes git.refs (no network)`, then `jailed (enforced by the OS): no network`) and
+per environmental atom the computed `dies on:` list, which is what the program author reads.
+
+## Jailing a grant: the media keys and `exec`
+
+The host enforces what a grant's child may reach with the OS sandbox: bubblewrap on Linux,
+Seatbelt (`sandbox-exec`) on macOS. The media keys are two of the four knobs; the `exec` table
+holds the other two. Every knob defaults to the unjailed baseline; a grant that sets none runs as
+the host does.
+
+```toml
+[[program]]
+name = "grep"
+argv = ["grep", "${FLAGS...}", "--", "${PATTERN}", "${FILES...}"]
+cwd  = "."
+network    = false                       # no network at all, loopback included
+write-fs   = false                       # no filesystem writes; only a private TMPDIR, discarded after
+exec.env   = ["PATH", "HOME", "LANG",    # passed through from the host; every other variable is scrubbed
+              { GREP_COLORS = "" }]      # set to a literal value
+exec.spawn = false                       # no process creation (threads are fine)
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `network` | bool, default true | `false`: the child runs in an empty network namespace |
+| `write-fs` | bool, default true | `false`: the whole filesystem is read-only to the child, except a fresh scratch directory `TMPDIR` names, thrown away after the run |
+| `exec.env` | list of names and tables | the child's environment is exactly this: a string passes that variable through from the host's environment (skipped if the host lacks it), a table `{ NAME = "value", ... }` sets each key to a literal. A variable is mentioned once, either way; values are literal, no `${...}`; `TMPDIR` may not be listed (the host sets it under `write-fs = false`). Absent: the host's whole environment; `[]`: an empty one |
+| `exec.spawn` | bool, default true | `false`: the child cannot create processes (no hooks, no `-exec`, no helpers, no shells). It can still replace itself with another program, which is not creation |
+
+A jailed grant whose sandbox is not installed does not run at all (the program gets a broker
+error), unlike the confined program itself, which runs with a warning when `srt` is missing. So
+`network = false` on a rule is also a requirement on the host. Tools that write caches or state
+where they run fail under `write-fs = false` unless told not to, or told to use `TMPDIR`: that
+is what the set form of `exec.env` is for (`{ PYTHONDONTWRITEBYTECODE = "1" }`,
+`{ GIT_OPTIONAL_LOCKS = "0" }`, `{ PIP_DISABLE_PIP_VERSION_CHECK = "1" }`); a tool with no such
+knob (`go` without a writable `GOCACHE`) declares `writes = []` or its regions instead and keeps
+the medium.
 
 ## `[[program]]`
 
@@ -181,7 +225,8 @@ the same program. `cwd` is a location *slot* on both: one location or a list mea
 | `requires` | list of atoms, or a table `{ cwd = [...], HOLE = [...] }` | the cwd must carry these, live, at the exec; a hole entry demands atoms of that hole's value, folded into its constraint (into `any` it leaves an atoms-only constraint) |
 | `when` | `true`/`false`, or `"${flag}"` in a ruleset | false drops the rule at load |
 | `source` | atom name | the rule's output yields this pure atom on extraction (Sources, below) |
-| `effect-free`, `network`, `write`, `writes` | | the write set (Media and `writes`, above) |
+| `network`, `write-fs`, `writes` | | the write set (Media and `writes`, above); the media are enforced |
+| `exec` | table | the rest of the jail: `env`, `spawn` (Jailing a grant, above) |
 | `argv` | list of words | templated form: literal words, `${X}` (one token), `${X...}` (a splice); the first is the program |
 | `holes` | table | templated form: one table per hole named in `argv` (below) |
 

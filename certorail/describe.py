@@ -124,10 +124,33 @@ def effects_line(policy: Policy, rule: Program | Validation) -> str:
     notes = []
     if not rule.network:
         notes.append("no network")
-    if not rule.write:
+    if not rule.write_fs:
         notes.append("no filesystem writes")
     text = f"effects: {writes_phrase(policy.write_set(rule))}"
     return text + (f" ({'; '.join(notes)})" if notes else "")
+
+
+def jail_line(rule: Program | Validation) -> str | None:
+    """The grant's jail (childjail), when it restricts anything: what the OS denies the child.
+    The media are enforced this way; ``writes`` stays the rule's claim."""
+    j = rule.jail
+    if not j.restricts:
+        return None
+    parts: list[str] = []
+    if not j.network:
+        parts.append("no network")
+    if not j.write_fs:
+        parts.append("no filesystem writes (a private TMPDIR only)")
+    if not j.spawn:
+        parts.append("no subprocesses")
+    if j.env is not None:
+        if j.env.empty:
+            parts.append("environment: empty")
+        else:
+            passed = ", ".join(j.env.passed) if j.env.passed else "nothing passed through"
+            sets = "".join(f"; sets {k}={v}" for k, v in j.env.sets)
+            parts.append(f"environment: {passed}{sets}")
+    return "jailed (enforced by the OS): " + "; ".join(parts)
 
 
 def dies_on(policy: Policy, atom_name: Atom) -> str:
@@ -187,6 +210,8 @@ def _program(p: Program, policy: Policy) -> list[str]:
         if p.source:
             out.append(f"    yields {p.source}: extract values from the result with certora.extract / extract_all / lines")
         out.append(f"    {effects_line(policy, p)}")
+        if (jailed := jail_line(p)) is not None:
+            out.append(f"    {jailed}")
         out.append("    exactly these words: no further arguments")
         return out
     out.append("- " + signature(t) + origin)
@@ -196,6 +221,8 @@ def _program(p: Program, policy: Policy) -> list[str]:
     if p.source:
         out.append(f"    yields {p.source}: extract values from the result with certora.extract / extract_all / lines")
     out.append(f"    {effects_line(policy, p)}")
+    if (jailed := jail_line(p)) is not None:
+        out.append(f"    {jailed}")
     keyword_only = t.keyword_only
     if keyword_only:
         out.append(f"    bind by keyword: {', '.join(keyword_only)}")
@@ -236,6 +263,8 @@ def _validation(v: Validation, policy: Policy, defined: frozenset[Atom]) -> list
         )
         out.append(f"    establishes on {key}: {kinds}")
     out.append(f"    {effects_line(policy, v)}")
+    if (jailed := jail_line(v)) is not None:
+        out.append(f"    {jailed}")
     if len(v.params) == 1:
         out.append(f'    also as an expression: certora.check_single("{v.name}", value)')
     return out

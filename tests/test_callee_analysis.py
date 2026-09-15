@@ -174,7 +174,7 @@ POLICY = from_data({
     "regions": {"git.config": {"footprint": ".git/config"}},
     "atoms": {"org-checkout": {"reads": ["git.config"]}},
     "validation": [
-        {"name": "org-repo", "argv": ["true"], "cwd": "repos/**", "effect-free": True,
+        {"name": "org-repo", "argv": ["true"], "cwd": "repos/**", "writes": [],
          "establishes": {"cwd": ["org-checkout"]}},
     ],
     "program": [

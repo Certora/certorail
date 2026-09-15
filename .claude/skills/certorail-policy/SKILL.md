@@ -37,7 +37,7 @@ program in the confined subset.
   location (`repos/**`, not `**`), the narrowest program rule (`git log`, not `git`), the
   narrowest network rule (one host, `GET` only). A grant that cannot be traced to a stated need
   does not go in.
-- **Trusted assertions.** `matches`, `pure`, `effect-free`, the checkers themselves and the
+- **Trusted assertions.** `matches`, `pure`, `writes`, the checkers themselves and the
   location grants are believed by the analysis without proof. A wrong one is a soundness hole,
   not a bug report. Apply the honesty rules in step 3 literally.
 - **Static where possible, runtime where necessary.** Locations, literal arguments and regex
@@ -76,6 +76,7 @@ interrogating further:
 | run a program with fixed words and no arguments | a flat `[[program]]` per (name, subcommand) with the narrowest `cwd`; anything after the words needs a template |
 | run a tool with flags and paths (`find`, `grep`, `rg`, `ls`, `tar`) | a **template**: `argv` with holes, a flagset listing exactly the permitted flags. A closed flags hole may sit before other holes (`tar FLAGS... -f ARCHIVE FILES...`): positionally it ends at the first value that provably is not a flag, and an ambiguous value is rejected, not guessed. An `each` hole that is not last, or an open (`any = true`) flags hole that is not last, makes it and everything after it keyword-only. See "Calling a template" in `reference.md` |
 | the same tools under several roots, or across policies | a **ruleset** in `~/.certorail/rulesets/`, applied with `[[apply]] ruleset = "unix.toml" where = ["repos", "/srv/data"]`. Its parameters are the root's decisions: bind every atom list (`[]` for none) and constraint a rung you enable reaches; bools are off unless you say `= true`. Nothing has a default |
+| a tool or checker whose whole value is changing nothing (`grep`, `find`, `git log`, a read-only checker) | `network = false` and `write-fs = false` on the grant, plus `exec.spawn = false` and `exec.env = ["PATH", ...]`: the OS enforces all four (bubblewrap / Seatbelt). Not for build or package tools, which write caches where they run: those say `writes = []` and keep the medium. See "Jailing a grant" in `reference.md` |
 | a flag that is fine only in a vouched-for state (`--force` on a non-default branch, `-delete` under a scratch tree) | a flag entry with `requires = { HOLE = [...] }` or `{ cwd = [...] }`: demanded only while the flag is present; `value = false` spells a bare flag in table form |
 | program takes paths | `location` on the hole |
 | program takes opaque arguments (`gh api -f q=...`) | `any = true` on that one hole, or an open flag vocabulary (`holes.FLAGS = { kind = "flags", any = true }`) for a tool trusted with all its options |
@@ -85,7 +86,7 @@ interrogating further:
 | talk to an API | one `[[network]]` per host: `methods`, default `https`, default port; `allow-nonpublic` only for loopback/private targets |
 | gate an action on a property | atoms + validations (step 3), consumed by `requires` / a hole's `atoms` / `[[network]].requires` |
 | a check that must survive an intervening command (check the checkout, then commit, then push) | regions: `writes` on the command, `reads` on the atom (step 3b). Without them every command kills every environmental fact |
-| a tool that never touches the network, or never writes files | `network = false` / `write = false` on its rule: a claim that bounds what it can kill with no region named; `effect-free = true` for both |
+| a tool that never touches the network, or never writes files | `network = false` / `write-fs = false` on its rule: enforced by the jail, and it bounds what the tool can kill with no region named. A tool that reaches a medium but changes nothing an atom depends on says `writes = []` |
 
 Subcommand rules for one program are prefix-free, cannot mix with a bare rule for that program,
 and **fail closed**: an unlisted or computed subcommand is denied.
@@ -103,7 +104,7 @@ not recognised.
 
 **B. The text alone decides it, but not by a regex** (a checksum, a fixed list too long for a
 regex, a version-string parse) → `atom = { pure = true }` plus a `[[validation]]` with exactly one
-`params` entry, `effect-free = true`, no `cwd`. This is a *literal checker*: the host runs it at
+`params` entry, `writes = []`, no `cwd`. This is a *literal checker*: the host runs it at
 analysis time on constants, so literal arguments need no `certora.check`; the broker runs it for
 dynamic values. It also qualifies for `on-redirect = "recheck"`.
 
@@ -122,9 +123,11 @@ Honesty rules:
 
 - `pure = true` iff the verdict depends on the characters of the value and nothing else, forever.
   "Not in today's inventory" is not pure even though it is a function of the text.
-- `effect-free = true` iff the checker changes nothing another validation or program could observe.
-  Reading files and querying a read-only API is effect-free; `git fetch` is not. Without it, a
-  checker kills the environmental atoms established before it, so two checks cannot stack.
+- `writes = []` iff the checker changes nothing another validation or program could observe.
+  Reading files and querying a read-only API qualify; `git fetch` does not. Without it, a
+  checker kills the environmental atoms established before it, so two checks cannot stack. A
+  checker that needs neither medium says `network = false, write-fs = false` instead, and the
+  jail makes it so.
 - `matches` is the atom's *definition*: anything matching the regex has the property. If a
   matching string could lack the property, it is not a defined atom.
 - A defined atom cannot also be established by an environmental route; it is pure by construction.
@@ -148,9 +151,10 @@ checked fact must outlive an intervening command, or when the same fact gates se
    what the atom *asserts*, whatever the checker does: "origin belongs to the org" reads
    `git.config`; "the remote branch is unprotected" reads `network`. An atom without `reads`
    depends on everything.
-3. **Bound each tool by medium.** `network = false` on local tools, `write = false` on query
-   tools, `effect-free = true` on pure queries. These need no knowledge of regions and already
-   preserve the other medium's facts wholesale.
+3. **Bound each tool by medium.** `network = false` on local tools, `write-fs = false` on query
+   tools, both on pure local queries; `writes = []` on a tool that reaches a medium without
+   changing anything. The media keys need no knowledge of regions, already preserve the other
+   medium's facts wholesale, and are enforced by the jail.
 4. **Narrow within the medium** only where the batch needs it: `writes = ["git.refs",
    "git.index"]` on `git commit` is what lets a commit sit between the org check and the push.
    `writes` is admissible only on a rule whose arguments cannot smuggle an option past the shape
@@ -158,8 +162,9 @@ checked fact must outlive an intervening command, or when the same fact gates se
 
 Honesty rules, in addition to the ones above: `writes` is complete when it names every declared
 region the tool can change, not every file it touches (`cargo build` writes registries and
-caches nobody declared; its write set is `["git.worktree"]` or nothing); `network = false` is a
-promise about the tool, not about this invocation. Both are trusted like the rest of the policy.
+caches nobody declared; its write set is `["git.worktree"]` or nothing). `writes` is trusted like
+the rest of the policy; `network = false` and `write-fs = false` are enforced, so a tool that does
+need the medium fails loudly rather than lying.
 Read the `dies on:` line `--describe` computes for each atom and confirm it says what you meant.
 
 ## Step 4: author the checkers
@@ -190,7 +195,7 @@ Templates:
 ```bash
 #!/usr/bin/env bash
 # org-checkout: the working directory is a checkout whose origin is in the certora org.
-# Validation: cwd = "repos/**", no params, establishes = { cwd = ["org-checkout"] }, effect-free.
+# Validation: cwd = "repos/**", no params, establishes = { cwd = ["org-checkout"] }, writes = [].
 set -euo pipefail
 [ "$#" -eq 0 ] || { echo "org-checkout: takes no arguments" >&2; exit 2; }
 url="$(git -C . remote get-url origin 2>/dev/null)" || { echo "not a git checkout" >&2; exit 1; }
@@ -203,7 +208,7 @@ esac
 ```python
 #!/usr/bin/env python3
 """not-prod-db: the URL's host is not in the production inventory.
-Validation: params = ["url"], no cwd, establishes = { url = ["not-prod-db"] }, effect-free.
+Validation: params = ["url"], no cwd, establishes = { url = ["not-prod-db"] }, writes = [] (it reads the inventory over the network).
 The inventory changes, so the atom is ENVIRONMENTAL (not pure): programs check right before use."""
 import json
 import pathlib
@@ -323,7 +328,8 @@ no-flag      = { matches = '[^-].*' }        # A: a branch argument is not an op
 name        = "org-repo"
 argv        = ["${checkers}/org-checkout"]
 cwd         = "repos/**"
-effect-free = true
+network     = false                          # enforced: the checker runs jailed out of both media
+write-fs    = false
 establishes = { cwd = ["org-checkout"] }
 
 [[program]]                                  # clone into repos/ from its parent
@@ -337,7 +343,8 @@ holes.DIR = { location = "*" }               # one name, directly under repos/
 name        = "git"
 subcommand  = "log"
 cwd         = "repos/**"
-effect-free = true
+network     = false                          # neither medium: effect-free, and jailed
+write-fs    = false
 
 [[program]]                                  # local: no network, and within the fs only these
 name       = "git"
@@ -367,7 +374,9 @@ cwd   = "."
 argv  = ["find", "${WHERE}", "${FLAGS...}"]  # certora.exec("find", where, "-name", "*.md", "-print", cwd=root)
 holes.WHERE = { location = "repos/**" }
 holes.FLAGS = { kind = "flags", bare = ["-print"], "-name" = { matches = '[^/]+' }, "-maxdepth" = { matches = '\d+' } }
-effect-free = true
+network  = false
+write-fs = false
+exec.spawn = false                           # find has no -exec here, and could not run one anyway
 
 [[network]]
 host    = "api.github.com"
