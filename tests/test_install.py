@@ -304,6 +304,13 @@ def test_session_hook_output_and_silence(cfg, tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "certorail governs" in out
     assert 'certora.check("clean"' in out
+    # the agent is told the subset, and what to do when denied: edit THIS file, never bypass
+    assert "## The subset" in out and "certora.exec(program, *args, cwd=" in out
+    assert "## When you are denied" in out
+    installed_policy = cfg / "policy"
+    assert str(installed_policy) in out  # the policy file's path, so the agent edits the right thing
+    assert "Do **not** disable certorail" in out
+    assert "base ruleset" not in out  # no base.toml installed here: no note about one
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(elsewhere))

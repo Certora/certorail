@@ -47,6 +47,7 @@ from .docpath import DocPath
 from .effects import as_medium
 from .ids import BUILTIN_ATOMS
 from .locations import parse_location
+from .dangerous import EXEC_CWD, EXEC_RESERVED_KEYWORDS
 
 # ---------------------------------------------------------------------------
 # scalars
@@ -109,13 +110,14 @@ def _argv_word(text: str) -> str:
     return text
 
 
-_CWD = "cwd"  # the exec keyword, the `requires` target: never a hole
+_CWD = EXEC_CWD  # the exec keyword, the `requires` target: never a hole
 
 
 def _hole_name(text: str) -> str:
-    """A hole's name: spelled as ``${X}``, so ``\\w+``; never ``cwd``."""
-    if text == _CWD:
-        raise ValueError("'cwd' is reserved and cannot be a hole")
+    """A hole's name: spelled as ``${X}``, so ``\\w+``; never a keyword of ``certora.exec``
+    itself (``dangerous.EXEC_RESERVED_KEYWORDS``)."""
+    if text in EXEC_RESERVED_KEYWORDS:
+        raise ValueError(f"{text!r} is reserved and cannot be a hole")
     if not re.fullmatch(r"\w+", text):
         raise ValueError(f"hole names are letters, digits and '_': {text!r}")
     return text

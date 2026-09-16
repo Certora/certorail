@@ -24,6 +24,7 @@ import pathlib
 import socket
 import struct
 import subprocess
+import sys
 import typing
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -80,7 +81,9 @@ CalledProcessError = subprocess.CalledProcessError
 type Word = str | os.PathLike[str]  # one command word: text, or a path standing for its text
 
 
-def exec(*cmd: Word, cwd: pathlib.Path | str, **holes: Word | Sequence[Word]) -> ExecResult:
+def exec(
+    *cmd: Word, cwd: pathlib.Path | str, stream: bool = False, **holes: Word | Sequence[Word]
+) -> ExecResult:
     """The only way to run a subprocess: tunneled to the host's broker, which re-checks the
     decidable half of the exec rules (program, fail-closed subcommand, cwd containment --
     defense in depth; the full rules were enforced statically), spawns the child outside the
@@ -89,9 +92,15 @@ def exec(*cmd: Word, cwd: pathlib.Path | str, **holes: Word | Sequence[Word]) ->
     was, one socket away -- returned as an ``ExecResult``, whose decoded views raise on a
     non-zero exit.
 
-    Keywords other than ``cwd`` bind the *holes* of the policy's command template for the
-    program (TEMPLATES.md): a string or a path for a token hole, a list of them for a splice.
-    The broker binds the call like a signature and composes the argv itself.
+    ``stream=True`` sends the child's stdout and stderr straight to the terminal the host is
+    running on -- the same descriptors the program's own ``print`` reaches -- as it happens,
+    instead of capturing them: for a build or a test run one wants to watch. The result then
+    carries the exit code and empty ``stdout``/``stderr``; live output and extraction from the
+    output are one or the other, per call.
+
+    Keywords other than ``cwd`` and ``stream`` bind the *holes* of the policy's command template
+    for the program (TEMPLATES.md): a string or a path for a token hole, a list of them for a
+    splice. The broker binds the call like a signature and composes the argv itself.
 
     This is the runtime half. The static half (``walker``) additionally requires the program to
     be a string literal, refuses ``*args``/``**kwargs``, and treats ``cwd`` as a sink whose
@@ -114,11 +123,19 @@ def exec(*cmd: Word, cwd: pathlib.Path | str, **holes: Word | Sequence[Word]) ->
     if socket_path is None:
         raise ExecFailed("no broker: the policy permits no programs")
     program, *arguments = words
+    if stream:
+        # the program's own prints may still sit in this process's buffers (block-buffered when
+        # stdout is a pipe); push them out so the child's output lands after them, in order
+        for out in (sys.stdout, sys.stderr):
+            try:
+                out.flush()
+            except (OSError, ValueError):
+                pass
     try:
         reply = _broker_roundtrip(
             socket_path,
             {"kind": "exec", "program": program, "arguments": arguments,
-             "kwargs": bindings, "cwd": os.fspath(cwd)},
+             "kwargs": bindings, "cwd": os.fspath(cwd), "stream": bool(stream)},
             timeout=None,
         )
     except OSError as exc:

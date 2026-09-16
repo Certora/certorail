@@ -31,6 +31,7 @@ from .analysis import (
     pretty_location,
     pretty_regex,
 )
+from .dangerous import EXEC_CWD, EXEC_RESERVED_KEYWORDS
 from .ids import NOT_OPTION, Atom, FlagName, HoleName
 
 __all__ = ["NOT_OPTION", "may_start_with_dash"]  # re-exported for their old importers
@@ -53,7 +54,7 @@ class HoleRef:
 type Piece = str | HoleRef
 
 
-CWD = "cwd"  # reserved: never a hole name; the target of a demand on the exec's cwd
+CWD = EXEC_CWD  # the target of a demand on the exec's cwd; like every exec keyword, never a hole
 
 
 @dataclass(frozen=True)
@@ -149,8 +150,8 @@ class Flagset:
                     f"expand-single-flags: {long_single[0]!r} is a single-dash multi-letter flag, so this "
                     "tool does not bundle short flags"
                 )
-        if CWD in self.holes:
-            raise ValueError(f"{CWD!r} is reserved and cannot be a hole")
+        for name in sorted(EXEC_RESERVED_KEYWORDS & self.holes):
+            raise ValueError(f"{name!r} is reserved and cannot be a hole")
         for flag, demands in self.requires.items():
             if flag not in names:
                 raise ValueError(f"requires on {flag!r}, which is not a flag of the vocabulary")
@@ -245,8 +246,8 @@ class Template:
         names = [r.name for r in refs]
         if len(set(names)) != len(names):
             raise ValueError("a hole appears once in a template")
-        if CWD in self.holes:
-            raise ValueError(f"{CWD!r} is reserved and cannot be a hole")
+        for name in sorted(EXEC_RESERVED_KEYWORDS & self.holes.keys()):
+            raise ValueError(f"{name!r} is reserved and cannot be a hole")
         for r in refs:
             hole = self.holes.get(r.name)
             if hole is None:

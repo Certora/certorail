@@ -40,7 +40,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from .analysis import DirSplat, Named, StaticPath
-from .broker import build_server
+from .broker import build_server, terminal_descriptors
 from .describe import describe
 from .policy import Denial, Policy
 from .policydir import AmbientPolicyError, find_policy
@@ -217,7 +217,8 @@ def run(
             # exec'd children and check evaluators alike -- for the lifetime of this one
             # program (broker.py). The child finds it by env var.
             socket_path = tmpdir / "broker.sock"
-            server = build_server(socket_path, policy, root)
+            # a stream=True exec writes to the descriptors this host holds for its terminal
+            server = build_server(socket_path, policy, root, stream_to=terminal_descriptors())
             threading.Thread(
                 target=server.serve_forever, name="certorail-broker", daemon=True
             ).start()

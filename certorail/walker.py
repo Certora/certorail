@@ -55,7 +55,7 @@ from .analysis import (
 )
 from .annotations import Contract, bind_arguments, default_of, is_plain_type, parse_annotation
 from .ids import Atom, SourceId
-from .dangerous import CHECK_CALLEE, EXEC_CALLEE, EXTRACT_ALL_CALLEE, LINES_CALLEE
+from .dangerous import CHECK_CALLEE, EXEC_CALLEE, EXEC_RESERVED_KEYWORDS, EXTRACT_ALL_CALLEE, LINES_CALLEE
 from .enforcement import (
     CONTAINER_METHODS,
     CONTAINER_READ_CALLS,
@@ -155,7 +155,7 @@ def _roster_blessings(
                     # a container bound to a hole of certora.exec is a roster read (the splat of
                     # TEMPLATES.md); the exec audit records its element fact for the policy
                     for k in kws:
-                        if k.arg is not None and k.arg != "cwd":
+                        if k.arg is not None and k.arg not in EXEC_RESERVED_KEYWORDS:
                             bless(k.value)
             case ast.Call(func=ast.Name(id=f), args=args):
                 if f in CONTAINER_READ_CALLS:

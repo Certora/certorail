@@ -760,6 +760,88 @@ class TestBrokerRoundTrip(unittest.TestCase):
         self.assertEqual(reply["error"], "policy_denied")
         self.assertIn("not a hole", reply["detail"])
 
+    def test_streaming_is_refused_where_the_host_has_no_terminal(self) -> None:
+        # this server was built without stream_to: a stream request is an error, not a
+        # silent fallback to capture (the program asked to see the output live)
+        reply = exec_request(self.sock, "printf", ["x"], cwd=".", stream=True)
+        self.assertFalse(reply["ok"])
+        self.assertIn("no terminal", reply["detail"])
+
+
+class TestStreaming(unittest.TestCase):
+    """``stream=True``: the child's stdout and stderr go to the host's terminal descriptors as
+    it runs; the reply carries the exit code and nothing else."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.root = pathlib.Path(tempfile.mkdtemp())
+        cls.terminal = tempfile.NamedTemporaryFile(prefix="certorail-terminal-", delete=False)
+        policy = Policy.allow(
+            programs=[
+                program(
+                    "sh", cwd=".", argv=["sh", "-c", hole("SCRIPT")],
+                    holes={"SCRIPT": Token(constraint(literal=True))},
+                )
+            ]
+        )
+        cls.sock = os.path.join(tempfile.mkdtemp(), "broker.sock")
+        fd = cls.terminal.fileno()
+        cls.server = build_server(cls.sock, policy, cls.root, stream_to=(fd, fd))
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.terminal.close()
+        os.unlink(cls.terminal.name)
+
+    def terminal_text(self) -> str:
+        return pathlib.Path(self.terminal.name).read_text()
+
+    def test_output_reaches_the_terminal_and_not_the_reply(self) -> None:
+        reply = exec_request(self.sock, "sh", ["-c", "echo out; echo err >&2; exit 3"], cwd=".", stream=True)
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(reply["returncode"], 3)
+        self.assertEqual((reply["stdout_b64"], reply["stderr_b64"]), ("", ""))
+        self.assertIn("out\n", self.terminal_text())
+        self.assertIn("err\n", self.terminal_text())
+
+    def test_without_the_flag_output_is_captured_as_before(self) -> None:
+        before = self.terminal_text()
+        reply = exec_request(self.sock, "sh", ["-c", "echo captured"], cwd=".")
+        self.assertTrue(reply["ok"], reply)
+        import base64
+
+        self.assertEqual(base64.b64decode(reply["stdout_b64"]), b"captured\n")
+        self.assertEqual(self.terminal_text(), before)
+
+    def test_markers_exec_streams(self) -> None:
+        os.environ["CERTORAIL_BROKER_SOCKET"] = self.sock
+        self.addCleanup(os.environ.pop, "CERTORAIL_BROKER_SOCKET", None)
+        result = markers.exec("sh", "-c", "echo live", cwd=".", stream=True)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b"", b""))
+        self.assertIn("live\n", self.terminal_text())
+
+
+class TestStreamStatically(Base):
+    def test_the_option_is_a_literal_bool_and_not_a_hole(self) -> None:
+        self.accept(REPO + 'certora.exec("git", "log", cwd=repo, stream=True)\n')
+        self.accept(REPO + 'certora.exec("git", "log", cwd=repo, stream=False)\n')
+        for body in (
+            'flag = True\ncertora.exec("git", "log", cwd=repo, stream=flag)\n',
+            'certora.exec("git", "log", cwd=repo, stream=1)\n',
+        ):
+            with self.subTest(body=body):
+                got = [what for _, what in analyze(HEADER + REPO + body).violations]
+                self.assertTrue(any("stream= must be the literal True or False" in v for v in got), got)
+        # and no template may claim the name as a hole
+        with self.assertRaisesRegex(ValueError, "'stream' is reserved"):
+            program("x", cwd=".", argv=["x", hole("stream")], holes={"stream": Token(constraint(any=True))})
+        with self.assertRaises(PolicyFileError) as cm:
+            from_data({"policy-version": 1, "program": [{"name": "x", "cwd": ".", "argv": ["x", "${stream}"], "holes": {"stream": {"any": True}}}]})
+        self.assertIn("'stream' is reserved", str(cm.exception))
+
 
 class TestDataFormat(unittest.TestCase):
     def test_templates_load(self) -> None:

@@ -391,7 +391,13 @@ PATH_SINK_METHOD_TARGETS: dict[str, tuple[str, AccessKind]] = {
 # ---------------------------------------------------------------------------
 
 EXEC_CALLEE: tuple[str, ...] = (NAMESPACE, "exec")
-EXEC_REQUIRED_KEYWORDS: frozenset[str] = frozenset({"cwd"})
+# the keywords of certora.exec that are the call's own, not hole bindings -- the one place they
+# are named. ``cwd`` is required and a sink; an option (``stream=True``: the child's output goes
+# to the host's terminal instead of the reply) is a literal bool. None of them may be a hole.
+EXEC_CWD = "cwd"
+EXEC_REQUIRED_KEYWORDS: frozenset[str] = frozenset({EXEC_CWD})
+EXEC_OPTION_KEYWORDS: frozenset[str] = frozenset({"stream"})
+EXEC_RESERVED_KEYWORDS: frozenset[str] = EXEC_REQUIRED_KEYWORDS | EXEC_OPTION_KEYWORDS
 
 # certora.check(name, key=value, ..., cwd=...) runs a policy-declared runtime validation (a
 # subprocess evaluator); its success establishes the validation's atoms on the argument

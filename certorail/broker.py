@@ -63,6 +63,7 @@ import socketserver
 import ssl
 import struct
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -463,12 +464,23 @@ def _resolve(root: pathlib.Path, cwd: str) -> pathlib.Path:
 
 
 def _spawn_drained(
-    client: socket.socket, argv: list[str], workdir: pathlib.Path, jail: Jail
+    client: socket.socket,
+    argv: list[str],
+    workdir: pathlib.Path,
+    jail: Jail,
+    stream_to: tuple[int, int] | None = None,
 ) -> tuple[int, bytes, bytes]:
     """Spawn host-side, under the grant's *jail* (``childjail``: the OS-enforced reach the
-    grant's ``exec`` table allows the child), and drain the output wholesale. A client hangup
-    kills the child's whole process group (it gets its own, so descendants die with it). A jail
-    the platform cannot enforce is a broker error before anything runs."""
+    grant's ``exec`` table allows the child), and drain the output wholesale -- or, with
+    *stream_to* (the host's stdout and stderr descriptors), let the child write straight to
+    them and return empty output. A client hangup kills the child's whole process group (it
+    gets its own, so descendants die with it). A jail the platform cannot enforce is a broker
+    error before anything runs."""
+    if stream_to is not None:
+        # the host's own buffered output goes first, so the terminal reads in order
+        for stream in (sys.stdout, sys.stderr):
+            with contextlib.suppress(Exception):
+                stream.flush()
     try:
         with confined(argv, jail) as spawn:
             try:
@@ -478,8 +490,8 @@ def _spawn_drained(
                     env=spawn.env,
                     pass_fds=spawn.pass_fds,
                     stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stdout=subprocess.PIPE if stream_to is None else stream_to[0],
+                    stderr=subprocess.PIPE if stream_to is None else stream_to[1],
                     shell=False,
                     start_new_session=True,
                 )
@@ -502,6 +514,7 @@ def _spawn_drained(
                     raise BrokerError(f"timeout ({EXEC_TIMEOUT:g}s) exceeded") from None
     except JailUnavailable as exc:
         raise BrokerError(f"jail: {exc}")
+    out, err = out or b"", err or b""  # None when streamed
     if len(out) > MAX_OUTPUT_BYTES or len(err) > MAX_OUTPUT_BYTES:
         raise ResponseTooLarge(f"output exceeds {MAX_OUTPUT_BYTES} bytes per stream")
     return proc.returncode, out, err
@@ -516,19 +529,27 @@ def _run_exec(
     keywords: dict[str, str | list[str]],
     cwd: str,
     discharge: Discharge | None,
+    stream: bool = False,
+    stream_to: tuple[int, int] | None = None,
 ) -> dict:
     """One brokered ``certora.exec``: re-check the decidable half of the exec rules
     (``Policy.exec_command`` -- defense in depth; the full rules were enforced statically),
     let the policy's template compose the argv, spawn the child host-side, and return its
-    drained output wholesale."""
+    drained output wholesale -- or stream it to the host's terminal (*stream*) and return the
+    exit code alone."""
     command = policy.exec_command(program, arguments, keywords, cwd, discharge)
     if isinstance(command, Refusal):
         raise PolicyDenied(command.reason)
     if root is None:
         raise BrokerError("exec: the broker was built without a root")
-    returncode, out, err = _spawn_drained(client, command.argv, _resolve(root, cwd), command.rule.jail)
-    log.info("EXEC %s (cwd=%s) -> %d (out %d bytes, err %d bytes)",
-             " ".join(command.argv), cwd, returncode, len(out), len(err))
+    if stream and stream_to is None:
+        raise BrokerError("stream: the host has no terminal to stream to")
+    returncode, out, err = _spawn_drained(
+        client, command.argv, _resolve(root, cwd), command.rule.jail, stream_to if stream else None
+    )
+    log.info("EXEC %s (cwd=%s) -> %d (%s)",
+             " ".join(command.argv), cwd, returncode,
+             "streamed" if stream else f"out {len(out)} bytes, err {len(err)} bytes")
     return {
         "returncode": returncode,
         "stdout_b64": base64.b64encode(out).decode("ascii"),
@@ -659,7 +680,8 @@ class _Handler(socketserver.BaseRequestHandler):
                 )
                 result = _run_exec(self.server.policy, self.server.root, conn,
                                    program, arguments, keywords, str(req.get("cwd", "")),
-                                   self.server.discharge)
+                                   self.server.discharge, bool(req.get("stream", False)),
+                                   self.server.stream_to)
             elif req.get("kind") == "check":
                 name = str(req.get("name", "?"))
                 what = f"check {name}"
@@ -703,25 +725,39 @@ class _Server(socketserver.ThreadingUnixStreamServer):
         policy: Policy,
         discharge: Discharge | None,
         root: pathlib.Path | None,
+        stream_to: tuple[int, int] | None,
     ):
         self.policy = policy
         self.tls = _tls_context()
         self.discharge = discharge
         self.root = root
+        self.stream_to = stream_to
         super().__init__(socket_path, _Handler)
+
+
+def terminal_descriptors() -> tuple[int, int] | None:
+    """The host's stdout and stderr descriptors, for streaming execs -- None when either is not
+    a real descriptor (captured by a test harness, say), in which case streaming is refused."""
+    try:
+        return sys.stdout.fileno(), sys.stderr.fileno()
+    except (AttributeError, ValueError, OSError):
+        return None
 
 
 def build_server(
     socket_path: str | os.PathLike[str],
     policy: Policy,
     root: str | os.PathLike[str] | None = None,
+    stream_to: tuple[int, int] | None = None,
 ) -> _Server:
     """A broker server on *socket_path*, enforcing *policy*'s ``network`` rules. The caller
     runs it (``serve_forever`` on a thread) for the lifetime of one confined program and
     tears it down after. The socket is created mode 0600 in a 0700 directory: filesystem
     permission is the authentication. *root* anchors the exec tunnel's relative cwds and
     enables literal-checker discharge of network rules' ``requires`` atoms
-    (``Policy.discharger``); without it only defined atoms discharge and exec is refused."""
+    (``Policy.discharger``); without it only defined atoms discharge and exec is refused.
+    *stream_to* is where a ``stream=True`` exec's child writes (the host's own stdout and
+    stderr descriptors, ``terminal_descriptors()``); without it streaming execs are refused."""
     path = os.fspath(socket_path)
     sock_dir = os.path.dirname(path)
     if sock_dir:
@@ -736,6 +772,7 @@ def build_server(
             policy,
             None if root is None else policy.discharger(root),
             None if root is None else pathlib.Path(root),
+            stream_to,
         )
     finally:
         os.umask(old_umask)
@@ -785,13 +822,16 @@ def exec_request(
     *,
     cwd: str,
     kwargs: dict[str, str | list[str]] | None = None,
+    stream: bool = False,
 ) -> dict:
     """One brokered exec: the client half of the exec tunnel, as ``certora.exec``'s runtime
-    speaks it. *kwargs* bind the holes of a templated form."""
+    speaks it. *kwargs* bind the holes of a templated form; *stream* asks for the child's
+    output on the host's terminal instead of in the reply."""
     return _roundtrip(socket_path, {
         "kind": "exec",
         "program": program,
         "arguments": list(arguments),
         "kwargs": dict(kwargs or {}),
         "cwd": cwd,
+        "stream": stream,
     })

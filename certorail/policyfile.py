@@ -35,6 +35,7 @@ from typing import Any, Literal, TypedDict, overload
 
 from . import markers
 from .analysis import Exact, RegexLit, StaticPath, alternation, is_prefix
+from .dangerous import EXEC_CWD
 from .docpath import DocPath, Keyed, Path
 from .ids import BUILTIN_ATOMS, Atom, CheckId, FlagName, FlagsetId, HoleName, ParamName, SourceId
 from .integrity import digest
@@ -101,7 +102,7 @@ class PolicyFileError(Exception):
 # ${checkers}/<name>: the whole executable surface a shared file can reach
 RULESET_STOCK_CHECKERS: frozenset[str] = frozenset({"test"})
 _CHECKERS = "${checkers}"
-_CWD = "cwd"
+_CWD = EXEC_CWD
 # the base ruleset: applied by this fixed name to every root policy that does not say
 # ``base = false``, when the file exists. Just a ruleset -- exec-side vocabulary and
 # protections, no filesystem or network grants, no absolute paths -- so that "read-only tools

@@ -69,7 +69,10 @@ from .dangerous import (
     CHECK_CALLEE,
     CHECK_SINGLE_CALLEE,
     EXEC_CALLEE,
+    EXEC_CWD,
+    EXEC_OPTION_KEYWORDS,
     EXEC_REQUIRED_KEYWORDS,
+    EXEC_RESERVED_KEYWORDS,
     EXTRACT_ALL_CALLEE,
     EXTRACT_CALLEE,
     FIELD_CALLEE,
@@ -1079,6 +1082,11 @@ class Enforcement:
         violations: list[tuple[ast.AST, str]] = [
             (node, f"exec: {name}= is required") for name in sorted(EXEC_REQUIRED_KEYWORDS - site.keywords.keys())
         ]
+        # an option is a literal bool: it configures the call and binds nothing
+        for name in sorted(EXEC_OPTION_KEYWORDS & site.keywords.keys()):
+            given = site.keyword_nodes[name]
+            if not (isinstance(given, ast.Constant) and isinstance(given.value, bool)):
+                violations.append((given, f"exec: {name}= must be the literal True or False"))
         if not site.args:
             violations.append((node, "exec: no program given"))
             return Audit(violations=tuple(violations))
@@ -1093,8 +1101,8 @@ class Enforcement:
             node,
             program,
             tuple(site.args[1:]),
-            _at_sink(site.keyword("cwd")) if "cwd" in site.keywords else None,
-            {name: b for name, b in site.keywords.items() if name != "cwd"},
+            _at_sink(site.keyword(EXEC_CWD)) if EXEC_CWD in site.keywords else None,
+            {name: b for name, b in site.keywords.items() if name not in EXEC_RESERVED_KEYWORDS},
         )
         return Audit((exec_site,), tuple(violations))
 
