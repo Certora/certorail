@@ -39,7 +39,8 @@ import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-from .analysis import DirSplat, Named, StaticPath
+from .analysis import Named, StaticPath
+from .childjail import Mounts
 from .broker import build_server, terminal_descriptors
 from .describe import describe
 from .policy import Denial, Policy
@@ -137,20 +138,30 @@ def _jail_write_paths(policy: Policy, root: pathlib.Path, tmp: pathlib.Path) -> 
     return paths
 
 
-def _jail_deny_paths(policy: Policy, root: pathlib.Path) -> list[str]:
+def _jail_deny_paths(mounts: Mounts) -> list[str]:
     """The jail's write denials: every protected location (``no-write``) that is one concrete
-    directory -- named components only, itself and everything below. A protection with a
-    wildcard in it (``repos/**/.git``) is the analysis' alone: srt denies paths, not patterns."""
-    out: list[str] = []
-    for loc in policy.no_write:
-        parts = loc.path_components if isinstance(loc, StaticPath) else loc.static_prefix
-        if isinstance(loc, DirSplat) and loc.final_component is not None:
-            continue
-        if not all(isinstance(c, Named) for c in parts):
-            continue
-        names = [c.name for c in parts if isinstance(c, Named)]
-        out.append("/" + "/".join(names) if loc.absolute else str(root.joinpath(*names)))
-    return out
+    path, as ``fsview`` lowered it. A protection with a wildcard in it (``repos/**/.git``) is
+    the analysis' alone: srt denies paths, not patterns."""
+    return [str(p) for p in mounts.no_write]
+
+
+def _announce_view(policy: Policy, mounts: Mounts) -> None:
+    """A confined grant's view is the policy's filesystem section as binds; whatever no bind
+    expresses is absent from it, and that is never silent (MOUNTS.md)."""
+    if not (policy.confines and mounts.omitted):
+        return
+    print(
+        "certorail: a grant runs under the policy filesystem view (exec.view = \"policy\"), and "
+        "these locations have no native mount, so the view OMITS them:",
+        file=sys.stderr,
+    )
+    for entry in mounts.omitted:
+        print(f"certorail:   {entry}", file=sys.stderr)
+    print(
+        "certorail:   (a literal path or a literal prefix ending in ** is mountable; a pattern "
+        "waits for the FUSE view)",
+        file=sys.stderr,
+    )
 
 
 def _srt_settings(
@@ -179,7 +190,7 @@ def _srt_settings(
         },
         "filesystem": {
             "allowWrite": _jail_write_paths(policy, root, tmp),
-            "denyWrite": _jail_deny_paths(policy, root),
+            "denyWrite": _jail_deny_paths(policy.mounts(root)),
             "denyRead": [],
         },
     }
@@ -194,6 +205,7 @@ def run(
     python: str = sys.executable,
     jail: bool = True,
 ) -> subprocess.CompletedProcess[bytes] | Rejected:
+    _announce_view(policy, policy.mounts(root))
     outcome = check(source, filename, policy, root)
     if isinstance(outcome, Rejected):
         return outcome

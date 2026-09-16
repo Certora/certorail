@@ -2,6 +2,7 @@
 media keys and the ``exec`` table, what ``--describe`` says, and -- where bubblewrap is present
 -- that the restrictions are properties of the process, not claims."""
 import base64
+import io
 import os
 import pathlib
 import shutil
@@ -16,7 +17,19 @@ from unittest import mock
 
 from certorail import markers
 from certorail.broker import _roundtrip, build_server, exec_request
-from certorail.childjail import UNJAILED, Environment, Jail, JailUnavailable, confined, environment, environment_spec
+from certorail.childjail import (
+    UNJAILED,
+    Environment,
+    Jail,
+    JailUnavailable,
+    Mounts,
+    Regex,
+    View,
+    confined,
+    environment,
+    environment_spec,
+    seatbelt_profile,
+)
 from certorail.describe import describe
 from certorail.ids import CheckId, ParamName
 from certorail.policy import Param, Policy, constraint, hole, program, pure, validation
@@ -158,6 +171,122 @@ class TestBubblewrap(unittest.TestCase):
         self.assertEqual((result.returncode, result.stdout), (0, b"still runs\n"), result.stderr)
 
 
+CONFINED = Jail(env=PATH_ONLY, network=False, write_fs=False, spawn=False, view=View.POLICY)
+CAT = shutil.which("cat") or "cat"
+LS = shutil.which("ls") or "ls"
+
+
+@unittest.skipUnless(HAS_BWRAP, "bubblewrap is the Linux mechanism")
+class TestPolicyView(unittest.TestCase):
+    """``exec.view = "policy"`` under bubblewrap: an empty world plus the policy's binds."""
+
+    def setUp(self) -> None:
+        self.root = pathlib.Path(tempfile.mkdtemp(prefix="certorail-root-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        (self.root / "src").mkdir()
+        (self.root / "src" / "main.py").write_text("print(1)\n")
+        (self.root / "secrets").mkdir()
+        (self.root / "secrets" / "key.pem").write_text("PRIVATE\n")
+        (self.root / "out").mkdir()
+        (self.root / "out" / "final").write_text("keep\n")
+        (self.root / "README.md").write_text("hello\n")
+        self.mounts = Mounts(reads=(self.root / "src", self.root / "README.md"), writes=(self.root / "out",),
+                             no_write=(self.root / "out" / "final",))
+
+    def confined(self, argv: list[str], jail: Jail = CONFINED, cwd: pathlib.Path | None = None,
+                 mounts: Mounts | None = None) -> subprocess.CompletedProcess[bytes]:
+        base = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+        with confined(argv, jail, base_env=base, mounts=self.mounts if mounts is None else mounts,
+                      cwd=self.root if cwd is None else cwd) as spawn:
+            return subprocess.run(spawn.argv, cwd=self.root if cwd is None else cwd, env=spawn.env,
+                                  pass_fds=spawn.pass_fds, capture_output=True)
+
+    def test_a_granted_file_reads_and_an_ungranted_one_does_not_exist(self) -> None:
+        result = self.confined([CAT, str(self.root / "src" / "main.py")])
+        self.assertEqual((result.returncode, result.stdout), (0, b"print(1)\n"), result.stderr)
+        result = self.confined([CAT, "README.md"])  # relative to the cwd, which is the root
+        self.assertEqual((result.returncode, result.stdout), (0, b"hello\n"), result.stderr)
+        result = self.confined([CAT, str(self.root / "secrets" / "key.pem")])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"No such file or directory", result.stderr)
+        self.assertNotIn(b"PRIVATE", result.stdout)
+
+    def test_the_root_lists_only_what_is_bound(self) -> None:
+        result = self.confined([LS, str(self.root)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sorted(result.stdout.decode().split()), ["README.md", "out", "src"])
+        # the directories above the root are a mountpoint chain: a sibling of the root is not there
+        sibling = pathlib.Path(tempfile.mkdtemp(prefix="certorail-sibling-", dir=self.root.parent))
+        self.addCleanup(shutil.rmtree, sibling, ignore_errors=True)
+        result = self.confined([LS, str(self.root.parent)])
+        listed = result.stdout.decode().split()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(self.root.name, listed)
+        self.assertNotIn(sibling.name, listed)
+
+    def test_the_cwd_exists_but_shows_nothing_unless_granted(self) -> None:
+        # cwd is the secrets directory, which no grant covers: the tool starts there and sees nothing
+        result = self.confined([LS, "-A"], cwd=self.root / "secrets")
+        self.assertEqual((result.returncode, result.stdout), (0, b""), result.stderr)
+        result = self.confined(py("import os; print(os.getcwd())"), cwd=self.root / "secrets")
+        self.assertEqual((result.returncode, result.stdout.decode().strip()), (0, str(self.root / "secrets")), result.stderr)
+
+    def test_writes_follow_write_fs_and_protections_stay_read_only(self) -> None:
+        writer = Jail(env=PATH_ONLY, network=False, write_fs=True, spawn=False, view=View.POLICY)
+        # a write grant, writable under write-fs = true
+        result = self.confined(py(f"open({str(self.root / 'out' / 'new')!r}, 'w').write('x')"), writer)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.root / "out" / "new").exists())
+        # the protection inside it: read-only on top of the writable bind
+        result = self.confined(py(f"open({str(self.root / 'out' / 'final')!r}, 'a').write('x')"), writer)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"Read-only file system", result.stderr)
+        self.assertEqual((self.root / "out" / "final").read_text(), "keep\n")
+        # a read grant is never writable, whatever write-fs says
+        result = self.confined(py(f"open({str(self.root / 'src' / 'new.py')!r}, 'w')"), writer)
+        self.assertIn(b"Read-only file system", result.stderr)
+        # under write-fs = false the write grant is read-only too, and TMPDIR is the one place
+        result = self.confined(py(f"open({str(self.root / 'out' / 'other')!r}, 'w')"))
+        self.assertIn(b"Read-only file system", result.stderr)
+        result = self.confined(py("import os; open(os.path.join(os.environ['TMPDIR'], 'x'), 'w'); print('ok')"))
+        self.assertEqual((result.returncode, result.stdout), (0, b"ok\n"), result.stderr)
+
+    def test_a_write_outside_every_bind_fails_rather_than_vanishing(self) -> None:
+        # a sloppy rule lets the argument through; the world still has nowhere to put it: the
+        # mountpoint chain above the root and the empty cwd are read-only, not a silent tmpfs
+        writer = Jail(env=PATH_ONLY, network=False, write_fs=True, spawn=False, view=View.POLICY)
+        outside = self.root.parent / "certorail-escaped"
+        self.addCleanup(lambda: outside.unlink(missing_ok=True))
+        result = self.confined(py(f"open({str(outside)!r}, 'w')"), writer)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"Read-only file system", result.stderr)
+        self.assertFalse(outside.exists())
+        result = self.confined(py("open('probe', 'w')"), writer, cwd=self.root / "secrets")
+        self.assertIn(b"Read-only file system", result.stderr)
+        self.assertFalse((self.root / "secrets" / "probe").exists())
+
+    def test_a_missing_protected_path_under_a_writable_bind_is_said_out_loud(self) -> None:
+        writer = Jail(write_fs=True, view=View.POLICY)
+        missing = Mounts(writes=(self.root / "out",), no_write=(self.root / "out" / "later",))
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            with confined(["true"], writer, mounts=missing, cwd=self.root):
+                pass
+        self.assertIn("no-write", err.getvalue())
+        self.assertIn(str(self.root / "out" / "later"), err.getvalue())
+        # an existing one, or one no write grant covers, is quietly held by the remount
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            with confined(["true"], writer, mounts=self.mounts, cwd=self.root):
+                pass
+            with confined(["true"], writer, mounts=Mounts(no_write=(self.root / "nowhere",)), cwd=self.root):
+                pass
+        self.assertEqual(err.getvalue(), "")
+
+    def test_the_view_needs_the_mounts(self) -> None:
+        with self.assertRaisesRegex(JailUnavailable, "not lowered"):
+            with confined(["true"], CONFINED):
+                self.fail("a confined grant without mounts must not run")
+
+
 # ---------------------------------------------------------------------------
 # the policy side: the media keys are the jail, the exec table is the rest of it
 # ---------------------------------------------------------------------------
@@ -193,16 +322,19 @@ class TestGrants(unittest.TestCase):
                  "exec": {"env": ["PATH"], "spawn": False}},
                 {"name": "git", "cwd": ".", "subcommand": "log", "network": False},
                 {"name": "ls", "cwd": "."},
+                {"name": "cat", "cwd": ".", "exec": {"view": "policy"}},
             ],
             "validation": [
                 {"name": "v", "argv": ["t"], "write-fs": False, "exec": {"env": []}},
                 {"name": "w", "argv": ["t"], "exec": {"env": ["HOME", {"PYTHONDONTWRITEBYTECODE": "1"}]}},
             ],
         })
-        grep, git, ls = policy.programs
+        grep, git, ls, cat = policy.programs
         self.assertEqual(grep.jail, READ_ONLY)
         self.assertEqual(git.jail, Jail(network=False))
         self.assertEqual(ls.jail, UNJAILED)
+        self.assertEqual(cat.jail, Jail(view=View.POLICY))
+        self.assertTrue(cat.jail.restricts and cat.jail.confined and policy.confines)
         self.assertEqual(policy.validations[0].jail, Jail(env=EMPTY, write_fs=False))
         self.assertEqual(policy.validations[1].jail, Jail(env=Environment(("HOME",), (("PYTHONDONTWRITEBYTECODE", "1"),))))
 
@@ -224,6 +356,32 @@ class TestGrants(unittest.TestCase):
         self.assertIn("program[0].exec.env[0].A: expected a string", problems('exec.env = [{ A = 1 }]'))
         self.assertEqual(problems('exec.env = ["PATH", { GIT_PAGER = "cat" }]'), [])
         self.assertEqual(problems('write-fs = "no"'), ["program[0].write-fs: expected true or false"])
+        self.assertEqual(problems('exec.view = "policy"'), [])
+        self.assertEqual(problems('exec.view = "host"'), [])
+        self.assertEqual(len(problems('exec.view = "fuse"')), 1)
+
+    def test_the_seatbelt_profile_of_a_policy_view(self) -> None:
+        mounts = Mounts(reads=(pathlib.Path("/r/src"),), writes=(pathlib.Path("/r/out"),), no_write=(pathlib.Path("/r/out/final"),))
+        profile = seatbelt_profile(CONFINED, "/tmp/scratch", mounts, "/usr/bin/cat")
+        self.assertIn("(deny file-read-data file-write*)", profile)
+        self.assertIn('(subpath "/usr/bin/cat")', profile)
+        self.assertIn('(subpath "/r/src")', profile)
+        # under write-fs = false the write grant is readable, and only the scratch dir writable
+        self.assertRegex(profile, r'\(allow file-write\* \(subpath "[^"]*scratch"\) \(literal "/dev/null"\)\)')
+        self.assertIn('(deny file-write* (subpath "/r/out/final"))', profile)
+        self.assertIn("(deny network*)", profile)
+        self.assertIn("(deny process-fork)", profile)
+        writer = Jail(write_fs=True, view=View.POLICY)
+        self.assertIn('(allow file-write* (subpath "/r/out")', seatbelt_profile(writer, "/tmp/scratch", mounts, None))
+        # patterns are regex filters, list grants literal directory reads
+        patterned = Mounts(reads=(Regex("^/r/src/(.*/)?[^/]+\\.py$"),), no_write=(Regex("^/r/(.*/)?\\.git(/.*)?$"),),
+                           listings=(pathlib.Path("/r"), Regex("^/r/src/[^/]+$")))
+        profile = seatbelt_profile(CONFINED, "/tmp/scratch", patterned, None)
+        self.assertIn('(regex #"^/r/src/(.*/)?[^/]+\\.py$")', profile)
+        self.assertIn('(deny file-write* (regex #"^/r/(.*/)?\\.git(/.*)?$"))', profile)
+        self.assertIn('(allow file-read-data (literal "/r") (regex #"^/r/src/[^/]+$"))', profile)
+        # the host view: today's profile, untouched
+        self.assertEqual(seatbelt_profile(Jail(network=False), None, None, None), "(version 1) (allow default) (deny network*)")
 
     def test_describe_says_what_is_enforced(self) -> None:
         policy = Policy.allow(
@@ -243,6 +401,8 @@ class TestGrants(unittest.TestCase):
         self.assertIn("jailed (enforced by the OS): no network; environment: PATH; sets GIT_PAGER=cat\n", text)
         self.assertIn("jailed (enforced by the OS): no subprocesses; environment: empty", text)
         self.assertIn("effects: writes anything on the filesystem (no network)\n    jailed", text)
+        confined_text = describe(Policy.allow(programs=[program("cat", cwd=".", view=View.POLICY)]), "p.toml", None)
+        self.assertIn("jailed (enforced by the OS): sees only what the policy grants", confined_text)
 
 
 @unittest.skipUnless(HAS_BWRAP, "bubblewrap is the Linux mechanism")
@@ -259,11 +419,20 @@ class TestBrokeredJail(unittest.TestCase):
                     "python3", cwd=markers.within("."), argv=["python3", "-c", hole("CODE")],
                     holes={"CODE": constraint(any=True)}, write_fs=False,
                 ),
+                program(
+                    "cat", cwd=markers.within("."), argv=["cat", hole("FILE")],
+                    holes={"FILE": constraint(any=True)}, network=False, write_fs=False, spawn=False,
+                    view=View.POLICY,
+                ),
             ],
             validations=[
                 validation("clean", argv=["python3", "-c", "open('probe', 'w')"], establishes={}, write_fs=False),
             ],
+            read=["src/**"],
         )
+        (cls.root / "src").mkdir()
+        (cls.root / "src" / "a.txt").write_text("granted\n")
+        (cls.root / "b.txt").write_text("not granted\n")
         cls.sock = os.path.join(tempfile.mkdtemp(), "broker.sock")
         cls.server = build_server(cls.sock, policy, cls.root)
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
@@ -283,6 +452,15 @@ class TestBrokeredJail(unittest.TestCase):
         self.assertFalse((self.root / "probe").exists())
         reply = exec_request(self.sock, "python3", ["-c", "print('read only is fine')"], cwd=".")
         self.assertEqual((reply["ok"], reply["returncode"]), (True, 0), reply)
+
+    def test_a_confined_tool_sees_the_policy_view(self) -> None:
+        reply = exec_request(self.sock, "cat", ["src/a.txt"], cwd=".")
+        self.assertEqual((reply["ok"], reply["returncode"]), (True, 0), reply)
+        self.assertEqual(base64.b64decode(reply["stdout_b64"]), b"granted\n")
+        reply = exec_request(self.sock, "cat", ["b.txt"], cwd=".")
+        self.assertTrue(reply["ok"], reply)
+        self.assertNotEqual(reply["returncode"], 0)
+        self.assertIn(b"No such file or directory", base64.b64decode(reply["stderr_b64"]))
 
     def test_the_checker_runs_jailed(self) -> None:
         reply = _roundtrip(self.sock, {"kind": "check", "name": "clean", "params": {}})

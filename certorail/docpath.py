@@ -113,7 +113,7 @@ type KeyedKey = Literal["holes", "regions", "atoms", "params", "flags", "binding
 type ScalarKey = Literal[
     "policy_version", "ruleset_version", "root", "base", "default_allow", "filesystem", "read", "write", "list", "no_write", "override",
     "name", "cwd", "when", "kind", "subcommand", "min", "literal", "any", "location", "matches",
-    "one_of", "footprint", "about", "pure", "reads", "writes", "write_fs", "exec", "env", "spawn", "ruleset", "host",
+    "one_of", "footprint", "about", "pure", "reads", "writes", "write_fs", "exec", "env", "spawn", "view", "ruleset", "host",
     "expand_single_flags",
     "schemes", "ports", "methods", "allow_nonpublic", "read_timeout", "total_timeout",
     "max_response_bytes", "path", "value", "atom", "on_redirect",
@@ -124,7 +124,7 @@ _KEYED: frozenset[str] = frozenset({"holes", "regions", "atoms", "params", "flag
 _SCALAR: frozenset[str] = frozenset({
     "policy_version", "ruleset_version", "root", "base", "default_allow", "filesystem", "read", "write", "list", "no_write", "override",
     "name", "cwd", "when", "kind", "subcommand", "min", "literal", "any", "location", "matches",
-    "one_of", "footprint", "about", "pure", "reads", "writes", "write_fs", "exec", "env", "spawn", "ruleset", "host",
+    "one_of", "footprint", "about", "pure", "reads", "writes", "write_fs", "exec", "env", "spawn", "view", "ruleset", "host",
     "expand_single_flags",
     "schemes", "ports", "methods", "allow_nonpublic", "read_timeout", "total_timeout",
     "max_response_bytes", "path", "value", "atom", "on_redirect",

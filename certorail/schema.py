@@ -488,11 +488,14 @@ class ExecDecl(_Table):
     """``exec``: the rest of how the grant's child is run (JAILS.md, ``childjail``), beyond the
     media keys -- the environment (``env``: a list whose strings name variables passed through
     from the host and whose tables set variables to literal values; absent: the host's whole
-    environment) and whether it may create processes (``spawn``). Enforced by the OS jail; both
-    default to the unjailed baseline."""
+    environment), whether it may create processes (``spawn``), and what it sees of the
+    filesystem (``view``: ``"host"``, the host's whole filesystem, or ``"policy"``, only what the
+    policy's filesystem section grants, MOUNTS.md). Enforced by the OS jail; all default to the
+    unjailed baseline."""
 
     env: list[str | dict[str, str]] | None = None
     spawn: bool = True
+    view: Literal["host", "policy"] = "host"
 
     @field_validator("env")
     @classmethod

@@ -145,6 +145,8 @@ def jail_line(rule: Program | Validation) -> str | None:
         parts.append("no filesystem writes (a private TMPDIR only)")
     if not j.spawn:
         parts.append("no subprocesses")
+    if j.confined:
+        parts.append("sees only what the policy grants (the filesystem section as mounts)")
     if j.env is not None:
         if j.env.empty:
             parts.append("environment: empty")

@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from certorail import markers
+from certorail.childjail import View
 from certorail.host import Accepted, Rejected
 from certorail.host import check as host_check
 from certorail.ids import HoleName
@@ -342,8 +343,9 @@ class TestCoreutilsRo(RulesetCase):
         self.assertGreaterEqual(len(self.policy.programs), 14)
         for p in self.policy.programs:
             with self.subTest(program=p.name):
-                self.assertEqual((p.network, p.write_fs, p.spawn), (False, False, False))
+                self.assertEqual((p.network, p.write_fs, p.spawn, p.view), (False, False, False, View.POLICY))
                 self.assertTrue(p.effect_free)
+                self.assertTrue(p.jail.confined)
 
     def check(self, body: str):
         return host_check(HEADER + body, "<t>", self.policy)

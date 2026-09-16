@@ -9,7 +9,9 @@
 # that would write (`sort -o`), phone home, or run a program (`find -exec`) is denied by shape
 # where it is listed at all and fails loudly where it is not. The flag lists therefore only have
 # to answer one question: which flags take a PATH the tool would open. Those are constrained to
-# `${where}/**`; everything else a flag takes is data for the tool.
+# `${where}/**`; everything else a flag takes is data for the tool. Every rule is also
+# `exec.view = "policy"`: the tool sees the filesystem section of the applying policy as mounts
+# and nothing else (MOUNTS.md), so `cat` of a path the program could not read is ENOENT.
 #
 # Absent, therefore denied, everywhere in this file: anything that follows or waits (`tail -f`,
 # `--follow`), writes (`sort -o`, `tee`, `--output`), runs a program (`find -exec/-execdir/-ok`,
@@ -47,6 +49,7 @@ holes.FILES = { kind = "each", location = "${where}/**" }
 network  = false
 write-fs = false
 exec.spawn = false
+exec.view  = "policy"
 
 [[program]]                            # tree [flags] [dirs]
 name = "tree"
@@ -61,6 +64,7 @@ holes.DIRS = { kind = "each", location = "${where}/**" }
 network  = false
 write-fs = false
 exec.spawn = false
+exec.view  = "policy"
 
 [[program]]                            # find <dir> [expression]: no -exec, -delete, -fprint*, -ok
 name = "find"
@@ -91,6 +95,7 @@ holes.FLAGS."-samefile" = { location = "${where}/**" }
 network  = false
 write-fs = false
 exec.spawn = false
+exec.view  = "policy"
 
 # ---------------------------------------------------------------------------------------------
 # printing
@@ -104,6 +109,7 @@ holes.FILES = { kind = "each", location = "${where}/**", min = 1 }
 network  = false
 write-fs = false
 exec.spawn = false
+exec.view  = "policy"
 
 [[program]]                            # head [flags] <files>
 name = "head"
@@ -118,6 +124,7 @@ holes.FILES = { kind = "each", location = "${where}/**", min = 1 }
 network  = false
 write-fs = false
 exec.spawn = false
+exec.view  = "policy"
 
 [[program]]                            # tail [flags] <files>: no -f / -F (waits forever)
 name = "tail"
@@ -132,6 +139,7 @@ holes.FILES = { kind = "each", location = "${where}/**", min = 1 }
 network  = false
 write-fs = false
 exec.spawn = false
+exec.view  = "policy"
 
 [[program]]                            # stat [flags] <files>
 name = "stat"
@@ -145,6 +153,7 @@ holes.FILES = { kind = "each", location = "${where}/**", min = 1 }
 network  = false
 write-fs = false
 exec.spawn = false
+exec.view  = "policy"
 
 [[program]]                            # file [flags] <files>
 name = "file"
@@ -155,6 +164,7 @@ holes.FILES = { kind = "each", location = "${where}/**", min = 1 }
 network  = false
 write-fs = false
 exec.spawn = false
+exec.view  = "policy"
 
 # ---------------------------------------------------------------------------------------------
 # searching
@@ -181,6 +191,7 @@ holes.FILES   = { kind = "each", location = "${where}/**", min = 1 }
 network  = false
 write-fs = false
 exec.spawn = false
+exec.view  = "policy"
 
 # ---------------------------------------------------------------------------------------------
 # comparing and counting
@@ -202,6 +213,7 @@ holes.FILES = { kind = "each", location = "${where}/**", min = 2 }
 network  = false
 write-fs = false
 exec.spawn = false
+exec.view  = "policy"
 
 [[program]]                            # wc [flags] [files]
 name = "wc"
@@ -212,6 +224,7 @@ holes.FILES = { kind = "each", location = "${where}/**" }
 network  = false
 write-fs = false
 exec.spawn = false
+exec.view  = "policy"
 
 [[program]]                            # du [flags] [paths]
 name = "du"
@@ -227,6 +240,7 @@ holes.FILES = { kind = "each", location = "${where}/**" }
 network  = false
 write-fs = false
 exec.spawn = false
+exec.view  = "policy"
 
 # ---------------------------------------------------------------------------------------------
 # filtering text (input from files; stdin is /dev/null under the broker)
@@ -244,6 +258,7 @@ holes.FILES = { kind = "each", location = "${where}/**" }
 network  = false
 write-fs = false
 exec.spawn = false
+exec.view  = "policy"
 
 [[program]]                            # uniq [flags] [file]
 name = "uniq"
@@ -259,6 +274,7 @@ holes.FILES = { kind = "each", location = "${where}/**" }
 network  = false
 write-fs = false
 exec.spawn = false
+exec.view  = "policy"
 
 [[program]]                            # cut [flags] [files]
 name = "cut"
@@ -276,3 +292,4 @@ holes.FILES = { kind = "each", location = "${where}/**" }
 network  = false
 write-fs = false
 exec.spawn = false
+exec.view  = "policy"

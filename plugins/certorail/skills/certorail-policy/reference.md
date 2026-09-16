@@ -55,7 +55,18 @@ methods = ["GET"]
 ## Locations
 
 Components separated by `/`. Each component is a literal name, `*` (any one name), `{a,b}`
-(one of the names), or `<regex>` (a full match of one name; raw regex, may contain `/`).
+(one of the names), or `<regex>` (a full match of one name; raw regex, may contain `/`). Note
+that `*.py` is a literal name: only a bare `*` is a wildcard, so "any `.py` file" is
+`<.*\.py>`.
+
+A `<regex>` is a Python regex. Under `exec.view = "policy"` on macOS it is also handed to
+Seatbelt, which reads POSIX ERE, and the two dialects agree only on a subset: literals, `.`,
+`[...]` of literals and ranges, `|`, plain groups, greedy `* + ? {n,m}`, `^` and `$`. A `<regex>`
+using anything else (`\d`, `\w`, `\s`, `(?...)`, lookarounds, backreferences, lazy or
+possessive quantifiers, non-ASCII) has no Seatbelt spelling: the location is omitted from the
+view and the host says so at startup. Write `[0-9]` where you would write `\d`. The translation
+is generated from Python's own parse of the pattern, so what does translate means the same
+thing on both sides, with one known exception: `.` in ERE also matches a newline.
 
 | Spelling | Meaning |
 |---|---|
@@ -211,9 +222,9 @@ per environmental atom the computed `dies on:` list, which is what the program a
 ## Jailing a grant: the media keys and `exec`
 
 The host enforces what a grant's child may reach with the OS sandbox: bubblewrap on Linux,
-Seatbelt (`sandbox-exec`) on macOS. The media keys are two of the four knobs; the `exec` table
-holds the other two. Every knob defaults to the unjailed baseline; a grant that sets none runs as
-the host does.
+Seatbelt (`sandbox-exec`) on macOS. The media keys are two of the five knobs; the `exec` table
+holds the other three. Every knob defaults to the unjailed baseline; a grant that sets none runs
+as the host does.
 
 ```toml
 [[program]]
@@ -225,14 +236,16 @@ write-fs   = false                       # no filesystem writes; only a private 
 exec.env   = ["PATH", "HOME", "LANG",    # passed through from the host; every other variable is scrubbed
               { GREP_COLORS = "" }]      # set to a literal value
 exec.spawn = false                       # no process creation (threads are fine)
+exec.view  = "policy"                    # sees only what the policy's [filesystem] grants
 ```
 
 | Key | Type | Meaning |
 |---|---|---|
 | `network` | bool, default true | `false`: the child runs in an empty network namespace |
 | `write-fs` | bool, default true | `false`: the whole filesystem is read-only to the child, except a fresh scratch directory `TMPDIR` names, thrown away after the run |
-| `exec.env` | list of names and tables | the child's environment is exactly this: a string passes that variable through from the host's environment (skipped if the host lacks it), a table `{ NAME = "value", ... }` sets each key to a literal. A variable is mentioned once, either way; values are literal, no `${...}`; `TMPDIR` may not be listed (the host sets it under `write-fs = false`). Absent: the host's whole environment; `[]`: an empty one |
+| `exec.env` | list of names and tables | the child's environment is exactly this: a string passes that variable through from the host's environment (skipped if the host lacks it), a table `{ NAME = "value", ... }` sets each key to a literal. A variable is mentioned once, either way; values are literal, no `${...}`; `TMPDIR` may not be listed (the host sets it under `write-fs = false` and under `exec.view = "policy"`). Absent: the host's whole environment; `[]`: an empty one |
 | `exec.spawn` | bool, default true | `false`: the child cannot create processes (no hooks, no `-exec`, no helpers, no shells). It can still replace itself with another program, which is not creation |
+| `exec.view` | `"host"` (default) or `"policy"` | what the child sees of the filesystem. `"host"`: the host's whole filesystem; the tool is trusted as granted. `"policy"`: an empty world holding the system toolchain, the tool itself, a private `TMPDIR`, the exec's cwd as an empty directory, and the applying policy's `[filesystem]` section as mounts: `read` grants read-only, `write` grants writable iff `write-fs = true`, `no-write` protections remounted read-only on top. Nothing else exists: on Linux a path outside the view is "No such file", not "Permission denied". On macOS Seatbelt takes every location, patterns as anchored regexes (a `<regex>` must stay within the subset Python and ERE share, see "Locations"; one that does not is omitted and reported), and `list` grants as the directory alone. On Linux only a literal path or a literal prefix ending in `**` has a mount; a location with `*`, `<regex>` or a `**/leaf` tail is omitted from the view and the host says so on stderr at startup, and `list` grants do not widen the view |
 
 A jailed grant whose sandbox is not installed does not run at all (the program gets a broker
 error), unlike the confined program itself, which runs with a warning when `srt` is missing. So
@@ -242,6 +255,14 @@ is what the set form of `exec.env` is for (`{ PYTHONDONTWRITEBYTECODE = "1" }`,
 `{ GIT_OPTIONAL_LOCKS = "0" }`, `{ PIP_DISABLE_PIP_VERSION_CHECK = "1" }`); a tool with no such
 knob (`go` without a writable `GOCACHE`) declares `writes = []` or its regions instead and keeps
 the medium.
+
+`exec.view = "policy"` is for the tools whose whole value is reading what the program may read
+(`cat`, `grep`, `ls`, `find`, `diff`: the shipped coreutils rung sets it on every rule). It is
+wrong for a tool that reads its own configuration or caches from the home directory (`git`
+reads `~/.gitconfig`, `cargo` needs `~/.cargo` and `~/.rustup`): under the policy view those do
+not exist. Such a tool keeps `"host"`; a way for a rule to add locations to its view
+(`exec.reads`) is designed in MOUNTS.md and not yet built. The policy view needs the same
+sandbox as the other knobs and the same rule applies: no bubblewrap or `sandbox-exec`, no run.
 
 ## `[[program]]`
 

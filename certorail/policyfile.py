@@ -37,6 +37,7 @@ from . import markers
 from .analysis import Exact, RegexLit, StaticPath, alternation, is_prefix
 from .dangerous import EXEC_CWD
 from .docpath import DocPath, Keyed, Path
+from .childjail import View
 from .ids import BUILTIN_ATOMS, Atom, CheckId, FlagName, FlagsetId, HoleName, ParamName, SourceId
 from .integrity import digest
 from .locations import parse_location
@@ -902,12 +903,15 @@ def _piece(word: str) -> Piece:
 class _Exec(TypedDict):
     env: list[str | dict[str, str]] | None
     spawn: bool
+    view: View
 
 
 def _exec(decl: ExecDecl | None) -> _Exec:
     """A grant's ``exec`` table as ``program()`` / ``validation()`` keywords; absent, the
     unjailed baseline."""
-    return _Exec(env=None, spawn=True) if decl is None else _Exec(env=decl.env, spawn=decl.spawn)
+    if decl is None:
+        return _Exec(env=None, spawn=True, view=View.HOST)
+    return _Exec(env=decl.env, spawn=decl.spawn, view=View(decl.view))
 
 
 def _network(root: PolicyDoc, where: str, declared: _Declared, errors: _Errors) -> list[NetworkRule]:

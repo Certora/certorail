@@ -89,7 +89,7 @@ from .analysis import (
     url_of,
     ValidationFact
 )
-from .childjail import Environment, Jail, JailUnavailable, confined, environment_spec
+from .childjail import Environment, Jail, JailUnavailable, Mounts, View, confined, environment_spec
 from .effects import EVERYTHING, NOTHING, Effects, Medium, effects_of, whole
 from .ids import (
     BUILTIN_ATOMS,
@@ -137,7 +137,7 @@ from .enforcement import (
     WriteTable,
     host_matches,
 )
-from . import footprints
+from . import footprints, fsview
 from .footprints import Footprint
 from .walker import Report
 
@@ -327,9 +327,11 @@ class Validation:
     write_fs: bool = True
     # the regions the evaluator writes, within its media; None: undeclared, every region of them
     writes: Effects | None = None
-    # the rest of the jail (``exec``): the environment (None: the broker's), process creation
+    # the rest of the jail (``exec``): the environment (None: the broker's), process creation,
+    # the filesystem view
     env: Environment | None = None
     spawn: bool = True
+    view: View = View.HOST
     # the sha256 the declaring document pinned its evaluator to (INSTALL.md); verified against
     # the bytes captured at load. None: unpinned
     pin: str | None = None
@@ -350,7 +352,7 @@ class Validation:
     @property
     def jail(self) -> Jail:
         """How the broker spawns the evaluator: its media, enforced, and its ``exec`` table."""
-        return Jail(self.env, self.network, self.write_fs, self.spawn)
+        return Jail(self.env, self.network, self.write_fs, self.spawn, self.view)
 
 
 def validation(
@@ -365,6 +367,7 @@ def validation(
     writes: Iterable[str] | None = None,
     env: Iterable[str | Mapping[str, str]] | None = None,
     spawn: bool = True,
+    view: View = View.HOST,
     pin: str | None = None,
     evaluator: bytes | None = None,
 ) -> Validation:
@@ -416,7 +419,7 @@ def validation(
     return Validation(
         ValidationName(name), params_t, argv_t, None if cwd is None else _one_or_many(cwd), est,
         frozenset(pure_set), network, write_fs, None if writes is None else effects_of(writes),
-        _env(env), spawn, pin, evaluator=evaluator,
+        _env(env), spawn, view, pin, evaluator=evaluator,
     )
 
 
@@ -454,9 +457,11 @@ class Program:
     write_fs: bool = True
     # the regions the tool writes, within its media; None: undeclared, every region of them
     writes: Effects | None = None
-    # the rest of the jail (``exec``): the environment (None: the broker's), process creation
+    # the rest of the jail (``exec``): the environment (None: the broker's), process creation,
+    # the filesystem view
     env: Environment | None = None
     spawn: bool = True
+    view: View = View.HOST
 
     @property
     def write_set(self) -> Effects:
@@ -470,7 +475,7 @@ class Program:
     @property
     def jail(self) -> Jail:
         """How the broker spawns the tool: its media, enforced, and its ``exec`` table."""
-        return Jail(self.env, self.network, self.write_fs, self.spawn)
+        return Jail(self.env, self.network, self.write_fs, self.spawn, self.view)
 
     @property
     def leading_words(self) -> tuple[str, ...]:
@@ -504,6 +509,7 @@ def program(
     writes: Iterable[str] | None = None,
     env: Iterable[str | Mapping[str, str]] | None = None,
     spawn: bool = True,
+    view: View = View.HOST,
 ) -> Program:
     """*requires* is the atoms the cwd must carry, or a table ``{cwd: [...], HOLE: [...]}``
     that also demands atoms of a hole's value, folded into that hole's constraint."""
@@ -575,6 +581,7 @@ def program(
         writes_e,
         _env(env),
         spawn,
+        view,
     )
 
 
@@ -902,10 +909,11 @@ def _literal_slot(v: Validation, atom_name: Atom) -> str | None:
     return None
 
 
-def _run_literal_checker(v: Validation, slot: str, text: str, root: pathlib.Path) -> bool:
+def _run_literal_checker(v: Validation, slot: str, text: str, root: pathlib.Path, mounts: Mounts) -> bool:
     """One evaluator run with *text* bound to *slot*: argv substitution for a parameter slot,
     ``cwd=root/text`` for the cwd slot (a pure text predicate should not care where it runs, so a
-    parameter-slot checker runs at the root)."""
+    parameter-slot checker runs at the root). *mounts* is the policy's view, for a confined
+    evaluator."""
     argv = [piece if isinstance(piece, str) else text for piece in v.argv]
     if v.evaluator is not None:
         # exec the load-time snapshot: what was (pin-)verified at load is what runs
@@ -914,7 +922,7 @@ def _run_literal_checker(v: Validation, slot: str, text: str, root: pathlib.Path
     if not cwd.is_dir():
         return False
     try:
-        with confined(argv, v.jail) as spawn:
+        with confined(argv, v.jail, mounts=mounts, cwd=cwd) as spawn:
             result = subprocess.run(
                 spawn.argv, cwd=cwd, env=spawn.env, pass_fds=spawn.pass_fds, shell=False,
                 capture_output=True, check=False,
@@ -1327,19 +1335,30 @@ class Policy:
         outcome = self.exec_command(program_name, arguments, {}, cwd)
         return outcome.reason if isinstance(outcome, Refusal) else None
 
+    def mounts(self, root: pathlib.Path) -> Mounts:
+        """The filesystem section lowered to the binds a confined child gets (``fsview``,
+        MOUNTS.md): the same grants and protections the program is held to, under *root*."""
+        return fsview.mounts(root, self.read, self.write, self.no_write, self.listing)
+
+    @property
+    def confines(self) -> bool:
+        """Does some grant run its child under the policy view (``exec.view = "policy"``)?"""
+        return any(r.view is View.POLICY for r in (*self.programs, *self.validations))
+
     def discharger(self, root: PathLike[str] | str) -> Discharge:
         """A runner for literal checkers: ``discharge(atom, text)`` is True when some effect-free
         validation establishing the pure *atom* through a single slot accepts the exact *text*,
         run right now under *root*. Cached per (atom, text); handed to ``evaluate`` and to
         ``analyze`` so constants need neither a ``certora.check`` nor a regex definition."""
         rootpath = pathlib.Path(root)
+        view = self.mounts(rootpath)
         cache: dict[tuple[Atom, str], bool] = {}
 
         def discharge(atom: Atom, text: str) -> bool:
             key = (atom, text)
             if key not in cache:
                 cache[key] = any(
-                    _run_literal_checker(v, slot, text, rootpath)
+                    _run_literal_checker(v, slot, text, rootpath, view)
                     for v in self.validations
                     if (slot := _literal_slot(v, atom)) is not None
                 )
