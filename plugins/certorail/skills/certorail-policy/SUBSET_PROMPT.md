@@ -222,8 +222,11 @@ slugs: list[typing.Annotated[str, certora.no_slash, certora.not_dot_dot]] = []
 ## Subprocesses
 
 - Only `certora.exec(program, *args, cwd=<located path>)`. `program` is a string literal (or a name bound to
-  one); arguments are separate strings, no `*`/`**` splats; the only keyword is `cwd`, and it is required and
-  must be a proven location. No shell; output is captured. A call the host refuses raises.
+  one); arguments are separate strings, no `*`/`**` splats; `cwd` is required and must be a proven location.
+  No shell; output is captured. A call the host refuses raises. `stream=True` (a literal, the only other
+  option) sends the command's output straight to the terminal as it happens -- for a build or a test run
+  you want to watch -- and the result then has the exit code and empty `stdout`/`stderr`: live output or
+  output to read, one or the other per call.
 - The result is a `CompletedProcess` with `.returncode`, `.stdout` and `.stderr` (bytes), plus decoded views:
   `.stdout_string()`, `.stdout_lines()`, `.stderr_string()`, `.stderr_lines()` (UTF-8, lines split like
   `str.splitlines`). **The views raise `certora.CalledProcessError` when the command exited non-zero**, so

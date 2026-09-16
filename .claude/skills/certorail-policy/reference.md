@@ -544,7 +544,7 @@ kill it.
 
 Full rules in `SUBSET_PROMPT.md` (next to this file). The parts a policy author needs:
 
-- `certora.exec(program, *args, cwd=<proven path>, HOLE=value, …)`: literal program name,
+- `certora.exec(program, *args, cwd=<proven path>, HOLE=value, …, stream=False)`: literal program name,
   string arguments, no splats, `cwd` mandatory; keyword arguments bind a template's holes by
   name (required for keyword-only holes and for a value the positional rule cannot place). Returns a `CompletedProcess` whose `.stdout_lines()` / `.stdout_string()` (and stderr
   twins) raise `certora.CalledProcessError` on a non-zero exit.
