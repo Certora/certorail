@@ -971,15 +971,25 @@ def from_data(data: object, where: str = "<policy>") -> Policy:
     net_rules = _network(top, where, declared, errors)
     errors.raise_if_any()
     no_write = [loc for d in documents for loc in d.body.filesystem.no_write]
+
+    def grants(written: list[str] | None) -> list[Any]:
+        # under default-allow a kind left unwritten is the whole root (Claude Code's own
+        # default); a kind written, `[]` included, is exactly what was written
+        if written is None:
+            return [parse_location("**")] if top.default_allow else []
+        return _slot(written) if written else []
+
     try:
         return Policy.allow(
-            read=_slot(top.filesystem.read) if top.filesystem.read else [],
-            write=_slot(top.filesystem.write) if top.filesystem.write else [],
-            listing=_slot(top.filesystem.list_) if top.filesystem.list_ else [],
+            read=grants(top.filesystem.read),
+            write=grants(top.filesystem.write),
+            listing=grants(top.filesystem.list_),
             no_write=_slot(no_write) if no_write else [],
             programs=own + applied, validations=validations, atoms=declared.defined,
             network=net_rules, sources=sources, regions=declared.regions, reads=declared.reads,
             applied=[d.label for d in documents[1:]],
+            default_allow=top.default_allow,
+            denied=[d.argv[0] for d in top.deny],
         )
     except ValueError as e:
         raise PolicyFileError(f"{where}: {e}") from None
@@ -991,8 +1001,10 @@ def _shape(words: Sequence[str]) -> str:
 
 def _deny(root: PolicyDoc, where: str, applied: list[Program], own: Sequence[Program], errors: _Errors) -> list[Program]:
     """``[[deny]]``: take back from the applied rulesets every rule whose leading words begin
-    with the denied words. A denial that takes nothing back is stale; one naming a shape the
-    root grants itself is a contradiction -- delete the rule instead."""
+    with the denied words. A denial that takes nothing back is stale -- except under
+    default-allow, where naming a program is what governs it, so a bare deny is the first-verb
+    blacklist; one naming a shape the root grants itself is a contradiction -- delete the rule
+    instead."""
     kept = list(applied)
     for i, d in enumerate(root.deny):
         path = Path().deny(i)
@@ -1001,7 +1013,7 @@ def _deny(root: PolicyDoc, where: str, applied: list[Program], own: Sequence[Pro
             errors.add(where, path, f"deny {_shape(words)!r} names a shape this policy grants itself; delete that rule instead")
             continue
         taken = [p for p in kept if is_prefix(words, p.leading_words)]
-        if not taken:
+        if not taken and not root.default_allow:
             errors.add(where, path, f"deny {_shape(words)!r} takes back nothing: no applied ruleset grants that shape")
             continue
         kept = [p for p in kept if p not in taken]

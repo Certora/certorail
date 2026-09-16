@@ -396,7 +396,10 @@ def bind(
         hole = template.holes[piece.name]
         assert isinstance(hole, Flags)
         following = holes[i + 1].name if i + 1 < len(holes) else None
-        taken, consumed, problem = _flag_head(hole.flagset, positionals, piece.name, following)
+        # "bind FOLLOWING by keyword" is advice only where a dash-shaped value can land there:
+        # a hole after a spelled "--"; elsewhere the value would fail the dash guard the same way
+        takes_dashes = following is not None and template.dash_exempt(following)
+        taken, consumed, problem = _flag_head(hole.flagset, positionals, piece.name, following, takes_dashes)
         if problem is not None:
             reasons.append(problem)
             break
@@ -443,7 +446,11 @@ def bind(
 
 
 def _flag_head(
-    fs: Flagset, positionals: Sequence[Value], name: HoleName, following: HoleName | None
+    fs: Flagset,
+    positionals: Sequence[Value],
+    name: HoleName,
+    following: HoleName | None,
+    following_takes_dashes: bool = False,
 ) -> tuple[list[Value], int, str | None]:
     """The prefix of *positionals* a non-last flags hole takes: flags -- known text beginning
     with ``-`` -- each valued one with the positional after it, up to the first positional that
@@ -461,7 +468,11 @@ def _flag_head(
             if isinstance(words, str):
                 if fs.expand_single_flags and _BUNDLE.fullmatch(text) is not None:
                     return taken, i, f"{name}: {words}"
-                hint = f"; if it is the value of {following}, bind {following} by keyword" if following else ""
+                hint = (
+                    f"; if it is the value of {following}, bind {following} by keyword"
+                    if following is not None and following_takes_dashes
+                    else f" (the flags of {name}: {' '.join(sorted(fs.bare | fs.valued.keys()))})"
+                )
                 return taken, i, f"{text!r} is not a flag of {name}{hint}"
             taken.extend(words if len(words) > 1 else (value,))
             i += 1

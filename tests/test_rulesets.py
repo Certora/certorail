@@ -13,7 +13,7 @@ from certorail.host import Accepted, Rejected
 from certorail.host import check as host_check
 from certorail.ids import HoleName
 from certorail.install import install_pack
-from certorail.policy import Policy
+from certorail.policy import Command, Policy
 from certorail.policyfile import PolicyFileError, from_data
 from certorail.templates import Constraint, Each, Flags, Token
 
@@ -370,6 +370,29 @@ class TestCoreutilsRo(RulesetCase):
                 outcome = self.check(body)
                 if isinstance(outcome, Rejected):
                     self.fail("\n".join(outcome.describe("<t>")))
+
+    def test_paths_come_after_a_host_inserted_double_dash(self) -> None:
+        # every rule but find spells "--" before its paths: a file named "-R" is a file, and no
+        # path the program passes can be read as an option -- so the dash guard need not apply
+        for name in ("ls", "cat", "head", "tail", "stat", "file", "diff", "wc", "du", "sort", "uniq", "cut", "tree"):
+            rule = next(p for p in self.policy.programs if p.name == name)
+            assert rule.template is not None
+            self.assertIn("--", rule.template.pieces, name)
+        find = next(p for p in self.policy.programs if p.name == "find")
+        assert find.template is not None
+        self.assertNotIn("--", find.template.pieces)
+        # a dash-shaped file name binds by keyword and reaches the tool after the "--" (-Q is
+        # no flag of the rung's ls; -R is, and is a recursive listing, which is fine)
+        outcome = self.check('certora.exec("ls", "-l", FILES=[pathlib.Path("-Q")], cwd=pathlib.Path("."))\n')
+        if isinstance(outcome, Rejected):
+            self.fail("\n".join(outcome.describe("<t>")))
+        command = self.policy.exec_command("ls", ["-l"], {"FILES": ["-Q"]}, ".")
+        assert isinstance(command, Command), command
+        self.assertEqual(command.argv, ["ls", "-l", "--", "-Q"])
+        # positionally it is refused as a non-flag, with the keyword named as the fix
+        outcome = self.check('certora.exec("ls", "-l", "-Q", cwd=pathlib.Path("."))\n')
+        assert isinstance(outcome, Rejected)
+        self.assertIn("'-Q' is not a flag of FLAGS; if it is the value of FILES, bind FILES by keyword", outcome.denials[0].reason)
 
     def test_the_script_tools_are_absent(self) -> None:
         # sed and awk scripts can name files the flag list never sees; not portable to close

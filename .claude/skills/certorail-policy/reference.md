@@ -8,6 +8,7 @@ values are errors, and every error in the document is reported, not just the fir
 policy-version = 1
 root = "/srv/work/repo"            # ambient policies only: the sandbox root this file governs
 base = true                        # the default: the installed base ruleset applies (below)
+default-allow = false              # the default: a program the policy does not name is denied (below)
 
 [filesystem]
 read  = ["**"]
@@ -75,9 +76,33 @@ text to quote. A relative location is under the sandbox root (`--root`, the prog
 directory). Absolute and relative locations never relate: an absolute grant says nothing about
 relative paths and vice versa. A program's literal beginning with `/` is an absolute path.
 
+## `default-allow`
+
+`default-allow = true` at the top of a root policy (a ruleset has no such key) flips the
+posture for programs the policy does not speak about: a `certora.exec` of a program that **no
+`[[program]]` rule and no `[[deny]]` names** runs, with any arguments, with the user's
+authority -- unjailed, its effects unknown, so every environmental fact dies at it. A program
+the policy *does* name is governed exactly as without the key: its listed shapes and nothing
+else, fail closed. `[[deny]] argv = ["rm"]` names a program without granting it a shape, which
+under default-allow is the first-verb blacklist.
+
+The classification is the **leading program name and nothing finer**. That is deliberate: a
+`git log` grant beside default-allow does not mean "other git invocations are allowed", because
+`git -C x push` accomplishes a `git push` without ever parsing as one, and no shape matching
+could say so soundly. Naming a program takes responsibility for all of it.
+
+What the key does not change: the cwd is still a sink that must be proven; the program's own
+filesystem operations are still held to `[filesystem]` (whose `read`/`write`/`list` default to
+the whole root under this key, matching an agent's ordinary permissions, while a written `[]`
+stays nothing and `no-write` protections still bind); network is still `[[network]]` only. Every
+run says on stderr that default-allow is on, and `--describe` lists the rule last under
+Programs.
+
 ## `[filesystem]`
 
-`read`, `write`, `list`: lists of locations; absent means nothing of that kind is permitted.
+`read`, `write`, `list`: lists of locations; absent means nothing of that kind is permitted
+(under `default-allow`, below, absent means the whole root, and a written `[]` still means
+nothing).
 `no-write`: locations **protected** from program writes whatever `write` grants -- a write whose
 path *may* lie at or below one is denied, by the same at-or-below alignment the kill uses for
 footprints. A `*` component may be anything, `.git` included, so under `repos/**/.git` a
@@ -356,6 +381,10 @@ checker supplies it for text the analysis cannot see the head of, by listing `no
 somewhere under `**`, or unguarded, unchecked text, is denied with the fix in the message. Flag
 *values* are exempt (the flag consumed the slot), and so is every hole after a literal `--` in
 the template, for tools that honour it (`argv = ["grep", "--", "${PATTERN}", "${FILES...}"]`).
+**Spell that `--` for every tool that honours it** -- all of coreutils, git, nearly everything
+but `find` -- so the guard does its work where a value could be read as an option and nowhere
+else: a file that happens to be named `-R` is then spellable (`FILES=["-R"]`), and the tool
+itself guarantees it is read as a file. The shipped coreutils rung does this throughout.
 
 **Built-in atoms.** `not-option` is one of five certorail defines -- with `no-slash`,
 `no-parent-traversal`, `not-absolute`, `not-dot-dot` -- that no policy declares (an `[atoms]`

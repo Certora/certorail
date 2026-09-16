@@ -769,9 +769,13 @@ class Protected(_Table):
 
 
 class Filesystem(Protected):
-    read: list[Location] = Field(default_factory=list)
-    write: list[Location] = Field(default_factory=list)
-    list_: list[Location] = Field(default_factory=list)  # the TOML key is ``list``
+    """The root's grants. A kind left unwritten is None, distinct from a written ``[]``: without
+    default-allow both mean nothing is permitted; with it, unwritten means the whole root and
+    ``[]`` still means nothing."""
+
+    read: list[Location] | None = None
+    write: list[Location] | None = None
+    list_: list[Location] | None = None  # the TOML key is ``list``
 
 
 class _Vocabulary(_Table):
@@ -807,6 +811,10 @@ class PolicyDoc(_Vocabulary):
     # apply the installed base ruleset (``rulesets/base.toml``); false: this policy is the whole
     # statement of what may run
     base: bool = True
+    # a program no grant and no deny names runs, with any arguments, with the user's authority;
+    # a named program keeps its shapes (fail closed). A `[filesystem]` kind left unwritten is
+    # then `**`. Root policies only: a ruleset has no such key
+    default_allow: bool = False
     filesystem: Filesystem = Field(default_factory=Filesystem)
     network: list[NetworkDecl] = Field(default_factory=list)
     deny: list[DenyDecl] = Field(default_factory=list)

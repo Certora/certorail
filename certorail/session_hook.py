@@ -51,7 +51,9 @@ around the checker.
   `subprocess`, `shutil`, `tempfile`, `glob`, `socket`, `http`, `urllib` (except `urllib.parse`),
   `threading`, `asyncio`, `importlib`, `pickle`, `ctypes`, `logging`, `platform`, `inspect`,
   `types`, or any archive/compression module. A module name or `certora` may appear only as the
-  receiver of a call (`json.loads(...)`), never as a value (`f = json.loads` is a violation).
+  receiver of a call (`json.loads(...)`), never as a value (`f = json.loads` is a violation);
+  the same goes for module attributes: `sys.argv[1]` and `sys.argv[1:]` are fine,
+  `len(sys.argv)` and `main(sys.argv)` are not -- write `args = sys.argv[1:]` and use `args`.
 - **Names**: never rebind an imported name, a builtin, `certora`, or a class you defined. No
   dunders anywhere -- there is no `if __name__ == "__main__":`, call `main()` at top level. No
   `getattr`/`setattr`/`vars`/`globals`/`eval`/`exec`/`compile`. No `async`, `:=`, `global`,

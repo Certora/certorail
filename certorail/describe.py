@@ -384,6 +384,15 @@ def describe(policy: Policy, origin: str, governs: str | None = None) -> str:
         )
     defined = frozenset(a.name for a in policy.atoms)
     programs = [line for p in policy.programs for line in _program(p, policy)]
+    if policy.default_allow:
+        listed = sorted({p.name for p in policy.programs})
+        programs.append(
+            "- DEFAULT-ALLOW: any program not named above"
+            + (f" (and not denied: {', '.join(sorted(policy.denied - set(listed)))})" if policy.denied - set(listed) else "")
+            + " runs with any arguments and your authority: unjailed, its effects unknown (every environmental "
+            "fact dies at it). Only the leading program name decides; a program named above keeps exactly "
+            "its listed shapes"
+        )
     validations = [line for v in policy.validations for line in _validation(v, policy, defined)]
     return "\n".join(
         head

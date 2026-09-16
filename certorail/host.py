@@ -267,6 +267,12 @@ def _announce_base(policy: Policy) -> Policy:
             "(base = false in the policy opts out)",
             file=sys.stderr,
         )
+    if policy.default_allow:
+        print(
+            "certorail: default-allow is on: a program the policy does not name runs with your "
+            "authority, unconfined",
+            file=sys.stderr,
+        )
     return policy
 
 

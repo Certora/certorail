@@ -233,7 +233,13 @@ class TestKeywordOnlyShapes(Base):
             + 'certora.exec("tar", "-c", "-x", pathlib.Path("repos") / "a", cwd=here)\n'
         )
         self.assertIn("'-x' is not a flag of FLAGS", reason)
-        self.assertIn("bind ARCHIVE by keyword", reason)
+        # ARCHIVE follows "-f", not "--": a dash-shaped value could never land there, so the
+        # message lists the flags instead of suggesting a keyword that would fail the same way
+        self.assertIn("(the flags of FLAGS: -c -z)", reason)
+        self.assertNotIn("by keyword", reason.split(";")[0])
+        # after a spelled "--" the hole does take dash-shaped values: the keyword IS the fix
+        reason = self.denial(REPO + self.HERE + 'certora.exec("grep", "-r", "-Q", repo, cwd=here)\n')
+        self.assertIn("'-Q' is not a flag of FLAGS; if it is the value of PATTERN, bind PATTERN by keyword", reason)
 
     def test_an_each_hole_that_is_not_last_stays_keyword_only(self) -> None:
         policy = Policy.allow(

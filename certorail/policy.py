@@ -950,6 +950,15 @@ class Policy:
     # the rulesets the loader composed into this policy, by label, in application order
     # ("base.toml", "unix.toml (where=repos)"): what --describe and the run announce
     applied: tuple[str, ...] = ()
+    # default-allow: a program that no rule and no deny names runs with any arguments, with the
+    # user's authority (unjailed, its write set undeclared: every environmental fact dies). A
+    # named program is governed by its rules exactly as without it. Decided on the leading
+    # program name and nothing finer -- the one classification of an exec that is decidable
+    # (`git -C x push` is a `git push`, and no shape matching would say so)
+    default_allow: bool = False
+    # the programs `[[deny]]` named, by leading name: named, so governed; with no rule of their
+    # own, refused outright -- the first-verb blacklist under default-allow
+    denied: frozenset[ProgramName] = frozenset()
     programs: tuple[Program, ...] = ()
     validations: tuple[Validation, ...] = ()
     atoms: tuple[AtomDef, ...] = ()
@@ -976,6 +985,8 @@ class Policy:
         regions: Iterable[Region] = (),
         reads: Mapping[str, Iterable[str]] | None = None,
         applied: Iterable[str] = (),
+        default_allow: bool = False,
+        denied: Iterable[str] = (),
     ) -> "Policy":
         vals = tuple(validations)
         names = [v.name for v in vals]
@@ -1123,7 +1134,20 @@ class Policy:
             read=_locations(read), write=_locations(write), listing=_locations(listing),
             no_write=_locations(no_write), programs=progs, validations=vals, atoms=atoms_t,
             network=tuple(net_rules), sources=srcs, regions=regs, reads=reads_m, applied=tuple(applied),
+            default_allow=default_allow, denied=frozenset(ProgramName(d) for d in denied),
         )
+
+    def governed(self, name: str) -> bool:
+        """Is *name* a program the policy speaks about -- by a rule, or by a deny? The one
+        classification default-allow makes: a program it does not govern is let through, a
+        program it governs is held to its rules."""
+        return name in self.denied or any(p.name == name for p in self.programs)
+
+    def _ungoverned(self, name: str) -> Program:
+        """The rule an ungoverned program runs under when default-allow lets it through: any
+        cwd within the root, no template (any arguments), the user's authority -- unjailed, its
+        writes undeclared."""
+        return Program(ProgramName(name), (parse_location("**"),), origin="default-allow")
 
     def protected(self, loc: LocationFact) -> LocationFact | None:
         """The first ``no_write`` location a write at *loc* may touch -- a path the write may name
@@ -1257,11 +1281,15 @@ class Policy:
         guard, textual atoms -- run again on the strings. The template, not the program,
         then composes the argv."""
         rules = [p for p in self.programs if p.name == program_name]
-        if not rules:
-            return Refusal(f"program {program_name!r} is not permitted")
         cwd_loc = _literal_location(cwd)
         if cwd_loc is None:
             return Refusal(f"cwd {cwd!r} has no safe location")
+        if not rules:
+            if self.default_allow and not self.governed(program_name):
+                if keywords:
+                    return Refusal(f"{program_name!r} is not governed by a rule: it has no holes to bind by keyword")
+                return Command([program_name, *arguments], self._ungoverned(program_name))
+            return Refusal(f"program {program_name!r} is not permitted")
         rule = _select(rules, arguments)
         if rule is None:
             return Refusal(
@@ -1343,10 +1371,14 @@ class Policy:
                 return [Denial(site, "the location of the path is not proven")]
             case ExecSite(program=name, cwd=cwd, arguments=arguments, keywords=keywords):
                 rules = [p for p in self.programs if p.name == name]
-                if not rules:
-                    return [Denial(site, f"program {name!r} is not permitted")]
                 if not isinstance(cwd, Located):
-                    return [Denial(site, "the cwd is not proven")]
+                    return [Denial(site, "the cwd is not proven")]  # a sink, default-allow or not
+                if not rules:
+                    if self.default_allow and not self.governed(name):
+                        if keywords:
+                            return [Denial(site, f"{name!r} is not governed by a rule: it has no holes to bind by keyword")]
+                        return []  # let it ride: the user's authority, every fact killed
+                    return [Denial(site, f"program {name!r} is not permitted")]
                 # forms fail closed: the leading words select exactly one rule
                 # (prefix-freedom); an unlisted or computed form matches nothing
                 rule = _select(rules, arguments)

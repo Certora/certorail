@@ -20,6 +20,11 @@
 #
 # Short flags bundle where the tool's parser does (GNU getopt: `ls -la`, `grep -rn`); `find`
 # takes single-dash words (`-name`) and does not bundle.
+#
+# Every rule but `find` spells `--` between the flags and the paths, and the host inserts it:
+# the tool then stops reading options, so a file that happens to be named `-R` is a file and
+# nothing the program passes as a path can be read as an option. (`find` has no `--`: its
+# starting point precedes the expression, so its WHERE hole stays under the leading-dash guard.)
 ruleset-version = 1
 
 [params]
@@ -30,7 +35,7 @@ where = { kind = "directory" }         # the tree the tools may look at; the bas
 
 [[program]]                            # ls [flags] [paths]
 name = "ls"
-argv = ["ls", "${FLAGS...}", "${FILES...}"]
+argv = ["ls", "${FLAGS...}", "--", "${FILES...}"]
 cwd  = "${where}/**"
 holes.FLAGS.kind = "flags"
 holes.FLAGS.expand-single-flags = true
@@ -45,7 +50,7 @@ exec.spawn = false
 
 [[program]]                            # tree [flags] [dirs]
 name = "tree"
-argv = ["tree", "${FLAGS...}", "${DIRS...}"]
+argv = ["tree", "${FLAGS...}", "--", "${DIRS...}"]
 cwd  = "${where}/**"
 holes.FLAGS.kind = "flags"
 holes.FLAGS.bare = ["-a", "-d", "-f", "-F", "-i", "-p", "-s", "-h", "-D", "-t", "-r", "--noreport", "--dirsfirst", "-n"]
@@ -92,7 +97,7 @@ exec.spawn = false
 
 [[program]]                            # cat [flags] <files>
 name = "cat"
-argv = ["cat", "${FLAGS...}", "${FILES...}"]
+argv = ["cat", "${FLAGS...}", "--", "${FILES...}"]
 cwd  = "${where}/**"
 holes.FLAGS = { kind = "flags", bare = ["-n", "-b", "-s", "-A", "-E", "-T", "-v", "-e", "-t"], expand-single-flags = true }
 holes.FILES = { kind = "each", location = "${where}/**", min = 1 }
@@ -102,7 +107,7 @@ exec.spawn = false
 
 [[program]]                            # head [flags] <files>
 name = "head"
-argv = ["head", "${FLAGS...}", "${FILES...}"]
+argv = ["head", "${FLAGS...}", "--", "${FILES...}"]
 cwd  = "${where}/**"
 holes.FLAGS.kind = "flags"
 holes.FLAGS.expand-single-flags = true
@@ -116,7 +121,7 @@ exec.spawn = false
 
 [[program]]                            # tail [flags] <files>: no -f / -F (waits forever)
 name = "tail"
-argv = ["tail", "${FLAGS...}", "${FILES...}"]
+argv = ["tail", "${FLAGS...}", "--", "${FILES...}"]
 cwd  = "${where}/**"
 holes.FLAGS.kind = "flags"
 holes.FLAGS.expand-single-flags = true
@@ -130,7 +135,7 @@ exec.spawn = false
 
 [[program]]                            # stat [flags] <files>
 name = "stat"
-argv = ["stat", "${FLAGS...}", "${FILES...}"]
+argv = ["stat", "${FLAGS...}", "--", "${FILES...}"]
 cwd  = "${where}/**"
 holes.FLAGS.kind = "flags"
 holes.FLAGS.bare = ["-L", "-t", "-f"]
@@ -143,7 +148,7 @@ exec.spawn = false
 
 [[program]]                            # file [flags] <files>
 name = "file"
-argv = ["file", "${FLAGS...}", "${FILES...}"]
+argv = ["file", "${FLAGS...}", "--", "${FILES...}"]
 cwd  = "${where}/**"
 holes.FLAGS = { kind = "flags", bare = ["-b", "-i", "-L", "-h", "-z", "-k", "--mime-type", "--mime-encoding"], expand-single-flags = true }
 holes.FILES = { kind = "each", location = "${where}/**", min = 1 }
@@ -182,7 +187,7 @@ exec.spawn = false
 
 [[program]]                            # diff [flags] <a> <b> (or directories)
 name = "diff"
-argv = ["diff", "${FLAGS...}", "${FILES...}"]
+argv = ["diff", "${FLAGS...}", "--", "${FILES...}"]
 cwd  = "${where}/**"
 holes.FLAGS.kind = "flags"
 holes.FLAGS.expand-single-flags = true
@@ -200,7 +205,7 @@ exec.spawn = false
 
 [[program]]                            # wc [flags] [files]
 name = "wc"
-argv = ["wc", "${FLAGS...}", "${FILES...}"]
+argv = ["wc", "${FLAGS...}", "--", "${FILES...}"]
 cwd  = "${where}/**"
 holes.FLAGS = { kind = "flags", bare = ["-l", "-w", "-c", "-m", "-L"], expand-single-flags = true }
 holes.FILES = { kind = "each", location = "${where}/**" }
@@ -210,7 +215,7 @@ exec.spawn = false
 
 [[program]]                            # du [flags] [paths]
 name = "du"
-argv = ["du", "${FLAGS...}", "${FILES...}"]
+argv = ["du", "${FLAGS...}", "--", "${FILES...}"]
 cwd  = "${where}/**"
 holes.FLAGS.kind = "flags"
 holes.FLAGS.expand-single-flags = true
@@ -228,7 +233,7 @@ exec.spawn = false
 
 [[program]]                            # sort [flags] [files]: no -o (writes), no -T (TMPDIR is set)
 name = "sort"
-argv = ["sort", "${FLAGS...}", "${FILES...}"]
+argv = ["sort", "${FLAGS...}", "--", "${FILES...}"]
 cwd  = "${where}/**"
 holes.FLAGS.kind = "flags"
 holes.FLAGS.expand-single-flags = true
@@ -242,7 +247,7 @@ exec.spawn = false
 
 [[program]]                            # uniq [flags] [file]
 name = "uniq"
-argv = ["uniq", "${FLAGS...}", "${FILES...}"]
+argv = ["uniq", "${FLAGS...}", "--", "${FILES...}"]
 cwd  = "${where}/**"
 holes.FLAGS.kind = "flags"
 holes.FLAGS.expand-single-flags = true
@@ -257,7 +262,7 @@ exec.spawn = false
 
 [[program]]                            # cut [flags] [files]
 name = "cut"
-argv = ["cut", "${FLAGS...}", "${FILES...}"]
+argv = ["cut", "${FLAGS...}", "--", "${FILES...}"]
 cwd  = "${where}/**"
 holes.FLAGS.kind = "flags"
 holes.FLAGS.expand-single-flags = true
