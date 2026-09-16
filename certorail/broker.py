@@ -530,16 +530,15 @@ def _run_exec(
     keywords: dict[str, str | list[str]],
     cwd: str,
     discharge: Discharge | None,
-    mounts: Mounts | None,
     stream: bool = False,
     stream_to: tuple[int, int] | None = None,
 ) -> dict:
     """One brokered ``certora.exec``: re-check the decidable half of the exec rules
     (``Policy.exec_command`` -- defense in depth; the full rules were enforced statically),
     let the policy's template compose the argv, spawn the child host-side (under the policy's
-    filesystem view, *mounts*, when the rule confines it), and return its drained output
-    wholesale -- or stream it to the host's terminal (*stream*) and return the exit code
-    alone."""
+    filesystem view plus the rule's own mounts, when the rule confines it), and return its
+    drained output wholesale -- or stream it to the host's terminal (*stream*) and return the
+    exit code alone."""
     command = policy.exec_command(program, arguments, keywords, cwd, discharge)
     if isinstance(command, Refusal):
         raise PolicyDenied(command.reason)
@@ -548,7 +547,8 @@ def _run_exec(
     if stream and stream_to is None:
         raise BrokerError("stream: the host has no terminal to stream to")
     returncode, out, err = _spawn_drained(
-        client, command.argv, _resolve(root, cwd), command.rule.jail, mounts, stream_to if stream else None
+        client, command.argv, _resolve(root, cwd), command.rule.jail, policy.mounts(root, command.rule),
+        stream_to if stream else None,
     )
     log.info("EXEC %s (cwd=%s) -> %d (%s)",
              " ".join(command.argv), cwd, returncode,
@@ -568,13 +568,13 @@ def _run_check(
     params: dict,
     cwd: str | None,
     single: object = None,
-    mounts: Mounts | None = None,
 ) -> dict:
     """One brokered ``certora.check``: run the declared evaluator host-side -- outside the
     jail, where whatever it consults (an inventory service, credentials, the org's tooling)
-    actually lives, or under the policy's filesystem view (*mounts*) when its rule confines it
-    -- and return its verdict. Unlike exec's rules, a check's declaration IS its whole runtime
-    contract, so this re-check is complete: name, parameters and cwd are all decidable here."""
+    actually lives, or under the policy's filesystem view plus its own mounts when its rule
+    confines it -- and return its verdict. Unlike exec's rules, a check's declaration IS its
+    whole runtime contract, so this re-check is complete: name, parameters and cwd are all
+    decidable here."""
     declared = next((v for v in policy.validations if v.name == name), None)
     if declared is None:
         raise PolicyDenied(f"check: no validation named {name!r}")
@@ -615,7 +615,7 @@ def _run_check(
         # exec the load-time snapshot: the installed checker drifting mid-run changes nothing,
         # because the file in checkers/ is not what runs (integrity.materialize)
         argv[0] = materialize(declared.evaluator)
-    returncode, _, err = _spawn_drained(client, argv, workdir, declared.jail, mounts)
+    returncode, _, err = _spawn_drained(client, argv, workdir, declared.jail, policy.mounts(root, declared))
     log.info("CHECK %s (cwd=%s) -> %d", name, cwd if cwd is not None else ".", returncode)
     return {
         "returncode": returncode,
@@ -684,8 +684,8 @@ class _Handler(socketserver.BaseRequestHandler):
                 )
                 result = _run_exec(self.server.policy, self.server.root, conn,
                                    program, arguments, keywords, str(req.get("cwd", "")),
-                                   self.server.discharge, self.server.mounts,
-                                   bool(req.get("stream", False)), self.server.stream_to)
+                                   self.server.discharge, bool(req.get("stream", False)),
+                                   self.server.stream_to)
             elif req.get("kind") == "check":
                 name = str(req.get("name", "?"))
                 what = f"check {name}"
@@ -693,7 +693,7 @@ class _Handler(socketserver.BaseRequestHandler):
                 result = _run_check(self.server.policy, self.server.root, conn,
                                     name, dict(req.get("params") or {}),
                                     None if cwd_value is None else str(cwd_value),
-                                    req.get("single"), self.server.mounts)
+                                    req.get("single"))
             else:
                 method = str(req.get("method", "GET")).upper()
                 url = req["url"]
@@ -736,8 +736,6 @@ class _Server(socketserver.ThreadingUnixStreamServer):
         self.discharge = discharge
         self.root = root
         self.stream_to = stream_to
-        # the policy's filesystem view, lowered once: what a confined child sees (MOUNTS.md)
-        self.mounts = None if root is None else policy.mounts(root)
         super().__init__(socket_path, _Handler)
 
 

@@ -40,10 +40,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from .analysis import Named, StaticPath
-from .childjail import Mounts
+from .childjail import Mounts, View
 from .broker import build_server, terminal_descriptors
 from .describe import describe
-from .policy import Denial, Policy
+from .policy import Denial, Policy, Program
 from .policydir import AmbientPolicyError, find_policy
 from .policyfile import BASE_RULESET, PolicyFileError, default_policy, load_policy_file
 from .rewrite import rewrite
@@ -145,18 +145,32 @@ def _jail_deny_paths(mounts: Mounts) -> list[str]:
     return [str(p) for p in mounts.no_write]
 
 
-def _announce_view(policy: Policy, mounts: Mounts) -> None:
-    """A confined grant's view is the policy's filesystem section as binds; whatever no bind
-    expresses is absent from it, and that is never silent (MOUNTS.md)."""
-    if not (policy.confines and mounts.omitted):
+def _announce_view(policy: Policy, root: pathlib.Path) -> None:
+    """A confined grant's view is the policy's filesystem section as binds, plus the rule's
+    own mounts; whatever no bind expresses is absent from it, and that is never silent
+    (MOUNTS.md)."""
+    if not policy.confines:
+        return
+    base = policy.mounts(root)
+    per_rule = [
+        (" ".join(rule.leading_words) if isinstance(rule, Program) else f"validation {rule.name}", extra)
+        for rule in (*policy.programs, *policy.validations)
+        if rule.view is View.POLICY
+        for extra in [tuple(o for o in policy.mounts(root, rule).omitted if o not in base.omitted)]
+        if extra
+    ]
+    if not (base.omitted or per_rule):
         return
     print(
         "certorail: a grant runs under the policy filesystem view (exec.view = \"policy\"), and "
         "these locations have no native mount, so the view OMITS them:",
         file=sys.stderr,
     )
-    for entry in mounts.omitted:
+    for entry in base.omitted:
         print(f"certorail:   {entry}", file=sys.stderr)
+    for name, extras in per_rule:
+        for entry in extras:
+            print(f"certorail:   {name}: {entry}", file=sys.stderr)
     print(
         "certorail:   (a literal path or a literal prefix ending in ** is mountable; a pattern "
         "waits for the FUSE view)",
@@ -205,7 +219,7 @@ def run(
     python: str = sys.executable,
     jail: bool = True,
 ) -> subprocess.CompletedProcess[bytes] | Rejected:
-    _announce_view(policy, policy.mounts(root))
+    _announce_view(policy, root)
     outcome = check(source, filename, policy, root)
     if isinstance(outcome, Rejected):
         return outcome

@@ -147,6 +147,10 @@ def jail_line(rule: Program | Validation) -> str | None:
         parts.append("no subprocesses")
     if j.confined:
         parts.append("sees only what the policy grants (the filesystem section as mounts)")
+        extras = [f"{pretty_location(loc)} (read)" for loc in rule.mount_read]
+        extras += [f"{pretty_location(loc)} (write)" for loc in rule.mount_write]
+        if extras:
+            parts.append("also sees: " + ", ".join(extras))
     if j.env is not None:
         if j.env.empty:
             parts.append("environment: empty")

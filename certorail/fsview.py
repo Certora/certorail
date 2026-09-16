@@ -308,3 +308,21 @@ def mounts(
         # the directory itself, whatever shape names it: a pattern with no descendant tail
         _lower("list", listing, root, patterns, False, listings, [])
     return Mounts(tuple(reads), tuple(writes), tuple(masks), tuple(listings), tuple(omitted))
+
+
+def additions(
+    root: Path,
+    mount_read: tuple[LocationFact, ...],
+    mount_write: tuple[LocationFact, ...],
+    *,
+    patterns: bool = PATTERNS_NATIVE,
+) -> Mounts:
+    """One rule's own additions to the view (``exec.mount-read`` / ``exec.mount-write``),
+    lowered like grants and reported under their own names; joined onto the policy's mounts
+    with ``|``."""
+    reads: list[Bind] = []
+    writes: list[Bind] = []
+    omitted: list[str] = []
+    _lower("mount-read", mount_read, root, patterns, False, reads, omitted)
+    _lower("mount-write", mount_write, root, patterns, False, writes, omitted)
+    return Mounts(tuple(reads), tuple(writes), (), (), tuple(omitted))

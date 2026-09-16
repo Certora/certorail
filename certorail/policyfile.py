@@ -394,8 +394,22 @@ class _Instantiator:
             case FlagsetRef():
                 return spec
 
+    def exec_(self, e: ExecDecl | None, path: Path) -> ExecDecl | None:
+        """The ``exec`` table with its mount locations substituted (a ruleset spells them
+        through a directory parameter, never absolute)."""
+        if e is None:
+            return None
+        update: dict[str, Any] = {}
+        if e.mount_read is not None:
+            update["mount_read"] = self.locations(e.mount_read, path.mount_read)
+        if e.mount_write is not None:
+            update["mount_write"] = self.locations(e.mount_write, path.mount_write)
+        return e.model_copy(update=update) if update else e
+
     def program(self, p: ProgramDecl, path: Path) -> ProgramDecl:
-        update: dict[str, Any] = {"when": None, "cwd": self.locations(p.cwd, path.cwd)}
+        update: dict[str, Any] = {
+            "when": None, "cwd": self.locations(p.cwd, path.cwd), "exec_": self.exec_(p.exec_, path.exec),
+        }
         if p.holes is not None:
             update["holes"] = {h: self.hole(spec, path.holes[h]) for h, spec in p.holes.items()}
         if isinstance(p.requires, dict):
@@ -406,7 +420,8 @@ class _Instantiator:
 
     def validation(self, v: ValidationDecl, path: Path) -> ValidationDecl:
         update: dict[str, Any] = {
-            "establishes": {k: self.atoms(a, path.establishes[k]) for k, a in v.establishes.items()}
+            "establishes": {k: self.atoms(a, path.establishes[k]) for k, a in v.establishes.items()},
+            "exec_": self.exec_(v.exec_, path.exec),
         }
         if v.cwd is not None:
             update["cwd"] = self.locations(v.cwd, path.cwd)
@@ -904,14 +919,19 @@ class _Exec(TypedDict):
     env: list[str | dict[str, str]] | None
     spawn: bool
     view: View
+    mount_read: list[Any]
+    mount_write: list[Any]
 
 
 def _exec(decl: ExecDecl | None) -> _Exec:
     """A grant's ``exec`` table as ``program()`` / ``validation()`` keywords; absent, the
     unjailed baseline."""
     if decl is None:
-        return _Exec(env=None, spawn=True, view=View.HOST)
-    return _Exec(env=decl.env, spawn=decl.spawn, view=View(decl.view))
+        return _Exec(env=None, spawn=True, view=View.HOST, mount_read=[], mount_write=[])
+    return _Exec(
+        env=decl.env, spawn=decl.spawn, view=View(decl.view),
+        mount_read=_slot(decl.mount_read or []), mount_write=_slot(decl.mount_write or []),
+    )
 
 
 def _network(root: PolicyDoc, where: str, declared: _Declared, errors: _Errors) -> list[NetworkRule]:

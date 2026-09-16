@@ -281,6 +281,25 @@ class TestPolicyView(unittest.TestCase):
                 pass
         self.assertEqual(err.getvalue(), "")
 
+    def test_a_rules_own_mounts_widen_its_view(self) -> None:
+        elsewhere = pathlib.Path(tempfile.mkdtemp(prefix="certorail-elsewhere-"))
+        self.addCleanup(shutil.rmtree, elsewhere, ignore_errors=True)
+        (elsewhere / "key").write_text("SECRET\n")
+        (elsewhere / "state").mkdir()
+        # without the addition the key does not exist for the tool; with it, it reads, and a
+        # writable addition takes a write (write-fs = true), while the base stays as it was
+        result = self.confined([CAT, str(elsewhere / "key")])
+        self.assertIn(b"No such file or directory", result.stderr)
+        widened = self.mounts | Mounts(reads=(elsewhere / "key",), writes=(elsewhere / "state",))
+        result = self.confined([CAT, str(elsewhere / "key")], mounts=widened)
+        self.assertEqual((result.returncode, result.stdout), (0, b"SECRET\n"), result.stderr)
+        writer = Jail(env=PATH_ONLY, network=False, write_fs=True, spawn=False, view=View.POLICY)
+        result = self.confined(py(f"open({str(elsewhere / 'state' / 'x')!r}, 'w'); print('ok')"), writer, mounts=widened)
+        self.assertEqual((result.returncode, result.stdout), (0, b"ok\n"), result.stderr)
+        self.assertTrue((elsewhere / "state" / "x").exists())
+        result = self.confined([CAT, str(self.root / "secrets" / "key.pem")], mounts=widened)
+        self.assertIn(b"No such file or directory", result.stderr)
+
     def test_the_view_needs_the_mounts(self) -> None:
         with self.assertRaisesRegex(JailUnavailable, "not lowered"):
             with confined(["true"], CONFINED):
@@ -359,6 +378,32 @@ class TestGrants(unittest.TestCase):
         self.assertEqual(problems('exec.view = "policy"'), [])
         self.assertEqual(problems('exec.view = "host"'), [])
         self.assertEqual(len(problems('exec.view = "fuse"')), 1)
+        self.assertEqual(problems('exec.view = "policy"\nexec.mount-read = ["/srv/keys/**"]\nexec.mount-write = [".git/**"]'), [])
+        self.assertEqual(
+            problems('exec.mount-read = ["/srv/keys/**"]'),
+            ['program[0].exec: mount-read / mount-write widen the policy view: they need view = "policy"'],
+        )
+        self.assertEqual(
+            problems('write-fs = false\nexec.view = "policy"\nexec.mount-write = [".git/**"]'),
+            ["program[0]: exec.mount-write on a grant with write-fs = false: nothing it mounts could be written"],
+        )
+        self.assertEqual(len(problems('exec.view = "policy"\nexec.mount-read = ["a/../b"]')), 1)
+
+    def test_the_constructors_hold_the_mount_rules_too(self) -> None:
+        with self.assertRaisesRegex(ValueError, "need view = policy"):
+            program("git", cwd=".", mount_read=["/srv/keys/**"])
+        with self.assertRaisesRegex(ValueError, "write-fs = false"):
+            program("git", cwd=".", view=View.POLICY, write_fs=False, mount_write=[".git/**"])
+        with self.assertRaisesRegex(ValueError, "need view = policy"):
+            validation("v", argv=["t"], establishes={}, mount_read=["/x/**"])
+        p = program("git", cwd=".", view=View.POLICY, mount_read=["/srv/keys/**"], mount_write=[".git/**"])
+        self.assertEqual(len(p.mount_read), 1)
+        self.assertEqual(len(p.mount_write), 1)
+        loaded = from_data({
+            "policy-version": 1,
+            "program": [{"name": "git", "cwd": ".", "exec": {"view": "policy", "mount-read": ["/srv/keys/**"]}}],
+        })
+        self.assertEqual(loaded.programs[0].mount_read, p.mount_read)
 
     def test_the_seatbelt_profile_of_a_policy_view(self) -> None:
         mounts = Mounts(reads=(pathlib.Path("/r/src"),), writes=(pathlib.Path("/r/out"),), no_write=(pathlib.Path("/r/out/final"),))
@@ -403,6 +448,8 @@ class TestGrants(unittest.TestCase):
         self.assertIn("effects: writes anything on the filesystem (no network)\n    jailed", text)
         confined_text = describe(Policy.allow(programs=[program("cat", cwd=".", view=View.POLICY)]), "p.toml", None)
         self.assertIn("jailed (enforced by the OS): sees only what the policy grants", confined_text)
+        widened = program("git", cwd=".", view=View.POLICY, mount_read=["/srv/keys/**"], mount_write=[".git/**"])
+        self.assertIn("also sees: /srv/keys/** (read), .git/** (write)", describe(Policy.allow(programs=[widened]), "p.toml", None))
 
 
 @unittest.skipUnless(HAS_BWRAP, "bubblewrap is the Linux mechanism")

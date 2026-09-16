@@ -332,6 +332,10 @@ class Validation:
     env: Environment | None = None
     spawn: bool = True
     view: View = View.HOST
+    # under the policy view: what the evaluator sees beyond the policy's filesystem section
+    # (``exec.mount-read`` / ``exec.mount-write``, MOUNTS.md); the analysis never consults them
+    mount_read: tuple[LocationFact, ...] = ()
+    mount_write: tuple[LocationFact, ...] = ()
     # the sha256 the declaring document pinned its evaluator to (INSTALL.md); verified against
     # the bytes captured at load. None: unpinned
     pin: str | None = None
@@ -368,6 +372,8 @@ def validation(
     env: Iterable[str | Mapping[str, str]] | None = None,
     spawn: bool = True,
     view: View = View.HOST,
+    mount_read: Iterable[Where] = (),
+    mount_write: Iterable[Where] = (),
     pin: str | None = None,
     evaluator: bytes | None = None,
 ) -> Validation:
@@ -416,11 +422,26 @@ def validation(
             f"validation {name!r}: a check that does not care about its cwd cannot establish "
             "atoms on cwd"
         )
+    mounts = _mounts(name, view, write_fs, mount_read, mount_write)
     return Validation(
         ValidationName(name), params_t, argv_t, None if cwd is None else _one_or_many(cwd), est,
         frozenset(pure_set), network, write_fs, None if writes is None else effects_of(writes),
-        _env(env), spawn, view, pin, evaluator=evaluator,
+        _env(env), spawn, view, *mounts, pin, evaluator=evaluator,
     )
+
+
+def _mounts(
+    name: str, view: View, write_fs: bool, mount_read: Iterable[Where], mount_write: Iterable[Where],
+) -> tuple[tuple[LocationFact, ...], tuple[LocationFact, ...]]:
+    """A grant's view additions, checked: they widen the policy view, so they need it, and a
+    writable addition needs the filesystem medium (the schema says the same for documents; the
+    constructors are the object model and hold the rule themselves)."""
+    reads, writes = _locations(mount_read), _locations(mount_write)
+    if (reads or writes) and view is not View.POLICY:
+        raise ValueError(f"{name!r}: mount-read / mount-write widen the policy view: they need view = policy")
+    if writes and not write_fs:
+        raise ValueError(f"{name!r}: mount-write with write-fs = false: nothing it mounts could be written")
+    return reads, writes
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +483,10 @@ class Program:
     env: Environment | None = None
     spawn: bool = True
     view: View = View.HOST
+    # under the policy view: what the tool sees beyond the policy's filesystem section
+    # (``exec.mount-read`` / ``exec.mount-write``, MOUNTS.md); the analysis never consults them
+    mount_read: tuple[LocationFact, ...] = ()
+    mount_write: tuple[LocationFact, ...] = ()
 
     @property
     def write_set(self) -> Effects:
@@ -510,6 +535,8 @@ def program(
     env: Iterable[str | Mapping[str, str]] | None = None,
     spawn: bool = True,
     view: View = View.HOST,
+    mount_read: Iterable[Where] = (),
+    mount_write: Iterable[Where] = (),
 ) -> Program:
     """*requires* is the atoms the cwd must carry, or a table ``{cwd: [...], HOLE: [...]}``
     that also demands atoms of a hole's value, folded into that hole's constraint."""
@@ -582,6 +609,7 @@ def program(
         _env(env),
         spawn,
         view,
+        *_mounts(name, view, write_fs, mount_read, mount_write),
     )
 
 
@@ -1335,10 +1363,14 @@ class Policy:
         outcome = self.exec_command(program_name, arguments, {}, cwd)
         return outcome.reason if isinstance(outcome, Refusal) else None
 
-    def mounts(self, root: pathlib.Path) -> Mounts:
+    def mounts(self, root: pathlib.Path, rule: "Program | Validation | None" = None) -> Mounts:
         """The filesystem section lowered to the binds a confined child gets (``fsview``,
-        MOUNTS.md): the same grants and protections the program is held to, under *root*."""
-        return fsview.mounts(root, self.read, self.write, self.no_write, self.listing)
+        MOUNTS.md): the same grants and protections the program is held to, under *root*, plus
+        what *rule* mounts for itself (``exec.mount-read`` / ``exec.mount-write``)."""
+        base = fsview.mounts(root, self.read, self.write, self.no_write, self.listing)
+        if rule is None or not (rule.mount_read or rule.mount_write):
+            return base
+        return base | fsview.additions(root, rule.mount_read, rule.mount_write)
 
     @property
     def confines(self) -> bool:
@@ -1351,14 +1383,13 @@ class Policy:
         run right now under *root*. Cached per (atom, text); handed to ``evaluate`` and to
         ``analyze`` so constants need neither a ``certora.check`` nor a regex definition."""
         rootpath = pathlib.Path(root)
-        view = self.mounts(rootpath)
         cache: dict[tuple[Atom, str], bool] = {}
 
         def discharge(atom: Atom, text: str) -> bool:
             key = (atom, text)
             if key not in cache:
                 cache[key] = any(
-                    _run_literal_checker(v, slot, text, rootpath, view)
+                    _run_literal_checker(v, slot, text, rootpath, self.mounts(rootpath, v))
                     for v in self.validations
                     if (slot := _literal_slot(v, atom)) is not None
                 )

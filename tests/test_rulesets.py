@@ -191,6 +191,47 @@ class TestApply(RulesetCase):
             self.assertIn(expected, str(cm.exception))
 
 
+class TestRuleMounts(RulesetCase):
+    """A ruleset widens a confined rule's view only through a directory parameter the root binds;
+    the root itself may write an absolute path."""
+
+    RULESET = """
+ruleset-version = 1
+
+[params]
+credentials = { kind = "directory" }
+
+[[program]]
+name = "git"
+subcommand = "push"
+cwd  = "**"
+network = false
+write-fs = false
+exec.view = "policy"
+exec.mount-read = ["${credentials}/**", "hooks/*"]
+"""
+
+    def test_a_bound_directory_parameter_heads_the_mount(self) -> None:
+        self.ruleset("push.toml", self.RULESET)
+        policy = from_data(self.root({"ruleset": "push.toml", "credentials": "/srv/keys"}))
+        (push,) = policy.programs
+        self.assertEqual([str(loc.absolute) for loc in push.mount_read], ["True", "False"])
+        m = policy.mounts(pathlib.Path("/root"), push)
+        self.assertIn(pathlib.Path("/srv/keys"), m.reads)
+        self.assertEqual([o for o in m.omitted if o.startswith("mount-read")], ["mount-read hooks/*"])
+
+    def test_a_ruleset_names_no_absolute_mount(self) -> None:
+        self.ruleset("abs.toml", self.RULESET.replace('"${credentials}/**"', '"/srv/keys/**"'))
+        with self.assertRaises(PolicyFileError) as cm:
+            from_data(self.root({"ruleset": "abs.toml", "credentials": "/srv/keys"}))
+        self.assertIn("a ruleset names no absolute locations: '/srv/keys/**'", str(cm.exception))
+        # the root policy may
+        policy = from_data(self.root(program=[
+            {"name": "git", "cwd": ".", "exec": {"view": "policy", "mount-read": ["/srv/keys/**"]}},
+        ]))
+        self.assertTrue(policy.programs[0].mount_read[0].absolute)
+
+
 BASE = """
 ruleset-version = 1
 

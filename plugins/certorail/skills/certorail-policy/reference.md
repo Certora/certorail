@@ -245,6 +245,7 @@ exec.view  = "policy"                    # sees only what the policy's [filesyst
 | `write-fs` | bool, default true | `false`: the whole filesystem is read-only to the child, except a fresh scratch directory `TMPDIR` names, thrown away after the run |
 | `exec.env` | list of names and tables | the child's environment is exactly this: a string passes that variable through from the host's environment (skipped if the host lacks it), a table `{ NAME = "value", ... }` sets each key to a literal. A variable is mentioned once, either way; values are literal, no `${...}`; `TMPDIR` may not be listed (the host sets it under `write-fs = false` and under `exec.view = "policy"`). Absent: the host's whole environment; `[]`: an empty one |
 | `exec.spawn` | bool, default true | `false`: the child cannot create processes (no hooks, no `-exec`, no helpers, no shells). It can still replace itself with another program, which is not creation |
+| `exec.mount-read`, `exec.mount-write` | lists of locations | under `exec.view = "policy"` only: what this rule's child sees beyond the policy's `[filesystem]` section, mounted read-only or writable (`mount-write` needs `write-fs = true`; either without the policy view is a load error). The analysis never reads them: they widen the tool's world, not the program's, and a call cannot widen them further. `no-write` still applies on top. Absolute in a root policy; in a ruleset headed by a directory parameter the root binds (`credentials = { kind = "directory" }`, `exec.mount-read = ["${credentials}/**"]`). Patterns follow the platform rule below. `--describe` prints them as `also sees:` on the jail line |
 | `exec.view` | `"host"` (default) or `"policy"` | what the child sees of the filesystem. `"host"`: the host's whole filesystem; the tool is trusted as granted. `"policy"`: an empty world holding the system toolchain, the tool itself, a private `TMPDIR`, the exec's cwd as an empty directory, and the applying policy's `[filesystem]` section as mounts: `read` grants read-only, `write` grants writable iff `write-fs = true`, `no-write` protections remounted read-only on top. Nothing else exists: on Linux a path outside the view is "No such file", not "Permission denied". On macOS Seatbelt takes every location, patterns as anchored regexes (a `<regex>` must stay within the subset Python and ERE share, see "Locations"; one that does not is omitted and reported), and `list` grants as the directory alone. On Linux only a literal path or a literal prefix ending in `**` has a mount; a location with `*`, `<regex>` or a `**/leaf` tail is omitted from the view and the host says so on stderr at startup, and `list` grants do not widen the view |
 
 A jailed grant whose sandbox is not installed does not run at all (the program gets a broker
@@ -260,9 +261,11 @@ the medium.
 (`cat`, `grep`, `ls`, `find`, `diff`: the shipped coreutils rung sets it on every rule). It is
 wrong for a tool that reads its own configuration or caches from the home directory (`git`
 reads `~/.gitconfig`, `cargo` needs `~/.cargo` and `~/.rustup`): under the policy view those do
-not exist. Such a tool keeps `"host"`; a way for a rule to add locations to its view
-(`exec.reads`) is designed in MOUNTS.md and not yet built. The policy view needs the same
-sandbox as the other knobs and the same rule applies: no bubblewrap or `sandbox-exec`, no run.
+not exist. Such a tool keeps `"host"`, or names what it needs with `exec.mount-read` /
+`exec.mount-write` (a `git push` rule mounting the deploy key its root binds as
+`credentials`): a trust statement about the tool, in the rule's own hand, that the program
+never sees. The policy view needs the same sandbox as the other knobs and the same rule
+applies: no bubblewrap or `sandbox-exec`, no run.
 
 ## `[[program]]`
 

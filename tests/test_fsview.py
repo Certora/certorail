@@ -4,8 +4,8 @@ import pathlib
 import re
 import unittest
 
-from certorail.childjail import Mounts, Regex
-from certorail.fsview import NOT_ERE, bind_path, ere_of, mounts, pattern_regex
+from certorail.childjail import Mounts, Regex, View
+from certorail.fsview import NOT_ERE, additions, bind_path, ere_of, mounts, pattern_regex
 from certorail.locations import parse_location as loc
 from certorail.policy import Policy, program
 
@@ -169,6 +169,20 @@ class TestMounts(unittest.TestCase):
         self.assertEqual(m.omitted, ())
         # the bind-mountable part drops the regexes and the listings
         self.assertEqual(m.paths, Mounts(reads=(ROOT / "docs",)))
+
+    def test_a_rules_additions_join_the_view_under_their_own_names(self) -> None:
+        base = mounts(ROOT, read=(loc("src/**"),), write=(loc("out/**"),), no_write=(loc("out/final"),), patterns=False)
+        extra = additions(ROOT, mount_read=(loc("/srv/keys/**"), loc("src/**"), loc("cfg/*")), mount_write=(loc(".git/**"),), patterns=False)
+        self.assertEqual(extra.omitted, ("mount-read cfg/*",))
+        joined = base | extra
+        self.assertEqual(joined.reads, (ROOT / "src", pathlib.Path("/srv/keys")))  # src once
+        self.assertEqual(joined.writes, (ROOT / "out", ROOT / ".git"))
+        self.assertEqual(joined.no_write, (ROOT / "out" / "final",))
+        self.assertEqual(joined.omitted, ("mount-read cfg/*",))
+        rule = program("git", cwd=".", view=View.POLICY, mount_read=["/srv/keys/**"], mount_write=[".git/**"])
+        policy = Policy.allow(read=["src/**"], write=["out/**"], no_write=["out/final"], programs=[rule])
+        self.assertEqual(policy.mounts(ROOT, rule).writes, (ROOT / "out", ROOT / ".git"))
+        self.assertEqual(policy.mounts(ROOT).writes, (ROOT / "out",))  # the base alone, without a rule
 
     def test_the_policy_lowers_its_own_section(self) -> None:
         policy = Policy.allow(read=["src/**"], write=["out/**"], no_write=["out/final"], programs=[program("cat", cwd=".")])

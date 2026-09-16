@@ -496,6 +496,11 @@ class ExecDecl(_Table):
     env: list[str | dict[str, str]] | None = None
     spawn: bool = True
     view: Literal["host", "policy"] = "host"
+    # under view = "policy": locations this grant's child sees beyond the policy's filesystem
+    # section (MOUNTS.md) -- mounted read-only, or writable (which needs write-fs = true). The
+    # analysis never sees them: they widen the tool's world, not the program's
+    mount_read: list[Location] | None = None
+    mount_write: list[Location] | None = None
 
     @field_validator("env")
     @classmethod
@@ -503,6 +508,12 @@ class ExecDecl(_Table):
         if items is not None:
             environment_spec(items)  # names are names, each mentioned once, none the host's own
         return items
+
+    @model_validator(mode="after")
+    def _mounts_need_the_view(self) -> "ExecDecl":
+        if self.view != "policy" and (self.mount_read is not None or self.mount_write is not None):
+            raise ValueError('mount-read / mount-write widen the policy view: they need view = "policy"')
+        return self
 
 
 _RETIRED_MEDIA_KEYS = {
@@ -528,6 +539,12 @@ class _Media(_Table):
                 if key in data:
                     raise ValueError(message)
         return data
+
+    @model_validator(mode="after")
+    def _writable_mounts_need_the_medium(self) -> "_Media":
+        if self.exec_ is not None and self.exec_.mount_write is not None and not self.write_fs:
+            raise ValueError("exec.mount-write on a grant with write-fs = false: nothing it mounts could be written")
+        return self
 
 
 class ValidationDecl(_Media):

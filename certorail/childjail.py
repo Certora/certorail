@@ -92,6 +92,18 @@ class Mounts:
     # were for
     omitted: tuple[str, ...] = ()
 
+    def __or__(self, other: "Mounts") -> "Mounts":
+        """This view widened by *other* (a rule's additions): the union, in order, nothing
+        repeated."""
+        def joined(a: tuple[Bind, ...], b: tuple[Bind, ...]) -> tuple[Bind, ...]:
+            return (*a, *(x for x in b if x not in a))
+
+        return Mounts(
+            joined(self.reads, other.reads), joined(self.writes, other.writes),
+            joined(self.no_write, other.no_write), joined(self.listings, other.listings),
+            (*self.omitted, *(o for o in other.omitted if o not in self.omitted)),
+        )
+
     @property
     def paths(self) -> "Mounts":
         """The bind-mountable part: paths only (what bubblewrap takes)."""
