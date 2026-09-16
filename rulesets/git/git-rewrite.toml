@@ -1,0 +1,118 @@
+# git, rewrite rung: commands that discard uncommitted work or rewrite local history. Everything
+# here is recoverable from a reflog at best (reset, rebase, checkout of a ref) and not at all at
+# worst (restore, checkout -- path, clean, rm of a modified file). Apply this rung to an agent you
+# would let run `rm -rf` inside a repository, and nowhere else. Every rule is `network = false`.
+#
+# Absent, therefore denied:
+#   rebase -i / --interactive (the todo list runs $GIT_SEQUENCE_EDITOR and its `exec` lines run
+#     shell commands), rebase -x / --exec (runs a shell command per commit), rebase --edit-todo
+#   the interactive forms: checkout -p, restore -p, reset -p, clean -i
+#   --pathspec-from-file everywhere
+#   filter-branch, filter-repo, reflog expire, gc --prune, update-ref -d, prune: the reflog is
+#     the recovery path for everything else here, so nothing may shorten it
+ruleset-version = 1
+
+[params]
+where      = { kind = "directory" }
+skip-hooks = { kind = "bool" }        # permit --no-verify on rebase
+
+[[apply]]
+ruleset = "git-vocabulary.toml"
+where   = "${where}"
+
+# ---------------------------------------------------------------------------------------------
+# Both meanings of checkout: a ref (moves HEAD, may create with -b/-B) and, after "--", paths
+# (restores them from the index or REVS, discarding local changes).
+[[program]]
+name    = "git"
+argv    = ["git", "checkout", "${FLAGS...}", "${REVS...}", "--", "${PATHS...}"]
+cwd     = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.bare = [
+  "-b", "-B", "-q", "--quiet", "-f", "--force", "-d", "--detach", "-t", "--track", "--no-track",
+  "-m", "--merge", "--ours", "--theirs", "--guess", "--no-guess", "--overwrite-ignore", "--no-overwrite-ignore",
+  "--ignore-other-worktrees", "--progress", "--no-progress", "--recurse-submodules", "--no-recurse-submodules",
+]
+holes.FLAGS."--orphan" = { atoms = ["git.ref-name"] }
+holes.REVS  = { kind = "each", atoms = ["git.rev"] }
+holes.PATHS = { kind = "each", location = "**" }
+network = false
+writes  = ["git.head", "git.index", "git.worktree", "git.refs"]
+
+# ---------------------------------------------------------------------------------------------
+[[program]]
+name    = "git"
+argv    = ["git", "restore", "${FLAGS...}", "--", "${PATHS...}"]
+cwd     = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.bare = [
+  "-S", "--staged", "-W", "--worktree", "-q", "--quiet", "--ours", "--theirs", "--ignore-unmerged",
+  "--overlay", "--no-overlay", "--progress", "--no-progress", "--recurse-submodules", "--no-recurse-submodules",
+]
+holes.FLAGS."-s"       = { atoms = ["git.rev"] }
+holes.FLAGS."--source" = { atoms = ["git.rev"] }
+holes.PATHS = { kind = "each", location = "**", min = 1 }
+network = false
+writes  = ["git.index", "git.worktree"]
+
+# ---------------------------------------------------------------------------------------------
+[[program]]
+name    = "git"
+argv    = ["git", "reset", "${FLAGS...}", "${REVS...}", "--", "${PATHS...}"]
+cwd     = "${where}/**"
+holes.FLAGS = { kind = "flags", bare = ["--soft", "--mixed", "--hard", "--merge", "--keep", "-q", "--quiet", "-N", "--no-refresh", "--refresh"] }
+holes.REVS  = { kind = "each", atoms = ["git.rev"] }
+holes.PATHS = { kind = "each", location = "**" }
+network = false
+writes  = ["git.head", "git.index", "git.worktree", "git.refs"]
+
+# ---------------------------------------------------------------------------------------------
+[[flagset]]
+name = "git.rebase"
+bare = [
+  "--continue", "--abort", "--skip", "--quit", "--autosquash", "--no-autosquash", "--autostash", "--no-autostash",
+  "-r", "--rebase-merges", "--root", "--keep-empty", "--no-keep-empty", "--empty=drop", "--empty=keep", "--empty=ask",
+  "-q", "--quiet", "-v", "--verbose", "--stat", "-n", "--no-stat", "--fork-point", "--no-fork-point",
+  "--update-refs", "--no-update-refs", "-f", "--force-rebase", "--no-ff", "--keep-base", "--committer-date-is-author-date",
+  "--ignore-date", "--reset-author-date", "--signoff", "--no-signoff", "--no-gpg-sign", "--reapply-cherry-picks",
+  "--no-reapply-cherry-picks", "--rerere-autoupdate", "--no-rerere-autoupdate",
+]
+"--onto"            = { atoms = ["git.rev"] }
+"-s"                = { one-of = ["ort", "recursive", "resolve", "ours", "subtree"] }
+"--strategy"        = { one-of = ["ort", "recursive", "resolve", "ours", "subtree"] }
+"-X"                = { matches = '[a-z-]+(?:=[a-z-]+)?' }
+"--strategy-option" = { matches = '[a-z-]+(?:=[a-z-]+)?' }
+"-C"                = { matches = '[0-9]+' }
+"--no-verify"       = { value = false, when = "${skip-hooks}" }
+
+[[program]]
+name    = "git"
+argv    = ["git", "rebase", "${FLAGS...}", "${REVS...}"]
+cwd     = "${where}/**"
+holes.FLAGS = { kind = "flags", flagset = "git.rebase" }
+holes.REVS  = { kind = "each", atoms = ["git.rev"] }
+network = false
+writes  = ["git.refs", "git.head", "git.index", "git.worktree"]
+
+# ---------------------------------------------------------------------------------------------
+[[program]]
+name    = "git"
+argv    = ["git", "rm", "${FLAGS...}", "--", "${PATHS...}"]
+cwd     = "${where}/**"
+holes.FLAGS = { kind = "flags", bare = ["-r", "--cached", "-q", "--quiet", "-n", "--dry-run", "--ignore-unmatch", "-f", "--force", "--sparse"] }
+holes.PATHS = { kind = "each", location = "**", min = 1 }
+network = false
+writes  = ["git.index", "git.worktree"]
+
+# ---------------------------------------------------------------------------------------------
+[[program]]
+name    = "git"
+argv    = ["git", "clean", "${FLAGS...}", "--", "${PATHS...}"]
+cwd     = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.bare = ["-f", "--force", "-d", "-n", "--dry-run", "-q", "--quiet", "-x", "-X", "-ff"]
+holes.FLAGS."-e"        = { any = true }
+holes.FLAGS."--exclude" = { any = true }
+holes.PATHS = { kind = "each", location = "**" }
+network = false
+writes  = ["git.worktree"]

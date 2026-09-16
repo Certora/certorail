@@ -1,0 +1,128 @@
+# git, remote rung: fetch, pull, push, ls-remote. The one rung with `network = true`, and the one
+# where deployments genuinely differ in shape, so it carries the parameters: where pushes may go
+# (`remote`, `branch`), what the repository must be for a push to be allowed at all
+# (`push-gate`), and the forced and deleting forms (`force`, `force-gate`, `delete`).
+#
+# A push names its remote and its branch: `git push origin feature`. Bare `git push` (upstream
+# from config), `--all`, `--mirror` and `--prune` are absent because each pushes to a destination
+# the policy never saw. A refspec is not a branch: the git-ref-name checker refuses ":" (a:b, :b),
+# a leading "+" (forced) and "*" (a glob), and the pack requires git.ref-name of BRANCH and REMOTE
+# beside whatever constraint the root bound, so a root constraint that happens to admit
+# "feature:main" does not push to main.
+#
+# Absent, therefore denied:
+#   --upload-pack, --receive-pack, --exec (run a command on either end)
+#   --all, --mirror, --prune, bare `git push`, refspecs
+#   --rebase=interactive on pull, --recurse-submodules on fetch/pull (clones URLs from .gitmodules)
+#   push --force-with-lease=<ref>:<sha> as one token (declare the bare form; git checks the
+#     remote-tracking ref)
+#   remote add / set-url / rename / remove (write config: the remote set is the root's decision;
+#     `git remote -v` is in the read rung)
+ruleset-version = 1
+
+[params]
+where       = { kind = "directory" }
+remote      = { kind = "constraint" }          # where pushes go, e.g. { one-of = ["origin"] }; the root says
+branch      = { kind = "constraint" }          # what may be pushed; the root says
+push-gate   = { kind = "atom" }                # atoms the repository (cwd) must carry to push; [] = none
+force       = { kind = "bool" }                # permit --force / --force-with-lease
+force-gate  = { kind = "atom" }                # atoms BRANCH must carry to force-push or delete; [] = none; bound only when force or delete
+delete      = { kind = "bool" }                # permit --delete
+rebase-pull = { kind = "bool" }                # permit pull --rebase
+skip-hooks  = { kind = "bool" }                # permit --no-verify on push and pull
+
+[[apply]]
+ruleset = "git-vocabulary.toml"
+where   = "${where}"
+
+# ---------------------------------------------------------------------------------------------
+# `holes` is the flagset's contract with the templates that use it: each must bind a token or
+# each hole of that name, and it is the only hole a flag's `requires` here may name besides cwd.
+[[flagset]]
+name  = "git.push"
+holes = ["BRANCH"]
+bare  = [
+  "-u", "--set-upstream", "--tags", "--follow-tags", "-q", "--quiet", "-v", "--verbose", "--progress", "--no-progress",
+  "-n", "--dry-run", "--porcelain", "--atomic", "--no-atomic", "--force-if-includes", "--no-signed", "--no-thin",
+]
+"-o"                 = { any = true }          # a push option: data for the server
+"--push-option"      = { any = true }
+"--force"            = { value = false, when = "${force}", requires = { BRANCH = ["${force-gate}"] } }
+"-f"                 = { value = false, when = "${force}", requires = { BRANCH = ["${force-gate}"] } }
+"--force-with-lease" = { value = false, when = "${force}", requires = { BRANCH = ["${force-gate}"] } }
+"--delete"           = { value = false, when = "${delete}", requires = { BRANCH = ["${force-gate}"] } }
+"-d"                 = { value = false, when = "${delete}", requires = { BRANCH = ["${force-gate}"] } }
+"--no-verify"        = { value = false, when = "${skip-hooks}" }
+
+[[program]]
+name         = "git"
+argv         = ["git", "push", "${REMOTE}", "${BRANCH}", "${FLAGS...}"]   # flags last: the positional fast path
+cwd          = "${where}/**"
+holes.REMOTE = "${remote}"
+holes.BRANCH = "${branch}"
+holes.FLAGS  = { kind = "flags", flagset = "git.push" }
+requires     = { cwd = ["${push-gate}"], REMOTE = ["git.ref-name"], BRANCH = ["git.ref-name"] }
+network      = true
+writes       = ["git.remote", "git.refs"]        # remote-tracking refs move too
+
+# ---------------------------------------------------------------------------------------------
+# fetch reads from a configured remote by name. A URL is not a ref-name (":" and "//"), so
+# fetching from an arbitrary host is not spellable; the remote set is repository config, which
+# the root's filesystem grants must keep out of the program's reach (git.md).
+[[program]]
+name    = "git"
+argv    = ["git", "fetch", "${FLAGS...}", "${ARGS...}"]
+cwd     = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.bare = [
+  "--all", "-p", "--prune", "-P", "--prune-tags", "-t", "--tags", "--no-tags", "-q", "--quiet", "-v", "--verbose",
+  "--dry-run", "-f", "--force", "--unshallow", "--update-shallow", "--progress", "--no-progress", "--no-recurse-submodules",
+  "--atomic", "--set-upstream", "--porcelain", "--refetch",
+]
+holes.FLAGS."--depth"         = { matches = '[0-9]+' }
+holes.FLAGS."--deepen"        = { matches = '[0-9]+' }
+holes.FLAGS."--shallow-since" = { any = true }
+holes.FLAGS."-j"              = { matches = '[0-9]+' }
+holes.FLAGS."--jobs"          = { matches = '[0-9]+' }
+holes.ARGS  = { kind = "each", atoms = ["git.ref-name"] }      # remote name, then branch names
+network = true
+writes  = ["git.refs"]
+
+# ---------------------------------------------------------------------------------------------
+[[flagset]]
+name = "git.pull"
+bare = [
+  "--ff", "--ff-only", "--no-ff", "--no-rebase", "--rebase=false", "--autostash", "--no-autostash",
+  "-q", "--quiet", "-v", "--verbose", "--progress", "--no-progress", "-p", "--prune", "-t", "--tags", "--no-tags",
+  "--no-commit", "--commit", "--squash", "--no-squash", "--stat", "--no-stat", "-n", "--no-edit",
+  "--allow-unrelated-histories", "--no-recurse-submodules", "--no-gpg-sign", "--signoff",
+]
+"-s"                = { one-of = ["ort", "recursive", "resolve", "octopus", "ours", "subtree"] }
+"--strategy"        = { one-of = ["ort", "recursive", "resolve", "octopus", "ours", "subtree"] }
+"-X"                = { matches = '[a-z-]+(?:=[a-z-]+)?' }
+"--strategy-option" = { matches = '[a-z-]+(?:=[a-z-]+)?' }
+"--depth"           = { matches = '[0-9]+' }
+"-r"                = { value = false, when = "${rebase-pull}" }
+"--rebase"          = { value = false, when = "${rebase-pull}" }
+"--rebase=true"     = { value = false, when = "${rebase-pull}" }
+"--rebase=merges"   = { value = false, when = "${rebase-pull}" }
+"--no-verify"       = { value = false, when = "${skip-hooks}" }
+
+[[program]]
+name    = "git"
+argv    = ["git", "pull", "${FLAGS...}", "${ARGS...}"]
+cwd     = "${where}/**"
+holes.FLAGS = { kind = "flags", flagset = "git.pull" }
+holes.ARGS  = { kind = "each", atoms = ["git.ref-name"] }      # remote name, then a branch
+network = true
+writes  = ["git.refs", "git.head", "git.index", "git.worktree"]
+
+# ---------------------------------------------------------------------------------------------
+[[program]]
+name    = "git"
+argv    = ["git", "ls-remote", "${FLAGS...}", "${ARGS...}"]
+cwd     = "${where}/**"
+holes.FLAGS = { kind = "flags", bare = ["-h", "--heads", "-t", "--tags", "--refs", "-q", "--quiet", "--exit-code", "--symref", "--get-url"] }
+holes.ARGS  = { kind = "each", atoms = ["git.ref-name"] }      # a remote name, then patterns
+network  = true
+write-fs = false

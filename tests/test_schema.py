@@ -17,7 +17,8 @@ from certorail.schema import (
     parse_ruleset,
 )
 
-HERE = pathlib.Path(__file__).resolve().parent.parent
+REPO = pathlib.Path(__file__).resolve().parent.parent
+FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"
 
 
 def load(text: str) -> PolicyDoc:
@@ -31,27 +32,21 @@ def problems(text: str) -> list[str]:
 
 
 class TestDocuments(unittest.TestCase):
-    def test_the_shipped_examples_have_the_shape(self) -> None:
-        for name in ("policy.toml", "find.toml"):
+    def test_the_fixture_policies_have_the_shape(self) -> None:
+        # a full root policy applying the git pack (deny, override, no-write, every key kind) and
+        # a read-only find with a large flagset: the two documents the loader tests lean on
+        for name in ("git-policy.toml", "find.toml"):
             with self.subTest(name=name):
-                data = tomllib.loads((HERE / "examples" / name).read_text(encoding="utf-8"))
+                data = tomllib.loads((FIXTURES / name).read_text(encoding="utf-8"))
                 parse_policy(data, name)
-        # git-policy.toml uses `override` and `[[deny]]`, which are ahead of the loader (git.md)
-        with self.assertRaises(SchemaError) as cm:
-            parse_policy(tomllib.loads((HERE / "examples" / "git-policy.toml").read_text(encoding="utf-8")), "git-policy.toml")
-        self.assertEqual(sorted(cm.exception.problems), ["program[0]: unknown key 'override'", "unknown key 'deny'"])
 
+    @unittest.skipUnless((REPO / "rulesets" / "git").is_dir(), "the shipped git pack is not in this tree")
     def test_the_git_pack_rulesets_have_the_shape(self) -> None:
-        for path in sorted((HERE / "rulesets").glob("git*.toml")):
-            if path.name == "git-vocabulary.toml":
-                continue
+        paths = sorted((REPO / "rulesets" / "git").glob("*.toml"))
+        self.assertTrue(paths)
+        for path in paths:
             with self.subTest(name=path.name):
                 parse_ruleset(tomllib.loads(path.read_text(encoding="utf-8")), path.name)
-        # git-vocabulary.toml spells `[regions] git.head = {...}` bare, which TOML reads as the
-        # nested table regions.git.head: a bug in the file, reported at the nesting
-        with self.assertRaises(SchemaError) as cm:
-            parse_ruleset(tomllib.loads((HERE / "rulesets" / "git-vocabulary.toml").read_text(encoding="utf-8")), "v")
-        self.assertTrue(all(p.startswith(("regions.git", "atoms.git")) for p in cm.exception.problems), cm.exception.problems)
 
     def test_the_dev_policy_has_the_shape(self) -> None:
         doc = load(

@@ -12,6 +12,7 @@ Shared by the analysis (values are facts) and the broker (values are the concret
 the runtime re-check is the same check: ``bind`` and the constraint, flag and dash-guard
 functions below take either.
 """
+import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
@@ -110,19 +111,28 @@ class Flagset:
     or of another hole's value (``--force`` requires ``not-default-branch`` of ``BRANCH``), on
     top of what the rule and that hole already ask. ``holes`` is a named flagset's contract with
     the templates that use it: the holes its demands reach, which every such template must
-    have; an inline vocabulary names its own template's holes directly."""
+    have; an inline vocabulary names its own template's holes directly.
+
+    ``expand_single_flags`` (opt-in: not every tool bundles) reads ``-lr`` as ``-l -r`` when
+    every letter is a declared bare single-letter flag; a bundle with a valued or unknown letter
+    is an error, and the tool receives the expanded words. It is refused on a vocabulary that
+    declares any single-dash multi-letter flag (``find -name``): such a word is one flag to that
+    tool, so the two readings cannot share a vocabulary and a bundle is never ambiguous."""
 
     bare: frozenset[FlagName] = frozenset()
     valued: Mapping[FlagName, Constraint] = field(default_factory=dict)
     any: bool = False
     requires: Mapping[FlagName, Demands] = field(default_factory=dict)
     holes: frozenset[HoleName] = frozenset()
+    expand_single_flags: bool = False
 
     def __post_init__(self) -> None:
         names = set(self.bare) | set(self.valued)
         if self.any:
             if names or self.requires or self.holes:
                 raise ValueError("an open flag vocabulary (any = true) lists no flags")
+            if self.expand_single_flags:
+                raise ValueError("expand-single-flags says nothing about an open flag vocabulary (any = true)")
             return
         if not names:
             raise ValueError("a flag vocabulary needs at least one flag, or any = true")
@@ -132,6 +142,13 @@ class Flagset:
         both = self.bare & self.valued.keys()
         if both:
             raise ValueError(f"flags both bare and valued: {sorted(both)}")
+        if self.expand_single_flags:
+            long_single = sorted(n for n in names if _BUNDLE.fullmatch(n))
+            if long_single:
+                raise ValueError(
+                    f"expand-single-flags: {long_single[0]!r} is a single-dash multi-letter flag, so this "
+                    "tool does not bundle short flags"
+                )
         if CWD in self.holes:
             raise ValueError(f"{CWD!r} is reserved and cannot be a hole")
         for flag, demands in self.requires.items():
@@ -151,6 +168,59 @@ class Flagset:
             for target, atoms in self.requires.get(flag, {}).items():
                 out[target] = out.get(target, frozenset()) | atoms
         return out
+
+    def declared(self, flag: str) -> bool:
+        return flag in self.bare or flag in self.valued
+
+    def words(self, text: str) -> tuple[str, ...] | str:
+        """The flag words a flag-position *text* stands for: itself when declared, its letters
+        when it is a bundle this vocabulary expands (the two never compete: an expanding
+        vocabulary declares no multi-letter single-dash flag), else the problem with it."""
+        if self.declared(text):
+            return (text,)
+        if not self.expand_single_flags or _BUNDLE.fullmatch(text) is None:
+            return f"{text!r} is not a declared flag"
+        letters = tuple(f"-{ch}" for ch in text[1:])
+        for letter in letters:
+            if letter in self.valued:
+                return f"the bundle {text!r} contains the valued flag {letter!r}: spell it separately"
+            if letter not in self.bare:
+                return f"{letter!r} is not a declared flag (from the bundle {text!r})"
+        return letters
+
+
+# a bundle of short flags, ``-lr``: one dash, two or more characters that are not dashes
+_BUNDLE = re.compile(r"-[^-]{2,}")
+
+
+def expand_bundles(fs: Flagset, elements: Sequence[Value]) -> tuple[list[Value], str | None]:
+    """*elements* with every bundle the vocabulary expands replaced by its letters, so that
+    ``flags_failure``, ``present_flags`` and ``instantiate`` see one word per flag. Elements in
+    value position are left alone; anything else undeclared is left for ``flags_failure`` to
+    report. Returns (the elements, the problem with a bundle that does not expand)."""
+    if fs.any or not fs.expand_single_flags:
+        return list(elements), None
+    out: list[Value] = []
+    i = 0
+    while i < len(elements):
+        element = elements[i]
+        text = known_text(element)
+        if text is None or fs.declared(text):
+            out.append(element)
+            i += 1
+            if text is not None and text in fs.valued and i < len(elements):
+                out.append(elements[i])
+                i += 1
+            continue
+        words = fs.words(text)
+        if isinstance(words, str):
+            if _BUNDLE.fullmatch(text) is not None:
+                return out, words
+            out.append(element)  # not a bundle: flags_failure names it
+        else:
+            out.extend(words)
+        i += 1
+    return out, None
 
 
 @dataclass(frozen=True)
@@ -325,13 +395,13 @@ def bind(
         hole = template.holes[piece.name]
         assert isinstance(hole, Flags)
         following = holes[i + 1].name if i + 1 < len(holes) else None
-        taken, problem = _flag_head(hole.flagset, positionals, piece.name, following)
+        taken, consumed, problem = _flag_head(hole.flagset, positionals, piece.name, following)
         if problem is not None:
             reasons.append(problem)
             break
         if taken:  # an empty head leaves the hole to a keyword (or to its default, nothing)
             bindings[piece.name] = Many(tuple(taken))
-            positionals = positionals[len(taken):]
+            positionals = positionals[consumed:]
     if positionals:
         reasons.append(
             f"{len(positionals)} positional argument(s) too many"
@@ -359,41 +429,53 @@ def bind(
                 bindings[name] = Many(())
             else:
                 reasons.append(f"hole {name!r} is unbound")
+    # a flags display bound by keyword may spell bundles; the positional head already expanded
+    for name, hole in template.holes.items():
+        value = bindings.get(name)
+        if isinstance(hole, Flags) and isinstance(value, Many):
+            elements, problem = expand_bundles(hole.flagset, value.elements)
+            if problem is not None:
+                reasons.append(f"{name}: {problem}")
+            else:
+                bindings[name] = Many(tuple(elements))
     return BindError(tuple(reasons)) if reasons else Bound(template, bindings)
 
 
 def _flag_head(
     fs: Flagset, positionals: Sequence[Value], name: HoleName, following: HoleName | None
-) -> tuple[list[Value], str | None]:
+) -> tuple[list[Value], int, str | None]:
     """The prefix of *positionals* a non-last flags hole takes: flags -- known text beginning
     with ``-`` -- each valued one with the positional after it, up to the first positional that
     carries ``not-option``, which begins the next hole. A positional that is neither a flag nor
     shown not to be one is ambiguous, and the answer is a binding error naming the fix rather
-    than a guess. Returns (the elements taken, the problem)."""
+    than a guess. Returns (the elements taken, with a bundle expanded to its letters; how many
+    positionals they came from; the problem)."""
     taken: list[Value] = []
     i = 0
     while i < len(positionals):
         value = positionals[i]
         text = known_text(value)
         if text is not None and text.startswith("-"):
-            flag = FlagName(text)
-            if flag not in fs.bare and flag not in fs.valued:
+            words = fs.words(text)
+            if isinstance(words, str):
+                if fs.expand_single_flags and _BUNDLE.fullmatch(text) is not None:
+                    return taken, i, f"{name}: {words}"
                 hint = f"; if it is the value of {following}, bind {following} by keyword" if following else ""
-                return taken, f"{text!r} is not a flag of {name}{hint}"
-            taken.append(value)
+                return taken, i, f"{text!r} is not a flag of {name}{hint}"
+            taken.extend(words if len(words) > 1 else (value,))
             i += 1
-            if flag in fs.valued and i < len(positionals):
+            if text in fs.valued and i < len(positionals):
                 taken.append(positionals[i])  # the flag's value, whatever it is
                 i += 1
             continue
         if not may_start_with_dash(value):
-            return taken, None  # shown not to be an option: the next hole begins here
+            return taken, i, None  # shown not to be an option: the next hole begins here
         where = "the next hole" if following is None else following
-        return taken, (
-            f"positional {len(taken) + 1} after the leading words could be a flag of {name} or the "
+        return taken, i, (
+            f"positional {i + 1} after the leading words could be a flag of {name} or the "
             f"value of {where} (it lacks not-option): bind by keyword to say which"
         )
-    return taken, None
+    return taken, i, None
 
 
 # ---------------------------------------------------------------------------

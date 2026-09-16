@@ -1,0 +1,105 @@
+# The git vocabulary: regions, atoms and validations every git rung shares. Applied by each rung
+# with `where = "${where}"`; identical applications dedupe to one document, so a root that applies
+# several rungs gets one copy.
+#
+# Grants nothing. A rung that applies this file gains the names below and nothing else.
+ruleset-version = 1
+
+[params]
+where = { kind = "directory" }        # the directory holding repositories (or a repository itself)
+
+# The obligation every rung places on the root: no program write may touch a repository's .git,
+# at any depth (nested repositories, submodules). Repository config and hooks are how a tree makes
+# git run programs (core.hooksPath, core.fsmonitor, diff.external, filter.*, credential.helper);
+# git itself writes there through the grants, the program never does. Enforced at analysis time
+# whatever the root's `write` grants: a dynamic component of a written path needs a regex that
+# cannot spell .git (`<\w+>`, `<[^.].*>`), a bare `*` could be it.
+[filesystem]
+no-write = ["${where}/**/.git"]
+
+# ---------------------------------------------------------------------------------------------
+# Regions: the state a git command changes and a checker observes. Footprints are relative to the
+# cwd of the validation that establishes an atom reading them; descendants are implicit.
+# (Keys are quoted: a bare `git.head` is TOML for the nested table regions.git.head.)
+[regions]
+"git.head"     = { footprint = ".git/HEAD",   about = "which branch HEAD names, or the detached commit" }
+"git.config"   = { footprint = ".git/config", about = "remotes, hooks path, fsmonitor, filters: everything git reads from repository config" }
+"git.index"    = { footprint = ".git/index",  about = "the staging area" }
+"git.refs"     = { footprint = [".git/refs", ".git/packed-refs", ".git/logs"], about = "local branches, tags, stashes, remote-tracking refs and their reflogs" }
+"git.worktree" = { footprint = ".",           about = "the checked-out files: everything below the repository" }
+"git.remote"   = { network = true, about = "the remote repository: its refs and history" }
+
+# ---------------------------------------------------------------------------------------------
+# Pure atoms: shapes of text, each established by a checker in checkers/ (a literal checker: the
+# host runs it at analysis time on statically-known text, so a literal needs no check call; a
+# dynamic value goes through `certora.check_single`). Structure is asserted in a few lines of
+# Python rather than encoded as a regex; the script is what a reviewer reads.
+#
+# Every text checker here also establishes the built-in `not-option`: the value does not begin
+# with "-", so it may fill a token or each hole that no spelled "--" precedes. (`not-option` is
+# declared by certorail, not by any file; a literal or a regex with a fixed head saturates it.)
+[atoms]
+"git.ref-name"           = { pure = true }   # a branch, tag or remote NAME: check-ref-format, and not a refspec (no ":", "+", "*")
+"git.rev"                = { pure = true }   # a revision or range for reading: ref-name plus ~ ^ .. ... :path @{u} @{-1}
+"git.not-default-branch" = { pure = true }   # not main/master/develop/trunk; says nothing about shape, combine with git.ref-name
+"git.remote-url"         = { pure = true }   # https://, ssh://, or user@host:path; never a local path, file://, ext:: or fd::
+"git.config-key"         = { pure = true }   # section.name or section.subsection.name
+
+# Environmental atoms: facts about a repository, established by the checkers below, killed by
+# any effect that meets what they read.
+"git.clean"            = { reads = ["git.index", "git.worktree"] }   # no staged or unstaged changes
+"git.head-not-default" = { reads = ["git.head"] }                    # HEAD is a branch, not main/master/develop/trunk
+
+# ---------------------------------------------------------------------------------------------
+# Text validations: cwd-free, writing nothing, one parameter, pure atoms established: literal checkers.
+[[validation]]
+name        = "git.ref-name"
+params      = ["value"]
+argv        = ["${checkers}/git-ref-name", "${value}"]
+writes      = []
+establishes = { value = ["git.ref-name", "not-option"] }
+
+[[validation]]
+name        = "git.rev"
+params      = ["value"]
+argv        = ["${checkers}/git-rev", "${value}"]
+writes      = []
+establishes = { value = ["git.rev", "not-option"] }
+
+[[validation]]
+name        = "git.not-default-branch"
+params      = ["value"]
+argv        = ["${checkers}/git-not-default-branch", "${value}"]
+writes      = []
+establishes = { value = ["git.not-default-branch"] }
+
+[[validation]]
+name        = "git.remote-url"
+params      = ["value"]
+argv        = ["${checkers}/git-remote-url", "${value}"]
+writes      = []
+establishes = { value = ["git.remote-url", "not-option"] }
+
+[[validation]]
+name        = "git.config-key"
+params      = ["value"]
+argv        = ["${checkers}/git-config-key", "${value}"]
+writes      = []
+establishes = { value = ["git.config-key", "not-option"] }
+
+# ---------------------------------------------------------------------------------------------
+# Repository validations. Both run in the repository (the validation's cwd) and read only;
+# `git status` is run with --no-optional-locks so it does not refresh the index.
+[[validation]]
+name        = "git.clean"
+argv        = ["${checkers}/git-clean"]
+cwd         = "${where}/**"
+writes      = []
+establishes = { cwd = ["git.clean"] }
+
+[[validation]]
+name        = "git.head-not-default"
+argv        = ["${checkers}/git-head-not-default"]
+cwd         = "${where}/**"
+writes      = []
+establishes = { cwd = ["git.head-not-default"] }

@@ -6,6 +6,7 @@ import pathlib
 import stat
 import tempfile
 import unittest
+from unittest import mock
 
 from certorail import markers
 from certorail.host import Accepted, Rejected
@@ -98,8 +99,7 @@ class TestSlotsInTheDataFormat(unittest.TestCase):
 class TestCheckersVariable(unittest.TestCase):
     def setUp(self) -> None:
         self.config = pathlib.Path(tempfile.mkdtemp())
-        os.environ["CERTORAIL_CONFIG_DIR"] = str(self.config)
-        self.addCleanup(os.environ.pop, "CERTORAIL_CONFIG_DIR", None)
+        self.enterContext(mock.patch.dict(os.environ, {"CERTORAIL_CONFIG_DIR": str(self.config)}))
         checkers = self.config / "checkers"
         checkers.mkdir()
         self.ok = checkers / "ok"

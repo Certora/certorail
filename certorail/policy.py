@@ -104,6 +104,7 @@ from .ids import (
     ValidationName,
     spelled,
 )
+from .integrity import PIN_PATTERN, materialize
 from .locations import parse_location
 from .templates import (
     BindError,
@@ -329,6 +330,13 @@ class Validation:
     # the rest of the jail (``exec``): the environment (None: the broker's), process creation
     env: Environment | None = None
     spawn: bool = True
+    # the sha256 the declaring document pinned its evaluator to (INSTALL.md); verified against
+    # the bytes captured at load. None: unpinned
+    pin: str | None = None
+    # the evaluator's bytes, captured when ${checkers}/x was resolved: what runs is a snapshot
+    # of these, so the installed file drifting mid-run changes nothing. None: a plain evaluator
+    # (a system binary), executed by path as spelled
+    evaluator: bytes | None = None
 
     @property
     def write_set(self) -> Effects:
@@ -357,6 +365,8 @@ def validation(
     writes: Iterable[str] | None = None,
     env: Iterable[str | Mapping[str, str]] | None = None,
     spawn: bool = True,
+    pin: str | None = None,
+    evaluator: bytes | None = None,
 ) -> Validation:
     params_t = tuple(ParamName(p) for p in params)
     if len(set(params_t)) != len(params_t) or CWD in params_t:
@@ -367,6 +377,8 @@ def validation(
     for piece in argv_t:
         if isinstance(piece, Param) and piece.name not in params_t:
             raise ValueError(f"validation {name!r}: argv references undeclared parameter {piece.name!r}")
+    if pin is not None and PIN_PATTERN.fullmatch(pin) is None:
+        raise ValueError(f'validation {name!r}: pin is "sha256:" plus 64 lowercase hex digits')
     est: dict[ParamName, frozenset[Atom]] = {}
     pure_set: set[Atom] = set()
     env_set: set[Atom] = set()
@@ -404,7 +416,7 @@ def validation(
     return Validation(
         ValidationName(name), params_t, argv_t, None if cwd is None else _one_or_many(cwd), est,
         frozenset(pure_set), network, write_fs, None if writes is None else effects_of(writes),
-        _env(env), spawn,
+        _env(env), spawn, pin, evaluator=evaluator,
     )
 
 
@@ -610,9 +622,11 @@ def flagset(
     any: bool = False,
     requires: Mapping[str, Mapping[str, Iterable[str]]] | None = None,
     holes: Iterable[str] = (),
+    expand_single_flags: bool = False,
 ) -> Flagset:
     """*requires* maps a flag to what it demands while present: atoms of ``cwd`` or of a hole,
-    by name; *holes* is a named flagset's contract, the holes those demands may reach."""
+    by name; *holes* is a named flagset's contract, the holes those demands may reach;
+    *expand_single_flags* reads ``-lr`` as ``-l -r`` (``templates.Flagset``)."""
     return Flagset(
         frozenset(FlagName(b) for b in bare),
         {FlagName(k): c for k, c in (valued or {}).items()},
@@ -622,6 +636,7 @@ def flagset(
             for f, d in (requires or {}).items()
         },
         frozenset(HoleName(h) for h in holes),
+        expand_single_flags,
     )
 
 
@@ -892,6 +907,9 @@ def _run_literal_checker(v: Validation, slot: str, text: str, root: pathlib.Path
     ``cwd=root/text`` for the cwd slot (a pure text predicate should not care where it runs, so a
     parameter-slot checker runs at the root)."""
     argv = [piece if isinstance(piece, str) else text for piece in v.argv]
+    if v.evaluator is not None:
+        # exec the load-time snapshot: what was (pin-)verified at load is what runs
+        argv[0] = materialize(v.evaluator)
     cwd = root / text if slot == CWD else root
     if not cwd.is_dir():
         return False
@@ -926,6 +944,12 @@ class Policy:
     read: tuple[LocationFact, ...] = ()
     write: tuple[LocationFact, ...] = ()
     listing: tuple[LocationFact, ...] = ()
+    # protected: a program write that may lie at or below one of these is denied, whatever
+    # ``write`` grants (a ruleset's obligation on the root, or the root's own)
+    no_write: tuple[LocationFact, ...] = ()
+    # the rulesets the loader composed into this policy, by label, in application order
+    # ("base.toml", "unix.toml (where=repos)"): what --describe and the run announce
+    applied: tuple[str, ...] = ()
     programs: tuple[Program, ...] = ()
     validations: tuple[Validation, ...] = ()
     atoms: tuple[AtomDef, ...] = ()
@@ -943,6 +967,7 @@ class Policy:
         read: Iterable[Where] = (),
         write: Iterable[Where] = (),
         listing: Iterable[Where] = (),
+        no_write: Iterable[Where] = (),
         programs: Iterable[Program] = (),
         validations: Iterable[Validation] = (),
         atoms: Iterable[AtomDef] = (),
@@ -950,6 +975,7 @@ class Policy:
         sources: Iterable[Source] = (),
         regions: Iterable[Region] = (),
         reads: Mapping[str, Iterable[str]] | None = None,
+        applied: Iterable[str] = (),
     ) -> "Policy":
         vals = tuple(validations)
         names = [v.name for v in vals]
@@ -1094,9 +1120,19 @@ class Policy:
                     resolved.add(ra)
             net_rules.append(replace(r, requires=frozenset(resolved)))
         return cls(
-            _locations(read), _locations(write), _locations(listing), progs, vals, atoms_t,
-            tuple(net_rules), srcs, regs, reads_m,
+            read=_locations(read), write=_locations(write), listing=_locations(listing),
+            no_write=_locations(no_write), programs=progs, validations=vals, atoms=atoms_t,
+            network=tuple(net_rules), sources=srcs, regions=regs, reads=reads_m, applied=tuple(applied),
         )
+
+    def protected(self, loc: LocationFact) -> LocationFact | None:
+        """The first ``no_write`` location a write at *loc* may touch -- a path the write may name
+        lying at or below one the protection names (``footprints.overlaps``, the same alignment
+        the kill uses) -- or None when the write provably stays outside every one."""
+        for guarded in self.no_write:
+            if footprints.overlaps(loc, footprints.instantiate(None, guarded)):
+                return guarded
+        return None
 
     @property
     def source_atoms(self) -> frozenset[SourceId]:
@@ -1294,9 +1330,15 @@ class Policy:
         match site:
             case SinkSite(kind=kind, fact=Located(location=loc)):
                 permitted = {"read": self.read, "write": self.write, "list": self.listing}[kind]
-                if any(location_le(loc, allowed) for allowed in permitted):
-                    return []
-                return [Denial(site, f"{kind} of {pretty_location(loc)} is not permitted")]
+                if not any(location_le(loc, allowed) for allowed in permitted):
+                    return [Denial(site, f"{kind} of {pretty_location(loc)} is not permitted")]
+                if kind == "write" and (hit := self.protected(loc)) is not None:
+                    return [Denial(
+                        site,
+                        f"write of {pretty_location(loc)} may touch {pretty_location(hit)}, which is "
+                        "protected (no-write): name a path that provably lies outside it",
+                    )]
+                return []
             case SinkSite():
                 return [Denial(site, "the location of the path is not proven")]
             case ExecSite(program=name, cwd=cwd, arguments=arguments, keywords=keywords):
@@ -1480,9 +1522,10 @@ class Policy:
 # the default policy: what ``certorail program.py`` applies when no policy file is given
 # ---------------------------------------------------------------------------
 
-# Everything the analysis proves to lie within the root, plus the two programs the reference
-# example shells out to, run anywhere within the root. Tight enough that any escape from the root
-# is a denial, loose enough that a well-formed script needs no policy file.
+# Everything the analysis proves to lie within the root and no programs: tight enough that any
+# escape from the root is a denial, loose enough that a well-formed script needs no policy file.
+# The host uses ``policyfile.default_policy()``, which is this plus the installed base ruleset;
+# this constant is the same posture for tests that want no rulesets involved.
 DEFAULT_POLICY = Policy.allow(
     read=[markers.within(".")],
     write=[markers.within(".")],

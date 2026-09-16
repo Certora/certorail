@@ -1,0 +1,311 @@
+"""The installer (`certorail policy`), the shipped packs, validator checker-pins, and the
+session hook: pack and
+policy rotation into a scratch config directory, the closure checks both ways, conflict
+refusal, pin extraction/consistency/drift, and the hook's output and silence.
+
+The ``pin`` key is live end to end: the schema accepts it, the loader carries it onto
+``policy.Validation``, and the evaluator sites verify it before exec. ``verify_all`` still
+reads installed documents raw (tomllib), so the sweep needs no loadable composition."""
+import os
+import pathlib
+
+import pytest
+
+from certorail import session_hook
+from certorail.install import InstallError, install_pack, install_policy, main, suggest_pins
+from certorail.integrity import (
+    CheckerIntegrityError,
+    digest,
+    document_pins,
+    verify_all,
+    verify_pinned,
+)
+from certorail.policydir import find_policy
+
+MINI = """\
+ruleset-version = 1
+
+[atoms]
+clean = { }
+
+[[validation]]
+name = "clean"
+argv = ["${checkers}/is-clean"]
+cwd = "."
+writes = []
+establishes = { cwd = ["clean"] }
+
+[[program]]
+name = "true"
+cwd = "."
+writes = []
+"""
+
+CHECKER = "#!/bin/sh\nexit 0\n"
+
+PINNED_TMPL = """\
+ruleset-version = 1
+
+[atoms]
+ok = {{ }}
+
+[[validation]]
+name = "pinned"
+argv = ["${{checkers}}/is-clean"]
+pin = "{pin}"
+cwd = "."
+writes = []
+establishes = {{ cwd = ["ok"] }}
+"""
+
+POLICY_TMPL = """\
+policy-version = 1
+root = "{root}"
+
+[[apply]]
+ruleset = "mini.toml"
+"""
+
+
+@pytest.fixture
+def cfg(tmp_path, monkeypatch):
+    config = tmp_path / "config"
+    monkeypatch.setenv("CERTORAIL_CONFIG_DIR", str(config))
+    return config
+
+
+def make_pack(tmp_path):
+    pack = tmp_path / "pack"
+    (pack / "checkers").mkdir(parents=True)
+    (pack / "mini.toml").write_text(MINI)
+    (pack / "mini.md").write_text("program-author note\n")
+    (pack / "README.md").write_text("about the pack\n")
+    (pack / "checkers" / "is-clean").write_text(CHECKER)
+    return pack
+
+
+def test_pack_install_and_idempotence(cfg, tmp_path):
+    pack = make_pack(tmp_path)
+    report = install_pack(pack)
+    checker = cfg / "checkers" / "is-clean"
+    assert checker.is_file() and os.access(checker, os.X_OK)
+    assert (cfg / "rulesets" / "mini.toml").read_text() == MINI
+    assert (cfg / "rulesets" / "mini.md").is_file()
+    # a pack-level README documents the pack, not the trusted tree
+    assert not (cfg / "rulesets" / "README.md").exists()
+    assert any("README.md" in n for n in report.notes)
+    again = install_pack(pack)
+    assert not again.installed and len(again.unchanged) == 3
+
+
+def test_pack_closure_both_ways(cfg, tmp_path):
+    pack = make_pack(tmp_path)
+    (pack / "checkers" / "stray").write_text(CHECKER)
+    with pytest.raises(InstallError) as e:
+        install_pack(pack)
+    assert "stray" in str(e.value) and "references" in str(e.value)
+    (pack / "checkers" / "stray").unlink()
+    (pack / "checkers" / "is-clean").unlink()
+    with pytest.raises(InstallError) as e:
+        install_pack(pack)
+    assert "is-clean" in str(e.value)
+
+
+def test_pack_conflicts_need_replace(cfg, tmp_path):
+    pack = make_pack(tmp_path)
+    install_pack(pack)
+    (pack / "mini.toml").write_text(MINI + "\n# revised\n")
+    with pytest.raises(InstallError) as e:
+        install_pack(pack)
+    assert "--replace" in str(e.value)
+    report = install_pack(pack, replace=True)
+    assert any(t.endswith("mini.toml") for t in report.installed)
+    assert (cfg / "rulesets" / "mini.toml").read_text().endswith("# revised\n")
+
+
+def test_policy_install_discovery_and_collisions(cfg, tmp_path):
+    install_pack(make_pack(tmp_path))
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    root = str(sandbox.resolve())
+    src = tmp_path / "dev.toml"
+    src.write_text(POLICY_TMPL.format(root=root))
+    report = install_policy(src)
+    found = find_policy(sandbox)
+    assert found is not None and found[0].name == "dev.toml"
+    assert any("--describe" in n for n in report.notes)
+    # a second file claiming the same root is refused outright
+    other = tmp_path / "other.toml"
+    other.write_text(POLICY_TMPL.format(root=root))
+    with pytest.raises(InstallError) as e:
+        install_policy(other)
+    assert "dev.toml" in str(e.value)
+    # revising the installed file needs --replace
+    src.write_text(POLICY_TMPL.format(root=root) + "\n# revised\n")
+    with pytest.raises(InstallError):
+        install_policy(src)
+    install_policy(src, replace=True)
+    assert (found[0].read_text()).endswith("# revised\n")
+
+
+def test_policy_validation_failures(cfg, tmp_path):
+    rootless = tmp_path / "rootless.toml"
+    rootless.write_text("policy-version = 1\n")
+    with pytest.raises(InstallError) as e:
+        install_policy(rootless)
+    assert "root" in str(e.value)
+    broken = tmp_path / "broken.toml"
+    broken.write_text('policy-version = 1\nroot = "/nowhere"\n\n[[apply]]\nruleset = "nope.toml"\n')
+    with pytest.raises(InstallError) as e:
+        install_policy(broken)
+    assert "nope.toml" in str(e.value)
+
+
+def test_document_pins_extraction():
+    good = {"validation": [{"name": "x", "argv": ["${checkers}/c"], "pin": "sha256:" + "0" * 64}]}
+    (p,) = document_pins(good, "<t>")
+    assert p.checker == "c" and p.validation == "x"
+    assert document_pins({"validation": [{"name": "y", "argv": ["${checkers}/c"]}]}, "<t>") == []
+    with pytest.raises(CheckerIntegrityError):  # malformed digest
+        document_pins({"validation": [{"name": "x", "argv": ["${checkers}/c"], "pin": "beef"}]}, "<t>")
+    with pytest.raises(CheckerIntegrityError):  # only installed checkers are pinnable
+        document_pins({"validation": [{"name": "x", "argv": ["test"], "pin": "sha256:" + "0" * 64}]}, "<t>")
+
+
+def test_verify_pinned_is_violent(cfg, tmp_path):
+    install_pack(make_pack(tmp_path))
+    installed = cfg / "checkers" / "is-clean"
+    good = digest(CHECKER.encode())
+    verify_pinned(installed, good)  # matching: silent
+    installed.write_text("#!/bin/sh\nexit 1\n")
+    with pytest.raises(CheckerIntegrityError) as e:
+        verify_pinned(installed, good)
+    assert "no longer mean" in str(e.value)
+    with pytest.raises(CheckerIntegrityError):
+        verify_pinned(cfg / "checkers" / "absent", good)
+
+
+def test_verify_all_scans_installed_documents(cfg, tmp_path):
+    install_pack(make_pack(tmp_path))  # supplies is-clean; mini's validation is unpinned
+    # written raw: the schema does not accept `pin` yet, but verify_all reads documents raw
+    pinned = PINNED_TMPL.format(pin=digest(CHECKER.encode()))
+    (cfg / "rulesets" / "pinned.toml").write_text(pinned)
+    vr = verify_all()
+    assert vr.clean
+    assert any("mini.toml" in n and "'clean'" in n for n in vr.notes)  # unpinned, noted
+    (cfg / "checkers" / "is-clean").write_text("#!/bin/sh\nexit 1\n")
+    vr = verify_all()
+    assert not vr.clean and any("pinned" in p and "is-clean" in p for p in vr.problems)
+
+
+def test_pack_pin_inconsistency_refused(cfg, tmp_path):
+    pack = make_pack(tmp_path)
+    wrong = PINNED_TMPL.format(pin="sha256:" + "0" * 64)
+    (pack / "pinned.toml").write_text(wrong)
+    with pytest.raises(InstallError) as e:
+        install_pack(pack)
+    assert "internally inconsistent" in str(e.value)
+
+
+def test_pin_carries_to_loaded_policy(cfg, tmp_path):
+    import tomllib
+
+    from certorail.policyfile import from_data
+
+    pack = make_pack(tmp_path)
+    good = digest(CHECKER.encode())
+    (pack / "pinned.toml").write_text(PINNED_TMPL.format(pin=good))
+    report = install_pack(pack)
+    assert any("1 validation pin" in n for n in report.notes)
+    sandbox = tmp_path / "sb"
+    sandbox.mkdir()
+    text = 'policy-version = 1\nroot = "%s"\n\n[[apply]]\nruleset = "pinned.toml"\n' % sandbox.resolve()
+    policy = from_data(tomllib.loads(text), "<t>")
+    assert any(v.pin == good for v in policy.validations)
+
+
+def test_cli_pin_and_verify(cfg, tmp_path, capsys):
+    pack = make_pack(tmp_path)
+    assert main(["pin", str(pack)]) == 0
+    out = capsys.readouterr().out
+    assert f'"{digest(CHECKER.encode())}"' in out and '"clean"' in out
+    install_pack(pack)
+    assert main(["verify"]) == 0
+    assert "clean" in capsys.readouterr().out
+    (cfg / "rulesets" / "pinned.toml").write_text(PINNED_TMPL.format(pin=digest(CHECKER.encode())))
+    (cfg / "checkers" / "is-clean").write_text("revised text\n")
+    assert main(["verify"]) == 1
+    assert "is-clean" in capsys.readouterr().out
+
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+
+
+@pytest.mark.skipif(not (REPO / "rulesets" / "git").is_dir(), reason="the shipped packs are not in this tree")
+def test_shipped_packs_install(cfg):
+    """The repo's git and coreutils packs are installable units: closure exact, seven checkers
+    placed executable, and the fixture root policy composes them with evaluator bytes captured."""
+    import tomllib
+
+    from certorail.policyfile import from_data
+
+    report = install_pack(REPO / "rulesets" / "git")
+    assert len([t for t in report.installed if "/checkers/" in t]) == 7
+    assert any(t.endswith("git.md") for t in report.installed)
+    install_pack(REPO / "rulesets" / "coreutils")
+    # the fixture root policy also runs a root-authored checker of its own, outside any pack
+    org = cfg / "checkers" / "org-checkout"
+    org.write_text(CHECKER)
+    org.chmod(0o755)
+    data = tomllib.loads((REPO / "tests" / "fixtures" / "git-policy.toml").read_text(encoding="utf-8"))
+    policy = from_data(data, "git-policy.toml")
+    assert any(v.evaluator is not None for v in policy.validations)
+
+
+def test_plugin_ships_the_skill_and_hook():
+    """One skill, two homes: the plugin's copy is byte-identical to the repo's canonical one
+    (sync is a test, not a memory), the hook script is executable, and every manifest parses."""
+    import json
+
+    plugin = REPO / "plugins" / "certorail"
+    canonical = REPO / ".claude" / "skills" / "certorail-policy"
+    shipped = plugin / "skills" / "certorail-policy"
+    ours = {p.name: p.read_bytes() for p in canonical.iterdir() if p.is_file()}
+    theirs = {p.name: p.read_bytes() for p in shipped.iterdir() if p.is_file()}
+    assert ours == theirs
+    assert {"SKILL.md", "reference.md", "SUBSET_PROMPT.md"} <= set(ours)
+    assert os.access(plugin / "hooks" / "session-start.sh", os.X_OK)
+    json.loads((plugin / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    hooks = json.loads((plugin / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+    assert "SessionStart" in hooks["hooks"]
+    market = json.loads((REPO / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))
+    assert market["plugins"][0]["source"] == "./plugins/certorail"
+
+
+def test_verbs_dispatch_under_certorail(cfg, tmp_path, capsys):
+    from certorail.host import main as certorail_main
+
+    install_pack(make_pack(tmp_path))
+    assert certorail_main(["policy", "verify"]) == 0
+    assert "clean" in capsys.readouterr().out
+    assert certorail_main(["policy", "list"]) == 0
+    assert "rulesets:" in capsys.readouterr().out
+
+
+def test_session_hook_output_and_silence(cfg, tmp_path, monkeypatch, capsys):
+    install_pack(make_pack(tmp_path))
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    src = tmp_path / "dev.toml"
+    src.write_text(POLICY_TMPL.format(root=str(sandbox.resolve())))
+    install_policy(src)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(sandbox))
+    assert session_hook.main() == 0
+    out = capsys.readouterr().out
+    assert "certorail governs" in out
+    assert 'certora.check("clean"' in out
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(elsewhere))
+    assert session_hook.main() == 0
+    assert capsys.readouterr().out == ""

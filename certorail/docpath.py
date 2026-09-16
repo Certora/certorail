@@ -108,22 +108,24 @@ class DocPath:
 # the document's grammar, one level deep: which keys hold arrays, which hold tables of tables,
 # which hold one value or one table. A key here is spelled as an attribute, dashes as
 # underscores. Everything else is a dynamic key and goes through ``[...]`` / ``.key(...)``.
-type IndexedKey = Literal["program", "validation", "flagset", "apply", "source", "network", "argv", "bare"]
+type IndexedKey = Literal["program", "validation", "flagset", "apply", "source", "network", "deny", "argv", "bare"]
 type KeyedKey = Literal["holes", "regions", "atoms", "params", "flags", "bindings", "establishes", "requires"]
 type ScalarKey = Literal[
-    "policy_version", "ruleset_version", "root", "filesystem", "read", "write", "list",
+    "policy_version", "ruleset_version", "root", "base", "filesystem", "read", "write", "list", "no_write", "override",
     "name", "cwd", "when", "kind", "subcommand", "min", "literal", "any", "location", "matches",
     "one_of", "footprint", "about", "pure", "reads", "writes", "write_fs", "exec", "env", "spawn", "ruleset", "host",
+    "expand_single_flags",
     "schemes", "ports", "methods", "allow_nonpublic", "read_timeout", "total_timeout",
     "max_response_bytes", "path", "value", "atom", "on_redirect",
 ]
 
-_INDEXED: frozenset[str] = frozenset({"program", "validation", "flagset", "apply", "source", "network", "argv", "bare"})
+_INDEXED: frozenset[str] = frozenset({"program", "validation", "flagset", "apply", "source", "network", "deny", "argv", "bare"})
 _KEYED: frozenset[str] = frozenset({"holes", "regions", "atoms", "params", "flags", "bindings", "establishes", "requires"})
 _SCALAR: frozenset[str] = frozenset({
-    "policy_version", "ruleset_version", "root", "filesystem", "read", "write", "list",
+    "policy_version", "ruleset_version", "root", "base", "filesystem", "read", "write", "list", "no_write", "override",
     "name", "cwd", "when", "kind", "subcommand", "min", "literal", "any", "location", "matches",
     "one_of", "footprint", "about", "pure", "reads", "writes", "write_fs", "exec", "env", "spawn", "ruleset", "host",
+    "expand_single_flags",
     "schemes", "ports", "methods", "allow_nonpublic", "read_timeout", "total_timeout",
     "max_response_bytes", "path", "value", "atom", "on_redirect",
 })

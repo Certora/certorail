@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""certorail checker: the argument is a branch, tag or remote NAME a confined program may spell.
+
+Establishes git.ref-name and not-option. A name, never a refspec: git's own check-ref-format
+rules (as for --branch), and additionally no ":" (a:b pushes a to b, :b deletes b), no leading
+"+" (a forced refspec) and no "*" (a glob refspec). Refuses with the reason on stderr.
+"""
+import sys
+
+
+def refuse(why: str) -> None:
+    print(f"git-ref-name: {why}", file=sys.stderr)
+    sys.exit(1)
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        refuse("expected exactly one argument")
+    name = sys.argv[1]
+    if not name:
+        refuse("empty")
+    if name.startswith("-"):
+        refuse(f"{name!r} begins with '-': an option, not a name")
+    if name in (".", "..", "@", "HEAD"):
+        refuse(f"{name!r} is not a branch name")
+    for bad in (":", "+", "*", "?", "[", "\\", "~", "^", " ", "\t", "\n", "@{", ".."):
+        if bad in name:
+            refuse(f"{name!r} contains {bad!r}")
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in name):
+        refuse(f"{name!r} contains a control character")
+    if name.endswith("/") or name.endswith(".") or name.endswith(".lock"):
+        refuse(f"{name!r} ends with '/', '.' or '.lock'")
+    for component in name.split("/"):
+        if not component:
+            refuse(f"{name!r} has an empty component")
+        if component.startswith("."):
+            refuse(f"{name!r} has a component beginning with '.'")
+        if component.endswith(".lock"):
+            refuse(f"{name!r} has a component ending in '.lock'")
+    sys.exit(0)
+
+
+main()

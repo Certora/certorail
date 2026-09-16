@@ -34,9 +34,10 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, TypedDict, overload
 
 from . import markers
-from .analysis import Exact, RegexLit, StaticPath, alternation
+from .analysis import Exact, RegexLit, StaticPath, alternation, is_prefix
 from .docpath import DocPath, Keyed, Path
 from .ids import BUILTIN_ATOMS, Atom, CheckId, FlagName, FlagsetId, HoleName, ParamName, SourceId
+from .integrity import digest
 from .locations import parse_location
 from .policy import (
     AtomDef,
@@ -89,7 +90,7 @@ from .templates import Constraint, Demands, Each, Flags, Flagset, Hole, HoleRef,
 
 # the location micro-syntax lives in ``locspec`` and ``locations``; ``parse_location`` is
 # re-exported here for its callers
-__all__ = ["PolicyFileError", "from_data", "load_policy_file", "parse_location", "rulesets_dir"]
+__all__ = ["BASE_RULESET", "PolicyFileError", "default_policy", "from_data", "load_policy_file", "parse_location", "rulesets_dir"]
 
 
 class PolicyFileError(Exception):
@@ -101,10 +102,30 @@ class PolicyFileError(Exception):
 RULESET_STOCK_CHECKERS: frozenset[str] = frozenset({"test"})
 _CHECKERS = "${checkers}"
 _CWD = "cwd"
+# the base ruleset: applied by this fixed name to every root policy that does not say
+# ``base = false``, when the file exists. Just a ruleset -- exec-side vocabulary and
+# protections, no filesystem or network grants, no absolute paths -- so that "read-only tools
+# everywhere" is one file the deployment installs rather than a line in every policy. The
+# repository never ships one and no installer writes one unasked: creating it is a first-run
+# setup act of whoever owns the machine, and every run that composes it says so (``host``)
+BASE_RULESET = "base.toml"
 
 
 def rulesets_dir() -> pathlib.Path:
     return config_dir() / "rulesets"
+
+
+# the policy of a root with no policy file: everything the analysis proves to lie within the
+# root, no programs of its own -- plus the base ruleset, like any root
+_DEFAULT_DOC: dict[str, Any] = {
+    "policy-version": 1,
+    "filesystem": {"read": ["**"], "write": ["**"], "list": ["**"]},
+}
+
+
+def default_policy() -> "Policy":
+    """The built-in policy, composed with the base ruleset if one is installed."""
+    return from_data(_DEFAULT_DOC, "the built-in default policy")
 
 # ---------------------------------------------------------------------------
 # errors: collected, located
@@ -437,6 +458,9 @@ class _Instantiator:
             "flagset": [self.flagset(f, root.flagset(i)) for i, f in enumerate(doc.flagset)],
             "validation": [self.validation(v, root.validation(i)) for i, v in enumerate(doc.validation)],
             "source": [self.source(s, root.source(i)) for i, s in enumerate(doc.source)],
+            "filesystem": doc.filesystem.model_copy(update={
+                "no_write": self.locations(doc.filesystem.no_write, root.filesystem.no_write),
+            }),
         })
 
 
@@ -471,10 +495,18 @@ class _Document:
 
 
 def _compose(root: PolicyDoc, where: str, errors: _Errors) -> list[_Document]:
-    """The root (its literal ``when``s resolved) and every ruleset it applies, instantiated."""
+    """The root (its literal ``when``s resolved), the base ruleset unless the root opts out
+    (``base = false``) or there is none, and every ruleset either applies, instantiated."""
     top = _Instantiator(None, {}, where, errors).document(root)
     out = [_Document(top, where, None)]
-    _apply_all(top, where, (), {}, out, errors)
+    seen: dict[tuple[str, str], tuple[str, str]] = {}
+    if root.base and (rulesets_dir() / BASE_RULESET).is_file():
+        # the base: a ruleset applied to every root by its fixed name, with no bindings -- so it
+        # declares no parameter but bools -- and otherwise just another pack: overlap with a
+        # root rule wants override = true, [[deny]] takes its shapes back
+        implicit = ApplyDecl.model_validate({"ruleset": BASE_RULESET})
+        _apply_one(implicit, Path().base, where, (), seen, out, errors)
+    _apply_all(top, where, (), seen, out, errors)
     return out
 
 
@@ -487,45 +519,58 @@ def _apply_all(
     errors: _Errors,
 ) -> None:
     for i, entry in enumerate(doc.apply):
-        path = Path().apply(i)
-        file = rulesets_dir() / entry.ruleset
-        try:
-            text = file.read_text(encoding="utf-8")
-            real = str(file.resolve())
-        except OSError as e:
-            errors.add(where, path.ruleset, f"cannot read ruleset {entry.ruleset}: {e}")
-            continue
-        if real in chain:
-            errors.add(where, path.ruleset, f"ruleset {entry.ruleset} applies itself (via {' -> '.join(chain)})")
-            continue
-        try:
-            ruleset = parse_ruleset(tomllib.loads(text), entry.ruleset)
-        except tomllib.TOMLDecodeError as e:
-            errors.add(where, path.ruleset, f"{entry.ruleset}: {e}")
-            continue
-        except SchemaError as e:
-            errors.schema(e)
-            continue
-        bindings = _bind(entry, ruleset, where, path, errors)
-        if bindings is None:
-            continue
-        canonical = _canonical(bindings)
-        key = (real, hashlib.sha256(text.encode("utf-8")).hexdigest())
-        if key in seen:
-            previous, previous_route = seen[key]
-            if previous != canonical:
-                errors.add(
-                    where, path,
-                    f"ruleset {entry.ruleset} is applied with different bindings here and at "
-                    f"{previous_route}; apply it once, at the root, with the union",
-                )
-            continue  # the same application again: one document
-        seen[key] = (canonical, f"{where} {path}")
-        shown = ", ".join(f"{k}={_show(v)}" for k, v in sorted(bindings.items()))
-        label = f"{entry.ruleset} ({shown})" if shown else entry.ruleset
-        instantiated = _Instantiator(ruleset, bindings, label, errors).document(ruleset)
-        out.append(_Document(instantiated, label, label))
-        _apply_all(instantiated, label, (*chain, real), seen, out, errors)
+        _apply_one(entry, Path().apply(i), where, chain, seen, out, errors)
+
+
+def _apply_one(
+    entry: ApplyDecl,
+    path: Path,
+    where: str,
+    chain: tuple[str, ...],
+    seen: dict[tuple[str, str], tuple[str, str]],
+    out: list[_Document],
+    errors: _Errors,
+) -> None:
+    """One application: read and parse the ruleset, bind, dedupe by (file, hash, bindings),
+    instantiate, and apply what it applies in turn."""
+    file = rulesets_dir() / entry.ruleset
+    try:
+        text = file.read_text(encoding="utf-8")
+        real = str(file.resolve())
+    except OSError as e:
+        errors.add(where, path.ruleset, f"cannot read ruleset {entry.ruleset}: {e}")
+        return
+    if real in chain:
+        errors.add(where, path.ruleset, f"ruleset {entry.ruleset} applies itself (via {' -> '.join(chain)})")
+        return
+    try:
+        ruleset = parse_ruleset(tomllib.loads(text), entry.ruleset)
+    except tomllib.TOMLDecodeError as e:
+        errors.add(where, path.ruleset, f"{entry.ruleset}: {e}")
+        return
+    except SchemaError as e:
+        errors.schema(e)
+        return
+    bindings = _bind(entry, ruleset, where, path, errors)
+    if bindings is None:
+        return
+    canonical = _canonical(bindings)
+    key = (real, hashlib.sha256(text.encode("utf-8")).hexdigest())
+    if key in seen:
+        previous, previous_route = seen[key]
+        if previous != canonical:
+            errors.add(
+                where, path,
+                f"ruleset {entry.ruleset} is applied with different bindings here and at "
+                f"{previous_route}; apply it once, at the root, with the union",
+            )
+        return  # the same application again: one document
+    seen[key] = (canonical, f"{where} {path}")
+    shown = ", ".join(f"{k}={_show(v)}" for k, v in sorted(bindings.items()))
+    label = f"{entry.ruleset} ({shown})" if shown else entry.ruleset
+    instantiated = _Instantiator(ruleset, bindings, label, errors).document(ruleset)
+    out.append(_Document(instantiated, label, label))
+    _apply_all(instantiated, label, (*chain, real), seen, out, errors)
 
 
 # ---------------------------------------------------------------------------
@@ -718,7 +763,7 @@ class _Rules:
         try:
             return Flagset(
                 frozenset(FlagName(b) for b in bare), valued, requires=requires,
-                holes=frozenset(HoleName(h) for h in holes),
+                holes=frozenset(HoleName(h) for h in holes), expand_single_flags=v.expand_single_flags,
             )
         except ValueError as e:
             self.errors.add(self.where, path, str(e))
@@ -765,10 +810,24 @@ class _Rules:
                     f"{', '.join(sorted(RULESET_STOCK_CHECKERS))}, not {v.argv[0]!r}",
                 )
             argv: list[str | Param] = []
+            evaluator: bytes | None = None
             for j, piece in enumerate(v.argv):
                 if piece.startswith(_CHECKERS):
                     resolved = _resolve_checker(piece, self.where, path.argv(j), self.errors)
                     if resolved is not None:
+                        # read the bytes ONCE: the pin is verified against them here, and they
+                        # ride the Validation so the run executes a snapshot of exactly these
+                        # bytes -- the installed file drifting later changes nothing
+                        try:
+                            evaluator = pathlib.Path(resolved).read_bytes()
+                        except OSError as e:
+                            self.errors.add(self.where, path.argv(j), f"checker unreadable: {e}")
+                        if evaluator is not None and v.pin is not None and digest(evaluator) != v.pin:
+                            self.errors.add(
+                                self.where, path.argv(j),
+                                f"{piece} is {digest(evaluator)}, pinned {v.pin}: not the "
+                                "implementation this validation was reviewed with",
+                            )
                         argv.append(resolved)
                     continue
                 # here ${p} names one of the validation's own params (the schema checked the
@@ -785,7 +844,7 @@ class _Rules:
                 out.append(validation(
                     v.name, argv=argv, cwd=None if v.cwd is None else _slot(v.cwd), params=v.params,
                     establishes=establishes, network=v.network, write_fs=v.write_fs, writes=v.writes,
-                    **_exec(v.exec_),
+                    pin=v.pin, evaluator=evaluator, **_exec(v.exec_),
                 ))
             except ValueError as e:
                 self.errors.add(self.where, path, str(e))
@@ -795,6 +854,8 @@ class _Rules:
         out: list[Program] = []
         for i, p in enumerate(self.doc.body.program):
             path = Path().program(i)
+            if p.override and self.doc.restricted:
+                self.errors.add(self.where, path.override, "only the root policy overrides a ruleset's rule")
             yields = self.source_atom(p.source, path.key("source"))
             if isinstance(p.requires, dict):
                 requires: list[Atom] | Demands = self.demands(p.requires, path.requires)
@@ -890,28 +951,82 @@ def from_data(data: object, where: str = "<policy>") -> Policy:
     documents = _compose(root, where, errors)
     declared = _declare(documents, errors)
     validations: list[Validation] = []
-    programs: list[Program] = []
+    own: list[Program] = []       # the root's rules
+    applied: list[Program] = []   # the rulesets' rules
     sources: list[Source] = []
     for d in documents:
         rules = _Rules(d, declared, errors)
         rules.declare_flagsets()
         validations += rules.validations()
-        programs += rules.programs()
+        (applied if d.restricted else own).extend(rules.programs())
         sources += rules.sources()
     top = documents[0].body
     assert isinstance(top, PolicyDoc)
+    applied = _deny(top, where, applied, own, errors)
+    # the root's rules and its program entries correspond one to one unless one failed to build,
+    # in which case errors are pending and nothing below is reported anyway
+    if len(own) == len(top.program):
+        applied = _override(where, applied, [(p, decl.override) for p, decl in zip(own, top.program)], errors)
     net_rules = _network(top, where, declared, errors)
     errors.raise_if_any()
+    no_write = [loc for d in documents for loc in d.body.filesystem.no_write]
     try:
         return Policy.allow(
             read=_slot(top.filesystem.read) if top.filesystem.read else [],
             write=_slot(top.filesystem.write) if top.filesystem.write else [],
             listing=_slot(top.filesystem.list_) if top.filesystem.list_ else [],
-            programs=programs, validations=validations, atoms=declared.defined,
+            no_write=_slot(no_write) if no_write else [],
+            programs=own + applied, validations=validations, atoms=declared.defined,
             network=net_rules, sources=sources, regions=declared.regions, reads=declared.reads,
+            applied=[d.label for d in documents[1:]],
         )
     except ValueError as e:
         raise PolicyFileError(f"{where}: {e}") from None
+
+
+def _shape(words: Sequence[str]) -> str:
+    return " ".join(words)
+
+
+def _deny(root: PolicyDoc, where: str, applied: list[Program], own: Sequence[Program], errors: _Errors) -> list[Program]:
+    """``[[deny]]``: take back from the applied rulesets every rule whose leading words begin
+    with the denied words. A denial that takes nothing back is stale; one naming a shape the
+    root grants itself is a contradiction -- delete the rule instead."""
+    kept = list(applied)
+    for i, d in enumerate(root.deny):
+        path = Path().deny(i)
+        words = tuple(d.argv)
+        if any(is_prefix(words, p.leading_words) for p in own):
+            errors.add(where, path, f"deny {_shape(words)!r} names a shape this policy grants itself; delete that rule instead")
+            continue
+        taken = [p for p in kept if is_prefix(words, p.leading_words)]
+        if not taken:
+            errors.add(where, path, f"deny {_shape(words)!r} takes back nothing: no applied ruleset grants that shape")
+            continue
+        kept = [p for p in kept if p not in taken]
+    return kept
+
+
+def _override(
+    where: str, applied: list[Program], own: Sequence[tuple[Program, bool]], errors: _Errors
+) -> list[Program]:
+    """``override = true`` on a root rule (*own* pairs each with its flag): it replaces every
+    applied rule whose leading words overlap its own (either a prefix of the other). Without it,
+    such an overlap is the error ``Policy.allow`` would raise, named here with the fix."""
+    kept = list(applied)
+    for i, (p, override) in enumerate(own):
+        path = Path().program(i)
+        overlapping = [
+            q for q in kept
+            if q.name == p.name and (is_prefix(p.leading_words, q.leading_words) or is_prefix(q.leading_words, p.leading_words))
+        ]
+        if overlapping and not override:
+            shown = ", ".join(f"{_shape(q.leading_words)!r} from {q.origin}" for q in overlapping)
+            errors.add(where, path, f"{_shape(p.leading_words)!r} overlaps {shown}; add override = true to replace it, or [[deny]] it")
+        elif override and not overlapping:
+            errors.add(where, path.override, f"{_shape(p.leading_words)!r} overrides nothing: no applied ruleset grants an overlapping shape")
+        kept = [q for q in kept if q not in overlapping]
+    return kept
 
 
 def load_policy_file(path: pathlib.Path) -> Policy:

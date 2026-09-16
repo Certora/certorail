@@ -20,9 +20,10 @@
    warning (or quietly with ``--no-jail``).
 
 The policy is a TOML (or JSON) document (``policyfile``), given with ``--policy`` or discovered
-ambiently for the root (``policydir``); without one, ``policy.DEFAULT_POLICY`` applies: read,
-write and list anywhere within the root, and no programs. Exit status: the program's own when it
-ran; 1 when rejected; 2 when the program does not parse.
+ambiently for the root (``policydir``); without one, ``policyfile.default_policy`` applies: read,
+write and list anywhere within the root, and no programs of its own. Either way the installed
+base ruleset (``rulesets/base.toml``) is applied unless the policy says ``base = false``. Exit
+status: the program's own when it ran; 1 when rejected; 2 when the program does not parse.
 """
 import argparse
 import ast
@@ -38,12 +39,12 @@ import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-from .analysis import Named, StaticPath
+from .analysis import DirSplat, Named, StaticPath
 from .broker import build_server
 from .describe import describe
-from .policy import DEFAULT_POLICY, Denial, Policy
+from .policy import Denial, Policy
 from .policydir import AmbientPolicyError, find_policy
-from .policyfile import PolicyFileError, load_policy_file
+from .policyfile import BASE_RULESET, PolicyFileError, default_policy, load_policy_file
 from .rewrite import rewrite
 from .safepy import FunctionAnalysis
 from .walker import Report, analyze, describe_sink, where
@@ -136,6 +137,22 @@ def _jail_write_paths(policy: Policy, root: pathlib.Path, tmp: pathlib.Path) -> 
     return paths
 
 
+def _jail_deny_paths(policy: Policy, root: pathlib.Path) -> list[str]:
+    """The jail's write denials: every protected location (``no-write``) that is one concrete
+    directory -- named components only, itself and everything below. A protection with a
+    wildcard in it (``repos/**/.git``) is the analysis' alone: srt denies paths, not patterns."""
+    out: list[str] = []
+    for loc in policy.no_write:
+        parts = loc.path_components if isinstance(loc, StaticPath) else loc.static_prefix
+        if isinstance(loc, DirSplat) and loc.final_component is not None:
+            continue
+        if not all(isinstance(c, Named) for c in parts):
+            continue
+        names = [c.name for c in parts if isinstance(c, Named)]
+        out.append("/" + "/".join(names) if loc.absolute else str(root.joinpath(*names)))
+    return out
+
+
 def _srt_settings(
     policy: Policy, root: pathlib.Path, tmp: pathlib.Path, socket_path: pathlib.Path | None
 ) -> dict:
@@ -162,7 +179,7 @@ def _srt_settings(
         },
         "filesystem": {
             "allowWrite": _jail_write_paths(policy, root, tmp),
-            "denyWrite": [],
+            "denyWrite": _jail_deny_paths(policy, root),
             "denyRead": [],
         },
     }
@@ -240,6 +257,18 @@ def run(
                 server.server_close()
 
 
+def _announce_base(policy: Policy) -> Policy:
+    """A security tool composing configuration the policy file did not name is never silent
+    about it: the installed base ruleset, when it was applied."""
+    if BASE_RULESET in policy.applied:
+        print(
+            f"certorail: base ruleset {BASE_RULESET} applied from the config directory "
+            "(base = false in the policy opts out)",
+            file=sys.stderr,
+        )
+    return policy
+
+
 def load_policy(path: pathlib.Path | None, root: pathlib.Path | None = None) -> Policy:
     if path is None:
         if root is not None:
@@ -252,14 +281,17 @@ def load_policy(path: pathlib.Path | None, root: pathlib.Path | None = None) -> 
                 # a security tool picking up ambient configuration is never silent about it
                 print(f"certorail: policy from {policy_file} (root {prefix})", file=sys.stderr)
                 try:
-                    return load_policy_file(policy_file)
+                    return _announce_base(load_policy_file(policy_file))
                 except PolicyFileError as e:
                     raise SystemExit(str(e))
-        return DEFAULT_POLICY
+        try:
+            return _announce_base(default_policy())  # the built-in posture, plus the base ruleset if installed
+        except PolicyFileError as e:
+            raise SystemExit(str(e))
     if path.suffix not in (".toml", ".json"):
         raise SystemExit(f"{path}: a policy is a .toml or .json document")
     try:
-        return load_policy_file(path)
+        return _announce_base(load_policy_file(path))
     except PolicyFileError as e:
         raise SystemExit(str(e))
 
@@ -279,6 +311,19 @@ def policy_origin(path: pathlib.Path | None, root: pathlib.Path) -> tuple[str, s
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # verbs, dispatched before the run parser: ``policy`` is a reserved first word
+    # (INSTALL.md) -- a program literally named ``policy`` is spelled ``./policy``. Imported
+    # lazily so a plain run never pays for the installer.
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] == "policy":
+        from .install import main as policy_main
+
+        return policy_main(args[1:])
+    if args and args[0] == "session-hook":
+        # the Claude Code SessionStart hook: the ambient policy into the session's context
+        from .session_hook import main as hook_main
+
+        return hook_main()
     parser = argparse.ArgumentParser(
         prog="certorail", description="Analyse a program, check it against a policy, and run it."
     )
@@ -317,7 +362,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # keeps parsing options anywhere, and `--` is the documented way to pass option-like
     # arguments through to the program.
     parser.add_argument("args", nargs="*", help="arguments for the program (after --)")
-    ns = parser.parse_args(argv)
+    ns = parser.parse_args(args)
 
     if ns.describe:
         if ns.program is not None or ns.command is not None or ns.args:

@@ -6,6 +6,7 @@ import os
 import pathlib
 import tempfile
 import unittest
+from unittest import mock
 
 from certorail.describe import describe
 from certorail.effects import EVERYTHING, NOTHING, effects_of, whole
@@ -257,8 +258,7 @@ class TestLoadErrors(unittest.TestCase):
 class TestRulesets(unittest.TestCase):
     def setUp(self) -> None:
         self.config = pathlib.Path(tempfile.mkdtemp())
-        os.environ["CERTORAIL_CONFIG_DIR"] = str(self.config)
-        self.addCleanup(os.environ.pop, "CERTORAIL_CONFIG_DIR", None)
+        self.enterContext(mock.patch.dict(os.environ, {"CERTORAIL_CONFIG_DIR": str(self.config)}))
         (self.config / "rulesets").mkdir()
 
     def ruleset(self, name: str, text: str) -> None:

@@ -83,10 +83,36 @@ class TestOverlaps(unittest.TestCase):
         self.assertFalse(overlaps(static("etc", "hosts"), etc))
         self.assertTrue(overlaps(static("etc", "hosts", absolute=True), etc))
 
-    def test_wildcards_may_name_anything(self) -> None:
-        wild = DirSplat((Named("repos"),), Matching(RegexLit(r"\d+")))  # repos/**/<\d+>
-        self.assertTrue(overlaps(wild, ORG))  # conservatively: the regex may spell "config"
+    def test_a_wildcard_may_name_anything_but_a_regex_is_read(self) -> None:
+        wild = DirSplat((Named("repos"),), Matching(RegexLit(r"\w+")))  # repos/**/<\w+>
+        self.assertTrue(overlaps(wild, ORG))  # \w+ spells "config"
+        digits = DirSplat((Named("repos"),), Matching(RegexLit(r"\d+")))  # repos/**/<\d+>
+        self.assertTrue(overlaps(digits, ORG))  # repos/.git/config/123 lies below the footprint
+        self.assertFalse(overlaps(StaticPath((Named("repos"), Named("x"), Matching(RegexLit(r"\d+")))), ORG))  # neither .git nor below
         self.assertTrue(overlaps(static("repos", "x", "a", "config"), instantiate(REPOS, StaticPath((ANY_NAME, Named("config"))))))
+        self.assertTrue(overlaps(StaticPath((Named("repos"), ANY_NAME, Named(".git"), Named("config"))), ORG))
+
+    def test_a_regex_is_read_against_every_spelling_of_the_name(self) -> None:
+        git = instantiate(REPOS, static(".git"))  # repos/**/.git and below
+        for regex, may in (
+            (r"\w+", False),           # cannot spell the dot
+            (r"[^-].*", True),         # .git itself
+            (r"[^.].*", False),        # not a dotfile: neither .git nor .GIT
+            (r"\.GIT", True),          # folds to .git
+            (r"\.g[iI]t", True),
+            (r"(?i)\.git", True),
+            (r"[a-z]+\.git", False),   # needs a prefix
+            (r"x|\.Git", True),
+        ):
+            with self.subTest(regex=regex):
+                self.assertIs(overlaps(StaticPath((Named("repos"), Named("x"), Matching(RegexLit(regex)))), git), may)
+        # a name whose spellings are many (ligatures, long s, sharp s) is still enumerated
+        stuff = instantiate(REPOS, static("assist"))
+        self.assertTrue(overlaps(StaticPath((Named("repos"), Named("x"), Matching(RegexLit("aſſiﬆ")))), stuff))
+        self.assertTrue(overlaps(StaticPath((Named("repos"), Named("x"), Matching(RegexLit("Aßiﬅ")))), stuff))
+        self.assertFalse(overlaps(StaticPath((Named("repos"), Named("x"), Matching(RegexLit("assis")))), stuff))
+        # a name this cannot enumerate falls back to the conservative answer
+        self.assertTrue(overlaps(StaticPath((Named("repos"), Matching(RegexLit(r"\d+")))), instantiate(REPOS, static("café"))))
 
     def test_one_of(self) -> None:
         either = StaticPath((Named("repos"), Named("x"), OneOf(frozenset({".git", "src"})), Named("config")))
@@ -107,8 +133,13 @@ class TestFold(unittest.TestCase):
     def test_normalisation(self) -> None:
         self.assertEqual(fold("café"), fold("café"))  # NFC vs decomposed
 
-    def test_ignorable_code_points(self) -> None:
-        self.assertEqual(fold("con‍fig"), fold("config"))  # a zero-width joiner hides nothing
+    def test_format_code_points_are_not_ignored(self) -> None:
+        # HFS+ ignored a zero-width joiner; APFS does not, and no sandbox root is on HFS+
+        self.assertNotEqual(fold("con‍fig"), fold("config"))
+
+    def test_the_kelvin_sign_and_the_long_s_are_spellings(self) -> None:
+        self.assertEqual(fold("Key"), fold("key"))
+        self.assertEqual(fold("ſ"), fold("s"))
 
 
 if __name__ == "__main__":

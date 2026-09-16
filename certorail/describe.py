@@ -78,6 +78,8 @@ def flagset_lines(fs: Flagset, sources: frozenset[SourceId]) -> list[str]:
         out.append(f"{name}{flag_demands(fs, name)}")
     for name, c in fs.valued.items():  # declaration order: the author's grouping
         out.append(f"{name} {constraint_phrase(c, sources)}{flag_demands(fs, name)}")
+    if fs.expand_single_flags:
+        out.append("bundled short flags accepted: -lr is -l -r (bare single-letter flags only)")
     return out
 
 
@@ -364,12 +366,22 @@ def describe(policy: Policy, origin: str, governs: str | None = None) -> str:
         "Locations are relative to the sandbox root (the working directory) unless they begin "
         "with '/'. Check without running: certorail -c SOURCE --check",
         NOTATION,
+        *(
+            [f"Rulesets composed into this policy: {', '.join(policy.applied)}"
+             + (" (base.toml is the config directory's base ruleset; base = false opts out)" if "base.toml" in policy.applied else "")]
+            if policy.applied else []
+        ),
         "",
     ]
     fs = [
         f"- {kind}: " + (", ".join(pretty_location(loc) for loc in locs) if locs else "nothing")
         for kind, locs in (("read", policy.read), ("write", policy.write), ("list", policy.listing))
     ]
+    if policy.no_write:
+        fs.append(
+            "- protected (no write may touch these, whatever write grants; a written path must "
+            "provably lie outside them): " + ", ".join(pretty_location(loc) for loc in policy.no_write)
+        )
     defined = frozenset(a.name for a in policy.atoms)
     programs = [line for p in policy.programs for line in _program(p, policy)]
     validations = [line for v in policy.validations for line in _validation(v, policy, defined)]

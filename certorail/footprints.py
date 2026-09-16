@@ -11,11 +11,15 @@ two such sequences -- does some concrete path lie in both what the write may nam
 footprint (with its implicit trailing descendants) may name? Both sides have finitely many
 splats, each standing for any run of components, so the test is a small alignment.
 
-Component equality folds case and normalises Unicode -- NFC, casefold, then git's ``protectHFS``
-rule of dropping ignorable code points -- unconditionally: whether two spellings name one file is
-a property of the mount, and an APFS directory bind-mounted into a Linux container keeps its
-insensitivity. A regex or wildcard component may equal any name, conservatively; only two
-concrete names that fold differently are known apart.
+Component equality folds case and normalises Unicode -- NFC, then casefold -- unconditionally:
+whether two spellings name one file is a property of the mount (APFS is case- and
+normalisation-insensitive by default), and an APFS directory bind-mounted into a Linux container
+keeps its insensitivity. HFS+'s further rule of ignoring format code points (git's
+``protectHFS``) is not applied: no sandbox root lives on HFS+ any more, and keeping it would make
+the set of spellings of a name unbounded. A wildcard component may equal any name; a regex
+component equals a concrete name exactly when it fullmatches some spelling that folds to it
+(``_spellings``: the fold's preimage, finite once format characters are not ignored), so ``\\w+``
+is known apart from ``.git`` and ``[^-].*`` is not.
 """
 import unicodedata
 from dataclasses import dataclass
@@ -30,8 +34,10 @@ from .analysis import (
     Matching,
     Named,
     OneOf,
+    PseudoRegex,
     StaticPath,
     _normalize_component,
+    _regex_accepts,
 )
 
 
@@ -59,17 +65,65 @@ class Footprint:
 ANYWHERE: Final = (Footprint((SPLAT,), absolute=False), Footprint((SPLAT,), absolute=True))
 
 
-# git's protectHFS: the code points HFS+ ignores when comparing names, which a name may
-# therefore smuggle without changing what it denotes
-_IGNORABLE = frozenset(
-    [0x200C, 0x200D, 0x200E, 0x200F, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
-     0x206A, 0x206B, 0x206C, 0x206D, 0x206E, 0x206F, 0xFEFF]
-)
-
-
 def fold(name: str) -> str:
     """The spelling under which two names denoting one file compare equal."""
-    return "".join(ch for ch in unicodedata.normalize("NFC", name).casefold() if ord(ch) not in _IGNORABLE)
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+# the exact regex-versus-name test enumerates a name's spellings; past these bounds it gives the
+# conservative answer instead
+_MAX_NAME = 16
+_MAX_SPELLINGS = 20_000
+
+
+@cache
+def _fold_table() -> dict[str, tuple[str, ...]]:
+    """Per folded ASCII fragment, every single code point that folds to it -- ``k`` is ``k``,
+    ``K`` and the Kelvin sign (NFC takes it to ``K``), ``ss`` is ``ß`` and ``ẞ``, ``fi`` the
+    ligature. A code point folds to a fragment of one to three characters; a raw spelling that is
+    a sequence of code points folds to the concatenation, so the preimage of a folded name is
+    every way of tiling it with fragments and choosing a code point per tile. Nothing non-ASCII
+    composes under NFC into a character folding to ASCII except through a single code point
+    (the Kelvin sign, the long s, the ligatures), which the scan sees directly."""
+    table: dict[str, list[str]] = {}
+    for code in range(0x110000):
+        ch = chr(code)
+        folded = fold(ch)
+        if 1 <= len(folded) <= 3 and folded.isascii():
+            table.setdefault(folded, []).append(ch)
+    return {k: tuple(v) for k, v in table.items()}
+
+
+def _spellings(folded: str) -> frozenset[str] | None:
+    """Every raw name that folds to *folded* (an ASCII folded name), or None when there are too
+    many to enumerate, or the name is not one this can be exact about."""
+    if not folded.isascii() or len(folded) > _MAX_NAME:
+        return None
+    table = _fold_table()
+    # left to right: extend every partial spelling by a code point for the next fragment
+    partial: dict[int, set[str]] = {0: {""}}
+    for end in range(1, len(folded) + 1):
+        here: set[str] = set()
+        for start in range(max(0, end - 3), end):
+            fragment = folded[start:end]
+            if fragment in table and start in partial:
+                for head in partial[start]:
+                    for ch in table[fragment]:
+                        here.add(head + ch)
+        if len(here) > _MAX_SPELLINGS:
+            return None
+        partial[end] = here
+    out = partial.get(len(folded), set())
+    return frozenset(out) if out else None
+
+
+def _regex_may_name(regex: PseudoRegex, folded: str) -> bool:
+    """Can a name in the regex's language fold to *folded*? Exact where the spellings of
+    *folded* can be enumerated, conservative (True) otherwise."""
+    spellings = _spellings(folded)
+    if spellings is None:
+        return True
+    return any(_regex_accepts(regex, s) for s in spellings)
 
 
 def items_of(loc: LocationFact) -> tuple[Item, ...]:
@@ -124,13 +178,17 @@ def _intersects(a: tuple[Item, ...], b: tuple[Item, ...]) -> bool:
 
 def compatible(c: Item, d: Item) -> bool:
     """May the two components name the same entry? Two concrete names are compared folded; a
-    regex or a wildcard may name anything, conservatively -- a regex that happens to exclude the
-    folded spellings of a name cannot be recognised without enumerating them."""
+    wildcard may name anything; a regex may name a concrete name exactly when it fullmatches
+    one of the name's spellings (``_regex_may_name``); two regexes, conservatively, may agree."""
     assert not isinstance(c, _Splat) and not isinstance(d, _Splat)
     c, d = _normalize_component(c), _normalize_component(d)
     match c, d:
-        case (AnyName(), _) | (_, AnyName()) | (Matching(), _) | (_, Matching()):
+        case (AnyName(), _) | (_, AnyName()) | (Matching(), Matching()):
             return True
+        case (Matching(regex=r), Named(name=n)) | (Named(name=n), Matching(regex=r)):
+            return _regex_may_name(r, fold(n))
+        case (Matching(regex=r), OneOf(names=ns)) | (OneOf(names=ns), Matching(regex=r)):
+            return any(_regex_may_name(r, fold(n)) for n in ns)
         case Named(name=n), Named(name=m):
             return fold(n) == fold(m)
         case (Named(name=n), OneOf(names=ms)) | (OneOf(names=ms), Named(name=n)):

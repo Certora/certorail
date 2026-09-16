@@ -1,0 +1,273 @@
+# coreutils, read rung: the tools an agent reaches for to look at a tree -- list, print, search,
+# compare, count -- and nothing that changes it. Meant as the common starting point of a
+# deployment's base.toml (applied with `where = "."`, so every rule works from any directory of
+# the sandbox root), and applicable on its own to a subtree. Nothing applies it by itself: the
+# owner of the machine writes the base.toml that does, or a root policy applies it directly.
+#
+# What makes a broad vocabulary safe here is the jail, not the flag list: every rule is
+# `network = false`, `write-fs = false` and `exec.spawn = false`, enforced by the OS, so a flag
+# that would write (`sort -o`), phone home, or run a program (`find -exec`) is denied by shape
+# where it is listed at all and fails loudly where it is not. The flag lists therefore only have
+# to answer one question: which flags take a PATH the tool would open. Those are constrained to
+# `${where}/**`; everything else a flag takes is data for the tool.
+#
+# Absent, therefore denied, everywhere in this file: anything that follows or waits (`tail -f`,
+# `--follow`), writes (`sort -o`, `tee`, `--output`), runs a program (`find -exec/-execdir/-ok`,
+# `xargs`, `grep --pre`, pagers), reads a file named inside another flag's value (`--files0-from`,
+# `-T DIR`), or takes a path outside `${where}`. Absent as whole tools: `sed` and `awk`, whose
+# *scripts* can name a file (`r FILE`, `getline < FILE`) that no flag list sees; GNU's `--sandbox`
+# would close that, but BSD sed and mawk lack it, and a base rung must hold on macOS too.
+#
+# Short flags bundle where the tool's parser does (GNU getopt: `ls -la`, `grep -rn`); `find`
+# takes single-dash words (`-name`) and does not bundle.
+ruleset-version = 1
+
+[params]
+where = { kind = "directory" }         # the tree the tools may look at; the base binds "."
+
+# ---------------------------------------------------------------------------------------------
+# listing
+
+[[program]]                            # ls [flags] [paths]
+name = "ls"
+argv = ["ls", "${FLAGS...}", "${FILES...}"]
+cwd  = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.expand-single-flags = true
+holes.FLAGS.bare = ["-l", "-a", "-A", "-h", "-R", "-t", "-S", "-r", "-1", "-d", "-F", "-p", "-i", "-s", "-g", "-o", "-n",
+                    "--color=never", "--group-directories-first", "--full-time"]
+holes.FLAGS."-I" = { any = true }                       # an ignore pattern: data
+holes.FLAGS."--time-style" = { matches = '[a-z-]+' }
+holes.FILES = { kind = "each", location = "${where}/**" }
+network  = false
+write-fs = false
+exec.spawn = false
+
+[[program]]                            # tree [flags] [dirs]
+name = "tree"
+argv = ["tree", "${FLAGS...}", "${DIRS...}"]
+cwd  = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.bare = ["-a", "-d", "-f", "-F", "-i", "-p", "-s", "-h", "-D", "-t", "-r", "--noreport", "--dirsfirst", "-n"]
+holes.FLAGS."-L" = { matches = '\d+' }
+holes.FLAGS."-I" = { any = true }                       # a pattern
+holes.FLAGS."-P" = { any = true }
+holes.DIRS = { kind = "each", location = "${where}/**" }
+network  = false
+write-fs = false
+exec.spawn = false
+
+[[program]]                            # find <dir> [expression]: no -exec, -delete, -fprint*, -ok
+name = "find"
+argv = ["find", "${WHERE}", "${FLAGS...}"]
+cwd  = "${where}/**"
+holes.WHERE = { location = "${where}/**" }
+holes.FLAGS.kind = "flags"                              # single-dash words: no bundling
+holes.FLAGS.bare = ["-print", "-print0", "-ls", "-empty", "-prune", "-not", "-a", "-o", "-and", "-or",
+                    "-readable", "-writable", "-executable", "-depth", "-mount", "-xdev", "-nogroup", "-nouser"]
+holes.FLAGS."-name"     = { any = true }                # patterns are matched against names, never opened
+holes.FLAGS."-iname"    = { any = true }
+holes.FLAGS."-path"     = { any = true }
+holes.FLAGS."-ipath"    = { any = true }
+holes.FLAGS."-regex"    = { any = true }
+holes.FLAGS."-iregex"   = { any = true }
+holes.FLAGS."-type"     = { one-of = ["f", "d", "l", "b", "c", "p", "s"] }
+holes.FLAGS."-maxdepth" = { matches = '\d+' }
+holes.FLAGS."-mindepth" = { matches = '\d+' }
+holes.FLAGS."-size"     = { matches = '[+-]?\d+[cwbkMG]?' }
+holes.FLAGS."-mtime"    = { matches = '[+-]?\d+' }
+holes.FLAGS."-mmin"     = { matches = '[+-]?\d+' }
+holes.FLAGS."-ctime"    = { matches = '[+-]?\d+' }
+holes.FLAGS."-atime"    = { matches = '[+-]?\d+' }
+holes.FLAGS."-perm"     = { matches = '[-/]?[0-7]{3,4}|[-/]?[ugoa]*[+-=][rwxXst]*' }
+holes.FLAGS."-user"     = { matches = '[\w-]+' }
+holes.FLAGS."-newer"    = { location = "${where}/**" }  # a path the tool stats
+holes.FLAGS."-samefile" = { location = "${where}/**" }
+network  = false
+write-fs = false
+exec.spawn = false
+
+# ---------------------------------------------------------------------------------------------
+# printing
+
+[[program]]                            # cat [flags] <files>
+name = "cat"
+argv = ["cat", "${FLAGS...}", "${FILES...}"]
+cwd  = "${where}/**"
+holes.FLAGS = { kind = "flags", bare = ["-n", "-b", "-s", "-A", "-E", "-T", "-v", "-e", "-t"], expand-single-flags = true }
+holes.FILES = { kind = "each", location = "${where}/**", min = 1 }
+network  = false
+write-fs = false
+exec.spawn = false
+
+[[program]]                            # head [flags] <files>
+name = "head"
+argv = ["head", "${FLAGS...}", "${FILES...}"]
+cwd  = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.expand-single-flags = true
+holes.FLAGS.bare = ["-q", "-v", "-z"]
+holes.FLAGS."-n" = { matches = '-?\d+[kKmMgG]?' }
+holes.FLAGS."-c" = { matches = '-?\d+[kKmMgG]?' }
+holes.FILES = { kind = "each", location = "${where}/**", min = 1 }
+network  = false
+write-fs = false
+exec.spawn = false
+
+[[program]]                            # tail [flags] <files>: no -f / -F (waits forever)
+name = "tail"
+argv = ["tail", "${FLAGS...}", "${FILES...}"]
+cwd  = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.expand-single-flags = true
+holes.FLAGS.bare = ["-q", "-v", "-z"]
+holes.FLAGS."-n" = { matches = '\+?\d+[kKmMgG]?' }
+holes.FLAGS."-c" = { matches = '\+?\d+[kKmMgG]?' }
+holes.FILES = { kind = "each", location = "${where}/**", min = 1 }
+network  = false
+write-fs = false
+exec.spawn = false
+
+[[program]]                            # stat [flags] <files>
+name = "stat"
+argv = ["stat", "${FLAGS...}", "${FILES...}"]
+cwd  = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.bare = ["-L", "-t", "-f"]
+holes.FLAGS."-c"       = { any = true }                 # a format string
+holes.FLAGS."--format" = { any = true }
+holes.FILES = { kind = "each", location = "${where}/**", min = 1 }
+network  = false
+write-fs = false
+exec.spawn = false
+
+[[program]]                            # file [flags] <files>
+name = "file"
+argv = ["file", "${FLAGS...}", "${FILES...}"]
+cwd  = "${where}/**"
+holes.FLAGS = { kind = "flags", bare = ["-b", "-i", "-L", "-h", "-z", "-k", "--mime-type", "--mime-encoding"], expand-single-flags = true }
+holes.FILES = { kind = "each", location = "${where}/**", min = 1 }
+network  = false
+write-fs = false
+exec.spawn = false
+
+# ---------------------------------------------------------------------------------------------
+# searching
+
+[[program]]                            # grep [flags] -- <pattern> <files>: "--" lets the pattern look like an option
+name = "grep"
+argv = ["grep", "${FLAGS...}", "--", "${PATTERN}", "${FILES...}"]
+cwd  = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.expand-single-flags = true
+holes.FLAGS.bare = ["-r", "-R", "-n", "-c", "-l", "-L", "-i", "-E", "-F", "-G", "-P", "-w", "-x", "-o", "-h", "-H", "-v", "-s",
+                    "-q", "-a", "-I", "-b", "-z", "-Z", "--color=never", "--no-messages", "--line-buffered"]
+holes.FLAGS."-e" = { any = true }                       # further patterns: data
+holes.FLAGS."-m" = { matches = '\d+' }
+holes.FLAGS."-A" = { matches = '\d+' }
+holes.FLAGS."-B" = { matches = '\d+' }
+holes.FLAGS."-C" = { matches = '\d+' }
+holes.FLAGS."--include"     = { matches = '[^/]+' }     # a glob on basenames
+holes.FLAGS."--exclude"     = { matches = '[^/]+' }
+holes.FLAGS."--exclude-dir" = { matches = '[^/]+' }
+holes.FLAGS."-f"            = { location = "${where}/**" }   # patterns read from a file: a path
+holes.PATTERN = { any = true }
+holes.FILES   = { kind = "each", location = "${where}/**", min = 1 }
+network  = false
+write-fs = false
+exec.spawn = false
+
+# ---------------------------------------------------------------------------------------------
+# comparing and counting
+
+[[program]]                            # diff [flags] <a> <b> (or directories)
+name = "diff"
+argv = ["diff", "${FLAGS...}", "${FILES...}"]
+cwd  = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.expand-single-flags = true
+holes.FLAGS.bare = ["-u", "-r", "-q", "-N", "-w", "-b", "-B", "-i", "-s", "-a", "-t", "-T", "-y", "-c", "-p",
+                    "--brief", "--color=never", "--no-dereference", "--strip-trailing-cr"]
+holes.FLAGS."-U" = { matches = '\d+' }
+holes.FLAGS."-C" = { matches = '\d+' }
+holes.FLAGS."-x" = { any = true }                       # an exclude pattern
+holes.FLAGS."--exclude" = { any = true }
+holes.FLAGS."-X" = { location = "${where}/**" }         # patterns read from a file
+holes.FILES = { kind = "each", location = "${where}/**", min = 2 }
+network  = false
+write-fs = false
+exec.spawn = false
+
+[[program]]                            # wc [flags] [files]
+name = "wc"
+argv = ["wc", "${FLAGS...}", "${FILES...}"]
+cwd  = "${where}/**"
+holes.FLAGS = { kind = "flags", bare = ["-l", "-w", "-c", "-m", "-L"], expand-single-flags = true }
+holes.FILES = { kind = "each", location = "${where}/**" }
+network  = false
+write-fs = false
+exec.spawn = false
+
+[[program]]                            # du [flags] [paths]
+name = "du"
+argv = ["du", "${FLAGS...}", "${FILES...}"]
+cwd  = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.expand-single-flags = true
+holes.FLAGS.bare = ["-h", "-s", "-a", "-c", "-x", "-L", "-k", "-m", "-b", "--apparent-size", "--total"]
+holes.FLAGS."-d" = { matches = '\d+' }
+holes.FLAGS."--max-depth" = { matches = '\d+' }
+holes.FLAGS."--exclude" = { any = true }
+holes.FILES = { kind = "each", location = "${where}/**" }
+network  = false
+write-fs = false
+exec.spawn = false
+
+# ---------------------------------------------------------------------------------------------
+# filtering text (input from files; stdin is /dev/null under the broker)
+
+[[program]]                            # sort [flags] [files]: no -o (writes), no -T (TMPDIR is set)
+name = "sort"
+argv = ["sort", "${FLAGS...}", "${FILES...}"]
+cwd  = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.expand-single-flags = true
+holes.FLAGS.bare = ["-r", "-n", "-u", "-f", "-b", "-h", "-V", "-s", "-z", "-c", "-C", "-d", "-i", "-M", "-R", "--stable"]
+holes.FLAGS."-k" = { matches = '[\d.,a-zA-Z]+' }
+holes.FLAGS."-t" = { any = true }                       # the field separator: one character of data
+holes.FILES = { kind = "each", location = "${where}/**" }
+network  = false
+write-fs = false
+exec.spawn = false
+
+[[program]]                            # uniq [flags] [file]
+name = "uniq"
+argv = ["uniq", "${FLAGS...}", "${FILES...}"]
+cwd  = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.expand-single-flags = true
+holes.FLAGS.bare = ["-c", "-d", "-D", "-u", "-i", "-z"]
+holes.FLAGS."-f" = { matches = '\d+' }
+holes.FLAGS."-s" = { matches = '\d+' }
+holes.FLAGS."-w" = { matches = '\d+' }
+holes.FILES = { kind = "each", location = "${where}/**" }
+network  = false
+write-fs = false
+exec.spawn = false
+
+[[program]]                            # cut [flags] [files]
+name = "cut"
+argv = ["cut", "${FLAGS...}", "${FILES...}"]
+cwd  = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.expand-single-flags = true
+holes.FLAGS.bare = ["-s", "-z", "--complement"]
+holes.FLAGS."-d" = { any = true }                       # the delimiter
+holes.FLAGS."-f" = { matches = '[\d,-]+' }
+holes.FLAGS."-c" = { matches = '[\d,-]+' }
+holes.FLAGS."-b" = { matches = '[\d,-]+' }
+holes.FLAGS."--output-delimiter" = { any = true }
+holes.FILES = { kind = "each", location = "${where}/**" }
+network  = false
+write-fs = false
+exec.spawn = false

@@ -385,6 +385,101 @@ class TestIntent(Base):
         self.assertEqual(command.argv, ["dropdb", "dev-x"])
 
 
+BUNDLING = Policy.allow(
+    read=[markers.within(".")],
+    programs=[
+        program(
+            "ls", cwd=".", argv=["ls", splice("FLAGS"), splice("FILES")],
+            holes={
+                "FLAGS": Flags(flagset(bare=["-l", "-a", "-h"], valued={"-w": constraint(matches=r"\d+")}, expand_single_flags=True)),
+                "FILES": Each(constraint(location=REPOS)),
+            },
+        ),
+        program(
+            "wc", cwd=".", argv=["wc", splice("FLAGS")],
+            holes={"FLAGS": Flags(flagset(bare=["-l", "-c"]))},  # no bundling here
+        ),
+    ],
+)
+
+
+class TestBundledFlags(unittest.TestCase):
+    def check(self, body: str):
+        return host_check(HEADER + REPO + body, "<t>", BUNDLING)
+
+    def accept(self, body: str) -> None:
+        result = self.check(body)
+        if isinstance(result, Rejected):
+            self.fail("\n".join(result.describe("<t>")))
+
+    def denial(self, body: str) -> str:
+        result = self.check(body)
+        assert isinstance(result, Rejected), "expected a rejection"
+        return result.denials[0].reason
+
+    def test_a_bundle_expands_positionally_and_by_keyword(self) -> None:
+        self.accept('certora.exec("ls", "-lh", repo, cwd=pathlib.Path("."))\n')
+        self.accept('certora.exec("ls", FLAGS=["-ah", "-l"], FILES=[repo], cwd=pathlib.Path("."))\n')
+        self.accept('certora.exec("ls", "-lh", "-w", "80", repo, cwd=pathlib.Path("."))\n')
+
+    def test_the_tool_receives_the_expanded_words(self) -> None:
+        command = BUNDLING.exec_command("ls", ["-lh", "repos/x"], {}, ".")
+        assert isinstance(command, Command)
+        self.assertEqual(command.argv, ["ls", "-l", "-h", "repos/x"])
+        command = BUNDLING.exec_command("ls", [], {"FLAGS": ["-ha", "-w", "80"], "FILES": ["repos/x"]}, ".")
+        assert isinstance(command, Command)
+        self.assertEqual(command.argv, ["ls", "-h", "-a", "-w", "80", "repos/x"])
+
+    def test_a_bundle_with_a_valued_or_unknown_letter_is_named(self) -> None:
+        self.assertIn(
+            "the bundle '-lw' contains the valued flag '-w': spell it separately",
+            self.denial('certora.exec("ls", "-lw", "80", repo, cwd=pathlib.Path("."))\n'),
+        )
+        self.assertIn(
+            "'-x' is not a declared flag (from the bundle '-lx')",
+            self.denial('certora.exec("ls", FLAGS=["-lx"], FILES=[repo], cwd=pathlib.Path("."))\n'),
+        )
+
+    def test_without_the_key_a_bundle_is_just_an_undeclared_flag(self) -> None:
+        self.assertIn("'-lc' is not a declared flag", self.denial('certora.exec("wc", FLAGS=["-lc"], cwd=pathlib.Path("."))\n'))
+        self.assertIn("'-lc' is not a declared flag", self.denial('certora.exec("wc", "-lc", cwd=pathlib.Path("."))\n'))
+
+    def test_long_options_never_expand(self) -> None:
+        self.assertIn("'--all' is not a declared flag", self.denial('certora.exec("ls", FLAGS=["--all"], FILES=[repo], cwd=pathlib.Path("."))\n'))
+
+    def test_the_key_is_refused_where_the_tool_does_not_bundle(self) -> None:
+        with self.assertRaisesRegex(ValueError, "'-name' is a single-dash multi-letter flag"):
+            flagset(bare=["-print"], valued={"-name": constraint(any=True)}, expand_single_flags=True)
+        with self.assertRaisesRegex(ValueError, "says nothing about an open flag vocabulary"):
+            flagset(any=True, expand_single_flags=True)
+        with self.assertRaises(PolicyFileError) as cm:
+            from_data({
+                "policy-version": 1,
+                "program": [{
+                    "name": "find", "cwd": ".", "argv": ["find", "${FLAGS...}"],
+                    "holes": {"FLAGS": {"kind": "flags", "bare": ["-print"], "-name": {"any": True}, "expand-single-flags": True}},
+                }],
+            })
+        self.assertIn("program[0].holes.FLAGS: expand-single-flags: '-name' is a single-dash multi-letter flag", str(cm.exception))
+
+    def test_loads_and_describes(self) -> None:
+        policy = from_data({
+            "policy-version": 1,
+            "flagset": [{"name": "ls-ro", "bare": ["-l", "-a"], "expand-single-flags": True}],
+            "program": [{
+                "name": "ls", "cwd": ".", "argv": ["ls", "${FLAGS...}"],
+                "holes": {"FLAGS": {"kind": "flags", "flagset": "ls-ro"}},
+            }],
+        })
+        ls = policy.programs[0].template
+        assert ls is not None
+        flags = ls.holes[HoleName("FLAGS")]
+        assert isinstance(flags, Flags)
+        self.assertTrue(flags.flagset.expand_single_flags)
+        from certorail.describe import describe
+        self.assertIn("bundled short flags accepted: -lr is -l -r", describe(policy, "p.toml", None))
+
+
 class TestTemplateWellFormedness(unittest.TestCase):
     def test_template_errors(self) -> None:
         good = Token(constraint(any=True))

@@ -71,6 +71,7 @@ from collections.abc import Callable, Sequence
 from .analysis import _literal_location, location_le
 from .childjail import Jail, JailUnavailable, confined
 from .enforcement import Discharge
+from .integrity import materialize
 from .policy import (
     NetworkRule,
     Policy,
@@ -585,6 +586,10 @@ def _run_check(
     workdir = root if cwd is None else _resolve(root, cwd)
     argv = [piece if isinstance(piece, str) else params[piece.name]
             for piece in declared.argv]
+    if declared.evaluator is not None:
+        # exec the load-time snapshot: the installed checker drifting mid-run changes nothing,
+        # because the file in checkers/ is not what runs (integrity.materialize)
+        argv[0] = materialize(declared.evaluator)
     returncode, _, err = _spawn_drained(client, argv, workdir, declared.jail)
     log.info("CHECK %s (cwd=%s) -> %d", name, cwd if cwd is not None else ".", returncode)
     return {

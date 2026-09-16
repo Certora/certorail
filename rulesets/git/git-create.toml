@@ -1,0 +1,60 @@
+# git, create rung: clone and init. Both run in the directory that holds repositories (`where`
+# itself, not a repository) and create a child of it: DIR is one path component, spelled
+# relative to that directory. Clone's URL is the root's constraint (`from`), and the pack
+# requires git.remote-url of it beside that (the git-remote-url checker: https, ssh or
+# user@host:path, never a local path, file://, or the ext:: transport that runs a command).
+#
+# Absent, therefore denied:
+#   --template (copies hooks into the new repository), -c/--config (sets repository config,
+#     core.hooksPath included), --separate-git-dir, --bare, --shared
+#   --recurse-submodules, --shallow-submodules (clone URLs read from the fetched .gitmodules)
+#   -l/--local, --reference, --dissociate, --shared (read another local repository)
+#   -u/--upload-pack (runs a command on the remote end)
+ruleset-version = 1
+
+[params]
+where = { kind = "directory" }
+from  = { kind = "constraint" }        # what may be cloned; no default: the root says
+
+[[apply]]
+ruleset = "git-vocabulary.toml"
+where   = "${where}"
+
+# ---------------------------------------------------------------------------------------------
+[[program]]
+name       = "git"
+argv       = ["git", "clone", "${URL}", "${DIR}", "${FLAGS...}"]
+cwd        = "${where}"
+holes.URL  = "${from}"
+holes.DIR  = { location = "*" }
+holes.FLAGS.kind = "flags"
+holes.FLAGS.bare = [
+  "-q", "--quiet", "-v", "--verbose", "--progress", "--no-progress", "-n", "--no-checkout",
+  "--single-branch", "--no-single-branch", "--no-tags", "--sparse", "--filter=blob:none", "--filter=tree:0",
+  "--no-remote-submodules", "--no-hardlinks",
+]
+holes.FLAGS."--depth"         = { matches = '[0-9]+' }
+holes.FLAGS."--shallow-since" = { any = true }
+holes.FLAGS."-b"              = { atoms = ["git.ref-name"] }
+holes.FLAGS."--branch"        = { atoms = ["git.ref-name"] }
+holes.FLAGS."-o"              = { atoms = ["git.ref-name"] }
+holes.FLAGS."--origin"        = { atoms = ["git.ref-name"] }
+holes.FLAGS."-j"              = { matches = '[0-9]+' }
+holes.FLAGS."--jobs"          = { matches = '[0-9]+' }
+requires   = { URL = ["git.remote-url"] }
+network    = true
+# writes: undeclared, deliberately. A fresh clone creates every region there is.
+
+# ---------------------------------------------------------------------------------------------
+[[program]]
+name       = "git"
+argv       = ["git", "init", "${FLAGS...}", "--", "${DIR}"]
+cwd        = "${where}"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.bare = ["-q", "--quiet"]
+holes.FLAGS."-b"               = { atoms = ["git.ref-name"] }
+holes.FLAGS."--initial-branch" = { atoms = ["git.ref-name"] }
+holes.FLAGS."--object-format"  = { one-of = ["sha1", "sha256"] }
+holes.DIR  = { location = "*" }
+network    = false
+# writes: undeclared, deliberately, as for clone.

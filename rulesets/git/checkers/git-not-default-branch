@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""certorail checker: the argument is not one of the conventional default branch names.
+
+Establishes git.not-default-branch. Says nothing about shape: combine with git.ref-name.
+"""
+import sys
+
+DEFAULTS = frozenset({"main", "master", "develop", "trunk"})
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        print("git-not-default-branch: expected exactly one argument", file=sys.stderr)
+        sys.exit(1)
+    name = sys.argv[1]
+    if name in DEFAULTS:
+        print(f"git-not-default-branch: {name!r} is a default branch", file=sys.stderr)
+        sys.exit(1)
+    sys.exit(0)
+
+
+main()

@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""certorail checker: the argument is a git configuration key, section.name or
+section.subsection.name.
+
+Establishes git.config-key and not-option. Section and variable names are alphanumeric with
+"-" and begin with a letter (git's rule); the optional subsection may be any text without a
+newline or NUL. Never begins with "-".
+"""
+import re
+import sys
+
+_NAME = re.compile(r"[A-Za-z][A-Za-z0-9-]*")
+
+
+def refuse(why: str) -> None:
+    print(f"git-config-key: {why}", file=sys.stderr)
+    sys.exit(1)
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        refuse("expected exactly one argument")
+    key = sys.argv[1]
+    if not key:
+        refuse("empty")
+    if key.startswith("-"):
+        refuse(f"{key!r} begins with '-'")
+    if "\n" in key or "\0" in key or "=" in key:
+        refuse(f"{key!r} contains a newline, NUL or '='")
+    section, _, rest = key.partition(".")
+    if not rest:
+        refuse(f"{key!r} has no variable name")
+    subsection, _, name = rest.rpartition(".")
+    if _NAME.fullmatch(section) is None:
+        refuse(f"{key!r}: section {section!r} is not a name")
+    if _NAME.fullmatch(name) is None:
+        refuse(f"{key!r}: variable {name!r} is not a name")
+    sys.exit(0)
+
+
+main()

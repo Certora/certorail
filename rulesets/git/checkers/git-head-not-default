@@ -1,0 +1,15 @@
+#!/bin/sh
+# certorail checker: HEAD at the working directory names a branch, and that branch is not one of
+# the conventional default branches. A detached HEAD fails.
+set -eu
+branch="$(git symbolic-ref -q --short HEAD 2>/dev/null)" || {
+    echo "git-head-not-default: HEAD is detached, or this is not a repository" >&2
+    exit 1
+}
+case "$branch" in
+    main|master|develop|trunk)
+        echo "git-head-not-default: HEAD is on $branch" >&2
+        exit 1
+        ;;
+esac
+exit 0

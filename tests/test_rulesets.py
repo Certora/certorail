@@ -6,11 +6,13 @@ import pathlib
 import stat
 import tempfile
 import unittest
+from unittest import mock
 
 from certorail import markers
 from certorail.host import Accepted, Rejected
 from certorail.host import check as host_check
 from certorail.ids import HoleName
+from certorail.install import install_pack
 from certorail.policy import Policy
 from certorail.policyfile import PolicyFileError, from_data
 from certorail.templates import Constraint, Each, Flags, Token
@@ -72,8 +74,8 @@ HEADER = "import pathlib\nimport sys\n"
 class RulesetCase(unittest.TestCase):
     def setUp(self) -> None:
         self.config = pathlib.Path(tempfile.mkdtemp())
-        os.environ["CERTORAIL_CONFIG_DIR"] = str(self.config)
-        self.addCleanup(os.environ.pop, "CERTORAIL_CONFIG_DIR", None)
+        # this test's own config directory; the suite-wide isolated one comes back after (conftest)
+        self.enterContext(mock.patch.dict(os.environ, {"CERTORAIL_CONFIG_DIR": str(self.config)}))
         (self.config / "rulesets").mkdir()
         (self.config / "checkers").mkdir()
         checker = self.config / "checkers" / "org-checkout"
@@ -188,6 +190,210 @@ class TestApply(RulesetCase):
             self.assertIn(expected, str(cm.exception))
 
 
+BASE = """
+ruleset-version = 1
+
+[filesystem]
+no-write = ["**/.secret"]
+
+[[program]]
+name = "cat"
+cwd  = "**"
+argv = ["cat", "${FILES...}"]
+holes.FILES = { kind = "each", location = "**", min = 1 }
+network  = false
+write-fs = false
+
+[[apply]]                      # a pack the base carries, bound to the root itself
+ruleset = "unix.toml"
+where   = "."
+"""
+
+
+class TestBase(RulesetCase):
+    """``rulesets/base.toml``: a ruleset applied to every root by its fixed name."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.ruleset("base.toml", BASE)
+
+    def test_the_base_applies_to_every_root(self) -> None:
+        policy = from_data({"policy-version": 1})
+        self.assertEqual(sorted(p.name for p in policy.programs), ["cat", "grep", "ls"])
+        self.assertEqual(sorted({p.origin for p in policy.programs}), ["base.toml", "unix.toml (where=.)"])
+        # never silent: the policy records what was composed in, and describe says so
+        self.assertEqual(policy.applied, ("base.toml", "unix.toml (where=.)"))
+        from certorail.describe import describe
+        self.assertIn("Rulesets composed into this policy: base.toml, unix.toml (where=.) (base.toml is the config directory's base ruleset; base = false opts out)", describe(policy, "p.toml", None))
+        self.assertEqual(from_data({"policy-version": 1, "base": False}).applied, ())
+        self.assertEqual([str(loc.absolute) for loc in policy.no_write], ["False"])  # the protection travels
+        grep = next(p for p in policy.programs if p.name == "grep")
+        self.assertEqual(len(grep.cwd), 1)  # ${where} with where = ".": the root
+
+    def test_the_default_policy_carries_it_too(self) -> None:
+        from certorail.policyfile import default_policy
+        policy = default_policy()
+        self.assertEqual(sorted(p.name for p in policy.programs), ["cat", "grep", "ls"])
+        self.assertEqual(len(policy.read), 1)
+
+    def test_no_base_file_means_no_base(self) -> None:
+        (self.config / "rulesets" / "base.toml").unlink()
+        self.assertEqual(from_data({"policy-version": 1}).programs, ())
+
+    def test_base_false_opts_out(self) -> None:
+        policy = from_data({"policy-version": 1, "base": False, "program": [{"name": "ls", "cwd": "."}]})
+        self.assertEqual([(p.name, p.origin) for p in policy.programs], [("ls", None)])
+
+    def test_a_root_rule_overlapping_the_base_needs_override(self) -> None:
+        with self.assertRaises(PolicyFileError) as cm:
+            from_data({"policy-version": 1, "program": [{"name": "cat", "cwd": "."}]})
+        self.assertIn("'cat' overlaps 'cat' from base.toml; add override = true to replace it, or [[deny]] it", str(cm.exception))
+        policy = from_data({"policy-version": 1, "program": [{"name": "cat", "cwd": ".", "override": True}]})
+        cat = [p for p in policy.programs if p.name == "cat"]
+        self.assertEqual([p.origin for p in cat], [None])
+
+    def test_deny_takes_a_base_shape_back(self) -> None:
+        policy = from_data({"policy-version": 1, "deny": [{"argv": ["cat"]}]})
+        self.assertEqual(sorted(p.name for p in policy.programs), ["grep", "ls"])
+
+    def test_applying_the_base_explicitly_is_the_same_document(self) -> None:
+        policy = from_data({"policy-version": 1, "apply": [{"ruleset": "base.toml"}]})
+        self.assertEqual(sorted(p.name for p in policy.programs), ["cat", "grep", "ls"])
+        # and applying a pack the base already carries, identically, is the same document too
+        policy = from_data({"policy-version": 1, "apply": [{"ruleset": "unix.toml", "where": "."}]})
+        self.assertEqual(sorted(p.name for p in policy.programs), ["cat", "grep", "ls"])
+
+    def test_a_base_with_a_parameter_to_bind_is_an_error(self) -> None:
+        self.ruleset("base.toml", 'ruleset-version = 1\n[params]\nwhere = { kind = "directory" }\n[[program]]\nname = "ls"\ncwd = "${where}"\n')
+        with self.assertRaises(PolicyFileError) as cm:
+            from_data({"policy-version": 1})
+        self.assertIn("base.toml: program[0].cwd: parameter 'where' is not bound", str(cm.exception))
+
+    def test_the_base_grants_run(self) -> None:
+        policy = from_data({"policy-version": 1, "filesystem": {"read": ["**"]}})
+        source = HEADER + 'certora.exec("cat", pathlib.Path("src") / "x.py", cwd=pathlib.Path("src") / "pkg")\n'
+        outcome = host_check(source, "<t>", policy)
+        if isinstance(outcome, Rejected):
+            self.fail("\n".join(outcome.describe("<t>")))
+        # the protection the base carries applies to the root's own writes
+        denied = host_check(HEADER + 'pathlib.Path("x/.secret").write_text("k")\n', "<t>", from_data({"policy-version": 1, "filesystem": {"write": ["**"]}}))
+        assert isinstance(denied, Rejected)
+        self.assertIn("protected (no-write)", denied.denials[0].reason)
+
+
+SHIPPED = pathlib.Path(__file__).resolve().parent.parent / "rulesets"
+FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"
+
+
+@unittest.skipUnless((SHIPPED / "git").is_dir(), "the shipped git pack is not in this tree")
+class TestGitPack(RulesetCase):
+    """The shipped git pack loads, through a root policy that applies it (the fixture)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        install_pack(SHIPPED / "git")  # the real install path: rulesets, notes, checkers made executable
+
+    def test_the_fixture_root_policy_loads(self) -> None:
+        import tomllib
+        data = tomllib.loads((FIXTURES / "git-policy.toml").read_text(encoding="utf-8"))
+        policy = from_data(data, "git-policy.toml")
+        shapes = sorted(" ".join(p.leading_words) for p in policy.programs)
+        self.assertIn("git log", shapes)
+        self.assertIn("git add", shapes)
+        self.assertNotIn("git apply", shapes)          # denied by the root
+        self.assertIn("git push", shapes)              # the root's override
+        self.assertNotIn("git push origin", shapes)    # the pack's shape it replaced
+        self.assertNotIn("git rebase", shapes)         # rewrite = false: the rung is not applied
+        push = next(p for p in policy.programs if p.leading_words == ("git", "push"))
+        self.assertIsNone(push.origin)
+        self.assertIn("git.ref-name", {a for v in policy.validations for atoms in v.establishes.values() for a in atoms})
+        # the vocabulary's protection reaches the root: no program write may touch a .git
+        self.assertTrue(any(".git" in str(loc) for loc in policy.no_write))
+
+    def test_every_rung_applies(self) -> None:
+        policy = from_data({
+            "policy-version": 1,
+            "filesystem": {"read": ["repos/**"], "write": ["repos/*/**"]},
+            "atoms": {"my-branch": {"matches": "agent/.*"}},
+            "apply": [{
+                "ruleset": "git.toml", "where": "repos", "remote": {"one-of": ["origin", "fork"]},
+                "branch": {"atoms": ["my-branch"]}, "push-gate": [],
+                "rewrite": True, "force": True, "force-gate": ["git.not-default-branch"], "delete": True,
+                "rebase-pull": True, "skip-hooks": True, "clone": True, "clone-from": {"atoms": ["git.remote-url"]},
+            }],
+        })
+        shapes = sorted(" ".join(p.leading_words) for p in policy.programs)
+        for shape in ("git log", "git commit", "git rebase", "git push", "git clone"):
+            self.assertIn(shape, shapes)
+
+
+@unittest.skipUnless((SHIPPED / "coreutils").is_dir(), "the shipped coreutils pack is not in this tree")
+class TestCoreutilsRo(RulesetCase):
+    """The shipped read rung of coreutils, as a base.toml would apply it: every rule jailed, the
+    common spellings bind, the excluded operations are unspellable."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        install_pack(SHIPPED / "coreutils")
+        self.ruleset("base.toml", 'ruleset-version = 1\n[[apply]]\nruleset = "coreutils-ro.toml"\nwhere = "."\n')
+        self.policy = from_data({"policy-version": 1, "filesystem": {"read": ["**"]}})
+
+    def test_every_rule_is_jailed(self) -> None:
+        self.assertGreaterEqual(len(self.policy.programs), 14)
+        for p in self.policy.programs:
+            with self.subTest(program=p.name):
+                self.assertEqual((p.network, p.write_fs, p.spawn), (False, False, False))
+                self.assertTrue(p.effect_free)
+
+    def check(self, body: str):
+        return host_check(HEADER + body, "<t>", self.policy)
+
+    def test_the_common_spellings_bind(self) -> None:
+        for body in (
+            'certora.exec("ls", "-la", pathlib.Path("src"), cwd=pathlib.Path("."))\n',
+            'certora.exec("ls", cwd=pathlib.Path("src") / "pkg")\n',
+            'certora.exec("cat", "-n", pathlib.Path("README.md"), cwd=pathlib.Path("."))\n',
+            'certora.exec("head", "-n", "20", pathlib.Path("README.md"), cwd=pathlib.Path("."))\n',
+            'certora.exec("tail", "-n", "+5", pathlib.Path("log.txt"), cwd=pathlib.Path("."))\n',
+            'certora.exec("grep", "-rn", "TODO", pathlib.Path("src"), cwd=pathlib.Path("."))\n',
+            'certora.exec("grep", "-rn", "--include", "*.py", "TODO", pathlib.Path("src"), cwd=pathlib.Path("."))\n',
+            'certora.exec("grep", FLAGS=["-r", "-e", "-x", "-e", "-y"], PATTERN="z", FILES=[pathlib.Path("src")], cwd=pathlib.Path("."))\n',
+            'certora.exec("find", pathlib.Path("src"), "-name", "*.py", "-type", "f", "-not", "-path", "*/tests/*", cwd=pathlib.Path("."))\n',
+            'certora.exec("diff", "-u", pathlib.Path("a.txt"), pathlib.Path("b.txt"), cwd=pathlib.Path("."))\n',
+            'certora.exec("wc", "-l", pathlib.Path("a.txt"), cwd=pathlib.Path("."))\n',
+            'certora.exec("sort", "-rn", "-k", "2,2", pathlib.Path("a.txt"), cwd=pathlib.Path("."))\n',
+            'certora.exec("du", "-sh", pathlib.Path("src"), cwd=pathlib.Path("."))\n',
+            'certora.exec("stat", "-c", "%s", pathlib.Path("a.txt"), cwd=pathlib.Path("."))\n',
+            'certora.exec("cut", "-d", ",", "-f", "1,3", pathlib.Path("a.csv"), cwd=pathlib.Path("."))\n',
+        ):
+            with self.subTest(body=body):
+                outcome = self.check(body)
+                if isinstance(outcome, Rejected):
+                    self.fail("\n".join(outcome.describe("<t>")))
+
+    def test_the_script_tools_are_absent(self) -> None:
+        # sed and awk scripts can name files the flag list never sees; not portable to close
+        for program in ("sed", "awk"):
+            self.assertNotIn(program, {p.name for p in self.policy.programs})
+
+    def test_the_excluded_operations_are_unspellable(self) -> None:
+        for body, why in (
+            ('certora.exec("find", pathlib.Path("src"), "-exec", "rm", "{}", ";", cwd=pathlib.Path("."))\n', "-exec"),
+            ('certora.exec("find", pathlib.Path("src"), "-delete", cwd=pathlib.Path("."))\n', "-delete"),
+            ('certora.exec("tail", "-f", pathlib.Path("log.txt"), cwd=pathlib.Path("."))\n', "-f"),
+            ('certora.exec("sort", "-o", pathlib.Path("out.txt"), pathlib.Path("a.txt"), cwd=pathlib.Path("."))\n', "-o"),
+            ('certora.exec("grep", "-r", "x", pathlib.Path("/etc"), cwd=pathlib.Path("."))\n', "not a proven path"),
+            ('certora.exec("grep", "-rf", pathlib.Path("/etc/passwd"), "x", pathlib.Path("src"), cwd=pathlib.Path("."))\n', "valued flag"),
+            ('certora.exec("diff", "-X", pathlib.Path("/etc/shadow"), pathlib.Path("a"), pathlib.Path("b"), cwd=pathlib.Path("."))\n', "not a proven path"),
+            ('certora.exec("cat", cwd=pathlib.Path("."))\n', "at least 1"),
+            ('certora.exec("grep", "-r", sys.argv[1], pathlib.Path("src"), cwd=pathlib.Path("."))\n', "could be a flag"),
+        ):
+            with self.subTest(body=body):
+                outcome = self.check(body)
+                assert isinstance(outcome, Rejected), body
+                self.assertIn(why, outcome.denials[0].reason)
+
+
 class TestRulesetWellFormedness(RulesetCase):
     def load(self, text: str, **bindings) -> Policy:
         self.ruleset("r.toml", text)
@@ -196,7 +402,7 @@ class TestRulesetWellFormedness(RulesetCase):
     def test_exec_side_vocabulary_only(self) -> None:
         with self.assertRaises(PolicyFileError) as cm:
             self.load('ruleset-version = 1\n[filesystem]\nread = ["**"]\n')
-        self.assertIn("unknown key 'filesystem'", str(cm.exception))
+        self.assertIn("filesystem: unknown key 'read'", str(cm.exception))  # only no-write: a ruleset grants nothing
 
     def test_version_is_required(self) -> None:
         with self.assertRaises(PolicyFileError) as cm:

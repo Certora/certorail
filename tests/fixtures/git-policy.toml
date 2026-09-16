@@ -1,0 +1,52 @@
+# Test fixture: a root policy applying the git pack, exercising deny, override, no-write and a
+# binding of every parameter kind. The agent works on repositories under repos/, may push only
+# its own branches, only from checkouts of the organisation, and may not force anything. One
+# shape is taken back from the pack (git apply) and one is replaced (git push, to allow a fork
+# remote as well). Loaded by tests/test_schema.py (shape), tests/test_rulesets.py::TestGitPack and
+# tests/test_install.py (through the installed pack).
+policy-version = 1
+
+[filesystem]
+read  = ["repos/**", "patches/**"]
+list  = ["repos/**", "patches/**"]
+# Writable: the repositories. The pack itself protects every .git below `where` (git-vocabulary's
+# `no-write`), so the exclusion needs no regex here: a program write that may touch one is denied.
+write = ["repos/*/**", "patches/**"]
+
+[atoms]
+org-checkout = { reads = ["git.config"] }               # origin belongs to the organisation
+my-branch    = { matches = 'agent/[A-Za-z0-9._-]+' }    # the branches this agent owns
+
+[[validation]]
+name        = "org-checkout"
+argv        = ["${checkers}/org-checkout"]              # the deployment's own checker: reads remote.origin.url
+cwd         = "repos/*"
+writes      = []
+establishes = { cwd = ["org-checkout"] }
+
+[[apply]]
+ruleset   = "git.toml"
+where     = "repos"
+remote    = { one-of = ["origin"] }                     # the pack's push (replaced below, but every bound parameter is the root's to say)
+branch    = { atoms = ["my-branch"], literal = true }   # a branch the program named, of the agent's shape
+push-gate = ["org-checkout"]
+# force, delete, rewrite, rebase-pull, skip-hooks, clone: unbound, so false
+
+# Patches are not for this agent: the local rung's `git apply` shape is removed.
+[[deny]]
+argv = ["git", "apply"]
+
+# Complete control over push: the pack's shape is replaced by one that also allows a fork
+# remote (without `override` the overlap of leading words is a load error). The pack's atoms and
+# checkers stay available to the replacement.
+[[program]]
+override     = true
+name         = "git"
+argv         = ["git", "push", "${REMOTE}", "${BRANCH}", "${FLAGS...}"]
+cwd          = "repos/*"
+holes.REMOTE = { one-of = ["origin", "fork"] }
+holes.BRANCH = { atoms = ["my-branch", "git.ref-name"], literal = true }
+holes.FLAGS  = { kind = "flags", bare = ["-u", "--set-upstream", "-q", "--dry-run"] }
+requires     = ["org-checkout"]
+network      = true
+writes       = ["git.remote", "git.refs"]

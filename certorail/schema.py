@@ -58,6 +58,9 @@ _REF = re.compile(r"\$\{([\w-]+)\}")
 _HEAD_REF = re.compile(r"\$\{([\w-]+)\}(?:/(.+))?")
 # a hole reference in an argv template: ``${X}`` (one token) or ``${X...}`` (a splice)
 _HOLE_REF = re.compile(r"\$\{(\w+)(\.\.\.)?\}")
+# a checker pin: the digest of the exact evaluator bytes a validation trusts
+# (``integrity.py`` owns the checking; this is the format)
+_PIN = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 def reference(text: str) -> str | None:
@@ -286,6 +289,9 @@ class FlagVocabulary(_Table):
     bare: list[str] | None = None
     any: bool = False
     flags: dict[str, FlagEntry] = Field(default_factory=dict)
+    # read an undeclared ``-lr`` as ``-l -r`` (templates.Flagset); opt-in, since not every tool
+    # bundles, and refused where a single-dash multi-letter flag shows this one does not
+    expand_single_flags: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -314,6 +320,15 @@ def _check_vocabulary(v: FlagVocabulary) -> None:
     both = set(v.bare or ()) & set(v.flags)
     if both:
         raise ValueError(f"flags both bare and valued: {sorted(both)}")
+    if v.expand_single_flags:
+        if v.any:
+            raise ValueError("expand-single-flags says nothing about an open flag vocabulary (any = true)")
+        long_single = sorted(n for n in [*(v.bare or ()), *v.flags] if re.fullmatch(r"-[^-]{2,}", n))
+        if long_single:
+            raise ValueError(
+                f"expand-single-flags: {long_single[0]!r} is a single-dash multi-letter flag, so this tool "
+                "does not bundle short flags"
+            )
 
 
 class FlagsetDecl(FlagVocabulary):
@@ -520,6 +535,9 @@ class ValidationDecl(_Media):
     argv: Annotated[list[Annotated[str, AfterValidator(_validation_argv_piece)]], Field(min_length=1)]
     cwd: LocationSlot | None = None
     establishes: dict[str, AtomList] = Field(default_factory=dict)
+    # the sha256 of the evaluator this assertion was reviewed with (INSTALL.md): the establishing
+    # behavior pinned to an implementation, checked before every run; absent, runs what is installed
+    pin: str | None = None
 
     @field_validator("params")
     @classmethod
@@ -546,6 +564,11 @@ class ValidationDecl(_Media):
         for piece in self.argv[1:]:
             if piece.startswith("${checkers}"):
                 raise ValueError("${checkers} may only head argv[0]")
+        if self.pin is not None:
+            if _PIN.fullmatch(self.pin) is None:
+                raise ValueError('pin is "sha256:" plus 64 lowercase hex digits')
+            if not self.argv[0].startswith("${checkers}/"):
+                raise ValueError("a pin binds an installed checker: it needs argv[0] = ${checkers}/<name>")
         return self
 
 
@@ -565,6 +588,9 @@ class ProgramDecl(_Media):
     requires: AtomList | Demands | None = None
     source: str | None = None
     when: When | None = None
+    # a root rule replacing every applied ruleset's rule its leading words overlap (root only;
+    # the semantic pass checks there is one)
+    override: bool = False
 
     @field_validator("subcommand")
     @classmethod
@@ -719,7 +745,28 @@ class ApplyDecl(_Table):
 # ---------------------------------------------------------------------------
 
 
-class Filesystem(_Table):
+def _literal_word(text: str) -> str:
+    if not text or "${" in text:
+        raise ValueError("the words of a shape are literal")
+    return text
+
+
+class DenyDecl(_Table):
+    """``[[deny]] argv = ["git", "apply"]``: take back from the applied rulesets every rule whose
+    leading words begin with these (root only)."""
+
+    argv: Annotated[list[Annotated[str, AfterValidator(_literal_word)]], Field(min_length=1)]
+
+
+class Protected(_Table):
+    """``[filesystem] no-write``: locations no program write may touch, whatever ``write``
+    grants -- a write that may lie at or below one is denied. A ruleset's obligation on every
+    root that applies it (``${where}/**/.git``); a root may state its own."""
+
+    no_write: list[Location] = Field(default_factory=list)
+
+
+class Filesystem(Protected):
     read: list[Location] = Field(default_factory=list)
     write: list[Location] = Field(default_factory=list)
     list_: list[Location] = Field(default_factory=list)  # the TOML key is ``list``
@@ -755,8 +802,12 @@ class PolicyDoc(_Vocabulary):
 
     policy_version: Literal[1]
     root: str | None = None
+    # apply the installed base ruleset (``rulesets/base.toml``); false: this policy is the whole
+    # statement of what may run
+    base: bool = True
     filesystem: Filesystem = Field(default_factory=Filesystem)
     network: list[NetworkDecl] = Field(default_factory=list)
+    deny: list[DenyDecl] = Field(default_factory=list)
 
     @field_validator("root")
     @classmethod
@@ -768,10 +819,11 @@ class PolicyDoc(_Vocabulary):
 
 class RulesetDoc(_Vocabulary):
     """A ruleset (TEMPLATES.md): exec-side vocabulary only, parameterised. No filesystem
-    grants, no network, no root."""
+    grants, no network, no root; it may *protect* locations (``[filesystem] no-write``)."""
 
     ruleset_version: Literal[1]
     params: dict[str, ParamDecl] = Field(default_factory=dict)
+    filesystem: Protected = Field(default_factory=Protected)
 
     @field_validator("params")
     @classmethod

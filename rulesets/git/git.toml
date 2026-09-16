@@ -1,0 +1,67 @@
+# git: the umbrella. One `[[apply]]` in a root policy gets the read and local rungs, and turns the
+# rest on by parameter. Every parameter passes through to the rung that owns it; nothing is
+# defined here. A root that wants a different mix applies the rungs directly instead.
+#
+#   [[apply]]
+#   ruleset    = "git.toml"
+#   where      = "repos"
+#   remote     = { one-of = ["origin"] }
+#   branch     = { atoms = ["my-branch"] }
+#   push-gate  = ["org-checkout"]
+#   force-gate = []
+#
+# The bools default to false, and false is always the tighter policy: an unbound bool never
+# grants anything. Nothing else has a default: the root binds every constraint and atom list
+# a rung it enables reaches (`[]` for no gate), in its own hand.
+ruleset-version = 1
+
+[params]
+where       = { kind = "directory" }
+# remote rung
+remote      = { kind = "constraint" }  # what REMOTE may be, e.g. { one-of = ["origin"] }
+branch      = { kind = "constraint" }
+push-gate   = { kind = "atom" }
+force       = { kind = "bool" }
+force-gate  = { kind = "atom" }
+delete      = { kind = "bool" }
+rebase-pull = { kind = "bool" }
+# local and rewrite rungs
+rewrite     = { kind = "bool" }        # apply git-rewrite.toml, and unlock --amend, branch -D/-M/-f, tag -f
+skip-hooks  = { kind = "bool" }        # --no-verify on commit, merge, rebase, push, pull
+# create rung
+clone       = { kind = "bool" }        # apply git-create.toml
+clone-from  = { kind = "constraint" }  # bound only when clone = true
+
+[[apply]]
+ruleset = "git-read.toml"
+where   = "${where}"
+
+[[apply]]
+ruleset    = "git-local.toml"
+where      = "${where}"
+rewrite    = "${rewrite}"
+skip-hooks = "${skip-hooks}"
+
+[[apply]]
+ruleset    = "git-rewrite.toml"
+when       = "${rewrite}"
+where      = "${where}"
+skip-hooks = "${skip-hooks}"
+
+[[apply]]
+ruleset     = "git-remote.toml"
+where       = "${where}"
+remote      = "${remote}"
+branch      = "${branch}"
+push-gate   = "${push-gate}"
+force       = "${force}"
+force-gate  = "${force-gate}"
+delete      = "${delete}"
+rebase-pull = "${rebase-pull}"
+skip-hooks  = "${skip-hooks}"
+
+[[apply]]
+ruleset = "git-create.toml"
+when    = "${clone}"
+where   = "${where}"
+from    = "${clone-from}"
