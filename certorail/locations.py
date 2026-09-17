@@ -1,6 +1,8 @@
 """The location micro-syntax as the analysis' ``LocationFact``: ``locspec`` parses the spelling,
 this converts. Used by the policy loader and by the ``certora.pathmatch`` guard, so a location a
 program guards for is, component for component, the location a policy grants."""
+import pathlib
+
 from . import locspec
 from .analysis import ANY_NAME, Component, DirSplat, LocationFact, Matching, Named, OneOf, RegexLit, StaticPath
 
@@ -30,3 +32,21 @@ def parse_location(text: str) -> LocationFact:
     """The location a compact spelling names; raises ``ValueError`` for a malformed one. A
     leading "/" anchors the location at the filesystem root instead of the sandbox root."""
     return to_location(locspec.parse(text))
+
+
+def single_path(loc: LocationFact, root: pathlib.Path) -> pathlib.Path | None:
+    """The one concrete path *loc* denotes -- a literal path, or the top of a literal subtree
+    (``a/b/**``) -- under *root*, or at the filesystem root for an absolute location; None when
+    *loc* is a pattern (a ``*``, a ``<regex>``, a ``**/leaf`` tail) and denotes no one path. What a
+    bind mount can say of a location is exactly this."""
+    match loc:
+        case StaticPath(path_components=parts):
+            pass
+        case DirSplat(static_prefix=parts, final_component=None):
+            pass
+        case _:
+            return None
+    if not all(isinstance(c, Named) for c in parts):
+        return None
+    names = [c.name for c in parts if isinstance(c, Named)]
+    return pathlib.Path("/", *names) if loc.absolute else root.joinpath(*names)

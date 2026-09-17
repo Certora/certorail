@@ -14,6 +14,17 @@ authors = [
 
 dependencies = ["typing-extensions", "pyright", "pydantic", "textual"]
 
+# the FUSE view of the sandbox root for confined tools under a patterned policy (MOUNTS.md,
+# Linux only): `uv sync --extra fuse`, plus libfuse3 / fusermount3 from the distribution
+[project.optional-dependencies]
+fuse = ["pyfuse3", "trio"]
+
+# `uv run pytest` must find pytest in the project environment: without it uv falls back to a
+# pytest on PATH under whatever interpreter owns it, and the suite silently tests that
+# interpreter's site-packages instead of this venv's
+[dependency-groups]
+dev = ["pytest"]
+
 # `uv tool install .` puts `certorail` on the PATH: analyse, check against the default
 # policy, and run --  `certorail program.py [--root DIR] [--check] [-- ARG ...]`
 [project.scripts]

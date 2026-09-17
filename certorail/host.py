@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 
 from .analysis import Named, StaticPath
 from .childjail import Mounts, View
+from .viewdaemon import Attachment, ViewUnavailable, attach
 from .broker import build_server, terminal_descriptors
 from .describe import describe
 from .policy import Denial, Policy, Program
@@ -75,14 +76,16 @@ class Accepted:
 
 
 def check(
-    source: str, filename: str, policy: Policy, root: pathlib.Path | None = None
+    source: str, filename: str, policy: Policy, root: pathlib.Path | None = None,
+    view: pathlib.Path | None = None,
 ) -> Accepted | Rejected:
     """Analyse and evaluate; on success, the program as it will run. Raises ``SyntaxError``.
 
-    With *root*, the policy's literal checkers may run (under it) to discharge pure atoms on
-    statically-known text; without it, only regex-defined atoms are discharged statically."""
+    With *root*, the policy's literal checkers may run (under it, a confined one through the
+    FUSE *view* when attached) to discharge pure atoms on statically-known text; without it,
+    only regex-defined atoms are discharged statically."""
     tree = ast.parse(source, filename)
-    discharge = None if root is None else policy.discharger(root)
+    discharge = None if root is None else policy.discharger(root, view)
     report = analyze(source, filename, policy.vocabulary(), discharge)
     if report.violations:
         return Rejected(report, violations=report.violations)
@@ -145,18 +148,34 @@ def _jail_deny_paths(mounts: Mounts) -> list[str]:
     return [str(p) for p in mounts.no_write]
 
 
-def _announce_view(policy: Policy, root: pathlib.Path) -> None:
-    """A confined grant's view is the policy's filesystem section as binds, plus the rule's
-    own mounts; whatever no bind expresses is absent from it, and that is never silent
-    (MOUNTS.md)."""
+def _attach_view(policy: Policy, root: pathlib.Path) -> Attachment | None:
+    """The FUSE view of the root for this run, when a confined grant needs one (a root-relative
+    pattern in the filesystem section that no bind expresses) and the host can serve it; None
+    otherwise, with the reason on stderr when it was needed (MOUNTS.md, ``viewdaemon``)."""
+    if not (policy.confines and policy.mounts(root).needs_view):
+        return None
+    try:
+        attached = attach(policy.view_spec(root))
+    except ViewUnavailable as e:
+        print(f"certorail: the policy filesystem view cannot be served here ({e}):", file=sys.stderr)
+        return None
+    if attached.spawned:
+        print(f"certorail: policy filesystem view mounted ({attached.keydir.name})", file=sys.stderr)
+    return attached
+
+
+def _announce_view(policy: Policy, root: pathlib.Path, view: pathlib.Path | None) -> None:
+    """A confined grant's view is the policy's filesystem section as binds (or the FUSE view of
+    the root, *view*), plus the rule's own mounts; whatever neither expresses is absent from it,
+    and that is never silent (MOUNTS.md)."""
     if not policy.confines:
         return
-    base = policy.mounts(root)
+    base = policy.mounts(root, view=view)
     per_rule = [
         (" ".join(rule.leading_words) if isinstance(rule, Program) else f"validation {rule.name}", extra)
         for rule in (*policy.programs, *policy.validations)
         if rule.view is View.POLICY
-        for extra in [tuple(o for o in policy.mounts(root, rule).omitted if o not in base.omitted)]
+        for extra in [tuple(o for o in policy.mounts(root, rule, view).omitted if o not in base.omitted)]
         if extra
     ]
     if not (base.omitted or per_rule):
@@ -173,7 +192,7 @@ def _announce_view(policy: Policy, root: pathlib.Path) -> None:
             print(f"certorail:   {name}: {entry}", file=sys.stderr)
     print(
         "certorail:   (a literal path or a literal prefix ending in ** is mountable; a pattern "
-        "waits for the FUSE view)",
+        + ("outside the root has no view)" if view is not None else "needs the FUSE view: the certorail[fuse] extra)"),
         file=sys.stderr,
     )
 
@@ -219,8 +238,27 @@ def run(
     python: str = sys.executable,
     jail: bool = True,
 ) -> subprocess.CompletedProcess[bytes] | Rejected:
-    _announce_view(policy, root)
-    outcome = check(source, filename, policy, root)
+    attached = _attach_view(policy, root)
+    view = None if attached is None else attached.mountpoint
+    _announce_view(policy, root, view)
+    try:
+        return _run(source, filename, policy, root, args, python, jail, view)
+    finally:
+        if attached is not None:
+            attached.close()  # the lease: the daemon may retire once no run holds one
+
+
+def _run(
+    source: str,
+    filename: str,
+    policy: Policy,
+    root: pathlib.Path,
+    args: Sequence[str],
+    python: str,
+    jail: bool,
+    view: pathlib.Path | None,
+) -> subprocess.CompletedProcess[bytes] | Rejected:
+    outcome = check(source, filename, policy, root, view)
     if isinstance(outcome, Rejected):
         return outcome
     certorail_parent = str(pathlib.Path(__file__).resolve().parent.parent)
@@ -244,7 +282,7 @@ def run(
             # program (broker.py). The child finds it by env var.
             socket_path = tmpdir / "broker.sock"
             # a stream=True exec writes to the descriptors this host holds for its terminal
-            server = build_server(socket_path, policy, root, stream_to=terminal_descriptors())
+            server = build_server(socket_path, policy, root, stream_to=terminal_descriptors(), view=view)
             threading.Thread(
                 target=server.serve_forever, name="certorail-broker", daemon=True
             ).start()
@@ -357,6 +395,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         from .session_hook import main as hook_main
 
         return hook_main()
+    if args and args[0] == "view":
+        # the FUSE view daemons: status, stop (MOUNTS.md)
+        from .viewdaemon import main as view_main
+
+        return view_main(args[1:])
     parser = argparse.ArgumentParser(
         prog="certorail", description="Analyse a program, check it against a policy, and run it."
     )

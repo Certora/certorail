@@ -39,10 +39,13 @@ from certorail.selfjail import ARCHES, fork_denial_filter
 
 HAS_BWRAP = sys.platform == "linux" and shutil.which("bwrap") is not None
 ENV_BINARY = shutil.which("env") or "env"
+# the child interpreter for the jail probes: the system's, whose libraries the policy world's
+# toolchain holds (a venv python loads libpython from beside itself, outside the world)
+SYSTEM_PYTHON = next((p for p in ("/usr/bin/python3", "/bin/python3") if os.path.exists(p)), sys.executable)
 
 
 def py(code: str) -> list[str]:
-    return [sys.executable, "-c", code]
+    return [SYSTEM_PYTHON, "-c", code]
 
 
 def run(argv: list[str], jail: Jail, cwd: str | None = None) -> subprocess.CompletedProcess[bytes]:

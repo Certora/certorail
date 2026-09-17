@@ -91,6 +91,11 @@ class Mounts:
     # the locations the mechanism cannot express, as the policy spelled them, with what they
     # were for
     omitted: tuple[str, ...] = ()
+    # a root-relative location no bind expresses: the FUSE view (``viewdaemon``) would serve it
+    needs_view: bool = False
+    # the FUSE view standing for the root, when one is attached: bound at *root*'s real path
+    # before every other bind, in place of the root-relative ones
+    view: tuple[pathlib.Path, pathlib.Path] | None = None  # (mountpoint, root)
 
     def __or__(self, other: "Mounts") -> "Mounts":
         """This view widened by *other* (a rule's additions): the union, in order, nothing
@@ -102,6 +107,8 @@ class Mounts:
             joined(self.reads, other.reads), joined(self.writes, other.writes),
             joined(self.no_write, other.no_write), joined(self.listings, other.listings),
             (*self.omitted, *(o for o in other.omitted if o not in self.omitted)),
+            self.needs_view or other.needs_view,
+            self.view if self.view is not None else other.view,
         )
 
     @property
@@ -113,6 +120,8 @@ class Mounts:
             tuple(p for p in self.no_write if isinstance(p, pathlib.Path)),
             (),
             self.omitted,
+            self.needs_view,
+            self.view,
         )
 
 
@@ -251,6 +260,11 @@ def _policy_world(jail: Jail, mounts: Mounts, scratch: str, cwd: str, exe: str |
         ops += ["--ro-bind-try", exe, exe]
     ops += ["--bind", scratch, scratch]
     binds = mounts.paths
+    if mounts.view is not None:
+        # the FUSE view stands for the root: the policy's patterns are enforced inside it, and
+        # whether the child may write through it at all is this bind's mode
+        mountpoint, root = mounts.view
+        ops += ["--bind" if jail.write_fs else "--ro-bind", str(mountpoint), str(root)]
     for path in binds.reads:
         ops += ["--ro-bind-try", str(path), str(path)]
     for path in binds.writes:

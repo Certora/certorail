@@ -54,13 +54,14 @@ keeps today's kill. The media are *enforced*: a grant with ``network=False`` or
 Evaluation presupposes ``Report.ok``: every site already has a proven location. The policy
 decides whether that location is one the host permits.
 """
-from os import PathLike
+import os
 import pathlib
 import subprocess
 import urllib.parse
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal, cast
+from os import PathLike
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from . import markers
 from .analysis import (
@@ -90,6 +91,7 @@ from .analysis import (
     ValidationFact
 )
 from .childjail import Environment, Jail, JailUnavailable, Mounts, View, confined, environment_spec
+from .confinement import Additions, Confinement, FilesystemSection, HostFilesystem, PolicyFilesystem
 from .effects import EVERYTHING, NOTHING, Effects, Medium, effects_of, whole
 from .ids import (
     BUILTIN_ATOMS,
@@ -138,6 +140,9 @@ from .enforcement import (
     host_matches,
 )
 from . import footprints, fsview
+
+if TYPE_CHECKING:
+    from .viewdaemon import ViewSpec
 from .footprints import Footprint
 from .walker import Report
 
@@ -1363,11 +1368,15 @@ class Policy:
         outcome = self.exec_command(program_name, arguments, {}, cwd)
         return outcome.reason if isinstance(outcome, Refusal) else None
 
-    def mounts(self, root: pathlib.Path, rule: "Program | Validation | None" = None) -> Mounts:
+    def mounts(
+        self, root: pathlib.Path, rule: "Program | Validation | None" = None, view: pathlib.Path | None = None,
+    ) -> Mounts:
         """The filesystem section lowered to the binds a confined child gets (``fsview``,
         MOUNTS.md): the same grants and protections the program is held to, under *root*, plus
-        what *rule* mounts for itself (``exec.mount-read`` / ``exec.mount-write``)."""
-        base = fsview.mounts(root, self.read, self.write, self.no_write, self.listing)
+        what *rule* mounts for itself (``exec.mount-read`` / ``exec.mount-write``). With *view*,
+        the FUSE mountpoint serving the root (``viewdaemon``), the root-relative section is the
+        view's and only the absolute locations and the rule's additions are binds."""
+        base = fsview.mounts(root, self.read, self.write, self.no_write, self.listing, view=view)
         if rule is None or not (rule.mount_read or rule.mount_write):
             return base
         return base | fsview.additions(root, rule.mount_read, rule.mount_write)
@@ -1377,10 +1386,32 @@ class Policy:
         """Does some grant run its child under the policy view (``exec.view = "policy"``)?"""
         return any(r.view is View.POLICY for r in (*self.programs, *self.validations))
 
-    def discharger(self, root: PathLike[str] | str) -> Discharge:
+    def view_spec(self, root: pathlib.Path) -> "ViewSpec":
+        """What a FUSE view of this policy under *root* serves (``viewdaemon``)."""
+        from .viewdaemon import ViewSpec
+
+        return ViewSpec(os.path.realpath(root), self.read, self.write, self.no_write, self.listing)
+
+    def section(self) -> FilesystemSection:
+        """The ``[filesystem]`` section as one value (``certorail.confinement``)."""
+        return FilesystemSection(self.read, self.write, self.no_write, self.listing)
+
+    def confinement(self, rule: "Program | Validation", root: pathlib.Path) -> Confinement:
+        """What *rule*'s child may do (``certorail.confinement``): its media and ``exec`` table,
+        and the filesystem it sees -- the host's, or this policy's section under *root* plus the
+        rule's own additions. The one constructor of a ``Confinement``."""
+        filesystem: HostFilesystem | PolicyFilesystem = (
+            PolicyFilesystem(root, self.section(), Additions(rule.mount_read, rule.mount_write))
+            if rule.view is View.POLICY
+            else HostFilesystem()
+        )
+        return Confinement(rule.env, rule.network, rule.write_fs, rule.spawn, filesystem)
+
+    def discharger(self, root: PathLike[str] | str, view: pathlib.Path | None = None) -> Discharge:
         """A runner for literal checkers: ``discharge(atom, text)`` is True when some effect-free
         validation establishing the pure *atom* through a single slot accepts the exact *text*,
-        run right now under *root*. Cached per (atom, text); handed to ``evaluate`` and to
+        run right now under *root* (a confined one under the policy view, *view* being the FUSE
+        mountpoint when one is attached). Cached per (atom, text); handed to ``evaluate`` and to
         ``analyze`` so constants need neither a ``certora.check`` nor a regex definition."""
         rootpath = pathlib.Path(root)
         cache: dict[tuple[Atom, str], bool] = {}
@@ -1389,7 +1420,7 @@ class Policy:
             key = (atom, text)
             if key not in cache:
                 cache[key] = any(
-                    _run_literal_checker(v, slot, text, rootpath, self.mounts(rootpath, v))
+                    _run_literal_checker(v, slot, text, rootpath, self.mounts(rootpath, v, view))
                     for v in self.validations
                     if (slot := _literal_slot(v, atom)) is not None
                 )

@@ -5,9 +5,11 @@ import re
 import unittest
 
 from certorail.childjail import Mounts, Regex, View
-from certorail.fsview import NOT_ERE, additions, bind_path, ere_of, mounts, pattern_regex
+from certorail.fsview import additions, mounts
 from certorail.locations import parse_location as loc
+from certorail.locations import single_path as bind_path
 from certorail.policy import Policy, program
+from certorail.sandbox.seatbelt import NOT_ERE, ere_of, pattern_regex
 
 ROOT = pathlib.Path("/sandbox")
 REAL = re.escape(os.path.realpath(ROOT))  # what a regex over canonical paths starts with
@@ -90,7 +92,7 @@ class TestPatternRegex(unittest.TestCase):
     def regex(self, text: str, below: bool = False) -> str:
         r = pattern_regex(loc(text), ROOT, below=below)
         assert r is not None
-        return r.pattern
+        return r
 
     def test_the_shapes(self) -> None:
         self.assertEqual(self.regex("src/**/<.*\\.py>"), f"^{REAL}/src/(.*/)?(.*\\.py)$")

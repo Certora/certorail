@@ -532,6 +532,7 @@ def _run_exec(
     discharge: Discharge | None,
     stream: bool = False,
     stream_to: tuple[int, int] | None = None,
+    view: pathlib.Path | None = None,
 ) -> dict:
     """One brokered ``certora.exec``: re-check the decidable half of the exec rules
     (``Policy.exec_command`` -- defense in depth; the full rules were enforced statically),
@@ -547,7 +548,7 @@ def _run_exec(
     if stream and stream_to is None:
         raise BrokerError("stream: the host has no terminal to stream to")
     returncode, out, err = _spawn_drained(
-        client, command.argv, _resolve(root, cwd), command.rule.jail, policy.mounts(root, command.rule),
+        client, command.argv, _resolve(root, cwd), command.rule.jail, policy.mounts(root, command.rule, view),
         stream_to if stream else None,
     )
     log.info("EXEC %s (cwd=%s) -> %d (%s)",
@@ -568,6 +569,7 @@ def _run_check(
     params: dict,
     cwd: str | None,
     single: object = None,
+    view: pathlib.Path | None = None,
 ) -> dict:
     """One brokered ``certora.check``: run the declared evaluator host-side -- outside the
     jail, where whatever it consults (an inventory service, credentials, the org's tooling)
@@ -615,7 +617,7 @@ def _run_check(
         # exec the load-time snapshot: the installed checker drifting mid-run changes nothing,
         # because the file in checkers/ is not what runs (integrity.materialize)
         argv[0] = materialize(declared.evaluator)
-    returncode, _, err = _spawn_drained(client, argv, workdir, declared.jail, policy.mounts(root, declared))
+    returncode, _, err = _spawn_drained(client, argv, workdir, declared.jail, policy.mounts(root, declared, view))
     log.info("CHECK %s (cwd=%s) -> %d", name, cwd if cwd is not None else ".", returncode)
     return {
         "returncode": returncode,
@@ -685,7 +687,7 @@ class _Handler(socketserver.BaseRequestHandler):
                 result = _run_exec(self.server.policy, self.server.root, conn,
                                    program, arguments, keywords, str(req.get("cwd", "")),
                                    self.server.discharge, bool(req.get("stream", False)),
-                                   self.server.stream_to)
+                                   self.server.stream_to, self.server.view)
             elif req.get("kind") == "check":
                 name = str(req.get("name", "?"))
                 what = f"check {name}"
@@ -693,7 +695,7 @@ class _Handler(socketserver.BaseRequestHandler):
                 result = _run_check(self.server.policy, self.server.root, conn,
                                     name, dict(req.get("params") or {}),
                                     None if cwd_value is None else str(cwd_value),
-                                    req.get("single"))
+                                    req.get("single"), self.server.view)
             else:
                 method = str(req.get("method", "GET")).upper()
                 url = req["url"]
@@ -730,12 +732,15 @@ class _Server(socketserver.ThreadingUnixStreamServer):
         discharge: Discharge | None,
         root: pathlib.Path | None,
         stream_to: tuple[int, int] | None,
+        view: pathlib.Path | None = None,
     ):
         self.policy = policy
         self.tls = _tls_context()
         self.discharge = discharge
         self.root = root
         self.stream_to = stream_to
+        # the FUSE view serving the root for confined children, when the host attached one
+        self.view = view
         super().__init__(socket_path, _Handler)
 
 
@@ -753,6 +758,7 @@ def build_server(
     policy: Policy,
     root: str | os.PathLike[str] | None = None,
     stream_to: tuple[int, int] | None = None,
+    view: pathlib.Path | None = None,
 ) -> _Server:
     """A broker server on *socket_path*, enforcing *policy*'s ``network`` rules. The caller
     runs it (``serve_forever`` on a thread) for the lifetime of one confined program and
@@ -761,7 +767,8 @@ def build_server(
     enables literal-checker discharge of network rules' ``requires`` atoms
     (``Policy.discharger``); without it only defined atoms discharge and exec is refused.
     *stream_to* is where a ``stream=True`` exec's child writes (the host's own stdout and
-    stderr descriptors, ``terminal_descriptors()``); without it streaming execs are refused."""
+    stderr descriptors, ``terminal_descriptors()``); without it streaming execs are refused.
+    *view* is the FUSE mountpoint serving the root for confined children, when attached."""
     path = os.fspath(socket_path)
     sock_dir = os.path.dirname(path)
     if sock_dir:
@@ -774,9 +781,10 @@ def build_server(
         return _Server(
             path,
             policy,
-            None if root is None else policy.discharger(root),
+            None if root is None else policy.discharger(root, view),
             None if root is None else pathlib.Path(root),
             stream_to,
+            view,
         )
     finally:
         os.umask(old_umask)
