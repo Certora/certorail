@@ -54,6 +54,9 @@ We will describe `SafePy` first; a description of how to work within the policy 
 - No dunder identifiers anywhere (`__name__`, `__dict__`, `__class__`, `__import__`, `x.__foo__`); the only
   dunder that may be defined is `__init__`. There is no `if __name__ == "__main__":` — call `main()` at top level.
 
+Most of the environment interactions are accessed through the dedicated `certora` module. Do **NOT** import
+this module yourself; it is preloaded into the namespace of your program by the `certorail` sandbox.
+
 ### Builtins
 
 The following builtins: `getattr`, `setattr`, `delattr`, `vars`, `locals`, `globals`, `compile`, `eval`, `exec`,
@@ -103,7 +106,7 @@ access (read, write, or directory listing) that cannot be proven to fall within 
 rejected. Filesystem permissions are stated as a combination of zero or more "relative path grants", and zero or more
 "absolute path grants". "Relative path grants" are always resolved from the CWD of the Certorail process.
 
-#### Operations are "sinks"
+#### Direct operations are "sinks"
 
 Every one of these operations accesses a path; the path component `p` must be
 proven (see below) to fall within the relevant access grant:
@@ -124,23 +127,65 @@ The current sandbox root (CWD of the Certorail process) is denoted `"."` as per 
 
 #### What proves a location
 
-- A relative string literal without a parent traversal `..` (e.g., `"data/x.txt"`);
-  `pathlib.Path(...)` of such literals or of
-  located values; `a / b`, `pathlib.Path(a, b, …)`, `os.path.join(a, b, …)`, `f"{a}/{b}"`, `a + "/" + b`
-  where `a` is located and each further component is a literal or a *safe component* (below);
-  `str(p)` / `os.fspath(p)` of a located `p`.
-- Loop variables: `for p in base.iterdir() / base.glob(pat) / base.rglob(pat)` with `base` located (also through
-  `sorted`, `list`, `reversed`, `enumerate`); `for name in os.listdir(...)` yields safe components;
-  `for dirpath, dirnames, filenames in os.walk(top)` with `top` located gives a located `dirpath`.
+As described above, the paths that flow to filesystem sinks must be proven to fall within the filesystem
+grants of the policy. The following describes (roughly) how how Certorail infers "located facts"; each located
+fact carries enough information to allow Certorail to place a filesystem access *through* that fact at a
+(potentially approximate) location on the filesystem. Filesystem accesses through values that are not "located facts"
+are denied.
+
+- A string literal that is a valid POSIX path (e.g., `"data/x.txt"` or `/home/user/data.txt`) denotes the named
+ located path precisely.
+- A `pathlib.Path(...)` of such literals is also modeled precisely.
+- Composition: if `a` is a located fact, child traversal is modeled. `a / b`, `pathlib.Path(a, b, …)`,
+  `os.path.join(a, b, …)`, `f"{a}/{b}"`, `a + "/" + b`, where `b` and each further component is a literal or a *safe component* (below)
+- Type conversion: `str(a)` / `os.fspath(a) / pathlib.Path(a)` for any located fact `a` is itself a "located fact"
+  at the same location.
+- Loop variables: `for p in base.iterdir() / base.glob(pat) / base.rglob(pat)` where `base` is located yield located facts
+  (these facts survive through `sorted(base.iterdir())`, `list(...)`, `reversed(...)`, `enumerate(...)`).
+- `for name in os.listdir(...)` yields *safe components* (see below)
+- `for dirpath, dirnames, filenames in os.walk(top)` where `top` is located yields location fact on `dirpath`.
 - Parameters annotated with a location marker (see contracts); results of contracted functions.
 - A containment guard (below) on a value whose text is otherwise unknown.
 
-### What a guard establishes
+#### Path Safety
+
+A **safe path component** is a component that can be appended to an existing located fact (either via string concatenation or
+`pathlib.Path`'s `/` operator) and provably yield a child path (modulo filesystem links).
+
+In particular a **safe path component** must satisfy two conditions:
+* It must not be an absolute path, i.e., it cannot start with `/`
+* It must not contain a parent directory traversal, i.e., `../`
+
+Thus `foo/bar` is a safe path component (it definitely descends in the filesystem tree), `foo/bar/../baz` is *technically*
+safe (it ultimately resolves to `foo/baz`) but Certorail conservatively rejects *any* parent traversal.
+
+#### On Precision
+
+Over-approximation accumulates in a located fact, and precise located facts may lose their precision at control-flow
+join, as usual in a static analysis. A located fact may simply encode "some path below `data/repos`" (usually
+denoted `data/repos/**`). Further, `for p in base.iterdir()` attaches to `p` the fact "some direct descendant of the location
+denoted by `base`". If `base` is already imprecise (e.g., its located fact is `data/repos/**`) then the "located fact" of `p`
+will likewise be precise; Certorail can only conclude the path of `p` points somewhere within `data/repos/**`.
+
+Precision can be recovered via runtime guards (see below), but you should strive whenever possible
+to write code which doesn't require these runtime assertions. For straightforward, "simple" traversal of filesystem
+facts (without computed names, for example) the Certorail inference works out of the box.
+
+`certora.reveal_fact(x)` is a runtime inert function in the style of `typing.reveal_type` which requests `certorail`
+dump all information it knows about the name `x` (named variables only, no complex expressions). You should
+only use this feature only as a last resort if you are unable to convince Certorail to accept a program you are certain
+is correct. Do **NOT** abuse this feature to "double check" the inference of certorail before running scripts "for real";
+do not second guess Certorail until it gives you a reason to do so.
+
+#### Recovering Precision with Runtime Guards
 
 A guard is `assert C`, or `if not C: raise …` / `return` / `continue` / `break` (`C` holds afterwards), or
-`if C:` (`C` holds in the body). `C` is one of the forms below, or several joined with `and`. Anything else
-establishes nothing — the analysis is never fooled, it just learns nothing, and the operation that needed
-the fact is rejected.
+`if C:` (`C` holds in the body). `C` is one of the forms below, or several joined with `and`.
+
+##### Text Facts
+
+In addition to "located facts", program values may be associated with "atoms" that establish facts
+about their shape.
 
 Text facts, on a `str` `s` (or a `pathlib.Path` `p` where a `p` form is given):
 
@@ -148,116 +193,74 @@ Text facts, on a `str` `s` (or a `pathlib.Path` `p` where a `p` form is given):
 - *no parent traversal*: `".." not in s`, `".." not in s.split("/")`, `".." not in p.parts`.
 - *not `..` itself*: `s != ".."`, `s not in (".", "..")`.
 - *not absolute*: `not s.startswith("/")`, `not os.path.isabs(s)`, `s[0] != "/"`, `not p.is_absolute()`.
-- *bare name* (no slash and not absolute; says nothing about `..`): `os.path.basename(s) == s`,
-  `os.path.dirname(s) == ""`, `pathlib.PurePath(s).name == s`.
-- *shape*: `s == "lit"`, `s in ("a", "b")`, `s == "a" or s == "b"`, `s.startswith("pre")`,
-  `s.endswith(".txt")` (a tuple of literals also works for both), `re.fullmatch(r"…", s)` (also
-  `… is not None`, `re.compile(r"…").fullmatch(s)`, `re.match(r"…\Z", s)` with no top-level `|`);
-  `s.isalnum()`, `s.isalpha()`, `s.isdecimal()`, `s.isdigit()`, `s.isnumeric()`, `s.isidentifier()` (each of
-  these also gives all four atoms above).
-- *type*: `isinstance(s, str)`, `isinstance(p, pathlib.Path)`.
 
-A **safe path component** needs *no slash* and either *no parent traversal* or *not `..`*.
+A `pathlib.Path` or a `str` with the textual atoms:
+* "not absolute", and
+* Any of:
+  * "no parent traversal"
+  * "no slash" and "not `..` itself*
+is considered a "safe path component".
 
-Containment, making `s`/`p` a located value under `BASE` (a literal or a located value, possibly through
-`str()`, `pathlib.Path()` or `.resolve()`):
+For example the following is accepted, assuming a read grant on `data/files/**`:
 
-- Lexical, trusted only once *no parent traversal* is established earlier in the same condition or block:
-  `s.startswith("data/")` (the trailing slash is required; also `str(BASE) + "/"` or `+ os.sep`),
+```python
+name = sys.argv[1]
+assert "/" not in name
+assert name != ".."
+open(f"data/files/{name}", "r").read()
+```
+
+##### Textual shape
+
+Certorail has limited support for tracking the regular language that accepts a textual fact.
+A guard `s == "lit"` establishes that `s` is exactly `"lit"`, `s in ("a", "b")`, `s == "a" or s == "b"` establishes
+alternation. `s.startswith("pre")`, `s.endswith(".txt")` (a tuple of literals also works for both), establishes a regex
+shape `^pre.*` and `.*\.txt` respectively. 
+`re.fullmatch(r"…", s)` (also`… is not None`, `re.compile(r"…").fullmatch(s)`, `re.match(r"…\Z", s)`) establish the target
+matches the provided regex. Certorail does not support a full regular expression domain, but you should only rely
+on regex shapes when the policy demands regex shapes.
+
+##### Containment
+
+Containment, ensuring a located fact on `p` is known to fall under under `BASE`
+(where `BASE` may be a literal or a located fact itself).
+
+The guards below understand casts through `str()`, `pathlib.Path()` or `.resolve()`:
+
+- Lexical, only if *no parent traversal* is established on `p`: `s.startswith(str(BASE) + "/")` or `+ os.sep`,
   `p.is_relative_to(BASE)`, `p.parent == BASE`, `BASE in p.parents`, `os.path.commonpath([s, BASE]) == BASE`.
-- Resolving, needing nothing else: `p.resolve().is_relative_to(BASE)`,
-  `os.path.realpath(s).startswith(str(BASE) + "/")`.
-- **The policy's own spelling**, needing nothing else: `certora.pathmatch(s, "repos/*/foundry.toml")`
-  establishes exactly that location on `s` (`repos/**` at or below, `*` one component, `<re>` a
-  component matching a regex, `{a,b}` one of, a leading `/` for the filesystem root). The
-  spelling must be a string literal; `s` must be a `str` (use `str(p)` for a path). Prefer this
-  when the policy's description names the location: guard with the same text it shows.
+- Resolving form, needing nothing else: `p.resolve().is_relative_to(BASE)`, `os.path.realpath(s).startswith(str(BASE) + "/")`, ...
+- **The policy's own spelling**: `certora.pathmatch(s, "repos/*/foundry.toml")`
+  establishes exactly that location on `s`. See below for the mini-DSL used for the path component.
+  Prefer this for complex paths with multiple constraints.
 
-Rules of use:
+##### Types
 
-- Guards apply in source order, once. Within a condition, put `isinstance` first and the `..` exclusion
-  before the containment (or URL) test that depends on it:
+Certorail does not trust the type annotations in the program and does not assume well-typedness in any event.
+Accordingly, the above guards only work when the interrogated object is known to be a type that
+supports the guards.
+
+The type of an object can be established via `isinstance(s, str)`, `isinstance(p, pathlib.Path)`.
+
+#### Effective Runtime Guard Use
+
+- Guards apply in source order, once. Within thus, if the type needs to be established,
+  put `isinstance` first and any shape constraints later, e.g.,
   `assert isinstance(s, str) and ".." not in s and pathlib.Path(s).is_relative_to("repos")`.
-- A value of unknown type — a JSON field, a dict lookup, the result of an unmodelled call — takes no text
-  facts until its type is known: guard `isinstance(s, str)` first, or receive it through a parameter
-  annotated `str`. `sys.argv[i]` and string-method results are already known to be `str`.
-- A guard on a derived view says nothing about the variable: `s.strip().isalnum()` proves nothing about
-  `s`. Assign the derived value to a variable, then guard that variable.
+- Aside from the exceptions enumerated above, a guard on a derived view says nothing about the variable:
+  `pathlib.Path(s.strip()).is_relative_to(BASE)` proves nothing about `s`.
+  Assign the derived value to a variable, then guard that variable.
 - A guard holds for the remaining statements of its block and nested blocks only; nothing established inside a
-  `try` body, a loop body, or a `with` body (other than `with open(...)`) survives that statement.
+  `try` body, a loop body, or a `with` body survives that statement.
 - Facts belong to a variable and are lost when it is reassigned; a variable assigned anywhere inside a loop is
-  unknown throughout the loop (except a `for` target bound by the header).
+  unknown at the start of the loop (except a `for` target bound by the header).
 - Any string method (`replace`, `strip`, `lower`, `format`, `join`, …) yields a plain string with no path facts:
   re-establish them with a guard afterwards.
 - Module-level constants are visible inside functions and keep their facts (`DATA = pathlib.Path("data")`
-  at module level, then `DATA / name` inside a function). This holds only for a name assigned exactly once
-  at module level; a name reassigned there carries no fact into functions. A parameter or local of the same
-  name shadows the constant, as in normal Python.
-- These prove nothing: `re.match`/`re.search` without `\Z`, `s.startswith("data")` without a trailing slash,
-  `not s.startswith("..")`, `"../" not in s`, `os.path.normpath(s) == s`, `.lower() in …`, `p.exists()`,
-  `len(s) > 0`, chained comparisons.
+  at module level, then `DATA / name` inside a function). These module level facts only work
+  for a module name proven to be constant, i.e., assigned exactly once at module level.
+  A parameter or local of the same name shadows the constant, as in normal Python.
 
-## Function contracts
-
-- Only module-level functions may carry marker annotations; nested functions and methods may use plain types only.
-  Each function name is defined once. Calls to a contracted function may not use `*args`/`**kwargs`.
-  A function whose parameters carry markers is only ever called directly by name: never passed as a value
-  (`key=f`, `map(f, …)`) or assigned to another name.
-- Rely (parameter): `def f(p: typing.Annotated[pathlib.Path, certora.within("data")])` — inside `f`, `p` is
-  located under `data/`; every call must pass an argument already proven to satisfy the annotation.
-- Guarantee (return): `def g(s: str) -> typing.Annotated[str, certora.no_slash, certora.not_dot_dot]` — every
-  `return` must return a value proven to satisfy it (build it, or guard it before returning). At a call site
-  the guarantee attaches only when the call is the entire right side of an assignment: `x = g(...)` gives `x`
-  the facts; `base / g(...)` or `f(g(...))` sees an unknown value. Assign first, then use the variable.
-- Plain type annotations (`str`, `pathlib.Path`, `list[str]`) are not checked statically; scalar ones are
-  checked at runtime. Markers go on a `str`/`pathlib.Path` parameter or return value, or on the element type
-  of a typed container (below); never on `*args`/`**kwargs`.
-- Markers, under `typing.Annotated[<str or pathlib.Path>, …]`:
-  `certora.within(prefix, leaf=…)` (at or below `prefix`; `"."` is the root),
-  `certora.exactly("a/b", …)` (components: literals, `certora.matches(r)`, `certora.one_of("a", "b")`),
-  `certora.matches(r"…")`, `certora.one_of("a", "b")`, `certora.seq("pre-", certora.matches(r"\d+"))`,
-  `certora.no_slash`, `certora.no_parent_traversal`, `certora.not_absolute`, `certora.not_dot_dot`,
-  `certora.not_option` (the text does not begin with `-`; `assert not s.startswith("-")` establishes it),
-  `certora.validated("atom", …)` (the value carries the named policy facts — see validations),
-  `certora.source("atom", …)` (the value came, unmodified, from the source that yields the atom — see provenance),
-  `certora.url(scheme="https", netloc="api.github.com", path_within="/repos")` (the value is a URL with these
-  components; each keyword is optional and claims only what it names — see network).
-  A location marker (`within`/`exactly`) does not combine with text markers; constrain the file name with
-  `within(prefix, leaf=certora.matches(...))`. At most one location marker and one regex marker per annotation.
-  `validated` combines with anything.
-
-## Typed containers
-
-A `list` or `set` whose elements all carry facts, declared and tracked by name:
-
-```python
-slugs: list[typing.Annotated[str, certora.no_slash, certora.not_dot_dot]] = []
-```
-
-- Tracking begins only at an annotated assignment (`x: list[typing.Annotated[…]] = …`,
-  `set[…]` likewise) whose right side is a constructor: a display `[a, b]` / `{a, b}`, `list()` / `set()`,
-  the copy `list(other)` / `set(other)`, or a comprehension with exactly one `for` (its element, evaluated
-  under the loop variable and the `if` filters, must satisfy the annotation). Every element is checked at
-  construction. `x: list[…] = y` is not a constructor: spell the copy as `list(y)`.
-- Reads give the element facts: `x[i]`, `for e in x` (also through `sorted`, `list`, `tuple`, `reversed`,
-  `iter`, `enumerate`), `x.pop()`, `len(x)`, `v in x`, `if x:`, `list(x)`, `set(x)`, iterating `x` in a
-  comprehension.
-- Writes must satisfy the annotation: `x.append(v)`, `x.insert(i, v)`, `x[i] = v` (a direct single-target
-  store only), `x.extend(ys)` / `x += ys` (`ys` a display or another typed container with at least as strong an
-  element type), `x.add(v)`; also `x.remove(v)`, `x.discard(v)`, `x.clear()`, `x.sort()`.
-- **Any other use of the name is a violation**: aliasing (`y = x`), passing it to `print`, `json.dumps`, or
-  a parameter that is not itself a typed container, `(x[0], z) = …`, `x[i] += v`, `x[1:] = …`, storing it in
-  another container. `x[1:]` is a copy with no facts (allowed, useless).
-- Passing: a `list[P]` argument binds only to a `list[P]` parameter with the *same* element type (the callee
-  may write), or to a `typing.Sequence[Q]` parameter with `P` at least as strong as `Q` — inside such a function
-  the parameter is read-only (no mutators, no aliasing). A `Sequence` can only be received, never constructed.
-- Returning: a *local* typed container may be returned against `-> list[…]` / `-> set[…]` with the same
-  element type (it moves out; the caller's variable receives the facts). A *parameter* container may not be
-  returned.
-- Element facts die like any other: an environmental validation fact on the elements is lost at the next
-  effectful call (see validations); text facts and pure facts persist.
-- Nested containers, dicts and tuples of marked values are not tracked; `list[str]` without `Annotated` is an
-  ordinary untracked list.
 
 ## Subprocesses
 
@@ -422,3 +425,64 @@ def main() -> None:
 
 main()
 ```
+## Function contracts
+
+- Only module-level functions may carry marker annotations; nested functions and methods may use plain types only.
+  Each function name is defined once. Calls to a contracted function may not use `*args`/`**kwargs`.
+  A function whose parameters carry markers is only ever called directly by name: never passed as a value
+  (`key=f`, `map(f, …)`) or assigned to another name.
+- Rely (parameter): `def f(p: typing.Annotated[pathlib.Path, certora.within("data")])` — inside `f`, `p` is
+  located under `data/`; every call must pass an argument already proven to satisfy the annotation.
+- Guarantee (return): `def g(s: str) -> typing.Annotated[str, certora.no_slash, certora.not_dot_dot]` — every
+  `return` must return a value proven to satisfy it (build it, or guard it before returning). At a call site
+  the guarantee attaches only when the call is the entire right side of an assignment: `x = g(...)` gives `x`
+  the facts; `base / g(...)` or `f(g(...))` sees an unknown value. Assign first, then use the variable.
+- Plain type annotations (`str`, `pathlib.Path`, `list[str]`) are not checked statically; scalar ones are
+  checked at runtime. Markers go on a `str`/`pathlib.Path` parameter or return value, or on the element type
+  of a typed container (below); never on `*args`/`**kwargs`.
+- Markers, under `typing.Annotated[<str or pathlib.Path>, …]`:
+  `certora.within(prefix, leaf=…)` (at or below `prefix`; `"."` is the root),
+  `certora.exactly("a/b", …)` (components: literals, `certora.matches(r)`, `certora.one_of("a", "b")`),
+  `certora.matches(r"…")`, `certora.one_of("a", "b")`, `certora.seq("pre-", certora.matches(r"\d+"))`,
+  `certora.no_slash`, `certora.no_parent_traversal`, `certora.not_absolute`, `certora.not_dot_dot`,
+  `certora.not_option` (the text does not begin with `-`; `assert not s.startswith("-")` establishes it),
+  `certora.validated("atom", …)` (the value carries the named policy facts — see validations),
+  `certora.source("atom", …)` (the value came, unmodified, from the source that yields the atom — see provenance),
+  `certora.url(scheme="https", netloc="api.github.com", path_within="/repos")` (the value is a URL with these
+  components; each keyword is optional and claims only what it names — see network).
+  A location marker (`within`/`exactly`) does not combine with text markers; constrain the file name with
+  `within(prefix, leaf=certora.matches(...))`. At most one location marker and one regex marker per annotation.
+  `validated` combines with anything.
+
+## Typed containers
+
+A `list` or `set` whose elements all carry facts, declared and tracked by name:
+
+```python
+slugs: list[typing.Annotated[str, certora.no_slash, certora.not_dot_dot]] = []
+```
+
+- Tracking begins only at an annotated assignment (`x: list[typing.Annotated[…]] = …`,
+  `set[…]` likewise) whose right side is a constructor: a display `[a, b]` / `{a, b}`, `list()` / `set()`,
+  the copy `list(other)` / `set(other)`, or a comprehension with exactly one `for` (its element, evaluated
+  under the loop variable and the `if` filters, must satisfy the annotation). Every element is checked at
+  construction. `x: list[…] = y` is not a constructor: spell the copy as `list(y)`.
+- Reads give the element facts: `x[i]`, `for e in x` (also through `sorted`, `list`, `tuple`, `reversed`,
+  `iter`, `enumerate`), `x.pop()`, `len(x)`, `v in x`, `if x:`, `list(x)`, `set(x)`, iterating `x` in a
+  comprehension.
+- Writes must satisfy the annotation: `x.append(v)`, `x.insert(i, v)`, `x[i] = v` (a direct single-target
+  store only), `x.extend(ys)` / `x += ys` (`ys` a display or another typed container with at least as strong an
+  element type), `x.add(v)`; also `x.remove(v)`, `x.discard(v)`, `x.clear()`, `x.sort()`.
+- **Any other use of the name is a violation**: aliasing (`y = x`), passing it to `print`, `json.dumps`, or
+  a parameter that is not itself a typed container, `(x[0], z) = …`, `x[i] += v`, `x[1:] = …`, storing it in
+  another container. `x[1:]` is a copy with no facts (allowed, useless).
+- Passing: a `list[P]` argument binds only to a `list[P]` parameter with the *same* element type (the callee
+  may write), or to a `typing.Sequence[Q]` parameter with `P` at least as strong as `Q` — inside such a function
+  the parameter is read-only (no mutators, no aliasing). A `Sequence` can only be received, never constructed.
+- Returning: a *local* typed container may be returned against `-> list[…]` / `-> set[…]` with the same
+  element type (it moves out; the caller's variable receives the facts). A *parameter* container may not be
+  returned.
+- Element facts die like any other: an environmental validation fact on the elements is lost at the next
+  effectful call (see validations); text facts and pure facts persist.
+- Nested containers, dicts and tuples of marked values are not tracked; `list[str]` without `Annotated` is an
+  ordinary untracked list.
