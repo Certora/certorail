@@ -111,7 +111,7 @@ class DocPath:
 type IndexedKey = Literal["program", "validation", "flagset", "apply", "source", "network", "deny", "argv", "bare"]
 type KeyedKey = Literal["holes", "regions", "atoms", "params", "flags", "bindings", "establishes", "requires"]
 type ScalarKey = Literal[
-    "policy_version", "ruleset_version", "root", "base", "default_allow", "filesystem", "read", "write", "list", "no_write", "override",
+    "policy_version", "ruleset_version", "description", "root", "base", "default_allow", "filesystem", "read", "write", "list", "no_write", "override",
     "name", "cwd", "when", "kind", "subcommand", "min", "literal", "any", "location", "matches",
     "one_of", "footprint", "about", "pure", "reads", "writes", "write_fs", "exec", "env", "spawn", "view", "mount_read", "mount_write", "ruleset", "host",
     "expand_single_flags",
@@ -122,7 +122,7 @@ type ScalarKey = Literal[
 _INDEXED: frozenset[str] = frozenset({"program", "validation", "flagset", "apply", "source", "network", "deny", "argv", "bare"})
 _KEYED: frozenset[str] = frozenset({"holes", "regions", "atoms", "params", "flags", "bindings", "establishes", "requires"})
 _SCALAR: frozenset[str] = frozenset({
-    "policy_version", "ruleset_version", "root", "base", "default_allow", "filesystem", "read", "write", "list", "no_write", "override",
+    "policy_version", "ruleset_version", "description", "root", "base", "default_allow", "filesystem", "read", "write", "list", "no_write", "override",
     "name", "cwd", "when", "kind", "subcommand", "min", "literal", "any", "location", "matches",
     "one_of", "footprint", "about", "pure", "reads", "writes", "write_fs", "exec", "env", "spawn", "view", "mount_read", "mount_write", "ruleset", "host",
     "expand_single_flags",

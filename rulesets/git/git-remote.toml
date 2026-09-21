@@ -19,17 +19,18 @@
 #   remote add / set-url / rename / remove (write config: the remote set is the root's decision;
 #     `git remote -v` is in the read rung)
 ruleset-version = 1
+description = "git, remote rung: fetch, pull, push, ls-remote. The one rung with network; where pushes may go, what the repository must be to push, and the forced and deleting forms are the root's parameters."
 
 [params]
-where       = { kind = "directory" }
-remote      = { kind = "constraint" }          # where pushes go, e.g. { one-of = ["origin"] }; the root says
-branch      = { kind = "constraint" }          # what may be pushed; the root says
-push-gate   = { kind = "atom" }                # atoms the repository (cwd) must carry to push; [] = none
-force       = { kind = "bool" }                # permit --force / --force-with-lease
-force-gate  = { kind = "atom" }                # atoms BRANCH must carry to force-push or delete; [] = none; bound only when force or delete
-delete      = { kind = "bool" }                # permit --delete
-rebase-pull = { kind = "bool" }                # permit pull --rebase
-skip-hooks  = { kind = "bool" }                # permit --no-verify on push and pull
+where       = { kind = "directory",  description = "the directory holding repositories, or a repository itself" }
+remote      = { kind = "constraint", description = "where pushes go, e.g. { one-of = [\"origin\"] }; the root says" }
+branch      = { kind = "constraint", description = "what may be pushed; the root says" }
+push-gate   = { kind = "atom",       description = "atoms the repository (cwd) must carry to push; [] is none" }
+force       = { kind = "bool",       description = "permit --force / --force-with-lease" }
+force-gate  = { kind = "atom",       description = "atoms BRANCH must carry to force-push or delete; [] is none; bound only when force or delete" }
+delete      = { kind = "bool",       description = "permit --delete" }
+rebase-pull = { kind = "bool",       description = "permit pull --rebase" }
+skip-hooks  = { kind = "bool",       description = "permit --no-verify on push and pull" }
 
 [[apply]]
 ruleset = "git-vocabulary.toml"

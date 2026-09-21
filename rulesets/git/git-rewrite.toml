@@ -11,10 +11,11 @@
 #   filter-branch, filter-repo, reflog expire, gc --prune, update-ref -d, prune: the reflog is
 #     the recovery path for everything else here, so nothing may shorten it
 ruleset-version = 1
+description = "git, rewrite rung: checkout, restore, reset, rebase, rm, clean -- discards uncommitted work or rewrites local history. For an agent you would let run rm -rf inside a repository, and nowhere else."
 
 [params]
-where      = { kind = "directory" }
-skip-hooks = { kind = "bool" }        # permit --no-verify on rebase
+where      = { kind = "directory", description = "the directory holding repositories, or a repository itself" }
+skip-hooks = { kind = "bool",      description = "permit --no-verify on rebase" }
 
 [[apply]]
 ruleset = "git-vocabulary.toml"

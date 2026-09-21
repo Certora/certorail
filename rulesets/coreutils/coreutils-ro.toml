@@ -28,9 +28,10 @@
 # nothing the program passes as a path can be read as an option. (`find` has no `--`: its
 # starting point precedes the expression, so its WHERE hole stays under the leading-dash guard.)
 ruleset-version = 1
+description = "Read-only coreutils for looking at a tree: ls, tree, find, cat, head, tail, stat, file, grep, diff, wc, du, sort, uniq, cut. Every rule is jailed: no network, no writes, no subprocesses, only the policy's own filesystem view."
 
 [params]
-where = { kind = "directory" }         # the tree the tools may look at; the base binds "."
+where = { kind = "directory", description = "the tree the tools may look at; a base ruleset binds \".\" so they work from any directory of a root" }
 
 # ---------------------------------------------------------------------------------------------
 # listing

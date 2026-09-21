@@ -15,7 +15,7 @@ must grow" records what the attempt found and what each finding became.
 | file | what it grants | media |
 |---|---|---|
 | `git-vocabulary.toml` | nothing: `git.*` regions, atoms, seven validations | |
-| `git-read.toml` | log, show, diff, status, rev-parse, remote -v, config --get/--list, ls-files, blame, grep, describe, cat-file, check-ignore | no network; status and diff write `git.index` |
+| `git-read.toml` | log, show, diff, status, rev-parse, remote -v, config --get/--list, ls-files, ls-tree, blame, grep, describe, cat-file, check-ignore | no network; status and diff write `git.index` |
 | `git-local.toml` | add, commit, branch, switch, stash, tag, merge, cherry-pick, mv, apply | no network |
 | `git-rewrite.toml` | checkout (both meanings), restore, reset, rebase, rm, clean | no network |
 | `git-remote.toml` | push, fetch, pull, ls-remote | network |

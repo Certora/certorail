@@ -18,6 +18,13 @@ sudo apt install bubblewrap                    # Linux: the jail around the tool
 
 `certorail --help` for the run commands; `certorail policy --help` for the installer.
 
+**Step 3 has a short way**: `certorail init` from the project directory is a deterministic
+interview that writes the directory's policy through the installer -- inherit the base ruleset
+or opt out, full access or locations per kind -- and then lists the installed rulesets the base
+does not apply. `certorail policy apply git.toml where=. ...` brings one into the policy with
+its bindings, asking for any the load says are missing; `certorail policy list` describes what is
+installed. `init` installs nothing itself; steps 1 and 2 are still yours.
+
 **Two jails, two prerequisites.** srt confines the *program* certorail runs; bubblewrap
 (`bwrap`, on macOS the system's `sandbox-exec`, nothing to install) confines the *tools* a
 policy grants whenever a rule says `network = false`, `write-fs = false` or `exec.spawn =
@@ -74,6 +81,11 @@ The full load runs first -- against your installed rulesets and checkers -- and 
 bytes are placed for the absolute `root` the file declares. Two files claiming one root are
 refused. From then on, any `certorail` run at or below that root finds the policy ambiently
 and says so.
+
+To change an installed policy, `certorail policy edit` (from anywhere under its root, or with
+`--root DIR`) opens it in `$VISUAL` or `$EDITOR` on a copy. When the editor exits, the copy is
+loaded against the installed tree; it replaces the original only if it loads and still declares
+the same root. Otherwise you see the problems and choose to edit again or discard.
 
 ## 4. Claude Code integration
 

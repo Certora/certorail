@@ -28,14 +28,17 @@ those would sit on.
 import argparse
 import os
 import pathlib
+import shlex
+import subprocess
+import sys
 import tempfile
 import tomllib
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 from .integrity import CheckerIntegrityError, Pin, digest, document_pins, verify_all
 from .policydir import AmbientPolicyError, config_dir, find_policy, munge, policy_dir
-from .policyfile import PolicyFileError, from_data, rulesets_dir
+from .policyfile import PolicyFileError, from_data, load_policy_file, rulesets_dir
 from .schema import RulesetDoc, SchemaError, parse_ruleset
 
 _CHECKER_HEAD = "${checkers}/"
@@ -381,12 +384,135 @@ def suggest_pins(pack: pathlib.Path) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# editing: $EDITOR on a copy, validated before it lands
+# ---------------------------------------------------------------------------
+
+type Editor = Callable[[pathlib.Path], int]   # opens the file, returns the editor's exit status
+type Prompt = Callable[[str], str]            # asks, returns the raw answer
+
+
+def edit_problems(draft: pathlib.Path, prefix: pathlib.Path | None) -> list[str]:
+    """Why *draft* may not replace the policy it was copied from: it fails to load against the
+    installed tree, or it no longer declares the root it governs (*prefix*)."""
+    try:
+        load_policy_file(draft)
+    except PolicyFileError as e:
+        return str(e).splitlines()
+    if prefix is None:
+        return []
+    try:
+        declared = tomllib.loads(draft.read_text(encoding="utf-8")).get("root")
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        return [f"{draft}: {e}"]
+    if declared != str(prefix):
+        return [
+            f"root changed from {prefix} to {declared!r}: this file governs {prefix}; a policy for "
+            "another directory is installed with `certorail policy install`, not edited into place"
+        ]
+    return []
+
+
+def edit_policy(
+    target: pathlib.Path, prefix: pathlib.Path | None, *, editor: Editor, prompt: Prompt,
+    say: Callable[[str], None] = print,
+) -> int:
+    """Open a copy of *target* in the editor; when it comes back changed, validate it and rotate
+    it into place, or show the problems and ask whether to edit again or give up. The original
+    is never touched until the copy loads. Exit status: 0 when the policy was updated or left
+    as it was, 1 when the edit was abandoned."""
+    original = target.read_bytes()
+    fd, name = tempfile.mkstemp(prefix=f"{target.stem}.", suffix=".toml")
+    draft = pathlib.Path(name)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(original)
+        while True:
+            status = editor(draft)
+            if status != 0:
+                say(f"editor exited with status {status}; {target} is unchanged")
+                return 1
+            data = draft.read_bytes()
+            if data == original:
+                say(f"no changes; {target} is as it was")
+                return 0
+            problems = edit_problems(draft, prefix)
+            if not problems:
+                _place([Placement(target, data)], replace=True)
+                say(f"updated {target}")
+                if prefix is not None:
+                    say(f"review it: certorail --describe --root {prefix}")
+                return 0
+            say("the edited policy does not load:")
+            for line in problems:
+                say(f"  {line}")
+            while True:
+                answer = prompt("(e)dit again, or (q)uit and discard the edit? [e/q] ").strip().lower()
+                if answer in ("e", "edit"):
+                    break
+                if answer in ("q", "quit"):
+                    say(f"edit discarded; {target} is unchanged")
+                    return 1
+    finally:
+        draft.unlink(missing_ok=True)
+
+
+def _spawn_editor(path: pathlib.Path) -> int:
+    command = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    try:
+        return subprocess.call([*shlex.split(command), str(path)])
+    except OSError as e:
+        print(f"cannot run the editor {command!r}: {e}", file=sys.stderr)
+        return 127
+
+
+def _tty_prompt(question: str) -> str:
+    try:
+        return input(question)
+    except EOFError:
+        print()
+        return "q"
+
+
+def _interactive() -> bool:
+    """Is someone there to answer? (A captured or redirected stdin is not a terminal.)"""
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+def _edit_target(root: pathlib.Path | None, policy: pathlib.Path | None) -> tuple[pathlib.Path, pathlib.Path | None]:
+    """What ``certorail policy edit`` edits: the file named, or the ambient policy governing
+    *root* -- and the root it must keep declaring."""
+    if policy is not None:
+        if not policy.is_file():
+            raise InstallError([f"{policy}: no such file"])
+        try:
+            declared = tomllib.loads(policy.read_text(encoding="utf-8")).get("root")
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            declared = None  # the editor is the place to fix it; the load will say
+        return policy, pathlib.Path(declared) if isinstance(declared, str) and declared.startswith("/") else None
+    where = (root or pathlib.Path.cwd()).resolve()
+    try:
+        found = find_policy(where)
+    except AmbientPolicyError as e:
+        raise InstallError([str(e)])
+    if found is None:
+        raise InstallError([f"no ambient policy governs {where} (`certorail init` creates one)"])
+    return found
+
+
+# ---------------------------------------------------------------------------
 # listing
 # ---------------------------------------------------------------------------
 
 
-def list_installed() -> str:
-    """What the config directory holds, by section, with each policy's declared root."""
+def list_installed(root: pathlib.Path | None = None) -> str:
+    """What the config directory holds, by section, with each policy's declared root, and every
+    ruleset described with its parameters and who applies it (the policy governing *root* among
+    them, when given)."""
+    from .apply import ruleset_lines  # the inventory lives with `apply`; imported here to avoid a cycle
+
     cfg = config_dir()
     out = [f"config directory: {cfg}"]
     out.append("policies:")
@@ -396,19 +522,17 @@ def list_installed() -> str:
         for f in sorted(bucket.glob("*.toml")):
             seen = True
             try:
-                root = tomllib.loads(f.read_text(encoding="utf-8")).get("root", "(no root)")
+                root_of = tomllib.loads(f.read_text(encoding="utf-8")).get("root", "(no root)")
             except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
-                root = f"(unreadable: {e})"
-            out.append(f"  {f}  ->  {root}")
+                root_of = f"(unreadable: {e})"
+            out.append(f"  {f}  ->  {root_of}")
     if not seen:
         out.append("  none")
     out.append("rulesets:")
-    rdir = rulesets_dir()
-    entries = [p for p in sorted(rdir.iterdir()) if p.is_file()] if rdir.is_dir() else []
-    if entries:
-        out.extend(f"  {p.name}" for p in entries)
-    else:
-        out.append("  none")
+    out.extend(ruleset_lines(root))
+    notes = [p.name for p in sorted(rulesets_dir().glob("*.md"))] if rulesets_dir().is_dir() else []
+    if notes:
+        out.append("  notes: " + ", ".join(notes))
     out.append("checkers:")
     cdir = cfg / "checkers"
     found = [p for p in sorted(cdir.rglob("*")) if p.is_file()] if cdir.is_dir() else []
@@ -446,16 +570,55 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_pol.add_argument("--name", default=None, help="the installed file name (default: the source's)")
     p_pol.add_argument("--replace", action="store_true",
                        help="install over an existing file of the same name whose content differs")
-    sub.add_parser("list", help="what the config directory holds")
+    p_list = sub.add_parser("list", help="what the config directory holds: policies, rulesets described, checkers")
+    p_list.add_argument("--root", type=pathlib.Path, default=None,
+                        help="also mark the rulesets the policy governing this directory applies")
+    p_apply = sub.add_parser(
+        "apply", help="apply an installed ruleset in the policy governing a directory: KEY=VALUE bindings, asked for if missing"
+    )
+    p_apply.add_argument("ruleset", help="an installed ruleset, e.g. git.toml")
+    p_apply.add_argument("--root", type=pathlib.Path, default=None,
+                         help="the directory whose ambient policy to apply it in (default: the current directory)")
+    p_apply.add_argument("--policy", type=pathlib.Path, default=None,
+                         help="apply it in this policy file instead of the ambient one")
+    p_apply.epilog = (
+        "bindings follow as KEY=VALUE, anywhere on the line; VALUE in TOML (true, [], "
+        '{ one-of = ["origin"] }), or a plain string when it is not TOML (where=.)'
+    )
     sub.add_parser("verify", help="re-hash every pinned validation's checker; report drift")
+    # KEY=VALUE bindings may sit anywhere after `apply`; argparse's positionals cannot straddle
+    # an option, so they are taken out before parsing
+    words = list(sys.argv[1:] if argv is None else argv)
+    bindings: list[str] = []
+    if words and words[0] == "apply":
+        bindings = [w for w in words[1:] if "=" in w and not w.startswith("-")]
+        words = [w for w in words if w not in bindings]
+        argv = words
     p_pin = sub.add_parser("pin", help="print pin = \"sha256:...\" lines for a pack's validations")
     p_pin.add_argument("pack", type=pathlib.Path)
+    p_edit = sub.add_parser(
+        "edit", help="open the policy governing a directory in $EDITOR; it lands only if it loads"
+    )
+    p_edit.add_argument("--root", type=pathlib.Path, default=None,
+                        help="the directory whose ambient policy to edit (default: the current directory)")
+    p_edit.add_argument("--policy", type=pathlib.Path, default=None,
+                        help="edit this policy file instead of the ambient one")
     ns = parser.parse_args(argv)
     try:
         if ns.command == "install-pack":
             report = install_pack(ns.pack, replace=ns.replace)
         elif ns.command == "install":
             report = install_policy(ns.policy, name=ns.name, replace=ns.replace)
+        elif ns.command == "edit":
+            target, prefix = _edit_target(ns.root, ns.policy)
+            return edit_policy(target, prefix, editor=_spawn_editor, prompt=_tty_prompt)
+        elif ns.command == "apply":
+            from .apply import apply_ruleset, parse_binding
+
+            target, prefix = _edit_target(ns.root, ns.policy)
+            bound = dict(parse_binding(b) for b in bindings)
+            interactive = _tty_prompt if _interactive() else None
+            return apply_ruleset(target, prefix, ns.ruleset, bound, prompt=interactive, say=print)
         elif ns.command == "verify":
             vr = verify_all()
             for line in (*vr.problems, *vr.notes):
@@ -469,7 +632,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(line)
             return 0
         else:
-            print(list_installed())
+            print(list_installed(ns.root))
             return 0
     except InstallError as e:
         raise SystemExit(str(e))

@@ -447,6 +447,13 @@ force      = true                     # bool; unbound means false
 force-gate = ["not-default-branch"]   # needed only because force = true enables the flag that uses it
 ```
 
+A ruleset (and a root policy) may carry a top-level `description = "..."`, one sentence on what
+it grants, and each parameter a `description` of what binding it decides: `[params] where = {
+kind = "directory", description = "the directory holding repositories" }`. Neither changes what
+loads; `certorail init` reads a pack's description from its documents (the one named like the
+pack directory, `git/git.toml`, else its only document) when offering it, and a policy author
+binding parameters reads theirs. The shipped packs carry both.
+
 `[params] x = { kind = "directory" | "atom" | "constraint" | "bool" }`. A **directory** binds one
 directory or a list (plain paths, no `**`); the ruleset writes `${where}` for the directory and
 `${where}/**` for its subtree, and every location slot so written becomes a one-of list over the
@@ -618,13 +625,40 @@ Full rules in `SUBSET_PROMPT.md` (next to this file). The parts a policy author 
 certorail [--root DIR] [--policy FILE] [--check] [--no-jail] PROGRAM [-- ARG ...]
 certorail -c SOURCE [--root DIR] [--policy FILE] [--check] [--no-jail] [-- ARG ...]
 certorail --describe [--root DIR] [--policy FILE]
-certorail policy install FILE | install-pack DIR | list | verify | pin DIR
+certorail init [--yes] [--root DIR]
+certorail policy install FILE | install-pack DIR | edit [--root DIR | --policy FILE] | list [--root DIR] | verify | pin DIR
+certorail policy apply RULESET [KEY=VALUE ...] [--root DIR | --policy FILE]
 certorail session-hook
+certorail view [status | stop [KEY]]
 ```
 
-`policy` and `session-hook` are reserved first words (a program literally named `policy` is
-spelled `./policy`). `certorail policy …` is the installer: it validates before it places,
-refuses conflicts instead of overwriting, and is the one path that keeps `verify` meaningful.
+`init`, `policy`, `session-hook` and `view` are reserved first words (a program literally named
+`policy` is spelled `./policy`). `certorail policy …` is the installer: it validates before it
+places, refuses conflicts instead of overwriting, and is the one path that keeps `verify`
+meaningful.
+
+`certorail init` creates the ambient policy for `--root` as a short deterministic interview,
+and writes nothing else. A directory already governed by a policy gets "already set up". If a
+base ruleset is installed, `init` summarises what it applies from the rulesets' own
+`description` keys and asks whether this root inherits it; no writes `base = false`. Then it
+asks whether programs get full read, write and list access under the root; no leads to one
+question per kind, answered as locations in the micro-syntax and checked as typed. Then whether
+to allow all programs the policy does not name (`default-allow`, default no). It ends by
+listing the installed rulesets the base does not apply, each with its description, its
+parameters, and the `apply` command that brings it in. Installing rulesets is the installer's
+job (`certorail policy install-pack DIR`); applying one is `certorail policy apply RULESET`,
+which appends an `[[apply]]` to the policy governing `--root` with the `KEY=VALUE` bindings
+given (VALUE in TOML: `true`, `[]`, `{ one-of = ["origin"] }`; a plain string otherwise, so
+`where=.` works), asks for each parameter the load reports unbound, with the parameter's own
+description, when a terminal is there, and lands the result only if the whole policy loads. It
+refuses a ruleset the policy already applies and one the base already applies to every root.
+`certorail policy list` describes every installed ruleset with its parameters and who applies
+it; with `--root DIR`, the policy governing that directory is among the appliers.
+`--yes` takes every default without a terminal. `certorail policy edit` opens the policy
+governing `--root` (or `--policy FILE`) in `$VISUAL` / `$EDITOR` on a copy; when the editor
+exits the copy is loaded against the installed tree, and it replaces the original only if it
+loads and still declares the same root. Otherwise the problems are printed and you choose to
+edit again or discard, as in `git add -p`.
 
 `--check` analyses and evaluates without running and prints every sink with its proven
 location. `--policy` takes a `.toml` or `.json` document; without it the nearest ambient policy

@@ -4,9 +4,10 @@
 #
 # Grants nothing. A rung that applies this file gains the names below and nothing else.
 ruleset-version = 1
+description = "The git vocabulary: the git.* regions, atoms and seven checkers every git rung shares. Grants nothing on its own."
 
 [params]
-where = { kind = "directory" }        # the directory holding repositories (or a repository itself)
+where = { kind = "directory", description = "the directory holding repositories, or a repository itself" }
 
 # The obligation every rung places on the root: no program write may touch a repository's .git,
 # at any depth (nested repositories, submodules). Repository config and hooks are how a tree makes

@@ -11,10 +11,11 @@
 #   -l/--local, --reference, --dissociate, --shared (read another local repository)
 #   -u/--upload-pack (runs a command on the remote end)
 ruleset-version = 1
+description = "git, create rung: clone and init, run in the directory that holds repositories and creating a child of it. What may be cloned is the root's constraint."
 
 [params]
-where = { kind = "directory" }
-from  = { kind = "constraint" }        # what may be cloned; no default: the root says
+where = { kind = "directory",  description = "the directory that holds repositories; clone and init create a child of it" }
+from  = { kind = "constraint", description = "what may be cloned; no default: the root says" }
 
 [[apply]]
 ruleset = "git-vocabulary.toml"

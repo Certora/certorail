@@ -14,10 +14,12 @@ authors = [
 
 dependencies = ["typing-extensions", "pyright", "pydantic", "textual"]
 
-# the FUSE view of the sandbox root for confined tools under a patterned policy (MOUNTS.md,
-# Linux only): `uv sync --extra fuse`, plus libfuse3 / fusermount3 from the distribution
+# the FUSE view of the sandbox root for confined tools under a patterned policy (MOUNTS.md):
+# `uv sync --extra fuse`, plus libfuse3 / fusermount3 from the distribution. Linux only by
+# marker: macOS takes patterns natively in Seatbelt and never needs the view, and pyfuse3 would
+# otherwise try to build against macFUSE there
 [project.optional-dependencies]
-fuse = ["pyfuse3", "trio"]
+fuse = ["pyfuse3; sys_platform == 'linux'", "trio; sys_platform == 'linux'"]
 
 # `uv run pytest` must find pytest in the project environment: without it uv falls back to a
 # pytest on PATH under whatever interpreter owns it, and the suite silently tests that

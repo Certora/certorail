@@ -14,9 +14,10 @@
 #   `git branch`/`git tag` listing: those subcommands create as well as list, so they live in
 #     git-local.toml as one shape each
 ruleset-version = 1
+description = "git, read rung: log, show, diff, status, rev-parse, remote -v, config --get/--list, ls-files, ls-tree, blame, grep, describe, cat-file, check-ignore. No network; status and diff write git.index."
 
 [params]
-where = { kind = "directory" }
+where = { kind = "directory", description = "the directory holding repositories, or a repository itself" }
 
 [[apply]]
 ruleset = "git-vocabulary.toml"
@@ -186,6 +187,26 @@ holes.FLAGS.bare = [
 ]
 holes.FLAGS."--exclude" = { any = true }     # a glob: data for git
 holes.FLAGS."-x"        = { any = true }
+holes.PATHS = { kind = "each", location = "**" }
+network  = false
+write-fs = false
+
+# ---------------------------------------------------------------------------------------------
+# ls-tree <tree-ish> [-- <path>...]: the tree at a revision, without touching the worktree or the
+# index. TREE is one checked revision (a token, so the shape binds positionally: `"HEAD"` after
+# the flags); `--format` takes placeholders git expands, never a command.
+[[program]]
+name    = "git"
+argv    = ["git", "ls-tree", "${FLAGS...}", "${TREE}", "--", "${PATHS...}"]
+cwd     = "${where}/**"
+holes.FLAGS.kind = "flags"
+holes.FLAGS.bare = [
+  "-d", "-r", "-t", "-l", "--long", "-z", "--name-only", "--name-status", "--object-only",
+  "--full-name", "--full-tree",
+]
+holes.FLAGS."--abbrev" = { matches = '[0-9]+' }
+holes.FLAGS."--format" = { any = true }
+holes.TREE  = { atoms = ["git.rev"] }
 holes.PATHS = { kind = "each", location = "**" }
 network  = false
 write-fs = false

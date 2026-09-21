@@ -238,6 +238,96 @@ def test_cli_pin_and_verify(cfg, tmp_path, capsys):
     assert "is-clean" in capsys.readouterr().out
 
 
+def test_edit_lands_only_a_loadable_policy(cfg, tmp_path, capsys):
+    """``certorail policy edit``: the editor works on a copy; a broken edit shows its problems
+    and offers to edit again or give up; a good edit rotates into place; the root cannot move."""
+    from certorail.install import edit_policy
+
+    install_pack(make_pack(tmp_path))
+    root = tmp_path / "work"
+    root.mkdir()
+    src = tmp_path / "policy.toml"
+    src.write_text(POLICY_TMPL.format(root=root))
+    install_policy(src)
+    found = find_policy(root)
+    assert found is not None
+    target, prefix = found
+    original = target.read_bytes()
+
+    def editor_writing(*versions: str):
+        queue = list(versions)
+
+        def editor(path: pathlib.Path) -> int:
+            path.write_text(queue.pop(0))
+            return 0
+
+        return editor
+
+    answers: list[str] = []
+
+    def prompt(question: str) -> str:
+        return answers.pop(0)
+
+    # 1. broken, then quit: nothing changes, status 1
+    answers[:] = ["q"]
+    assert edit_policy(target, prefix, editor=editor_writing("policy-version = 1\nroot = "), prompt=prompt) == 1
+    assert target.read_bytes() == original
+    out = capsys.readouterr().out
+    assert "does not load" in out and "discarded" in out
+
+    # 2. broken, edit again, then good: the second version lands
+    good = POLICY_TMPL.format(root=root) + '\n[[program]]\nname = "false"\ncwd = "."\n'
+    answers[:] = ["x", "e"]  # a stray answer is re-asked
+    assert edit_policy(target, prefix, editor=editor_writing("policy-version = 1\n[[program]]\nname = 3\n", good), prompt=prompt) == 0
+    assert target.read_text() == good
+    assert "updated" in capsys.readouterr().out
+    assert any(p.name == "false" for p in load_policy_file_ok(target))
+
+    # 3. unchanged: nothing to do, status 0
+    assert edit_policy(target, prefix, editor=editor_writing(good), prompt=prompt) == 0
+    assert "no changes" in capsys.readouterr().out
+
+    # 4. the root may not move: refused with the reason, then quit
+    answers[:] = ["q"]
+    moved = good.replace(f'root = "{root}"', f'root = "{tmp_path / "elsewhere"}"')
+    assert edit_policy(target, prefix, editor=editor_writing(moved), prompt=prompt) == 1
+    assert "root changed" in capsys.readouterr().out
+    assert target.read_text() == good
+
+    # 5. an editor that fails leaves the file alone
+    assert edit_policy(target, prefix, editor=lambda p: 1, prompt=prompt) == 1
+    assert target.read_text() == good
+
+
+def load_policy_file_ok(path: pathlib.Path):
+    from certorail.policyfile import load_policy_file
+
+    return load_policy_file(path).programs
+
+
+def test_edit_target_resolution(cfg, tmp_path):
+    from certorail.install import _edit_target
+
+    with pytest.raises(InstallError, match="no ambient policy governs"):
+        _edit_target(tmp_path, None)
+    install_pack(make_pack(tmp_path))
+    root = tmp_path / "work"
+    root.mkdir()
+    src = tmp_path / "policy.toml"
+    src.write_text(POLICY_TMPL.format(root=root))
+    install_policy(src)
+    target, prefix = _edit_target(root / "deeper" if (root / "deeper").mkdir() is None else root, None)
+    assert prefix == root.resolve() and target.name == "policy.toml"
+    # a file named directly: its declared root is what it must keep
+    direct, declared = _edit_target(None, src)
+    assert (direct, declared) == (src, root)
+    rootless = tmp_path / "rootless.toml"
+    rootless.write_text("policy-version = 1\n")
+    assert _edit_target(None, rootless) == (rootless, None)
+    with pytest.raises(InstallError, match="no such file"):
+        _edit_target(None, tmp_path / "missing.toml")
+
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
 

@@ -23,11 +23,12 @@
 #   submodule entirely: `update --init` clones URLs read from an agent-writable .gitmodules
 #   worktree, notes, replace, filter-branch, update-ref, reflog
 ruleset-version = 1
+description = "git, local rung: add, commit, branch, switch, stash, tag, merge, cherry-pick, mv, apply. No network; nothing is discarded, every result stays reachable from a reflog."
 
 [params]
-where      = { kind = "directory" }
-rewrite    = { kind = "bool" }        # permit --amend, branch -D/-M/-f/-C, tag -f
-skip-hooks = { kind = "bool" }        # permit --no-verify on commit and merge
+where      = { kind = "directory", description = "the directory holding repositories, or a repository itself" }
+rewrite    = { kind = "bool",      description = "permit --amend, branch -D/-M/-f/-C, tag -f" }
+skip-hooks = { kind = "bool",      description = "permit --no-verify on commit and merge" }
 
 [[apply]]
 ruleset = "git-vocabulary.toml"

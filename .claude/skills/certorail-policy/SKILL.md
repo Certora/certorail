@@ -263,9 +263,14 @@ A trivial text predicate can be a `test` one-liner with no script at all:
    `certorail policy install-pack DIR` -- shape-checked, the checker closure exact in both
    directions, pins verified against the supplied bytes, checkers made executable.
    `certorail policy list` shows what is installed; `certorail policy verify` re-hashes every
-   pinned checker. (The config directory is `$CERTORAIL_CONFIG_DIR`, else
-   `$XDG_CONFIG_HOME/certorail`, else `~/.certorail`; write into it by hand only when you
-   must, and run `verify` after.)
+   pinned checker; `certorail policy edit --root ROOT` opens the installed policy in the
+   user's editor on a copy and lands it only if it loads. (The config directory is
+   `$CERTORAIL_CONFIG_DIR`, else `$XDG_CONFIG_HOME/certorail`, else `~/.certorail`; write
+   into it by hand only when you must, and run `verify` after.) `certorail init` writes a
+   first policy for a directory from a few questions (base inherited or not, full access or
+   locations per kind); `certorail policy apply RULESET where=. ...` brings an installed
+   ruleset into it with its bindings, asking for any the load says are missing; `certorail
+   policy list` describes what is installed and who applies it.
 5. **Put the policy in the agent's context.** `certorail --describe --root ROOT` renders the
    loaded policy as the program author's interface. The certorail Claude Code plugin ships a
    `SessionStart` hook that injects it automatically (and stays silent in projects no policy

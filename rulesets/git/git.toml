@@ -14,23 +14,24 @@
 # grants anything. Nothing else has a default: the root binds every constraint and atom list
 # a rung it enables reaches (`[]` for no gate), in its own hand.
 ruleset-version = 1
+description = "git: the read and local rungs (log, show, diff, status, add, commit, branch, switch, stash, ...) from one [[apply]]; push, fetch, history rewrite and clone unlocked per root by parameter, with seven checkers for revisions, ref names, remote URLs and config keys."
 
 [params]
-where       = { kind = "directory" }
+where       = { kind = "directory",  description = "the directory holding repositories, or a repository itself; commands run from any directory below it" }
 # remote rung
-remote      = { kind = "constraint" }  # what REMOTE may be, e.g. { one-of = ["origin"] }
-branch      = { kind = "constraint" }
-push-gate   = { kind = "atom" }
-force       = { kind = "bool" }
-force-gate  = { kind = "atom" }
-delete      = { kind = "bool" }
-rebase-pull = { kind = "bool" }
+remote      = { kind = "constraint", description = "what REMOTE may be on push, fetch and pull, e.g. { one-of = [\"origin\"] }" }
+branch      = { kind = "constraint", description = "what BRANCH may be on push; { atoms = [\"git.ref-name\"] } is any well-formed branch" }
+push-gate   = { kind = "atom",       description = "atoms the repository must carry to push; [] is no gate" }
+force       = { kind = "bool",       description = "permit push --force / --force-with-lease" }
+force-gate  = { kind = "atom",       description = "atoms BRANCH must carry to force-push or delete; [] is no gate; bound only when force or delete" }
+delete      = { kind = "bool",       description = "permit push --delete" }
+rebase-pull = { kind = "bool",       description = "permit pull --rebase" }
 # local and rewrite rungs
-rewrite     = { kind = "bool" }        # apply git-rewrite.toml, and unlock --amend, branch -D/-M/-f, tag -f
-skip-hooks  = { kind = "bool" }        # --no-verify on commit, merge, rebase, push, pull
+rewrite     = { kind = "bool",       description = "apply the rewrite rung (checkout, restore, reset, rebase, rm, clean) and unlock --amend, branch -D/-M/-f, tag -f" }
+skip-hooks  = { kind = "bool",       description = "permit --no-verify on commit, merge, rebase, push and pull" }
 # create rung
-clone       = { kind = "bool" }        # apply git-create.toml
-clone-from  = { kind = "constraint" }  # bound only when clone = true
+clone       = { kind = "bool",       description = "apply the create rung: clone and init" }
+clone-from  = { kind = "constraint", description = "what may be cloned; bound only when clone = true" }
 
 [[apply]]
 ruleset = "git-read.toml"

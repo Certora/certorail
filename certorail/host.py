@@ -400,6 +400,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         from .viewdaemon import main as view_main
 
         return view_main(args[1:])
+    if args and args[0] == "init":
+        # first-run setup: the base, the packs, a policy for the root -- as an interview
+        from .init import main as init_main
+
+        return init_main(args[1:])
     parser = argparse.ArgumentParser(
         prog="certorail", description="Analyse a program, check it against a policy, and run it."
     )

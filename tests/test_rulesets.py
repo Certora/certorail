@@ -352,6 +352,31 @@ class TestGitPack(RulesetCase):
         # the vocabulary's protection reaches the root: no program write may touch a .git
         self.assertTrue(any(".git" in str(loc) for loc in policy.no_write))
 
+    def test_ls_tree_binds_positionally_with_a_checked_revision(self) -> None:
+        import tomllib
+        data = tomllib.loads((FIXTURES / "git-policy.toml").read_text(encoding="utf-8"))
+        policy = from_data(data, "git-policy.toml")
+        self.assertIn("git ls-tree", {" ".join(p.leading_words) for p in policy.programs})
+        # a literal revision is discharged by the pack's git-rev checker (hence the root)
+        accepted = host_check(
+            HEADER + REPO + 'certora.exec("git", "ls-tree", "-r", "--name-only", "HEAD", pathlib.Path("src"), cwd=repo)\n',
+            "<t>", policy, root=self.config,
+        )
+        if isinstance(accepted, Rejected):
+            self.fail("\n".join(accepted.describe("<t>")))
+        # unknown text after the flags is not guessed at: positionally it is ambiguous, and bound
+        # by keyword it is an unchecked revision
+        ambiguous = host_check(
+            HEADER + REPO + 'certora.exec("git", "ls-tree", "-r", sys.argv[1], cwd=repo)\n', "<t>", policy, root=self.config,
+        )
+        assert isinstance(ambiguous, Rejected)
+        self.assertIn("bind by keyword", ambiguous.denials[0].reason)
+        denied = host_check(
+            HEADER + REPO + 'certora.exec("git", "ls-tree", "-r", TREE=sys.argv[1], cwd=repo)\n', "<t>", policy, root=self.config,
+        )
+        assert isinstance(denied, Rejected)
+        self.assertIn("git.rev", denied.denials[0].reason)
+
     def test_every_rung_applies(self) -> None:
         policy = from_data({
             "policy-version": 1,

@@ -725,10 +725,12 @@ type ParamKind = Literal["directory", "atom", "bool", "constraint"]
 
 
 class ParamDecl(_Table):
-    """``[params] x = { kind = ... }``. No defaults: an unbound bool is false, everything else a
-    surviving piece references must be bound."""
+    """``[params] x = { kind = ..., description = "..." }``. No defaults: an unbound bool is
+    false, everything else a surviving piece references must be bound. The description is for
+    whoever binds it: the installer's interview, ``--describe``, a policy author."""
 
     kind: ParamKind
+    description: str | None = None
 
 
 # a binding in an ``[[apply]]``: a directory or a list; an atom name or a list (``[]``: none);
@@ -799,8 +801,10 @@ class Filesystem(Protected):
 
 
 class _Vocabulary(_Table):
-    """What a root policy and a ruleset share: the exec-side vocabulary."""
+    """What a root policy and a ruleset share: the exec-side vocabulary, and a ``description``
+    of the document for whoever picks it up (the installer's interview, ``--describe``)."""
 
+    description: str | None = None
     regions: dict[RegionName, RegionDecl] = Field(default_factory=dict)
     atoms: dict[DeclaredAtomName, AtomDecl] = Field(default_factory=dict)
     flagset: list[FlagsetDecl] = Field(default_factory=list)

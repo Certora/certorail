@@ -1,91 +1,131 @@
 # Writing Python for the certorail sandbox
 
-Programs are checked statically before they run. A program is rejected on any violation below, or if
-any filesystem, subprocess or network operation cannot be proven to stay where the host's policy
-allows. Rejections are reported per line: `violation:` means the program breaks a rule of the subset
-or the analysis could not follow it; `denied:` means the program is well-formed but the policy does
-not permit the operation. Fix the line named; do not work around the checker.
+The `certorail` sandbox lets you run "arbitrary" Python programs that can be proven to
+conform to user specific security policies. In addition to kernel-level runtime enforcement,
+`certorail` statically analyzes your Python programs to judge conformance to the user's provided
+policies.
 
-## Imports and names
+In full generality, Python is near impossible to statically analyze; accordingly the Python you author
+must fall within a restricted subset that is amenable to static checking. In addition, conformance to security
+policy requires reasoning about the effects of the program you author. Thus all effectful operations *must*
+go through specific, named entry points.
 
-- Only `import x` / `import x.y`. No `from … import`, no `import … as`.
-- Standard library only. Forbidden modules (import is a violation) include: `os` (see allowlist),
-  `subprocess`, `shutil`, `tempfile`, `glob`, `fileinput`, `linecache`, `filecmp`, `tarfile`, `zipfile`,
-  `gzip`, `bz2`, `lzma`, `zlib`, `sqlite3`, `socket`, `ssl`, `asyncio`, `urllib` (except `urllib.parse`),
-  `http`, `ftplib`, `smtplib`, `xmlrpc`, `xml`, `webbrowser`, `threading`, `_thread`, `multiprocessing`,
-  `concurrent`, `signal`, `mmap`, `fcntl`, `resource`, `ctypes`, `importlib`, `pkgutil`, `runpy`, `code`,
-  `codeop`, `types`, `marshal`, `pickle`, `copyreg`, `shelve`, `dbm`, `gc`, `inspect`, `traceback`, `dis`,
-  `pdb`, `bdb`, `trace`, `doctest`, `timeit`, `cProfile`, `profile`, `py_compile`, `compileall`, `unittest`,
-  `logging`, `configparser`, `optparse`, `platform`, `pwd`, `grp`, `getpass`, `crypt`, `netrc`, `builtins`,
-  `sysconfig`, `distutils`, `setuptools`, `venv`, `pip`, `pydoc`, `tkinter`, `turtle`, `idlelib`,
-  `antigravity`, `winreg`, `certorail`.
+The subset of Python that is statically analyzable by certorail is called `SafePy`. Programs can be rejected
+by certorail for two reasons: failure to fall within the `SafePy` dialect, or violating the security policy.
+In the former case, the rejection is labeled with `violation`, the latter is labeled `denied`.
+We will describe `SafePy` first; a description of how to work within the policy follows.
+
+## The SafePy Dialect
+
+### Imports and names
+
+- Only `import x` / `import x.y`. No `from ... import`, no `import ... as`.
+- Standard library only. Forbidden modules (import is a violation) include:
+  * `os` (with narrow exceptions, see allowlist)
+  * Process/Code execution: `subprocess`, `shutil`, `runpy`, `code`, `timeit`, `profile`, `py_compile`, `compileall`, `unittest`
+  * Filesystem accessors: `tempfile`, `glob`, `fileinput`, `linecache`, `filecmp`, `sqlite3`, `xml`, `mmap`, `fcntl`, `resource`
+  * Compression modules: `tarfile`, `zipfile`, `gzip`, `bz2`, `lzma`, `zlib`
+  * Network: `socket`, `ssl`, `asyncio`, `urllib` (except `urllib.parse`, see below), `http`, `ftplib`, `smtplib`, `xmlrpc`, `webbrowser`,
+  * Concurrency/execution internals: `threading`, `_thread`, `multiprocessing`, `concurrent`, `signal`, `ctypes`, `importlib`, `pkgutil`, `codeop`, `types`, `marshal`, `pickle`, `copyreg`, `shelve`, `dbm`, `gc`, `inspect`, `traceback`, `dis`,
+    `pdb`, `bdb`, `trace`, `doctest`, `cProfile`, `builtins`, `sysconfig`, `distutils`, `setuptools`, `venv`, `pip`
+  * Other: `logging`, `configparser`, `optparse`, `platform`, `pwd`, `grp`, `getpass`, `crypt`, `netrc`, `pydoc`, `tkinter`, `turtle`, `idlelib`, `antigravity`, `winreg`, `certorail` (see below)
 - `import urllib.parse` is allowed, for its text half only: `urlsplit`, `urlparse`, `urlunsplit`,
   `urlunparse`, `urljoin`, `urlencode`, `quote`, `quote_plus`, `unquote`, `unquote_plus`, `parse_qs`,
-  `parse_qsl`. Nothing else under `urllib`.
+  `parse_qsl`. Nothing else under `urllib` may be imported.
 - `os` is allowlisted member-by-member: `os.path.{join, basename, dirname, split, splitext, isabs, normpath,
   abspath, realpath, commonpath, exists, isfile, isdir}`, `os.sep`, `os.pathsep`, `os.linesep`, `os.fspath`,
   `os.PathLike`, `os.listdir`, `os.walk`. Nothing else under `os` (no `os.environ`, `os.getcwd`, `os.remove`, …).
 - `typing` is likewise allowlisted, to annotation vocabulary only: `Annotated`, `Optional`, `Union`,
   `Literal`, `Any`, `Final`, `ClassVar`, `Callable`, `TypeAlias`, `Self`, `Never`, `NoReturn`, `TypeVar`,
   `ParamSpec`, `NamedTuple`, `TypedDict`, `Protocol`, `Generic`, `Sequence`, `Mapping`, `MutableMapping`,
-  `Iterable`, `Iterator`, `Collection`. Not `get_type_hints`, `get_args`, `get_origin`, `cast`,
-  `runtime_checkable`, `NewType` or any other helper.
-- Forbidden members of otherwise-allowed modules include: `sys.{modules, path, meta_path, _getframe,
-  settrace, setprofile, exc_info, excepthook, …}`, `functools.{partial, partialmethod, reduce, wraps}`,
-  `operator.{attrgetter, methodcaller, itemgetter, getitem, setitem, delitem}`, `copy.{copy, deepcopy}`,
-  `io.open`, `codecs.open`.
+  `Iterable`, `Iterator`, `Collection`.
+- In addition, some members of otherwise allowed modules are forbidden:
+  * `sys`: `modules`, `path`, `meta_path`, `_getframe`, `settrace`, `setprofile`, `exc_info`, `excepthook`, (among others),
+  * `functools`: `partial`, `partialmethod`, `reduce`, `wraps`,
+  * `operator` `attrgetter`, `methodcaller`, `itemgetter`, `getitem`, `setitem`, `delitem`,
+  * `copy`: `copy`, `deepcopy`
+  * `io`: `open`
+  * `codecs`: `open`,
 - A module name (`json`, `sys`, `pathlib`, …) and the `certora` namespace may appear only as the receiver of
   an attribute that is called or subscripted, or in a type position. Never as a value: no `m = json`,
   `f(sys)`, `f = os.path.join`, `g = certora.exec`. `sys.argv[1:]` is fine; `main(sys.argv)` is not.
 - Never rebind (by assignment, parameter, loop target, `as`, `match` capture, `def`, `class`): an imported
-  name, a builtin name, `certora`, or the name of a class defined in the program.
+  name, a builtin name, `certora`, or the name of a class defined in the program (the program is rejected if this is done)
 - No dunder identifiers anywhere (`__name__`, `__dict__`, `__class__`, `__import__`, `x.__foo__`); the only
   dunder that may be defined is `__init__`. There is no `if __name__ == "__main__":` — call `main()` at top level.
-- Forbidden builtins: `getattr`, `setattr`, `delattr`, `vars`, `locals`, `globals`, `compile`, `eval`, `exec`,
+
+### Builtins
+
+The following builtins: `getattr`, `setattr`, `delattr`, `vars`, `locals`, `globals`, `compile`, `eval`, `exec`,
   `breakpoint`, `help`, `slice`. `type(x)` is allowed; `type(name, bases, ns)` is not.
-- Opening a file is only the bare builtin `open(...)` or a pathlib path's `.open()`. Never `open` reached through
-  a module — `io.open`, `codecs.open`, `os.open`, `tokenize.open`, `pathlib.Path.open`, … are all forbidden.
+
+### Attributes
+
 - Forbidden attribute names on any receiver: frame/code/generator internals (`f_globals`, `f_locals`, `f_back`,
   `gi_frame`, `co_code`, …), `extract`, `extractall`, `load_extension`, `exec_module`, `load_module`,
   `unlink`, `rmdir`, `rename`, `symlink_to`, `hardlink_to`, `lchmod`, `expanduser`, `get_field`.
-- No `async`/`await`, no `:=`, no `nonlocal`, no `global`.
-- Callees must be a name or an attribute chain: `f()()`, `fs[0]()`, `(lambda: 0)()` are violations.
-  Method calls on computed receivers (`f().g()`, `s.strip().lower()`) are allowed.
 - Attribute assignment is allowed only on plain variables (`obj.x = v`): never on a module or class member,
   never through a computed receiver (`f().x = v`).
 
-## Classes
+### Method Invocation
 
-- Every base must be a *name*: a class defined in the program, or one of `object`, `dict`, `list`, `tuple`, `set`,
+- Callees must be a name or an attribute chain: `f()()`, `fs[0]()`, `(lambda: 0)()` are violations.
+  Method calls on computed receivers (`f().g()`, `s.strip().lower()`) are allowed.
+
+### Classes
+
+- Every base must be a *name*: either a class defined in the program, or one of `object`, `dict`, `list`, `tuple`, `set`,
   `frozenset`, `int`, `float`, `enum.Enum`, `enum.IntEnum`, `enum.Flag`, `enum.IntFlag`, `abc.ABC`,
   `typing.NamedTuple`, `typing.TypedDict`, `typing.Protocol`, `typing.Generic`, or any builtin exception class.
-  In particular not `str`, `bytes`, `type`, `pathlib.*`, `enum.StrEnum`, nor any expression.
-- No `metaclass=` or `**kwargs` in a class statement. No class factories: `type(...)` with 3 arguments,
-  `abc.ABCMeta(...)`, the functional `enum` API (`enum.Enum("X", …)`, `enum.StrEnum(…)`),
+- `str`, `bytes`, `type`, `pathlib.*`, `enum.StrEnum`, may **not** be subclassed
+- Computed base classes are forbidden
+- No `metaclass=` or `**kwargs` in a class statement.
+- No class factories: `type(...)` with 3 arguments, `abc.ABCMeta(...)`, the functional `enum` API (`enum.Enum("X", …)`, `enum.StrEnum(…)`),
   `dataclasses.make_dataclass`, `types.new_class`.
 - Each class name is defined once.
 - The only decorators (on functions, methods or classes) are `@staticmethod`, `@classmethod`, `@property`,
   `@dataclasses.dataclass`, `@functools.cache`, `@functools.lru_cache`, `@enum.unique` and `@abc.abstractmethod`,
   bare or with arguments. Do not define or use any other decorator.
 
-## Filesystem operations are sinks
+### Other Restrictions
+- No `async`/`await`, no `:=`, no `nonlocal`, no `global`.
 
-Every one of these is accepted only if the location of its path is proven (below) *and* the policy permits
-that kind of access there; otherwise the program is rejected: `open(path, …)`, `os.listdir(p)`, `os.walk(p)`,
-`os.path.exists/isfile/isdir(p)`, and on a `pathlib.Path`: `.open()`, `.read_text()`, `.read_bytes()`,
-`.write_text()`, `.write_bytes()`, `.iterdir()`, `.glob()`, `.rglob()`, `.exists()`, `.is_file()`, `.is_dir()`,
-`.mkdir()`, `.touch()`, `.chmod()`, `.replace(target)` (both the path and `target` are writes). These methods may
-only be called, never referenced (`f = p.read_text` is a violation). The mode of `open` decides read vs write;
-listing and existence probes count as `list`.
+## Policy Enforcement
 
-Locations are relative to the sandbox root (the working directory); `"."` is the root. A literal beginning
-with `/` names a location under the *filesystem* root instead. It is accepted only where the policy grants
-that absolute location explicitly, and the two anchors never relate: no relative path satisfies an absolute
-grant or vice versa. Prefer relative paths.
+Certorail focuses on controlling 3 types of effectful operations: filesystem writes, network requests, and subprocess spawning.
+In addition, Certorail prevents sensitive data disclosure by restricting the network locations and files that can be read by the
+process. Each broad category of effect/source (filesystem, network, process) is treated in the following sections.
 
-### What proves a location
+### Filesystem
 
-- A relative string literal without `..` (`"data/x.txt"`); `pathlib.Path(...)` of such literals or of
+The Certorail policy defines a fixed set of locations that the Certorail process can access. Any filesystem
+access (read, write, or directory listing) that cannot be proven to fall within one of these allowed locations leads the program being
+rejected. Filesystem permissions are stated as a combination of zero or more "relative path grants", and zero or more
+"absolute path grants". "Relative path grants" are always resolved from the CWD of the Certorail process.
+
+#### Operations are "sinks"
+
+Every one of these operations accesses a path; the path component `p` must be
+proven (see below) to fall within the relevant access grant:
+* open builtin: `open(p, …)`
+* `os` accessors: `os.listdir(p)`, `os.walk(p)`, `os.path.exists/isfile/isdir(p)`
+* `pathlib.Path` methods: `p.open()`, `.read_text()`, `.read_bytes()`,
+   `.write_text()`, `.write_bytes()`, `.iterdir()`, `.glob()`, `.rglob()`, `.exists()`, `.is_file()`, `.is_dir()`,
+   `.mkdir()`, `.touch()`, `.chmod()`, `.replace(target)` (both the path and `target` are writes).
+
+The `pathlib.Path` methods must be fully applied at reference; `f = p.read_text` is a violation.
+
+The mode of `open` (which must be resolvable to a static string at analysis time) determines
+the grant that allows access to `p`, `r` requires read grant, `w` a write grant.
+Listing and existence probes count as `list`. The writer methods `write_text` and `write_bytes` require
+a "write" graph.
+
+The current sandbox root (CWD of the Certorail process) is denoted `"."` as per usual.
+
+#### What proves a location
+
+- A relative string literal without a parent traversal `..` (e.g., `"data/x.txt"`);
+  `pathlib.Path(...)` of such literals or of
   located values; `a / b`, `pathlib.Path(a, b, …)`, `os.path.join(a, b, …)`, `f"{a}/{b}"`, `a + "/" + b`
   where `a` is located and each further component is a literal or a *safe component* (below);
   `str(p)` / `os.fspath(p)` of a located `p`.
