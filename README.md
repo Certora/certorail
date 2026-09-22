@@ -29,7 +29,8 @@ enforces it.
 Programs run with your authority. A policy grant is trust you extend: a program that is allowed to
 write under a directory, run a command or reach a host does so as you, and the tools it runs do
 whatever those tools do. The analysis proves that the Certorail program stays within the grants; it does not
-judge whether the grants were wise. Read the policy as carefully as you would a sudoers file.
+judge whether the grants were wise. Read the policy as carefully as you would a sudoers file. For
+information on how to lockdown programs launched via certorail, see the (grants guide)[GRANTS.md].
 
 A program is rejected before it runs if any operation cannot be proven to stay within the policy.
 The OS jail backs the analysis at run time; on Linux, without `bubblewrap` installed the program
