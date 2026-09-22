@@ -517,6 +517,12 @@ INERT_BUILTIN_TYPES: frozenset[str] = frozenset({
 # spelling that parses).
 PATHMATCH_CALLEE: tuple[str, ...] = (NAMESPACE, "pathmatch")
 
+# certora.reveal_fact(x): the analysis' own probe. Statically the walker records what it knows
+# about the NAME x at that program point (a bare name, nothing else) and reports it with the
+# outcome; it establishes nothing, kills nothing, and is a no-op at runtime (markers). For the
+# program author debugging a denial: "what did the analysis think x was here?"
+REVEAL_CALLEE: tuple[str, ...] = (NAMESPACE, "reveal_fact")
+
 # The extractors, for the walker's audit: the only constructors of a source atom.
 EXTRACT_CALLEE: tuple[str, ...] = (NAMESPACE, "extract")
 EXTRACT_ALL_CALLEE: tuple[str, ...] = (NAMESPACE, "extract_all")

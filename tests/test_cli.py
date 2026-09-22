@@ -33,12 +33,15 @@ class TestInlineSource(unittest.TestCase):
             prog.write_text("x = 1\n", encoding="utf-8")
             self.assertEqual(main([str(prog), "--check"]), 0)
 
-    def test_both_program_and_command_is_an_error(self) -> None:
-        # -c before the positional, so REMAINDER (which captures everything after the
-        # program arg, `-- ARG...` style) does not swallow the flag
-        with self.assertRaises(SystemExit) as cm:
-            main(["-c", "print(1)", "p.py", "--check"])
-        self.assertEqual(cm.exception.code, 2)
+    def test_inline_source_takes_arguments(self) -> None:
+        # with -c every positional is an argument for the program, as with `python -c`; `--`
+        # passes option-like ones through
+        with tempfile.TemporaryDirectory() as tmp:
+            source = 'import pathlib\nimport sys\npathlib.Path("argv.txt").write_text(" ".join(sys.argv[1:]))\n'
+            self.assertEqual(main(["-c", source, "--root", tmp, "--no-jail", "--", "a", "-b", "--check"]), 0)
+            self.assertEqual((pathlib.Path(tmp) / "argv.txt").read_text(), "a -b --check")
+            self.assertEqual(main(["-c", source, "first", "--root", tmp, "--no-jail"]), 0)
+            self.assertEqual((pathlib.Path(tmp) / "argv.txt").read_text(), "first")
 
     def test_neither_is_an_error(self) -> None:
         with self.assertRaises(SystemExit) as cm:

@@ -31,6 +31,50 @@ def problems(text: str) -> list[str]:
     return cm.exception.problems
 
 
+class TestOneStandsForTheListOfOne(unittest.TestCase):
+    """Every set-valued key takes one string (``ports``: one integer) as the list of one; the
+    model always holds the list."""
+
+    def test_every_set_valued_key(self) -> None:
+        doc = load(
+            'policy-version = 1\n'
+            '[filesystem]\nread = "**"\nwrite = "out/**"\nlist = "**"\nno-write = ".git/**"\n'
+            '[regions]\nblah = { footprint = "thing" }\n'
+            '[atoms]\nmy-thing = { reads = "blah" }\n'
+            '[[program]]\nname = "git"\nargv = ["git", "push", "${B}", "${F...}"]\ncwd = "repos/*"\n'
+            'requires = "my-thing"\nwrites = "blah"\n'
+            'holes.B = { one-of = "main" }\nholes.F = { kind = "flags", bare = "-v" }\n'
+            'exec.view = "policy"\nexec.env = "PATH"\nexec.mount-read = "/srv/keys/**"\n'
+            '[[validation]]\nname = "v"\nparams = "X"\nargv = ["test", "${X}"]\ncwd = "**"\n'
+            'establishes = { X = "my-thing" }\nwrites = "blah"\n'
+            '[[network]]\nhost = "api.github.com"\nschemes = "https"\nports = 443\nmethods = "GET"\n'
+            'requires = "my-thing"\nwrites = "blah"\n'
+        )
+        fs = doc.filesystem
+        self.assertEqual((fs.read, fs.write, fs.list_, fs.no_write), (["**"], ["out/**"], ["**"], [".git/**"]))
+        self.assertEqual(doc.regions["blah"].footprint, ["thing"])  # type: ignore[union-attr]
+        self.assertEqual(doc.atoms["my-thing"].reads, ["blah"])
+        (rule,) = doc.program
+        self.assertEqual((rule.requires, rule.writes), (["my-thing"], ["blah"]))
+        assert rule.holes is not None and rule.exec_ is not None
+        b, f = rule.holes["B"], rule.holes["F"]
+        assert isinstance(b, TokenHole) and isinstance(f, FlagsHole)
+        self.assertEqual((b.one_of, f.bare), (["main"], ["-v"]))
+        self.assertEqual((rule.exec_.env, rule.exec_.mount_read), (["PATH"], ["/srv/keys/**"]))
+        (v,) = doc.validation
+        self.assertEqual((v.params, v.establishes, v.writes), (["X"], {"X": ["my-thing"]}, ["blah"]))
+        (n,) = doc.network
+        self.assertEqual(
+            (n.schemes, n.ports, n.methods, n.requires, n.writes),
+            (["https"], [443], ["GET"], ["my-thing"], ["blah"]),
+        )
+
+    def test_only_a_scalar_of_the_element_kind_is_lifted(self) -> None:
+        self.assertEqual(problems('policy-version = 1\n[filesystem]\nread = { x = 1 }\n'), ["filesystem.read: expected a list"])
+        self.assertEqual(problems('policy-version = 1\n[[network]]\nhost = "h"\nports = "443"\n'), ["network[0].ports: expected a list"])
+        self.assertEqual(problems('policy-version = 1\n[[network]]\nhost = "h"\nmethods = 7\n'), ["network[0].methods: expected a list"])
+
+
 class TestDocuments(unittest.TestCase):
     def test_the_fixture_policies_have_the_shape(self) -> None:
         # a full root policy applying the git pack (deny, override, no-write, every key kind) and

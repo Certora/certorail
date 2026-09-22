@@ -97,111 +97,413 @@ The following builtins: `getattr`, `setattr`, `delattr`, `vars`, `locals`, `glob
 
 Certorail focuses on controlling 3 types of effectful operations: filesystem writes, network requests, and subprocess spawning.
 In addition, Certorail prevents sensitive data disclosure by restricting the network locations and files that can be read by the
-process. Each broad category of effect/source (filesystem, network, process) is treated in the following sections.
+process. The vocabulary in which a policy states what it permits comes first; the categories of effect and source (filesystem,
+process, network) follow, each an instance of that vocabulary.
+
+### Policies and Vocabulary
+
+A policy grants operations: the locations a program may read, write and list; the programs it may run and the command lines it
+may run them with; the hosts it may send requests to. Certorail accepts an operation when a grant covers it and every value
+flowing into the operation provably meets the grant's constraints. The description of the policy in your context (the text
+`certorail --describe` prints) lists every grant in a fixed vocabulary, used throughout this document:
+
+- A **constraint** is a requirement on one value flowing into an operation: the path given to `open`, an argument of
+  `certora.exec`, the URL of a request. The description writes constraints as `<...>`:
+  * `<path within L>`: the value denotes a path within the location `L`.
+  * `</re/>`: text matching the regex; `<(a|b)>`: one of the literals.
+  * `<literal>`: text your program itself names, a literal or a module constant.
+  * `<... validated X>`: the value carries the atom `X`; `<... from S>`: the value came, unmodified, from the source `S`.
+  * `<any>`: anything.
+
+  Claims combine: `</dev-\w+/ literal>` is a literal of that shape.
+- A **location fact** is what Certorail knows about where a path value points: an exact path, or some path within a location.
+  A location fact within `L` is what satisfies `<path within L>`.
+- An **atom** is a named fact carried by a value. The built-in atoms describe text: *no-slash*, *no-parent-traversal*,
+  *not-absolute*, *not-dot-dot*, and *not-option* (the text does not begin with `-`). The policy defines further atoms by a
+  regex on the text, by a validation, or by a source.
+- A **validation** is a named check the policy declares, called with `certora.check`; it establishes atoms on the values
+  passed to it.
+- A **source** is a program, host or readable location the policy marks as yielding a provenance atom; values extracted from
+  its results carry that atom.
+
+A value meets a constraint by construction (a literal, a path joined from located parts), through a validation, through
+extraction from a source, or through a runtime guard on its text (see Runtime Guards).
+
+### Location Facts
+
+Locations are spelled as paths. `repos/**` is `repos` and everything below it; `repos/*/x` has one arbitrary component;
+`<re>` is one component matching the regex `re`; `{a,b}` is one of the names `a` and `b`; a leading `/` is the filesystem
+root. Any other location is relative to the sandbox root, the working directory of the Certorail process, spelled `.`.
+
+A **location fact** on a value places the path it denotes at a location, exactly (`data/x.txt`) or approximately
+(`data/**`: some path at or below `data`; `repos/*`: some direct child of `repos`). A value satisfies `<path within L>` when
+its location lies within `L`: a value at `data/**` satisfies `<path within data/**>` and `<path within **>`, and no narrower
+constraint.
+
+Location facts arise from:
+
+- A string literal that is a valid POSIX path (`"data/x.txt"`, `"/home/user/data.txt"`), and `pathlib.Path(...)` of such
+  literals: the exact path.
+- Joins below a located `a`: `a / b`, `pathlib.Path(a, b, …)`, `os.path.join(a, b, …)`, `f"{a}/{b}"`, `a + "/" + b`, where
+  `b` and each further component is a literal or a *safe component* (below). A literal component keeps the location exact
+  (`pathlib.Path("data") / "x.txt"` is at `data/x.txt`); a non-literal safe component gives some path below `a`
+  (`pathlib.Path("data") / name` is at `data/**`).
+- Conversions: `str(a)`, `os.fspath(a)`, `pathlib.Path(a)` have the location of `a`.
+- Traversal loops over a located `base`: `for p in base.iterdir()`, `base.glob(pat)` or `base.rglob(pat)` places `p` below
+  `base`; `for dirpath, dirnames, filenames in os.walk(base)` places `dirpath` below `base`. The fact survives
+  `sorted(...)`, `list(...)`, `reversed(...)` and `enumerate(...)` around the iterable.
+- A module-level constant, assigned exactly once at module level (`DATA = pathlib.Path("data")`): it keeps its fact inside
+  functions. A parameter or local of the same name shadows it.
+- A parameter annotated with a location, and the result of a function whose return is so annotated (see Function Contracts).
+- A runtime guard on a value whose text is otherwise unknown (see Runtime Guards).
+
+#### Safe components
+
+A **safe component** is text that, joined below a located path, stays below it: it does not begin with `/` (*not-absolute*)
+and has no `..` component (*no-parent-traversal*). A single name with no `/` that is not `..` itself is one. `foo/bar` is a
+safe component; `foo/../baz` is not. A literal with these properties is a safe component. `for name in os.listdir(base)`
+gives `name` the atoms of a single name: *no-slash*, *not-dot-dot*, *not-absolute*, *no-parent-traversal*. Other text (an
+argument, a line of a file, a field of a response) becomes a safe component through a runtime guard (see Runtime Guards).
+
+### Effects
+
+Atoms are of two kinds. A *text* atom (the built-in atoms, the regex-defined atoms, provenance, and the validation atoms the
+policy declares pure) is a property of the value and holds as long as the variable holds that value. An *environmental* atom
+is a property of the world a validation examined, that a directory is a clean checkout, that a branch is not protected; it
+holds only while that state is unchanged.
+
+State is divided into **regions**. A region is a named piece of state that a validation can observe and an operation can
+change; it lives on the filesystem, where its footprint places it below the `cwd` of the validation reading it, or it is
+remote. The description lists them under `Regions: the state checks depend on and commands change`:
+
+```
+- repo-state (on disk at .git/** below the check's cwd, and everything under it): the checkout's history and index
+- remote-branches (remote): the branches of the origin repository
+```
+
+A whole medium, `anything on the filesystem` or `anything remote`, stands for every region of it, declared or not.
+
+Every operation **writes** a set of regions, i.e., its effects; every environmental atom **depends on** a set of regions. The atom
+dies at an operation when the two sets meet: they share a region, or one names a whole medium and the other a region in it.
+The description states both sides:
+
+- A program run writes what its shape's `effects:` line says: `none`, `writes repo-state`, or `writes anything on the filesystem`.
+  A program that names a region kills all atoms that read that region.
+- A network request writes what its entry says; an entry admitting only `GET` and `HEAD` writes nothing.
+- A validation writes what its own `effects:` line says.
+- A file write (`open` for writing, `write_text`, `write_bytes`, `mkdir`, `touch`, `chmod`, `replace`, `print(..., file=f)`)
+  meets `anything on the filesystem` and every region whose footprint, below the
+  establishing validation's `cwd`, covers that location. A write elsewhere leaves the atom standing. Reads and listings
+  write nothing.
+- A call to a function defined in the program writes what its body writes. A method call on an instance of a class defined
+  in the program, or on a value whose type is unknown, writes everything.
+- An environmental atom's entry in the atoms section says what it depends on and what kills it:
+  `depends on repo-state; dies on: git push; file writes under .git/** (below the check's cwd)`. An atom with no stated
+  dependencies depends on everything and dies at any effectful call.
+
+Only calling the validation again re-establishes an atom that died. Call the validation immediately before the operation that
+needs the atom; inside a loop, inside the body.
+
+Every fact, atom or location, belongs to the variable it was established on, and is lost when the variable is reassigned. A
+value derived from the variable carries only what the derivation preserves: a path join keeps a location, a string method
+(`strip`, `replace`, `lower`, `format`, `join`, …) keeps nothing.
 
 ### Filesystem
 
-The Certorail policy defines a fixed set of locations that the Certorail process can access. Any filesystem
-access (read, write, or directory listing) that cannot be proven to fall within one of these allowed locations leads the program being
-rejected. Filesystem permissions are stated as a combination of zero or more "relative path grants", and zero or more
-"absolute path grants". "Relative path grants" are always resolved from the CWD of the Certorail process.
+The policy grants filesystem access as three lists of locations, *read*, *write* and *list*, printed at the top of the
+description (`- read: data/**, /etc/hosts`); a location listed as *protected* admits no write whatever the write grants say.
+Every filesystem accessor is constrained by these grants: its path must carry a location fact within a location of the
+matching kind.
 
-#### Direct operations are "sinks"
+- `open(p, mode)`: a mode containing `w`, `a`, `x` or `+` needs *write*, any other mode *read*. The mode is a literal; a
+  computed mode counts as a write.
+- `os.listdir(p)`, `os.walk(p)`, `os.path.exists(p)`, `os.path.isfile(p)`, `os.path.isdir(p)`: *list*.
+- `pathlib.Path` methods on `p`: `.open()` (the mode as for `open`), `.read_text()`, `.read_bytes()` need *read*;
+  `.write_text()`, `.write_bytes()`, `.mkdir()`, `.touch()`, `.chmod()`, `.replace(target)` (both `p` and `target`) need
+  *write*; `.iterdir()`, `.glob()`, `.rglob()`, `.exists()`, `.is_file()`, `.is_dir()` need *list*. Each is called fully
+  applied where it is named; `f = p.read_text` is a violation.
 
-Every one of these operations accesses a path; the path component `p` must be
-proven (see below) to fall within the relevant access grant:
-* open builtin: `open(p, …)`
-* `os` accessors: `os.listdir(p)`, `os.walk(p)`, `os.path.exists/isfile/isdir(p)`
-* `pathlib.Path` methods: `p.open()`, `.read_text()`, `.read_bytes()`,
-   `.write_text()`, `.write_bytes()`, `.iterdir()`, `.glob()`, `.rglob()`, `.exists()`, `.is_file()`, `.is_dir()`,
-   `.mkdir()`, `.touch()`, `.chmod()`, `.replace(target)` (both the path and `target` are writes).
+### Subprocess Exec
 
-The `pathlib.Path` methods must be fully applied at reference; `f = p.read_text` is a violation.
+The policy grants programs as **shapes**: the program, the literal words that follow it, and typed *holes* for the values you
+supply, each hole carrying a constraint from the vocabulary above. `certora.exec` names a shape and fills its holes, the way a
+call fills a signature. The description lists every shape under `Programs: certora.exec(<words>, <holes>, cwd=<proven path>)`:
 
-The mode of `open` (which must be resolvable to a static string at analysis time) determines
-the grant that allows access to `p`, `r` requires read grant, `w` a write grant.
-Listing and existence probes count as `list`. The writer methods `write_text` and `write_bytes` require
-a "write" graph.
+```
+- ls FLAGS... -- FILES...    [from coreutils-ro.toml (where=.)]
+    cwd within **
+    effects: none (effect-free: kills no facts)
+    FLAGS... ends at the first positional that is not a flag; FILES begins there (a value that could be either is rejected: bind by keyword)
+    inserted by the host, do not spell: --
+    FLAGS...: a list of flags --
+        bare: --color=never --full-time -1 -A -F -R -S -a -d -h -l -r -t
+        -I <any>
+        --time-style </[a-z-]+/>
+        bundled short flags accepted: -lr is -l -r (bare single-letter flags only)
+    FILES...: each <path within **>
+```
 
-The current sandbox root (CWD of the Certorail process) is denoted `"."` as per usual.
+Reading an entry:
 
-#### What proves a location
+- The head line is the shape: the program, the literal words, and the holes in order. `NAME...` takes a list; `NAME` takes
+  one value. A word of the head line that is not a hole is a literal word of the shape (`--` here, a subcommand such as `log`
+  elsewhere).
+- `cwd within L`: the constraint on your `cwd=` argument, a location fact within `L`. `cwd validated by X`: the directory
+  must also carry the atom `X` (see Calling validations).
+- `effects:`: what the run writes (see Effects).
+- `inserted by the host, do not spell: --`: these literal words of the shape are placed for you; spelling them is rejected.
+  Without this line, a `--` in the head line is spelled like any other literal word.
+- `bind by keyword: NAME`: the hole is bound by keyword only.
+- One line per hole gives its constraint in the `<...>` notation; `each <...>` constrains every element of a list hole.
+- A flags hole lists the only flags that exist for the shape: `bare` ones, and valued ones with the constraint on the value.
+  A valued flag is two list elements, `["-n", "20"]`; a bundle such as `-la` is accepted only where the entry says so.
 
-As described above, the paths that flow to filesystem sinks must be proven to fall within the filesystem
-grants of the policy. The following describes (roughly) how how Certorail infers "located facts"; each located
-fact carries enough information to allow Certorail to place a filesystem access *through* that fact at a
-(potentially approximate) location on the filesystem. Filesystem accesses through values that are not "located facts"
-are denied.
+#### Calling a shape
 
-- A string literal that is a valid POSIX path (e.g., `"data/x.txt"` or `/home/user/data.txt`) denotes the named
- located path precisely.
-- A `pathlib.Path(...)` of such literals is also modeled precisely.
-- Composition: if `a` is a located fact, child traversal is modeled. `a / b`, `pathlib.Path(a, b, …)`,
-  `os.path.join(a, b, …)`, `f"{a}/{b}"`, `a + "/" + b`, where `b` and each further component is a literal or a *safe component* (below)
-- Type conversion: `str(a)` / `os.fspath(a) / pathlib.Path(a)` for any located fact `a` is itself a "located fact"
-  at the same location.
-- Loop variables: `for p in base.iterdir() / base.glob(pat) / base.rglob(pat)` where `base` is located yield located facts
-  (these facts survive through `sorted(base.iterdir())`, `list(...)`, `reversed(...)`, `enumerate(...)`).
-- `for name in os.listdir(...)` yields *safe components* (see below)
-- `for dirpath, dirnames, filenames in os.walk(top)` where `top` is located yields location fact on `dirpath`.
-- Parameters annotated with a location marker (see contracts); results of contracted functions.
-- A containment guard (below) on a value whose text is otherwise unknown.
+Positionally, spell the literal words and then the holes in order, as the head line shows them minus the host-inserted words.
+The program and the literal words are string literals:
 
-#### Path Safety
+```python
+certora.exec("ls", "-l", "-a", "src", cwd=".")
+certora.exec("cat", "-n", "README.md", cwd=".")
+certora.exec("git", "status", "--short", cwd="repos/app")
+```
 
-A **safe path component** is a component that can be appended to an existing located fact (either via string concatenation or
-`pathlib.Path`'s `/` operator) and provably yield a child path (modulo filesystem links).
+`cwd=` is required: a location fact within the shape's `cwd within`. A string literal that is a valid path is a location fact;
+`pathlib.Path` is for paths you build (`REPOS / name`, an element of `iterdir()`).
 
-In particular a **safe path component** must satisfy two conditions:
-* It must not be an absolute path, i.e., it cannot start with `/`
-* It must not contain a parent directory traversal, i.e., `../`
+A flags list followed by another hole ends at the first positional value carrying *not-option*: a literal not beginning with
+`-`, a located path, or a variable guarded with `assert not s.startswith("-")`; text that could still be a flag (from
+`sys.argv`, a file, a response) is rejected there. Any other list hole followed by another hole (`REVS...` in
+`git log FLAGS... REVS... -- PATHS...`) is bound by keyword only, together with every hole after it; the entry says so with
+`bind by keyword:`. Keyword binding uses the hole names from the head line:
 
-Thus `foo/bar` is a safe path component (it definitely descends in the filesystem tree), `foo/bar/../baz` is *technically*
-safe (it ultimately resolves to `foo/baz`) but Certorail conservatively rejects *any* parent traversal.
+```python
+certora.exec("grep", FLAGS=["-n", "-E"], PATTERN=pattern, FILES=["src"], cwd=".")
+certora.exec("git", "log", FLAGS=["--oneline", "-n", "20"], REVS=["main..HEAD"], cwd=repo)
+```
 
-#### On Precision
+A list hole takes a list display (or a typed container, see Containers); a single hole takes one value. Literal words
+positionally and every hole by keyword is always accepted.
 
-Over-approximation accumulates in a located fact, and precise located facts may lose their precision at control-flow
-join, as usual in a static analysis. A located fact may simply encode "some path below `data/repos`" (usually
-denoted `data/repos/**`). Further, `for p in base.iterdir()` attaches to `p` the fact "some direct descendant of the location
-denoted by `base`". If `base` is already imprecise (e.g., its located fact is `data/repos/**`) then the "located fact" of `p`
-will likewise be precise; Certorail can only conclude the path of `p` points somewhere within `data/repos/**`.
+A program the description names runs in its listed shapes. Where the description ends with a `DEFAULT-ALLOW` line, a program
+it does not name runs with any positional arguments and no holes; every environmental atom dies at such a run.
 
-Precision can be recovered via runtime guards (see below), but you should strive whenever possible
-to write code which doesn't require these runtime assertions. For straightforward, "simple" traversal of filesystem
-facts (without computed names, for example) the Certorail inference works out of the box.
+#### What goes into a hole
 
-`certora.reveal_fact(x)` is a runtime inert function in the style of `typing.reveal_type` which requests `certorail`
-dump all information it knows about the name `x` (named variables only, no complex expressions). You should
-only use this feature only as a last resort if you are unable to convince Certorail to accept a program you are certain
-is correct. Do **NOT** abuse this feature to "double check" the inference of certorail before running scripts "for real";
-do not second guess Certorail until it gives you a reason to do so.
+The hole's constraint decides, as everywhere:
 
-#### Recovering Precision with Runtime Guards
+- `<path within L>`: a location fact within `L`. The tool receives the value's text and resolves it against its own working
+  directory, so spell an operand as the tool expects it from `cwd`.
+- `<any>`: any text, unknown values included. Where no `--` precedes the hole in the head line, the value also needs
+  *not-option*: a literal, a located path, or a guarded variable (see Runtime Guards).
+- `<literal>`: a literal or a module constant of your program.
+- `</re/>`: a literal matching the regex, or a variable guarded with `re.fullmatch` on that exact regex text (see Runtime
+  Guards).
+- `<... validated X>`: a value carrying the atom `X`. A literal matching a regex-defined atom carries it; otherwise the value
+  goes through the validation that establishes `X` (below). `<... from S>`: a value extracted from the source `S` (see
+  Sources).
+- Flags: the flags listed, as separate list elements; a flag's value meets the constraint next to it, and a flag may require
+  an atom elsewhere (`--force (requires BRANCH validated by not-force)`), stated next to it.
 
-A guard is `assert C`, or `if not C: raise …` / `return` / `continue` / `break` (`C` holds afterwards), or
-`if C:` (`C` holds in the body). `C` is one of the forms below, or several joined with `and`.
+Build the value, establish its fact on a variable, then pass the variable.
 
-##### Text Facts
+#### Reading the output
 
-In addition to "located facts", program values may be associated with "atoms" that establish facts
-about their shape.
+`certora.exec` returns once the process has exited, with `.returncode`, and `.stdout` and `.stderr` as bytes. Four decoded
+views do what a pipeline would: `.stdout_string()`, `.stdout_lines()`, `.stderr_string()`, `.stderr_lines()` (UTF-8,
+undecodable bytes replaced). The views raise `certora.CalledProcessError` when the process exited non-zero:
 
-Text facts, on a `str` `s` (or a `pathlib.Path` `p` where a `p` form is given):
+```python
+for line in certora.exec("git", "log", FLAGS=["--oneline"], cwd=repo).stdout_lines()[:20]:
+    print(line)
+```
 
-- *no slash*: `"/" not in s`, `os.sep not in s`, `s.find("/") == -1`, `s.count("/") == 0`.
-- *no parent traversal*: `".." not in s`, `".." not in s.split("/")`, `".." not in p.parts`.
-- *not `..` itself*: `s != ".."`, `s not in (".", "..")`.
-- *not absolute*: `not s.startswith("/")`, `not os.path.isabs(s)`, `s[0] != "/"`, `not p.is_absolute()`.
+is `git log --oneline | head -20`, and raises if `git` failed. Where a non-zero exit is an answer (`grep` finding nothing exits
+1), test `.returncode` and decode the bytes yourself:
 
-A `pathlib.Path` or a `str` with the textual atoms:
-* "not absolute", and
-* Any of:
-  * "no parent traversal"
-  * "no slash" and "not `..` itself*
-is considered a "safe path component".
+```python
+result = certora.exec("grep", FLAGS=["-c"], PATTERN="TODO", FILES=["src"], cwd=".")
+if result.returncode == 1:
+    print("no TODOs")
+else:
+    print(result.stdout.decode("utf-8", "replace"))
+```
 
-For example the following is accepted, assuming a read grant on `data/files/**`:
+For a run whose output you want to watch, a build or a test suite, pass `stream=True` (a literal): stdout and stderr go to the
+terminal, and the result carries the exit code with empty `stdout` and `stderr`.
+
+#### Calling validations
+
+The description's `Validations` section lists each validation as the call that runs it and what the call establishes:
+
+```
+- certora.check("org-checkout", cwd=<path within repos/*>)
+    establishes on cwd: org-checkout (environmental)
+    effects: none (effect-free: kills no facts)
+- certora.check("not-force-check", branch=<str>)
+    establishes on branch: not-force (pure)
+    effects: none (effect-free: kills no facts)
+    also as an expression: certora.check_single("not-force-check", value)
+```
+
+- `certora.check("name", key=value, ..., cwd=path)` is a statement on its own. The name is a literal; the keywords are the
+  declared parameters, each a string; `cwd=` is given exactly when the entry shows it, a location fact within its constraint.
+  On success the declared atoms are established on the variables passed: pass variables, not expressions. Failure raises,
+  so the statements after the call may rely on the atoms.
+- `certora.check_single("name", value)` (plus `cwd=` when declared) is the expression form of a validation with one
+  parameter: the atom rides the result. Assign it and use that variable:
+  `rev = certora.check_single("git-rev", sys.argv[1])`, then `certora.exec("git", "show", REVS=[rev], cwd=repo)`.
+- A regex-defined atom needs no validation: a literal matching the regex carries it, and `assert re.fullmatch(r"…", s)` with
+  that exact regex text establishes it on `s` (see Runtime Guards).
+- An environmental atom follows the Effects section: call the validation immediately before the operation that needs it, on
+  the same variable you pass to that operation.
+
+#### Putting it together
+
+Against a policy that applies the coreutils pack under `.`, the git read pack under `repos`, and declares
+`uv run pytest FLAGS... TESTS...`:
+
+```python
+import pathlib
+import sys
+import typing
+
+REPOS = pathlib.Path("repos")
+
+
+def python_files(under: typing.Annotated[str, certora.within("src")]) -> list[str]:
+    # find WHERE FLAGS...: no -- precedes WHERE, so it needs not-option; a path within src begins with "src/"
+    return certora.exec("find", under, "-name", "*.py", "-type", "f", cwd=".").stdout_lines()
+
+
+def recent_commits(repo: typing.Annotated[pathlib.Path, certora.within("repos")], n: int) -> list[str]:
+    # git log FLAGS... REVS... -- PATHS...: REVS is bound by keyword
+    return certora.exec("git", "log", FLAGS=["--oneline", "-n", str(n)], REVS=["HEAD"], cwd=repo).stdout_lines()
+
+
+def main() -> None:
+    pattern = sys.argv[1]
+    # grep FLAGS... -- PATTERN FILES...: PATTERN follows the host's --, so any text is data
+    hits = certora.exec("grep", FLAGS=["-r", "-n"], PATTERN=pattern, FILES=["src"], cwd=".")
+    if hits.returncode == 0:                      # 1 is no match
+        for line in hits.stdout_lines()[:50]:
+            print(line)
+    for path in python_files("src"):
+        print(path)
+    for repo in sorted(REPOS.iterdir()):          # a direct child of repos
+        for line in recent_commits(repo, 5):
+            print(repo.name, line)
+    certora.exec("uv", "run", "pytest", FLAGS=["-q"], TESTS=["tests"], cwd=".", stream=True)
+
+
+main()
+```
+
+### Network
+
+The policy grants requests by method, scheme and host, optionally with a location the URL's path lies within; the description
+lists them under `Network: certora.network.<method>(url)` (`- GET, HEAD https://api.github.com; path within /repos/**`).
+
+- `certora.network.get(url, headers=…, timeout=…)`, `head` and `delete` likewise; `post(url, headers=…, body=<bytes>,
+  timeout=…)`, `put` and `patch` likewise. The response has `.status`, `.reason`, `.headers` (a tuple of pairs), `.body`
+  (bytes) and `.url` (the final URL, after redirects). A refused or failed request raises.
+- The constraint on `url`: its scheme and host are known and granted with the method, and where the grant names a path
+  location, the path is a location fact within it. A string literal meets it outright. A URL built from parts is text: guard
+  the finished string, held in a variable `u`, with `urllib.parse.urlsplit(u).scheme == "https"`,
+  `urllib.parse.urlsplit(u).netloc == "api.github.com"` (or `in ("a.com", "b.com")`), and for the path
+  `urllib.parse.urlsplit(u).path == "/v1/users"` or
+  `certora.pathmatch(urllib.parse.urlsplit(u).path, r"/repos/*/*/issues/<\d+>/comments")` with the location as the
+  description spells it. `urlparse` serves for `.scheme` and `.netloc`. Text guards on `u` (a regex-defined atom, for
+  instance) come before the URL guards.
+- `the URL must be validated by X`: the URL carries the atom `X`, a literal matching a regex-defined atom or a value passed
+  through the validation (see Calling validations).
+- Headers and bodies are ordinary values.
+- A request writes what its entry states (see Effects); `GET` and `HEAD` write nothing.
+
+### Advanced features
+
+#### Function Contracts
+
+A module-level function states constraints on its parameters and its result with markers under `typing.Annotated`:
+
+```python
+def push(repo: typing.Annotated[pathlib.Path, certora.within("repos"), certora.validated("org-checkout")],
+         branch: typing.Annotated[str, certora.validated("not-force")]) -> bool:
+    return certora.exec("git", "push", "origin", branch, cwd=repo).returncode == 0
+
+
+def slug_of(name: str) -> typing.Annotated[str, certora.no_slash, certora.not_dot_dot]:
+    assert "/" not in name and name not in (".", "..")
+    return name
+```
+
+- A parameter marker is a *rely*: inside the function the parameter carries the facts, and every call passes an argument
+  already carrying them.
+- A return marker is a *guarantee*: every `return` returns a value carrying the facts. At the call site the facts attach when
+  the call is the whole right side of an assignment, `slug = slug_of(name)`; assign first, then use the variable.
+- Markers, under `typing.Annotated[<str or pathlib.Path>, …]`: `certora.within(prefix, leaf=…)` (a location fact at or below
+  `prefix`; `"."` is the root; `leaf=certora.matches(...)` constrains the file name), `certora.exactly("a/b", …)`
+  (components: literals, `certora.matches(r)`, `certora.one_of("a", "b")`); the text shapes `certora.matches(r"…")`,
+  `certora.one_of("a", "b")`, `certora.seq("pre-", certora.matches(r"\d+"))`; the built-in atoms `certora.no_slash`,
+  `certora.no_parent_traversal`, `certora.not_absolute`, `certora.not_dot_dot`, `certora.not_option`;
+  `certora.validated("atom", …)` (the value carries the atoms); `certora.source("atom", …)` (provenance, see Sources);
+  `certora.url(scheme="https", netloc="api.github.com", path_within="/repos")` (a URL with these components, each keyword
+  optional). An annotation carries either a location marker or text markers, with at most one regex marker among them;
+  `validated` combines with either.
+- Markers go on a `str` or `pathlib.Path` parameter or return value, or on the element type of a typed container (below).
+  Only module-level functions carry markers; nested functions and methods use plain types, which state nothing to the
+  policy. Each function name is defined once, and a contracted function is called directly by name, without `*args` or
+  `**kwargs`.
+
+#### Containers
+
+A `list` or `set` whose elements all carry facts, declared by annotation and owned by the one name it is assigned to:
+
+```python
+slugs: list[typing.Annotated[str, certora.no_slash, certora.not_dot_dot]] = []
+branches: list[typing.Annotated[str, certora.validated("not-force")]] = [
+    certora.check_single("not-force-check", b) for b in sys.argv[1:]
+]
+```
+
+- Tracking begins at an annotated assignment whose right side is a constructor: a display `[a, b]` / `{a, b}`, `list()` /
+  `set()`, the copy `list(other)` / `set(other)`, or a comprehension with exactly one `for` (its element, under the loop
+  variable and the `if` filters, meets the annotation). Every element is checked at construction; a copy is spelled
+  `list(y)`.
+- Reads give the element facts: `x[i]`, `for e in x` (also through `sorted`, `list`, `tuple`, `reversed`, `iter`,
+  `enumerate`), `x.pop()`, `len(x)`, `v in x`, `if x:`, iterating `x` in a comprehension, and `x` as a list hole of
+  `certora.exec`.
+- Writes meet the annotation: `x.append(v)`, `x.insert(i, v)`, `x[i] = v`, `x.extend(ys)` / `x += ys` (`ys` a display or a
+  typed container with at least as strong an element type), `x.add(v)`; also `x.remove(v)`, `x.discard(v)`, `x.clear()`,
+  `x.sort()`.
+- The name is used in those ways only; aliasing it (`y = x`), storing it in another container, passing it to a parameter
+  that is not itself a typed container, `x[i] += v` and `x[1:] = …` are violations.
+- Passing moves or borrows: a `list[P]` argument binds to a `list[P]` parameter with the same element type (the callee may
+  write), or to a `typing.Sequence[Q]` parameter with `P` at least as strong as `Q`, read-only inside the function. A local
+  typed container is returned against `-> list[…]` / `-> set[…]` with the same element type and moves to the caller's
+  variable; a parameter container is not returned.
+- Element atoms follow the Effects section. Nested containers, dicts and tuples of marked values are untracked; `list[str]`
+  without `Annotated` is an ordinary list.
+
+### Runtime Guards
+
+A guard is `assert C`, or `if not C: raise …` / `return` / `continue` / `break` (`C` holds afterwards), or `if C:` (`C` holds
+in the body). `C` is one of the forms below, or several joined with `and`. A guard establishes atoms or a location fact on
+the variable it interrogates.
+
+#### Text atoms
+
+On a `str` `s` (or a `pathlib.Path` `p` where a `p` form is given):
+
+- *no-slash*: `"/" not in s`, `os.sep not in s`, `s.find("/") == -1`, `s.count("/") == 0`.
+- *no-parent-traversal*: `".." not in s`, `".." not in s.split("/")`, `".." not in p.parts`.
+- *not-dot-dot*: `s != ".."`, `s not in (".", "..")`.
+- *not-absolute*: `not s.startswith("/")`, `not os.path.isabs(s)`, `s[0] != "/"`, `not p.is_absolute()`.
+- *not-option*: `not s.startswith("-")`, `s[0] != "-"`.
+
+*not-absolute* with either *no-parent-traversal* or both *no-slash* and *not-dot-dot* makes a safe component. With a read
+grant on `data/files/**`:
 
 ```python
 name = sys.argv[1]
@@ -210,279 +512,63 @@ assert name != ".."
 open(f"data/files/{name}", "r").read()
 ```
 
-##### Textual shape
+#### Text shape
 
-Certorail has limited support for tracking the regular language that accepts a textual fact.
-A guard `s == "lit"` establishes that `s` is exactly `"lit"`, `s in ("a", "b")`, `s == "a" or s == "b"` establishes
-alternation. `s.startswith("pre")`, `s.endswith(".txt")` (a tuple of literals also works for both), establishes a regex
-shape `^pre.*` and `.*\.txt` respectively. 
-`re.fullmatch(r"…", s)` (also`… is not None`, `re.compile(r"…").fullmatch(s)`, `re.match(r"…\Z", s)`) establish the target
-matches the provided regex. Certorail does not support a full regular expression domain, but you should only rely
-on regex shapes when the policy demands regex shapes.
+`s == "lit"` establishes that `s` is exactly `"lit"`; `s in ("a", "b")` and `s == "a" or s == "b"` establish the
+alternation. `s.startswith("pre")` and `s.endswith(".txt")` (a tuple of literals also works for both) establish the shapes
+`^pre.*` and `.*\.txt`. `re.fullmatch(r"…", s)` (also `… is not None`, `re.compile(r"…").fullmatch(s)`,
+`re.match(r"…\Z", s)`) establishes that `s` matches the regex. Where a constraint is a regex (`</re/>`, a regex-defined
+atom), guard with that exact regex text.
 
-##### Containment
+#### Containment
 
-Containment, ensuring a located fact on `p` is known to fall under under `BASE`
-(where `BASE` may be a literal or a located fact itself).
+Containment establishes a location fact on `p` under `BASE`, a literal or a located value. The guards understand casts
+through `str()`, `pathlib.Path()` or `.resolve()`:
 
-The guards below understand casts through `str()`, `pathlib.Path()` or `.resolve()`:
-
-- Lexical, only if *no parent traversal* is established on `p`: `s.startswith(str(BASE) + "/")` or `+ os.sep`,
+- Lexical, once *no-parent-traversal* is established on `p`: `s.startswith(str(BASE) + "/")` or `+ os.sep`,
   `p.is_relative_to(BASE)`, `p.parent == BASE`, `BASE in p.parents`, `os.path.commonpath([s, BASE]) == BASE`.
-- Resolving form, needing nothing else: `p.resolve().is_relative_to(BASE)`, `os.path.realpath(s).startswith(str(BASE) + "/")`, ...
-- **The policy's own spelling**: `certora.pathmatch(s, "repos/*/foundry.toml")`
-  establishes exactly that location on `s`. See below for the mini-DSL used for the path component.
-  Prefer this for complex paths with multiple constraints.
+- Resolving, needing nothing else: `p.resolve().is_relative_to(BASE)`, `os.path.realpath(s).startswith(str(BASE) + "/")`.
+- The location's own spelling: `certora.pathmatch(s, "repos/*/foundry.toml")` establishes exactly that location on `s`, in
+  the notation of the Location Facts section. Prefer it for a location with several constraints.
 
-##### Types
+#### Types
 
-Certorail does not trust the type annotations in the program and does not assume well-typedness in any event.
-Accordingly, the above guards only work when the interrogated object is known to be a type that
-supports the guards.
+The guards above apply to a value known to be a `str` or a `pathlib.Path`; `isinstance(s, str)` and
+`isinstance(p, pathlib.Path)` establish the type.
 
-The type of an object can be established via `isinstance(s, str)`, `isinstance(p, pathlib.Path)`.
+#### Effective guard use
 
-#### Effective Runtime Guard Use
-
-- Guards apply in source order, once. Within thus, if the type needs to be established,
-  put `isinstance` first and any shape constraints later, e.g.,
+- Guards apply in source order, once: `isinstance` first, then text atoms, then containment:
   `assert isinstance(s, str) and ".." not in s and pathlib.Path(s).is_relative_to("repos")`.
-- Aside from the exceptions enumerated above, a guard on a derived view says nothing about the variable:
-  `pathlib.Path(s.strip()).is_relative_to(BASE)` proves nothing about `s`.
-  Assign the derived value to a variable, then guard that variable.
-- A guard holds for the remaining statements of its block and nested blocks only; nothing established inside a
-  `try` body, a loop body, or a `with` body survives that statement.
-- Facts belong to a variable and are lost when it is reassigned; a variable assigned anywhere inside a loop is
-  unknown at the start of the loop (except a `for` target bound by the header).
-- Any string method (`replace`, `strip`, `lower`, `format`, `join`, …) yields a plain string with no path facts:
-  re-establish them with a guard afterwards.
-- Module-level constants are visible inside functions and keep their facts (`DATA = pathlib.Path("data")`
-  at module level, then `DATA / name` inside a function). These module level facts only work
-  for a module name proven to be constant, i.e., assigned exactly once at module level.
-  A parameter or local of the same name shadows the constant, as in normal Python.
+- Aside from the casts named above, a guard on a derived view says nothing about the variable:
+  `pathlib.Path(s.strip()).is_relative_to(BASE)` establishes nothing on `s`. Assign the derived value to a variable, then
+  guard that variable.
+- A guard holds for the remaining statements of its block and nested blocks; nothing established inside a `try` body, a
+  loop body, or a `with` body survives that statement.
+- Facts belong to a variable and are lost when it is reassigned; a variable assigned anywhere inside a loop is unknown at
+  the start of the loop (except a `for` target bound by the header). Guard it inside the body, after the assignment.
+- A string method (`replace`, `strip`, `lower`, `format`, `join`, …) yields a plain string with no facts: re-establish them
+  with a guard afterwards.
 
+`certora.reveal_fact(x)` is a runtime inert function in the style of `typing.reveal_type`: Certorail reports everything it
+knows about the variable `x` at that point (named variables only, no complex expressions). Use it only as a last resort when
+you are unable to convince Certorail to accept a program you are certain is correct. Do **not** use it to "double check" the
+inference before running scripts for real; do not second guess Certorail until it gives you a reason to do so.
 
-## Subprocesses
+### Sources
 
-- Only `certora.exec(program, *args, cwd=<located path>)`. `program` is a string literal (or a name bound to
-  one); arguments are separate strings, no `*`/`**` splats; `cwd` is required and must be a proven location.
-  No shell; output is captured. A call the host refuses raises. `stream=True` (a literal, the only other
-  option) sends the command's output straight to the terminal as it happens -- for a build or a test run
-  you want to watch -- and the result then has the exit code and empty `stdout`/`stderr`: live output or
-  output to read, one or the other per call.
-- The result is a `CompletedProcess` with `.returncode`, `.stdout` and `.stderr` (bytes), plus decoded views:
-  `.stdout_string()`, `.stdout_lines()`, `.stderr_string()`, `.stderr_lines()` (UTF-8, lines split like
-  `str.splitlines`). **The views raise `certora.CalledProcessError` when the command exited non-zero**, so
-  `for line in certora.exec("git", "log", "--oneline", cwd=repo).stdout_lines()[:10]:` is the whole
-  pipeline and fails loudly if `git` did. To handle failure yourself, test `.returncode` and read the bytes.
-  There is no shell: do filtering (`head`, `tail`, `grep`, `wc`) in Python on the lines.
-- The policy may pin subcommands: if it declares `git log` and `git push origin`, any other `git`
-  invocation — including one whose subcommand is not a literal — is rejected.
-- The policy may declare a command's *shape* (a template): literal words, then typed *holes*. A
-  template binds like a function call: spell the literal words positionally, then fill the holes
-  positionally in order — `certora.exec("git", "push", "origin", branch, cwd=repo)`,
-  `certora.exec("find", where, "-mindepth", "1", "-name", "*.py", cwd=here)` — or by keyword
-  (`BRANCH=branch`). Some holes are keyword-only (the description says which):
-  `certora.exec("git", "log", REVS=["main..HEAD"], PATHS=[src], cwd=repo)`. A flags list before
-  other holes ends at the first argument that provably is not a flag (a literal, a path, a guarded
-  string): `certora.exec("tar", "-c", "-z", out, a, b, cwd=here)`. If the next argument could be a
-  flag (text read from a file or `sys.argv`), the call is rejected: name the holes instead,
-  `certora.exec("grep", FLAGS=["-r"], PATTERN=pat, FILES=[repo], cwd=here)`. A list hole takes a
-  list display (or a typed container); a flags hole takes a list of flag names with their values
-  following, and only the flags the policy lists. Never spell the words the host inserts (`--`,
-  `-f`). Every hole is checked like a parameter annotation (a proven path within a location, text
-  matching a regex, a validation fact). A value that may begin with `-` where the tool could read
-  it as an option is rejected: use a path under a named directory, or a literal.
-- Run `certorail --describe` (or read the description in your context) for the exact shapes,
-  hole names, flags and validations this policy permits.
-- The policy may refuse arguments it cannot vouch for: anything other than a string literal, a module-level
-  constant, or a proven path (an f-string or `.strip()` result is not vouched for). It may confine path
-  arguments to locations. Spell arguments out as literals where you can; pass paths as located values.
-- Arguments after the subcommand may be required to carry validation facts; a value whose text is statically
-  known (a literal, a constant) automatically satisfies any fact the policy defines as a text property or whose
-  checker the host can run on the literal directly — no `certora.check` needed for constants.
+The policy marks a program, a host or a readable location as a *source* yielding a provenance atom; the entry says so
+(`yields gh-api`), as does the atoms section. A value carries the atom when it came out of the source's result unmodified,
+through an extractor:
 
-## Network
-
-- Only `certora.network.get/head/delete(url, headers=…, timeout=…)` and
-  `certora.network.post/put/patch(url, headers=…, body=<bytes>, timeout=…)`. One positional argument, the
-  URL; no other keywords; no splats. Returns a response with `.status`, `.reason`, `.headers` (a tuple of
-  pairs), `.body` (bytes) and `.url` (the final URL after redirects, which the host follows). A refused or
-  failed request raises.
-- The URL's scheme and host must be proven, and the policy must permit that host, port and method. A string
-  literal is proven outright. A URL built from parts (`f"https://api.github.com/repos/{owner}"`) is not:
-  guard the finished string, with `u` the variable holding it:
-  `urllib.parse.urlsplit(u).scheme == "https"`, `urllib.parse.urlsplit(u).netloc == "api.github.com"` (or
-  `in ("a.com", "b.com")`), `urllib.parse.urlsplit(u).path == "/v1/users"`,
-  `urllib.parse.urlsplit(u).path.startswith("/repos/")` (with `".." not in u` earlier in the condition), or
-  `certora.pathmatch(urllib.parse.urlsplit(u).path, r"/repos/*/*/issues/<\d+>/comments")` for a path shape the
-  policy spells out (a raw string when it contains a regex; this one needs no `..` guard and may come after
-  the scheme and netloc guards).
-  `urlparse` is accepted for `.scheme` and `.netloc`, not for `.path`. Once a value is read as a URL no more
-  text facts attach to it: put text guards first.
-- The policy may require validation facts on the URL (see validations): a literal URL that matches the
-  policy's definition of the fact carries it; a computed URL needs a `certora.check` on it first.
-- Headers and bodies are ordinary values; credentials in headers are not forwarded across hosts on redirect.
-- A network call is an effectful call: it kills environmental validation facts (below).
-
-## Runtime validations
-
-- The host's policy may declare named validations: runtime predicates, run by the host, whose success
-  establishes policy-defined facts ("atoms"). `certora.check(name, key=value, ..., cwd=<located path>)` runs
-  the validation `name` (a string literal) and raises on failure, so the statements after it may rely on
-  what it established. It must be a bare statement. The keywords are fixed by the validation's declaration;
-  `cwd=` is required and must be a proven location when the validation declares one, and must be omitted when
-  it does not; other arguments are strings.
-- A fact is established on the *variable* passed in the corresponding keyword — pass a plain variable, not an
-  expression. `certora.check_single(name, value)` (plus `cwd=` if declared) is the expression form for
-  validations with exactly one parameter: it returns `value` on success and the fact rides the *result* —
-  `branch = certora.check_single("not-force-check", sys.argv[1])` — so it also works as the element of a
-  container comprehension. The argument itself gains nothing; use the result.
-- Facts are consumed by policy rules ("`git push` requires a cwd validated by X") and by
-  `certora.validated("…")` markers in `typing.Annotated` contracts.
-- A fact the policy defines by a regex needs no check: a literal matching it carries it, and
-  `assert re.fullmatch(r"…", s)` with that exact regex text establishes it on a dynamic `s`. A
-  different guard for the same property is not recognised.
-- Every validation fact dies when its variable is reassigned or a new value is derived from it.
-  A fact about the *environment* (e.g. "this directory is a clean checkout") additionally dies at every call
-  that may have effects: any call to a program-defined function, a method on a non-path value, a class
-  instantiation, `certora.exec`, `certora.network.*`, and any `certora.check` not declared effect-free.
-  Effect-free operations preserve it: `str`, `repr`, `len`, `print`, `format`, `int`, `float`, `bool`,
-  `isinstance`, `os.fspath`, `os.path.*`, `pathlib.Path(...)`, `re.fullmatch/match/search/compile`,
-  `json.dumps/loads`, reads and listings on a proven path, and validations the policy declares effect-free.
-  Check immediately before the operation that needs the fact; inside a loop, check inside the body. Facts about
-  the value's *text* alone (as declared by the policy) survive any number of calls. In a comprehension only
-  text facts accumulate: an environmental `check_single` establishes nothing on the container.
-
-## Sources and extraction
-
-- The policy may mark a program, a network host, or a readable location as a *source* yielding a
-  named fact (the description lists them: "yields gh-api"). A value carries that fact only if it
-  came out of the source's result **unmodified**, through one of four extractors:
-  `certora.extract(x, ".data.repos[0].name")` (one value), `certora.extract_all(x, ".data[].name")`
-  (a list; exactly one `[]` in the path), `certora.lines(x)` (a list of lines), and
-  `certora.field(line, i, sep=None)` (one field of an extracted line). `x` is the result of
-  `certora.exec` or `certora.network.*`, a file object from `with open(...)`, or text from
-  `.read_text()` / `f.read()`. Iterating a file (`for line in f`) and `f.readlines()` count as
-  `lines`. The path is a string literal in a small jq subset: `.key`, `."quoted key"`, `[0]`,
-  `[]`; no pipes or filters. Scalars come back as text; `null`, a missing path and non-scalars raise.
-- The result of `extract_all` / `lines` / `readlines` is a typed container: annotate it,
-  `xs: list[typing.Annotated[str, certora.source("gh-api")]] = certora.extract_all(...)`
-  (`certora.source`, not `certora.validated`: provenance is spelled as what it is).
-- Any string operation (`strip`, `+`, f-strings, `split`) drops the fact, as does `json.loads`
-  followed by indexing; guards (`assert re.fullmatch(...)`) keep it. A literal never has it.
-  Where a hole or contract demands a source fact, the extractor is the only spelling that works.
-
-## Everything else
-
-Ordinary Python is fine: functions, classes with the bases above, dataclasses (`@dataclasses.dataclass`),
-`enum.Enum`, comprehensions, lambdas, `match`, `try`/`except` with builtin or module exception classes,
-`with open(...)`, f-strings, `json`, `re`, `math`, `collections`, `itertools`, `datetime`, `pathlib`,
-`urllib.parse`.
-
-A small program using most of the above, against a policy that permits read, write and list under `repos/`,
-`git log` and `git push origin` there (the push requiring an `org-checkout` fact on the cwd and a `not-force`
-fact on its arguments), and `GET` on `api.github.com`:
-
-```python
-import json
-import pathlib
-import sys
-import typing
-
-REPOS = pathlib.Path("repos")
-
-
-def slug_of(name: str) -> typing.Annotated[str, certora.no_slash, certora.not_dot_dot]:
-    # untrusted API data becomes a safe path component by exactly one guard
-    assert "/" not in name and name not in (".", "..")
-    return name
-
-
-def push(repo: typing.Annotated[pathlib.Path, certora.within("repos"), certora.validated("org-checkout")],
-         branch: typing.Annotated[str, certora.validated("not-force")]) -> bool:
-    result = certora.exec("git", "push", "origin", branch, cwd=repo)
-    return result.returncode == 0
-
-
-def main() -> None:
-    response = certora.network.get("https://api.github.com/orgs/certora/repos")
-    names = [r["name"] for r in json.loads(response.body)]
-    branches: list[typing.Annotated[str, certora.validated("not-force")]] = [
-        certora.check_single("not-force-check", b) for b in sys.argv[1:]
-    ]
-    for name in names:
-        slug = slug_of(name)                     # the guarantee lands on the variable
-        repo = REPOS / slug                      # located: repos/<safe component>
-        if not (repo / ".git").is_dir():
-            continue
-        (repo / "AUDIT.md").write_text("checked\n")
-        for branch in branches:
-            certora.check("org-repo", cwd=repo)  # right before the use: any effectful call kills it
-            if not push(repo, branch):
-                print(f"push of {branch} to {name} failed")
-
-
-main()
-```
-## Function contracts
-
-- Only module-level functions may carry marker annotations; nested functions and methods may use plain types only.
-  Each function name is defined once. Calls to a contracted function may not use `*args`/`**kwargs`.
-  A function whose parameters carry markers is only ever called directly by name: never passed as a value
-  (`key=f`, `map(f, …)`) or assigned to another name.
-- Rely (parameter): `def f(p: typing.Annotated[pathlib.Path, certora.within("data")])` — inside `f`, `p` is
-  located under `data/`; every call must pass an argument already proven to satisfy the annotation.
-- Guarantee (return): `def g(s: str) -> typing.Annotated[str, certora.no_slash, certora.not_dot_dot]` — every
-  `return` must return a value proven to satisfy it (build it, or guard it before returning). At a call site
-  the guarantee attaches only when the call is the entire right side of an assignment: `x = g(...)` gives `x`
-  the facts; `base / g(...)` or `f(g(...))` sees an unknown value. Assign first, then use the variable.
-- Plain type annotations (`str`, `pathlib.Path`, `list[str]`) are not checked statically; scalar ones are
-  checked at runtime. Markers go on a `str`/`pathlib.Path` parameter or return value, or on the element type
-  of a typed container (below); never on `*args`/`**kwargs`.
-- Markers, under `typing.Annotated[<str or pathlib.Path>, …]`:
-  `certora.within(prefix, leaf=…)` (at or below `prefix`; `"."` is the root),
-  `certora.exactly("a/b", …)` (components: literals, `certora.matches(r)`, `certora.one_of("a", "b")`),
-  `certora.matches(r"…")`, `certora.one_of("a", "b")`, `certora.seq("pre-", certora.matches(r"\d+"))`,
-  `certora.no_slash`, `certora.no_parent_traversal`, `certora.not_absolute`, `certora.not_dot_dot`,
-  `certora.not_option` (the text does not begin with `-`; `assert not s.startswith("-")` establishes it),
-  `certora.validated("atom", …)` (the value carries the named policy facts — see validations),
-  `certora.source("atom", …)` (the value came, unmodified, from the source that yields the atom — see provenance),
-  `certora.url(scheme="https", netloc="api.github.com", path_within="/repos")` (the value is a URL with these
-  components; each keyword is optional and claims only what it names — see network).
-  A location marker (`within`/`exactly`) does not combine with text markers; constrain the file name with
-  `within(prefix, leaf=certora.matches(...))`. At most one location marker and one regex marker per annotation.
-  `validated` combines with anything.
-
-## Typed containers
-
-A `list` or `set` whose elements all carry facts, declared and tracked by name:
-
-```python
-slugs: list[typing.Annotated[str, certora.no_slash, certora.not_dot_dot]] = []
-```
-
-- Tracking begins only at an annotated assignment (`x: list[typing.Annotated[…]] = …`,
-  `set[…]` likewise) whose right side is a constructor: a display `[a, b]` / `{a, b}`, `list()` / `set()`,
-  the copy `list(other)` / `set(other)`, or a comprehension with exactly one `for` (its element, evaluated
-  under the loop variable and the `if` filters, must satisfy the annotation). Every element is checked at
-  construction. `x: list[…] = y` is not a constructor: spell the copy as `list(y)`.
-- Reads give the element facts: `x[i]`, `for e in x` (also through `sorted`, `list`, `tuple`, `reversed`,
-  `iter`, `enumerate`), `x.pop()`, `len(x)`, `v in x`, `if x:`, `list(x)`, `set(x)`, iterating `x` in a
-  comprehension.
-- Writes must satisfy the annotation: `x.append(v)`, `x.insert(i, v)`, `x[i] = v` (a direct single-target
-  store only), `x.extend(ys)` / `x += ys` (`ys` a display or another typed container with at least as strong an
-  element type), `x.add(v)`; also `x.remove(v)`, `x.discard(v)`, `x.clear()`, `x.sort()`.
-- **Any other use of the name is a violation**: aliasing (`y = x`), passing it to `print`, `json.dumps`, or
-  a parameter that is not itself a typed container, `(x[0], z) = …`, `x[i] += v`, `x[1:] = …`, storing it in
-  another container. `x[1:]` is a copy with no facts (allowed, useless).
-- Passing: a `list[P]` argument binds only to a `list[P]` parameter with the *same* element type (the callee
-  may write), or to a `typing.Sequence[Q]` parameter with `P` at least as strong as `Q` — inside such a function
-  the parameter is read-only (no mutators, no aliasing). A `Sequence` can only be received, never constructed.
-- Returning: a *local* typed container may be returned against `-> list[…]` / `-> set[…]` with the same
-  element type (it moves out; the caller's variable receives the facts). A *parameter* container may not be
-  returned.
-- Element facts die like any other: an environmental validation fact on the elements is lost at the next
-  effectful call (see validations); text facts and pure facts persist.
-- Nested containers, dicts and tuples of marked values are not tracked; `list[str]` without `Annotated` is an
-  ordinary untracked list.
+- `certora.extract(x, ".data.repos[0].name")`: one value. `certora.extract_all(x, ".data[].name")`: a list, with exactly one
+  `[]` in the path. `certora.lines(x)`: the lines. `certora.field(line, i, sep=None)`: one field of an extracted line. `x`
+  is the result of `certora.exec` or `certora.network.*`, a file object from `with open(...)`, or text from `.read_text()` /
+  `f.read()`; `for line in f` and `f.readlines()` count as `lines`.
+- The path is a string literal in a small jq subset: `.key`, `."quoted key"`, `[0]`, `[]`. Scalars come back as text;
+  `null`, a missing path and a non-scalar raise.
+- The result of `extract_all`, `lines` or `readlines` is a typed container: annotate it,
+  `xs: list[typing.Annotated[str, certora.source("gh-api")]] = certora.extract_all(...)`.
+- A guard (`assert re.fullmatch(...)`) keeps the atom; a string operation, or `json.loads` followed by indexing, yields a
+  value without it, and no literal carries it. Where a hole or a contract asks for `<... from S>`, the value comes from an
+  extractor.

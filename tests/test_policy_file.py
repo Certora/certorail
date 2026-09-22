@@ -169,7 +169,7 @@ class TestPolicyDocument(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             p = pathlib.Path(tmp) / "policy.toml"
             p.write_text(DOCUMENT)
-            self.assertEqual(load_policy(p), EXPECTED)
+            self.assertEqual(load_policy(p).policy, EXPECTED)
 
 
 class TestStrictness(unittest.TestCase):

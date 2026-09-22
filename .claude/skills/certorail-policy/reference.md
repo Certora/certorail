@@ -2,7 +2,9 @@
 
 The policy is a TOML document (JSON with the same shape is accepted too). The schema is strict
 and fails closed: unknown keys, undeclared atoms or regions, malformed locations and mistyped
-values are errors, and every error in the document is reported, not just the first.
+values are errors, and every error in the document is reported, not just the first. Every key
+that takes a list of strings also takes one string, meaning the list of one (`read = "**"`,
+`writes = "git.refs"`, `requires = "org-checkout"`); `ports` likewise takes one integer.
 
 ```toml
 policy-version = 1
@@ -15,10 +17,10 @@ read  = ["**"]
 write = ["repos/**"]
 list  = ["repos/**"]
 
-[regions]                          # the state checks depend on and commands change
-git.config = { footprint = ".git/config", about = "remotes, hooks: everything git reads from config" }
-git.refs   = { footprint = [".git/refs", ".git/packed-refs"], about = "local and remote-tracking refs" }
-git.remote = { network = true, about = "the remote repository" }
+[regions]                          # the state checks depend on and commands change (quote dotted names)
+"git.config" = { footprint = ".git/config", about = "remotes, hooks: everything git reads from config" }
+"git.refs"   = { footprint = [".git/refs", ".git/packed-refs"], about = "local and remote-tracking refs" }
+"git.remote" = { network = true, about = "the remote repository" }
 
 [atoms]
 org-checkout = { reads = ["git.config"] }  # environmental: dies when git.config may have changed
@@ -495,8 +497,10 @@ root policy, and to the built-in policy of a root with none, exactly as if the r
 `[[apply]] ruleset = "base.toml"` with no bindings. **Nobody ships it.** The repository provides
 rulesets to apply (`coreutils-ro.toml`), never a `base.toml`; no installer writes one unasked;
 creating it is a deliberate first-run act of whoever owns the machine (a setup verb may generate
-it on request). Every run that composes it says so on stderr, and `--describe` lists every
-ruleset composed into the policy. It is just a ruleset: exec shapes and
+it on request). `--check`, `--describe`, every rejection and the session hook say when it was
+composed in (an accepted run prints nothing: those lines would be tokens in an agent's context
+saying nothing new), and `--describe` lists every ruleset composed into the policy. It is just a
+ruleset: exec shapes and
 `no-write` protections, no filesystem or network grants, no absolute paths, and no parameters
 except bools (which are false). Its purpose is the read-only tooling an agent reaches for
 everywhere (`ls`, `cat`, `grep`, `find`, the git read rung bound to `where = "."`), each jailed
@@ -661,7 +665,10 @@ loads and still declares the same root. Otherwise the problems are printed and y
 edit again or discard, as in `git add -p`.
 
 `--check` analyses and evaluates without running and prints every sink with its proven
-location. `--policy` takes a `.toml` or `.json` document; without it the nearest ambient policy
+location. `certora.reveal_fact(x)` in the program -- a bare name, nothing else -- makes the
+report begin with what the analysis knew about `x` at that point (its location, the text shape
+it matches, the atoms it carries, or that nothing is known); it establishes nothing, kills
+nothing, and does nothing at runtime. A run prints the reveals on stderr before starting. `--policy` takes a `.toml` or `.json` document; without it the nearest ambient policy
 for the root applies, else the built-in default (read, write and list anywhere within the root;
 no programs, no network). `--describe` prints the policy's interface for the program author,
 rendered from the loaded policy: filesystem grants, regions, every program form as a signature

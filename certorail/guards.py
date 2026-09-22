@@ -407,6 +407,54 @@ def _same_variable(a: Term, b: Term) -> bool:
     return sa is not None and sb is not None and sa.name == sb.name and not sb.viewed
 
 
+# The typed nonsense a recognizer must see through. A comparison between a string literal and a
+# pathlib object is ill-typed: ``".." in pathlib.Path(x)`` raises TypeError, ``Path(x) == ".."``
+# is always false, ``Path(x) != ".."`` and ``Path(x) not in (".", "..")`` are vacuously true. None
+# says anything about the text, so a guard built from one would be a fact the program never
+# earned (John, 2026-09-21: ``assert ".." not in pathlib.Path(name)`` established
+# no-parent-traversal). Likewise a str method on a pathlib object, or a pathlib method on text,
+# raises AttributeError. What is known by construction (a constructor, a path-returning method)
+# or from the state (a variable holding a path fact) decides; an unknown term may be either and
+# is left to the shape rules.
+
+_PATH_METHODS = frozenset({
+    "resolve", "absolute", "expanduser", "with_name", "with_suffix", "with_stem", "joinpath",
+    "relative_to", "readlink",
+})
+
+
+def _path_object(t: Term, st: StateMap) -> bool:
+    """Does *t* evaluate to a pathlib object rather than text?"""
+    match t:
+        case Call(("pathlib", _), _, _):
+            return True
+        case Method(_, name, _, _) if name in _PATH_METHODS:
+            return True
+        case Attr(_, "parent"):
+            return True
+        case BinOp(left, op, _) if op is ast.Div:
+            return _path_object(left, st)
+        case Var(name):
+            fact = st.get(name)
+            return isinstance(fact, PathFact) or (isinstance(fact, Located) and fact.repr == "path")
+        case _:
+            return False
+
+
+def _text_object(t: Term, st: StateMap) -> bool:
+    """Does *t* evaluate to text rather than a pathlib object?"""
+    match t:
+        case Const(str()):
+            return True
+        case Call(("str",) | ("os", "fspath") | ("os", "path", _), _, _):
+            return True
+        case Var(name):
+            fact = st.get(name)
+            return isinstance(fact, (StrFact, UrlString)) or (isinstance(fact, Located) and fact.repr == "str")
+        case _:
+            return False
+
+
 def _type_of(t: Term) -> TypeInfo | None:
     """The type named by the second argument of ``isinstance``; tuples name no single type."""
     match t:
@@ -505,13 +553,13 @@ def _compare(
         return probed
     match op:
         case ast.NotIn:
-            return _not_in(left, right)
+            return _not_in(left, right, st)
         case ast.In:
             return _in(left, right, st)
         case ast.Eq:
             return _eq(left, right, st) + _eq(right, left, st)
         case ast.NotEq:
-            return _neq(left, right) + _neq(right, left)
+            return _neq(left, right, st) + _neq(right, left, st)
         case ast.IsNot:
             # ``re.fullmatch(...) is not None``: the truthiness of the left operand
             match left, right:
@@ -554,16 +602,20 @@ def _probe_compare(left: Term, op: type[ast.cmpop], right: Term) -> list[Guard] 
     return _guard(sub, NO_SLASH_REF) if hit else []
 
 
-def _not_in(left: Term, right: Term) -> list[Guard]:
-    # "/" not in x ; os.sep not in x
+def _not_in(left: Term, right: Term, st: StateMap) -> list[Guard]:
+    # "/" not in x ; os.sep not in x   (a substring test: on a pathlib object it raises)
     if _is_sep(left):
-        return _guard(subject_of(right), NO_SLASH_REF)
-    # ".." not in x (substring: over-strict but sound) ; ".." not in x.split("/") ; ".." not in p.parts
+        return [] if _path_object(right, st) else _guard(subject_of(right), NO_SLASH_REF)
+    # ".." not in x.split("/") ; ".." not in p.parts   (a component test)
+    # ".." not in x   (substring: over-strict but sound -- for text; on a pathlib object it raises)
     if left.as_str() == "..":
-        return _guard(_components_of(right) or subject_of(right), NO_PARENT_REF)
-    # x not in (".", "..")
+        components = _components_of(right)
+        if components is not None:
+            return _guard(components, NO_PARENT_REF)
+        return [] if _path_object(right, st) else _guard(subject_of(right), NO_PARENT_REF)
+    # x not in (".", "..")   (vacuously true of a pathlib object: never equal to a str)
     lits = right.str_items()
-    if lits is not None and ".." in lits:
+    if lits is not None and ".." in lits and not _path_object(left, st):
         return _guard(subject_of(left), NOT_DOT_DOT_REF)
     return []
 
@@ -628,9 +680,9 @@ def _eq(a: Term, b: Term, st: StateMap) -> list[Guard]:
     sub = subject_of(a)
     if sub is None:
         return []
-    # x == "lit"
+    # x == "lit"   (never true of a pathlib object: the branch is dead, and says nothing)
     if (s := b.as_str()) is not None:
-        return _guard(sub, Refinement(type_info="str", regex=Exact(s)))
+        return [] if _path_object(a, st) else _guard(sub, Refinement(type_info="str", regex=Exact(s)))
     # x == E: whatever is known about E is known about x
     other = subject_of(b)
     if other is not None and other.name == sub.name:
@@ -649,13 +701,15 @@ def _is_head_slice(t: Term) -> bool:
             return False
 
 
-def _neq(a: Term, b: Term) -> list[Guard]:
+def _neq(a: Term, b: Term, st: StateMap) -> list[Guard]:
     """``a != b``; called in both orientations."""
-    # x != ".."
+    # x != ".."   (vacuously true of a pathlib object: never equal to a str)
     if b.as_str() == "..":
-        return _guard(subject_of(a), NOT_DOT_DOT_REF)
-    # x[0] != "/" ; x[:1] != "/" ; x[0] != "-" ; x[:1] != "-"
+        return [] if _path_object(a, st) else _guard(subject_of(a), NOT_DOT_DOT_REF)
+    # x[0] != "/" ; x[:1] != "/" ; x[0] != "-" ; x[:1] != "-"   (a pathlib object is not subscriptable)
     match a:
+        case Subscript(inner, _) if _path_object(inner, st):
+            return []
         case Subscript(inner, index) if _is_sep(b) and _is_head_slice(index):
             return _guard(subject_of(inner), NOT_ABSOLUTE_REF)
         case Subscript(inner, index) if b.as_str() == "-" and _is_head_slice(index):
@@ -768,6 +822,13 @@ def _method(
 
     sub = subject_of(recv)
     if sub is None:
+        return []
+    # a str method on a pathlib object, or a pathlib method on text, is an AttributeError, not a
+    # guard
+    if name in ("startswith", "endswith") or name in _IS_PREDICATES:
+        if _path_object(recv, st):
+            return []
+    elif name in ("is_absolute", "is_relative_to") and _text_object(recv, st):
         return []
     match name, args:
         # not p.is_absolute()

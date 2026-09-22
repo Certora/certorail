@@ -55,7 +55,14 @@ from .analysis import (
 )
 from .annotations import Contract, bind_arguments, default_of, is_plain_type, parse_annotation
 from .ids import Atom, SourceId
-from .dangerous import CHECK_CALLEE, EXEC_CALLEE, EXEC_RESERVED_KEYWORDS, EXTRACT_ALL_CALLEE, LINES_CALLEE
+from .dangerous import (
+    CHECK_CALLEE,
+    EXEC_CALLEE,
+    EXEC_RESERVED_KEYWORDS,
+    EXTRACT_ALL_CALLEE,
+    LINES_CALLEE,
+    REVEAL_CALLEE,
+)
 from .enforcement import (
     CONTAINER_METHODS,
     CONTAINER_READ_CALLS,
@@ -66,6 +73,7 @@ from .enforcement import (
     Argument,
     Audit,
     Callsite,
+    describe_entry,
     CheckSignature,
     CheckSite,
     Discharge,
@@ -157,6 +165,11 @@ def _roster_blessings(
                     for k in kws:
                         if k.arg is not None and k.arg not in EXEC_RESERVED_KEYWORDS:
                             bless(k.value)
+                if method == REVEAL_CALLEE[1] and isinstance(recv, ast.Name) and recv.id == REVEAL_CALLEE[0]:
+                    # the analysis' own probe reads nothing at runtime: naming a container to it
+                    # is not an escape
+                    for a in args:
+                        bless(a)
             case ast.Call(func=ast.Name(id=f), args=args):
                 if f in CONTAINER_READ_CALLS:
                     for a in args:
@@ -211,10 +224,20 @@ def _roster_blessings(
     return blessed
 
 
+@dataclass(frozen=True)
+class Reveal:
+    """One ``certora.reveal_fact(x)``: what the walk knew about ``x`` when it got there."""
+
+    node: ast.AST
+    name: str
+    fact: str  # rendered (enforcement.describe_entry): the report is for reading
+
+
 @dataclass
 class Report:
     violations: list[tuple[ast.AST, str]] = field(default_factory=list)
     sinks: list[Site] = field(default_factory=list)
+    reveals: list[Reveal] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -383,6 +406,7 @@ class ValidationWalker(ast.NodeVisitor):
         self.state: State = {}
         self.violations: list[tuple[ast.AST, str]] = []
         self.sinks: list[Site] = []
+        self.reveals: list[Reveal] = []
         # rely/guarantee: the module-level functions' contracts (collected and validated by
         # FunctionAnalysis) and the guarantee of the function being walked, if it has one
         self.contracts = contracts
@@ -1182,6 +1206,15 @@ class ValidationWalker(ast.NodeVisitor):
             self.visit(a)
         for k in node.keywords:
             self.visit(k.value)
+        if callee.matches(*REVEAL_CALLEE):
+            # the probe: what the state holds for the name, recorded and nothing else -- no
+            # sink, no fact established, no kill (at runtime the call does nothing)
+            match node.args, node.keywords:
+                case [ast.Name(id=name)], []:
+                    self.reveals.append(Reveal(node, name, describe_entry(self.state.get(name))))
+                case _:
+                    self._violation(node, "reveal_fact: exactly one bare name, reveal_fact(x) -- the analysis reports what it knows about x here")
+            return
         site = self._digest(node, self.state)
         if callee.matches(*CHECK_CALLEE):
             # only the statement form (visit_Expr) has a program point whose fall-through the
@@ -1666,8 +1699,17 @@ def analyze(
     try:
         walker.visit(tree)
     except InvalidProgram as e:
-        return Report(violations=[*walker.violations, (e.node, str(e))], sinks=walker.sinks)
-    return Report(violations=walker.violations, sinks=walker.sinks)
+        return Report(violations=[*walker.violations, (e.node, str(e))], sinks=walker.sinks, reveals=_settled(walker.reveals))
+    return Report(violations=walker.violations, sinks=walker.sinks, reveals=_settled(walker.reveals))
+
+
+def _settled(reveals: Sequence[Reveal]) -> list[Reveal]:
+    """One reveal per program point: a loop body is walked more than once, and the last walk's
+    state is the one that holds (the earlier passes feed the join). In the order first seen."""
+    last: dict[int, Reveal] = {}
+    for r in reveals:
+        last[id(r.node)] = r
+    return list(last.values())
 
 
 def where(filename: str, node: ast.AST) -> str:

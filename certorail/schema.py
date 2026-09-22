@@ -149,14 +149,24 @@ type Regex = Annotated[str, AfterValidator(_regex_text)]
 type AtomName = Annotated[str, AfterValidator(_atom_text)]
 
 def _listed(value: Any) -> Any:
-    """One spelling stands for the list of one; the model always holds the list."""
+    """A set-valued key: one string stands for the list of one; the model always holds the
+    list. Every list of locations, atoms or names below is spelled through this."""
     return [value] if isinstance(value, str) else value
+
+
+def _listed_int(value: Any) -> Any:
+    """``ports``: one integer stands for the list of one."""
+    return [value] if isinstance(value, int) and not isinstance(value, bool) else value
 
 
 # a location *slot*: one spelling or a non-empty list, meaning any-of; held as the list
 type LocationSlot = Annotated[list[Location], BeforeValidator(_listed), Field(min_length=1)]
+# locations that may be empty (grants, protections, mounts): one spelling or a list
+type Locations = Annotated[list[Location], BeforeValidator(_listed)]
 # an atom list, or one name standing for a list of one
-type AtomList = list[AtomName]
+type AtomList = Annotated[list[AtomName], BeforeValidator(_listed)]
+# names (regions, flags, parameters, literals, methods), or one standing for a list of one
+type Names = Annotated[list[str], BeforeValidator(_listed)]
 # ``when``: a literal toggle, or a bool parameter (checked to be one by the semantic pass)
 type When = bool | Annotated[str, AfterValidator(lambda s: s if reference(s) else _bad_when(s))]
 
@@ -216,7 +226,7 @@ class ConstraintFields(_Table):
 
     location: LocationSlot | None = None
     matches: Regex | None = None
-    one_of: list[str] | None = None
+    one_of: Names | None = None
     atoms: AtomList | None = None
     literal: bool = False
     any: bool = False
@@ -288,7 +298,7 @@ class FlagVocabulary(_Table):
     the document the entries are keys of the table itself (``"-n" = { matches = '\\d+' }``);
     the model holds them under ``flags``."""
 
-    bare: list[str] | None = None
+    bare: Names | None = None
     any: bool = False
     flags: dict[str, FlagEntry] = Field(default_factory=dict)
     # read an undeclared ``-lr`` as ``-l -r`` (templates.Flagset); opt-in, since not every tool
@@ -338,7 +348,7 @@ class FlagsetDecl(FlagVocabulary):
     with the templates that use it -- the holes its flags' ``requires`` may reach."""
 
     name: str
-    holes: list[HoleName] | None = None
+    holes: Annotated[list[HoleName], BeforeValidator(_listed)] | None = None
 
 
 class TokenHole(ConstraintFields):
@@ -465,7 +475,7 @@ class AtomDecl(_Table):
 
     pure: bool | None = None
     matches: Regex | None = None
-    reads: list[str] | None = None
+    reads: Names | None = None
 
     @model_validator(mode="after")
     def _kind(self) -> "AtomDecl":
@@ -493,14 +503,14 @@ class ExecDecl(_Table):
     policy's filesystem section grants, MOUNTS.md). Enforced by the OS jail; all default to the
     unjailed baseline."""
 
-    env: list[str | dict[str, str]] | None = None
+    env: Annotated[list[str | dict[str, str]], BeforeValidator(_listed)] | None = None
     spawn: bool = True
     view: Literal["host", "policy"] = "host"
     # under view = "policy": locations this grant's child sees beyond the policy's filesystem
     # section (MOUNTS.md) -- mounted read-only, or writable (which needs write-fs = true). The
     # analysis never sees them: they widen the tool's world, not the program's
-    mount_read: list[Location] | None = None
-    mount_write: list[Location] | None = None
+    mount_read: Locations | None = None
+    mount_write: Locations | None = None
 
     @field_validator("env")
     @classmethod
@@ -528,7 +538,7 @@ class _Media(_Table):
 
     network: bool = True
     write_fs: bool = True
-    writes: list[str] | None = None
+    writes: Names | None = None
     exec_: ExecDecl | None = None
 
     @model_validator(mode="before")
@@ -553,7 +563,7 @@ class ValidationDecl(_Media):
     establish atoms on cwd."""
 
     name: str
-    params: list[str] = Field(default_factory=list)
+    params: Names = Field(default_factory=list)
     argv: Annotated[list[Annotated[str, AfterValidator(_validation_argv_piece)]], Field(min_length=1)]
     cwd: LocationSlot | None = None
     establishes: dict[str, AtomList] = Field(default_factory=dict)
@@ -693,17 +703,17 @@ class NetworkDecl(_Table):
     """``[[network]]``: one permitted destination of ``certora.network``."""
 
     host: str
-    schemes: list[Literal["http", "https"]] | None = None
-    ports: list[int] | None = None
-    methods: list[str] | None = None
+    schemes: Annotated[list[Literal["http", "https"]], BeforeValidator(_listed)] | None = None
+    ports: Annotated[list[int], BeforeValidator(_listed_int)] | None = None
+    methods: Names | None = None
     allow_nonpublic: bool = False
-    requires: list[str | RequiredAtom] | None = None
+    requires: Annotated[list[str | RequiredAtom], BeforeValidator(_listed)] | None = None
     read_timeout: float | int | None = None
     total_timeout: float | int | None = None
     max_response_bytes: int | None = None
     source: str | None = None
     path: LocationSlot | None = None
-    writes: list[str] | None = None
+    writes: Names | None = None
 
     @field_validator("host")
     @classmethod
@@ -787,7 +797,7 @@ class Protected(_Table):
     grants -- a write that may lie at or below one is denied. A ruleset's obligation on every
     root that applies it (``${where}/**/.git``); a root may state its own."""
 
-    no_write: list[Location] = Field(default_factory=list)
+    no_write: Locations = Field(default_factory=list)
 
 
 class Filesystem(Protected):
@@ -795,9 +805,9 @@ class Filesystem(Protected):
     default-allow both mean nothing is permitted; with it, unwritten means the whole root and
     ``[]`` still means nothing."""
 
-    read: list[Location] | None = None
-    write: list[Location] | None = None
-    list_: list[Location] | None = None  # the TOML key is ``list``
+    read: Locations | None = None
+    write: Locations | None = None
+    list_: Locations | None = None  # the TOML key is ``list``
 
 
 class _Vocabulary(_Table):

@@ -644,7 +644,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="the sandbox root (default: the working directory)")
     ns = parser.parse_args(argv)
     root = (ns.root or pathlib.Path.cwd()).resolve()
-    policy = load_policy(ns.policy, root)
+    policy = load_policy(ns.policy, root).policy
     origin, governs = policy_origin(ns.policy, root)
     ExplorerApp(policy, origin, governs).run()
     return 0

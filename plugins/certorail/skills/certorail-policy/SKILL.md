@@ -257,8 +257,9 @@ A trivial text predicate can be a `test` one-liner with no script at all:
 4. **Install.** `certorail policy install policy.toml`: the full load runs against the
    installed rulesets and checkers, the exact validated bytes are placed in
    `policy/<munged root>/` for the absolute `root` the file declares, and a second file
-   claiming the same root is refused. A run rooted there, or below, then prints
-   `certorail: policy from …`; `--policy path` bypasses discovery for a one-off. A ruleset
+   claiming the same root is refused. A run rooted there, or below, then loads it ambiently
+   (`--check` and every rejection print `certorail: policy from …`; an accepted run is quiet);
+   `--policy path` bypasses discovery for a one-off. A ruleset
    pack (a directory of ruleset TOML plus its `checkers/`) installs with
    `certorail policy install-pack DIR` -- shape-checked, the checker closure exact in both
    directions, pins verified against the supplied bytes, checkers made executable.

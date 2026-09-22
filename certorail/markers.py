@@ -426,6 +426,17 @@ def field(line: str, index: int, sep: str | None = None) -> str:
         raise ExtractError(f"field {index} of {len(parts)}") from None
 
 
+def reveal_fact(value: object) -> None:
+    """Show what the analysis knows about a variable at this point of the program.
+
+    ``certora.reveal_fact(x)`` -- a bare name, nothing else -- makes ``certorail --check`` (and
+    a run, on stderr) print the fact the analysis holds for ``x`` there: its location, the text
+    shape it matches, the atoms it carries, or that nothing is known. It changes nothing: no fact
+    is established or killed, and at runtime it does nothing at all. For finding out why a sink
+    was denied."""
+    return None
+
+
 def pathmatch(text: str, location: str) -> bool:
     """Is *text* -- a filesystem path (relative to the sandbox root, or absolute) or a URL path
     -- at the *location*, spelled the way the policy spells locations: ``repos/**``,

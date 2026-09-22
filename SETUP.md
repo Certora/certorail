@@ -65,7 +65,8 @@ ruleset = "coreutils-ro.toml"
 where   = "."
 ```
 
-Every run that composes it says so, and `base = false` in any policy opts that root out.
+`--check`, `--describe` and every rejection say when it was composed in, and `base = false` in
+any policy opts that root out.
 
 ## 3. A policy per project
 
@@ -79,8 +80,8 @@ certorail policy install my-policy.toml
 
 The full load runs first -- against your installed rulesets and checkers -- and the validated
 bytes are placed for the absolute `root` the file declares. Two files claiming one root are
-refused. From then on, any `certorail` run at or below that root finds the policy ambiently
-and says so.
+refused. From then on, any `certorail` run at or below that root finds the policy ambiently;
+`--check` and every rejection name the file, an accepted run stays quiet.
 
 To change an installed policy, `certorail policy edit` (from anywhere under its root, or with
 `--root DIR`) opens it in `$VISUAL` or `$EDITOR` on a copy. When the editor exits, the copy is

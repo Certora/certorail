@@ -96,10 +96,12 @@ class TestFindPolicy(unittest.TestCase):
             f'policy-version = 1\nroot = "{deep}"\n\n[[network]]\nhost = "api.github.com"\n',
             encoding="utf-8",
         )
-        policy = load_policy(None, deep)
-        self.assertIsInstance(policy, Policy)
-        (rule,) = policy.network
+        loaded = load_policy(None, deep)
+        self.assertIsInstance(loaded.policy, Policy)
+        (rule,) = loaded.policy.network
         self.assertEqual(rule.host, "api.github.com")
+        # the provenance is collected, not printed: the host decides when it is news
+        self.assertTrue(loaded.provenance[0].startswith(f"certorail: policy from {bucket / 'here.toml'} (root "))
 
 
 if __name__ == "__main__":

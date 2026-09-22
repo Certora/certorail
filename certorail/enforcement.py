@@ -1393,6 +1393,24 @@ def describe_value(v: Value | Container | Std) -> str:
             return f"url ({claims or 'nothing known'})" + _atoms_suffix(atoms)
 
 
+def describe_entry(entry: Value | Container | Std | Data) -> str:
+    """A state entry as ``certora.reveal_fact`` reports it: the scalar facts and containers as
+    ``describe_value`` renders them, a source handle by what it yields and can do, and nothing
+    tracked as exactly that."""
+    match entry:
+        case None:
+            return "nothing is known about it (not tracked at this point)"
+        case Data(sources=sources, closed=closed, writes=writes):
+            what = "a source handle"
+            if sources:
+                what += " yielding " + ", ".join(sorted(sources))
+            if writes is not None:
+                what = "a file open for writing at " + " or ".join(pretty_location(w) for w in writes)
+            return what + ("" if closed else ", touched by program code (no longer inert)")
+        case _:
+            return describe_value(entry)
+
+
 def _describe_binding(value: Binding) -> str:
     match value:
         case Many(elements=elements):

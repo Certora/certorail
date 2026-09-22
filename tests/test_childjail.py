@@ -372,7 +372,7 @@ class TestGrants(unittest.TestCase):
         self.assertEqual(problems('exec.spawn = false'), [])
         self.assertEqual(problems('exec.network = false'), ["program[0].exec: unknown key 'network'"])
         self.assertEqual(problems('exec.spawn = "no"'), ["program[0].exec.spawn: expected true or false"])
-        self.assertEqual(problems('exec.env = "PATH"'), ["program[0].exec.env: expected a list"])
+        self.assertEqual(problems('exec.env = "PATH"'), [])  # one name stands for the list of one
         self.assertEqual(problems('exec.env = ["A=1"]'), ["program[0].exec.env: an environment variable name, not an assignment: 'A=1'"])
         self.assertEqual(problems('exec.env = ["PATH", { PATH = "/bin" }]'), ["program[0].exec.env: environment variable PATH is mentioned twice"])
         self.assertIn("program[0].exec.env[0].A: expected a string", problems('exec.env = [{ A = 1 }]'))

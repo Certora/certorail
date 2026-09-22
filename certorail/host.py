@@ -59,11 +59,18 @@ class Rejected:
     denials: list[Denial] = field(default_factory=list)
 
     def describe(self, filename: str) -> list[str]:
-        lines = [f"{where(filename, node)}: violation: {what}" for node, what in self.violations]
+        lines = reveal_lines(self.report, filename)
+        lines += [f"{where(filename, node)}: violation: {what}" for node, what in self.violations]
         lines += [
             f"{where(filename, d.site.node)}: denied: {d.site.what}: {d.reason}" for d in self.denials
         ]
         return lines
+
+
+def reveal_lines(report: Report, filename: str) -> list[str]:
+    """What the program asked the analysis to show (``certora.reveal_fact``), first in any
+    report: the reader wants the facts before the verdict they explain."""
+    return [f"{where(filename, r.node)}: reveal: {r.name}: {r.fact}" for r in report.reveals]
 
 
 @dataclass(frozen=True)
@@ -72,7 +79,9 @@ class Accepted:
     source: str  # the rewritten program
 
     def describe(self, filename: str) -> list[str]:
-        return [f"{where(filename, s.node)}: {s.what}: {describe_sink(s)}" for s in self.report.sinks]
+        return reveal_lines(self.report, filename) + [
+            f"{where(filename, s.node)}: {s.what}: {describe_sink(s)}" for s in self.report.sinks
+        ]
 
 
 def check(
@@ -159,9 +168,7 @@ def _attach_view(policy: Policy, root: pathlib.Path) -> Attachment | None:
     except ViewUnavailable as e:
         print(f"certorail: the policy filesystem view cannot be served here ({e}):", file=sys.stderr)
         return None
-    if attached.spawned:
-        print(f"certorail: policy filesystem view mounted ({attached.keydir.name})", file=sys.stderr)
-    return attached
+    return attached  # a spawn is not news: `certorail view status` shows the daemons
 
 
 def _announce_view(policy: Policy, root: pathlib.Path, view: pathlib.Path | None) -> None:
@@ -261,6 +268,8 @@ def _run(
     outcome = check(source, filename, policy, root, view)
     if isinstance(outcome, Rejected):
         return outcome
+    for line in reveal_lines(outcome.report, filename):
+        print(line, file=sys.stderr)  # asked for in the source: shown even when the run proceeds
     certorail_parent = str(pathlib.Path(__file__).resolve().parent.parent)
     # the runtime halves of check/exec/network all live in the broker: the confined program
     # never sees the policy, only the socket
@@ -322,25 +331,36 @@ def _run(
                 server.server_close()
 
 
-def _announce_base(policy: Policy) -> Policy:
-    """A security tool composing configuration the policy file did not name is never silent
-    about it: the installed base ruleset, when it was applied."""
+@dataclass(frozen=True)
+class Loaded:
+    """The policy for a run, and where it came from. A security tool composing configuration
+    the program did not name is never silent about it -- but not on every accepted run either,
+    where the lines are tokens in an agent's context and say nothing new. The provenance is
+    printed under ``--check`` and ``--describe``, with every rejection (the denial tells the
+    agent to edit the named policy file), and by the session hook; an accepted run is quiet."""
+
+    policy: Policy
+    provenance: tuple[str, ...]
+
+
+def _provenance(policy: Policy, origin: str | None) -> tuple[str, ...]:
+    lines: list[str] = []
+    if origin is not None:
+        lines.append(f"certorail: policy from {origin}")
     if BASE_RULESET in policy.applied:
-        print(
+        lines.append(
             f"certorail: base ruleset {BASE_RULESET} applied from the config directory "
-            "(base = false in the policy opts out)",
-            file=sys.stderr,
+            "(base = false in the policy opts out)"
         )
     if policy.default_allow:
-        print(
+        lines.append(
             "certorail: default-allow is on: a program the policy does not name runs with your "
-            "authority, unconfined",
-            file=sys.stderr,
+            "authority, unconfined"
         )
-    return policy
+    return tuple(lines)
 
 
-def load_policy(path: pathlib.Path | None, root: pathlib.Path | None = None) -> Policy:
+def load_policy(path: pathlib.Path | None, root: pathlib.Path | None = None) -> Loaded:
     if path is None:
         if root is not None:
             try:
@@ -349,22 +369,23 @@ def load_policy(path: pathlib.Path | None, root: pathlib.Path | None = None) -> 
                 raise SystemExit(str(e))
             if found is not None:
                 policy_file, prefix = found
-                # a security tool picking up ambient configuration is never silent about it
-                print(f"certorail: policy from {policy_file} (root {prefix})", file=sys.stderr)
                 try:
-                    return _announce_base(load_policy_file(policy_file))
+                    policy = load_policy_file(policy_file)
                 except PolicyFileError as e:
                     raise SystemExit(str(e))
+                return Loaded(policy, _provenance(policy, f"{policy_file} (root {prefix})"))
         try:
-            return _announce_base(default_policy())  # the built-in posture, plus the base ruleset if installed
+            policy = default_policy()  # the built-in posture, plus the base ruleset if installed
         except PolicyFileError as e:
             raise SystemExit(str(e))
+        return Loaded(policy, _provenance(policy, None))
     if path.suffix not in (".toml", ".json"):
         raise SystemExit(f"{path}: a policy is a .toml or .json document")
     try:
-        return _announce_base(load_policy_file(path))
+        policy = load_policy_file(path)
     except PolicyFileError as e:
         raise SystemExit(str(e))
+    return Loaded(policy, _provenance(policy, None))
 
 
 def policy_origin(path: pathlib.Path | None, root: pathlib.Path) -> tuple[str, str | None]:
@@ -449,17 +470,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         if ns.program is not None or ns.command is not None or ns.args:
             parser.error("--describe takes no program")
         root = ns.root.resolve()
-        print(describe(load_policy(ns.policy, root), *policy_origin(ns.policy, root)))
+        loaded = load_policy(ns.policy, root)
+        for line in loaded.provenance:
+            print(line, file=sys.stderr)
+        print(describe(loaded.policy, *policy_origin(ns.policy, root)))
         return 0
-    if (ns.program is None) == (ns.command is None):
+    if ns.program is None and ns.command is None:
         parser.error("exactly one of PROGRAM or -c SOURCE is required")
+    args = ns.args[1:] if ns.args[:1] == ["--"] else ns.args
     if ns.command is not None:
         source, filename = ns.command, "<command>"
+        if ns.program is not None:
+            # with -c there is no program file: every positional is an argument for the
+            # program, as with `python -c` (`certorail -c SOURCE -- a b`)
+            args = [str(ns.program), *args]
     else:
+        assert ns.program is not None  # the pair-is-required check above
         source, filename = ns.program.read_text(encoding="utf-8"), str(ns.program)
     root = ns.root.resolve()
-    policy = load_policy(ns.policy, root)
-    args = ns.args[1:] if ns.args[:1] == ["--"] else ns.args
+    loaded = load_policy(ns.policy, root)
+    policy = loaded.policy
+    if ns.check:
+        for line in loaded.provenance:
+            print(line, file=sys.stderr)
     try:
         if ns.check:
             outcome: Accepted | Rejected | subprocess.CompletedProcess[bytes] = check(
@@ -473,6 +506,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     match outcome:
         case Rejected():
+            if not ns.check:
+                for line in loaded.provenance:  # the denial says "edit the policy": name it
+                    print(line, file=sys.stderr)
             print(f"{filename}: rejected", file=sys.stderr)
             for line in outcome.describe(filename):
                 print(line, file=sys.stderr)

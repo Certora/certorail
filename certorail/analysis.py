@@ -1590,7 +1590,25 @@ class _Start(_Spelling):
         return _Boundary(StaticPath((), absolute=True))  # a leading "/": absolute
 
     def splat(self) -> _Spelling:
-        return _Boundary(DirSplat((), None))
+        return _AfterSplat(DirSplat((), None))
+
+
+@dataclass(frozen=True)
+class _AfterSplat(_Spelling):
+    """Just replayed a ``**``: the text so far is some path at or below *loc*, and it ends in a
+    component, not a separator (``data/**`` stands for ``data``, ``data/x``, ``data/x/y``). So a
+    chunk glued on here (``f"{p}.bak"``) lands inside that last component -- ``data.bak``,
+    ``data/x.bak`` -- and has no location; only a ``/`` opens a new component below."""
+    loc: LocationFact
+
+    def sep(self) -> _Spelling:
+        return _Boundary(self.loc)
+
+    def splat(self) -> _Spelling:
+        return self  # "**" onto "**" adds nothing
+
+    def finish(self) -> LocationFact | None:
+        return self.loc
 
 @dataclass(frozen=True)
 class _Boundary(_Spelling):
@@ -1604,7 +1622,7 @@ class _Boundary(_Spelling):
         return self  # "//" collapses
 
     def splat(self) -> _Spelling:
-        return _Boundary(splat_under(self.loc))
+        return _AfterSplat(splat_under(self.loc))
 
     def finish(self) -> LocationFact | None:
         return self.loc  # a trailing "/" adds nothing
