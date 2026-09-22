@@ -590,7 +590,7 @@ every call whose write set meets the atom's `reads`. What a call writes:
 - `certora.exec`, `certora.network.*`, `certora.check`: the rule's declared write set, as
   above; an undeclared rule writes everything.
 - a file write by the program (`write_text`, `open(p, "w")`, `mkdir`, …): every filesystem
-  region, today.
+  region, wherever the file is.
 - a call the analysis can place as the interpreter's own code over values it can see are
   ordinary data (`s.strip()`, `sorted(xs)`, `json.loads(text)`, `p.read_text()`, `len`, `print`
   with plain arguments): nothing. Handing such a call a program-defined function, a generator,
