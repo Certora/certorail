@@ -120,7 +120,6 @@ REPORT_NAME = (
 REPORTS_POLICY = Policy.allow(
     read=[markers.within(".")],
     write=[markers.within("reports", leaf=markers.matches(r"\w+\.md"))],
-    listing=[markers.within(".")],
 )
 
 
@@ -145,7 +144,6 @@ class TestEndToEnd(unittest.TestCase):
         policy = Policy.allow(
             read=[markers.within(".")],
             write=[markers.within(".")],
-            listing=[markers.within(".")],
             atoms=[atom("no-flag", markers.matches(r"[^-].*"))],
             programs=[
                 program(

@@ -146,13 +146,11 @@ class TestMounts(unittest.TestCase):
             read=(loc("src/**/<.*\\.py>"), loc("docs/**")),
             write=(loc("repos/*/**"),),
             no_write=(loc("repos/**/.git"),),
-            listing=(loc("."), loc("src/*")),
             patterns=False,
         )
         self.assertEqual(m.reads, (ROOT / "docs",))
         self.assertEqual(m.writes, ())
         self.assertEqual(m.no_write, ())
-        self.assertEqual(m.listings, ())  # a bind cannot say "this directory, not its files"
         self.assertEqual(m.omitted, ("read src/**/</.*\\.py/>", "write repos/*/**", "no-write repos/**/.git"))
 
     def test_with_patterns_everything_lowers(self) -> None:
@@ -161,15 +159,13 @@ class TestMounts(unittest.TestCase):
             read=(loc("src/**/<.*\\.py>"), loc("docs/**")),
             write=(loc("repos/*/**"),),
             no_write=(loc("repos/**/.git"),),
-            listing=(loc("."), loc("src/*")),
             patterns=True,
         )
         self.assertEqual(m.reads, (Regex(f"^{REAL}/src/(.*/)?(.*\\.py)$"), ROOT / "docs"))
         self.assertEqual(m.writes, (Regex(f"^{REAL}/repos/[^/]+(/.*)?$"),))
         self.assertEqual(m.no_write, (Regex(f"^{REAL}/repos/(.*/)?\\.git(/.*)?$"),))
-        self.assertEqual(m.listings, (ROOT, Regex(f"^{REAL}/src/[^/]+$")))
         self.assertEqual(m.omitted, ())
-        # the bind-mountable part drops the regexes and the listings
+        # the bind-mountable part drops the regexes
         self.assertEqual(m.paths, Mounts(reads=(ROOT / "docs",)))
 
     def test_a_rules_additions_join_the_view_under_their_own_names(self) -> None:

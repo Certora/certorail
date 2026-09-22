@@ -187,7 +187,7 @@ def _hyphenated(name: str) -> str:
 class _Table(BaseModel):
     """A TOML table with a closed key set. Field names are the TOML keys with ``-`` as ``_``
     (``effect-free`` is ``effect_free``); a trailing underscore escapes a Python keyword or
-    builtin (``list_`` is ``list``).
+    builtin (``exec_`` is ``exec``).
 
     Every table remembers the document it was read from (``where``), stamped from the
     validation context by ``parse_policy`` / ``parse_ruleset``, so a semantic pass working on
@@ -800,14 +800,29 @@ class Protected(_Table):
     no_write: Locations = Field(default_factory=list)
 
 
+_RETIRED_FILESYSTEM_KEYS = {
+    "list": "'list' is no longer a key: listing a directory is reading it, so grant the directory under read "
+            "(a read grant covering a directory or its subtree permits listing it and probing its entries)",
+}
+
+
 class Filesystem(Protected):
     """The root's grants. A kind left unwritten is None, distinct from a written ``[]``: without
     default-allow both mean nothing is permitted; with it, unwritten means the whole root and
-    ``[]`` still means nothing."""
+    ``[]`` still means nothing. Listing a directory is reading it: the read grants cover
+    ``os.listdir``, ``exists`` and their kin."""
 
     read: Locations | None = None
     write: Locations | None = None
-    list_: Locations | None = None  # the TOML key is ``list``
+
+    @model_validator(mode="before")
+    @classmethod
+    def _retired_filesystem(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            for key, message in _RETIRED_FILESYSTEM_KEYS.items():
+                if key in data:
+                    raise ValueError(message)
+        return data
 
 
 class _Vocabulary(_Table):

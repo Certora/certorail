@@ -32,7 +32,6 @@ SECTION = FilesystemSection(
     read=(loc("src/**"), loc("docs/**/<.*\\.md>"), loc("/opt/data/**"), loc("/srv/*/pub/**")),
     write=(loc("out/**"),),
     no_write=(loc("out/final"), loc("out/**/.git")),
-    listing=(loc("."),),
 )
 HAS_BWRAP = sys.platform == "linux" and shutil.which("bwrap") is not None
 HAS_FUSE = HAS_BWRAP and viewdaemon.unavailable() is None
@@ -74,7 +73,7 @@ class TestConfinement(unittest.TestCase):
         policy_rule = program("cat", cwd=".", write_fs=False, spawn=False, view=View.POLICY, mount_read=["/srv/keys/**"])
         checker = validation("v", argv=["t"], establishes={}, view=View.POLICY)
         policy = Policy.allow(
-            read=["src/**"], write=["out/**"], no_write=["out/final"], listing=["."],
+            read=["src/**"], write=["out/**"], no_write=["out/final"],
             programs=[host_rule, policy_rule], validations=[checker],
         )
         c = policy.confinement(host_rule, ROOT)
@@ -88,7 +87,7 @@ class TestConfinement(unittest.TestCase):
             ),
         )
         self.assertEqual(policy.confinement(checker, ROOT).filesystem, PolicyFilesystem(ROOT, policy.section()))
-        self.assertEqual(policy.section(), FilesystemSection((loc("src/**"),), (loc("out/**"),), (loc("out/final"),), (loc("."),)))
+        self.assertEqual(policy.section(), FilesystemSection((loc("src/**"),), (loc("out/**"),), (loc("out/final"),)))
 
 
 class TestBubblewrapLowering(unittest.TestCase):
@@ -197,10 +196,9 @@ class TestSeatbelt(unittest.TestCase):
         fs = PolicyFilesystem(ROOT, SECTION, Additions(read=(loc("/srv/keys/**"), loc("cfg/<\\d+>")), write=(loc(".git/**"),)))
         lowered = SeatbeltSpawner().lower(fs, write_fs=True)
         kinds = [type(x).__name__ for x in lowered]
-        self.assertEqual(kinds, ["Bind", "RegexRule", "Bind", "RegexRule", "Bind", "Bind", "Bind", "Omitted", "Bind", "Bind", "RegexRule"])
-        self.assertEqual(lowered[5], Bind(ROOT, "list"))
-        self.assertEqual(lowered[7], Omitted(loc("cfg/<\\d+>"), "mount-read", NOT_ERE))
-        guard = lowered[10]
+        self.assertEqual(kinds, ["Bind", "RegexRule", "Bind", "RegexRule", "Bind", "Bind", "Omitted", "Bind", "Bind", "RegexRule"])
+        self.assertEqual(lowered[6], Omitted(loc("cfg/<\\d+>"), "mount-read", NOT_ERE))
+        guard = lowered[9]
         assert isinstance(guard, RegexRule)
         self.assertTrue(guard.pattern.endswith("(.*/)?\\.git(/.*)?$"))  # a protection covers its subtree
 
@@ -210,10 +208,10 @@ class TestSeatbelt(unittest.TestCase):
         c = Confinement(network=False, write_fs=False, spawn=False, filesystem=fs)
         profile = spawner.profile(c, "/tmp/scratch", "/usr/bin/cat")
         self.assertIn("(deny file-read-data file-write*)", profile)
+        self.assertIn('(allow file-read-data (literal "/"))', profile)  # every process reads the root's entries at startup
         self.assertIn('(subpath "/usr/bin/cat")', profile)
         self.assertIn('(subpath "/sandbox/src")', profile)
         self.assertIn('(regex #"', profile)
-        self.assertIn('(allow file-read-data (literal "/sandbox"))', profile)
         self.assertRegex(profile, r'\(allow file-write\* \(subpath "[^"]*scratch"\) \(literal "/dev/null"\)\)')
         self.assertIn('(deny file-write* (subpath "/sandbox/out/final") (regex #"', profile)
         self.assertIn("(deny network*)", profile)

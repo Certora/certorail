@@ -11,7 +11,6 @@ thing::
     POLICY = Policy.allow(
         read=[markers.within("data"), markers.within("repos")],
         write=[markers.within("repos")],
-        listing=[markers.within("repos")],
         programs=[
             program("git", cwd=markers.within("repos"), subcommand="status", requires=["org-checkout"]),
             program(
@@ -982,9 +981,9 @@ class Denial:
 
 @dataclass(frozen=True)
 class Policy:
+    # read covers listing too: a directory is listed, or a path probed, by reading it
     read: tuple[LocationFact, ...] = ()
     write: tuple[LocationFact, ...] = ()
-    listing: tuple[LocationFact, ...] = ()
     # protected: a program write that may lie at or below one of these is denied, whatever
     # ``write`` grants (a ruleset's obligation on the root, or the root's own)
     no_write: tuple[LocationFact, ...] = ()
@@ -1016,7 +1015,6 @@ class Policy:
         *,
         read: Iterable[Where] = (),
         write: Iterable[Where] = (),
-        listing: Iterable[Where] = (),
         no_write: Iterable[Where] = (),
         programs: Iterable[Program] = (),
         validations: Iterable[Validation] = (),
@@ -1172,7 +1170,7 @@ class Policy:
                     resolved.add(ra)
             net_rules.append(replace(r, requires=frozenset(resolved)))
         return cls(
-            read=_locations(read), write=_locations(write), listing=_locations(listing),
+            read=_locations(read), write=_locations(write),
             no_write=_locations(no_write), programs=progs, validations=vals, atoms=atoms_t,
             network=tuple(net_rules), sources=srcs, regions=regs, reads=reads_m, applied=tuple(applied),
             default_allow=default_allow, denied=frozenset(ProgramName(d) for d in denied),
@@ -1347,7 +1345,7 @@ class Policy:
         what *rule* mounts for itself (``exec.mount-read`` / ``exec.mount-write``). With *view*,
         the FUSE mountpoint serving the root (``viewdaemon``), the root-relative section is the
         view's and only the absolute locations and the rule's additions are binds."""
-        base = fsview.mounts(root, self.read, self.write, self.no_write, self.listing, view=view)
+        base = fsview.mounts(root, self.read, self.write, self.no_write, view=view)
         if rule is None or not (rule.mount_read or rule.mount_write):
             return base
         return base | fsview.additions(root, rule.mount_read, rule.mount_write)
@@ -1361,11 +1359,11 @@ class Policy:
         """What a FUSE view of this policy under *root* serves (``viewdaemon``)."""
         from certorail.viewdaemon import ViewSpec
 
-        return ViewSpec(os.path.realpath(root), self.read, self.write, self.no_write, self.listing)
+        return ViewSpec(os.path.realpath(root), self.read, self.write, self.no_write)
 
     def section(self) -> FilesystemSection:
         """The ``[filesystem]`` section as one value (``certorail.confinement``)."""
-        return FilesystemSection(self.read, self.write, self.no_write, self.listing)
+        return FilesystemSection(self.read, self.write, self.no_write)
 
     def confinement(self, rule: "Program | Validation", root: pathlib.Path) -> Confinement:
         """What *rule*'s child may do (``certorail.confinement``): its media and ``exec`` table,
@@ -1409,9 +1407,11 @@ class Policy:
     ) -> list[Denial]:
         match site:
             case SinkSite(kind=kind, fact=Located(location=loc)):
-                permitted = {"read": self.read, "write": self.write, "list": self.listing}[kind]
+                # listing a directory, or probing a path, is reading it: the read grants cover both
+                permitted = self.write if kind == "write" else self.read
                 if not any(location_le(loc, allowed) for allowed in permitted):
-                    return [Denial(site, f"{kind} of {pretty_location(loc)} is not permitted")]
+                    why = " (listing a directory is reading it: no read grant covers this one)" if kind == "list" else ""
+                    return [Denial(site, f"{kind} of {pretty_location(loc)} is not permitted{why}")]
                 if kind == "write" and (hit := self.protected(loc)) is not None:
                     return [Denial(
                         site,
@@ -1613,6 +1613,5 @@ class Policy:
 DEFAULT_POLICY = Policy.allow(
     read=[markers.within(".")],
     write=[markers.within(".")],
-    listing=[markers.within(".")],
     programs=[],
 )

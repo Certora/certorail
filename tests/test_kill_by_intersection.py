@@ -11,7 +11,7 @@ from certorail.policyfile import from_data
 
 POLICY = from_data({
     "policy-version": 1,
-    "filesystem": {"read": ["repos/**"], "write": ["repos/**"], "list": ["repos/**"]},
+    "filesystem": {"read": ["repos/**"], "write": ["repos/**"]},
     "regions": {
         "git.config": {"footprint": ".git/config"},
         "git.index": {"footprint": ".git/index"},

@@ -22,9 +22,9 @@ from certorail.analysis import LocationFact
 
 __all__ = ["Bind", "Lowered", "Omitted", "RegexRule", "Role", "readable", "writable"]
 
-# what a location is for: the section's four kinds, and the rule's two additions (read and
+# what a location is for: the section's three kinds, and the rule's two additions (read and
 # written exactly like the section's read and write, reported under their own names)
-type Role = Literal["read", "write", "no-write", "list", "mount-read", "mount-write"]
+type Role = Literal["read", "write", "no-write", "mount-read", "mount-write"]
 
 
 @dataclass(frozen=True)

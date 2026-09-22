@@ -1,8 +1,10 @@
 """The broker: the runtime half of ``certora.network`` and ``certora.exec``.
 
 The confined program runs jailed -- no network (an empty network namespace on Linux, a
-Seatbelt deny on macOS) and eventually no subprocesses; the broker is the host-side process
-that acts on its behalf, over a Unix socket -- the single, auditable hole in the wall. TLS
+Seatbelt deny on macOS) and no subprocesses; the broker is the host-side half that acts on its
+behalf, over one Unix socket the host created as a socketpair and handed to the program as an
+inherited descriptor -- the single, auditable hole in the wall, with no name on disk for
+anything else to find. TLS
 terminates here: the sandboxed program never sees a certificate, a proxy variable, or a DNS
 answer. Exec'd children are spawned here, outside the program's jail, after re-checking the decidable
 half of the exec rules (program, fail-closed subcommand, cwd containment -- defense in depth;
@@ -12,12 +14,12 @@ wholesale: ``certora.exec`` keeps its ``CompletedProcess`` contract to the byte.
 process creation) put its child in a jail of its own (``childjail``); each is opt-in and
 enforced. A client hangup mid-exec kills the child's whole process group.
 
-One connection carries exactly one request. The client connects, sends one framed request,
-and blocks on the framed response; hanging up is the cancellation protocol. When the client
-disconnects -- its call timed out, the program moved on or died -- the broker shuts down the
-upstream socket, so the blocked read fails at once and the origin sees the connection drop.
-(Cancellation saves the response transfer; it cannot un-send a request whose side effects the
-origin has already committed.)
+One connection lives for the whole run and carries one request at a time: the program, which
+has no threads, sends a framed request and blocks on the framed reply. Hanging up is the
+cancellation protocol. When the connection drops -- the program's call timed out and it closed
+the channel, or the program died -- the broker shuts down the upstream socket, so the blocked
+read fails at once and the origin sees the connection drop. (Cancellation saves the response
+transfer; it cannot un-send a request whose side effects the origin has already committed.)
 
 Every request, and every redirect hop, is checked against the policy's ``network`` rules
 (``policy.network``, see :class:`certorail.policy.NetworkRule`) and logged. Deny by default.
@@ -25,10 +27,10 @@ Credential headers never survive a change of host: a token sent to an allowed AP
 forwarded along a redirect to some other host (the redirect URL carries its own
 authorization).
 
-There is no CLI and no configuration file: the host builds a :func:`build_server` around the
-policy it already holds and runs it for the lifetime of one confined program. The socket is
-created mode 0600 in a 0700 directory -- filesystem permission is the authentication; the
-sandbox can reach the socket only because the host put it inside the sandbox's world.
+There is no CLI and no configuration file: the host builds a :class:`Broker` around the policy
+it already holds (:func:`build_broker`) and serves one end of a socketpair for the lifetime of
+one confined program; the other end is the program's by inheritance, and that is the whole
+authentication.
 
 Wire protocol (both directions): 4-byte big-endian length prefix + UTF-8 JSON.
 
@@ -59,7 +61,6 @@ import pathlib
 import select
 import signal
 import socket
-import socketserver
 import ssl
 import struct
 import subprocess
@@ -646,30 +647,57 @@ def _send_frame(conn: socket.socket, payload: bytes) -> None:
     conn.sendall(struct.pack("!I", len(payload)) + payload)
 
 
-class _Handler(socketserver.BaseRequestHandler):
-    def handle(self) -> None:
-        conn = self.request
+class Broker:
+    """The host-side half for one confined run: the policy, the TLS context, the literal
+    discharger, where a streamed exec writes, and the FUSE view serving the root for confined
+    children when one is attached. ``serve`` speaks the wire protocol on one connected socket
+    until the peer closes it."""
+
+    def __init__(
+        self,
+        policy: Policy,
+        discharge: Discharge | None,
+        root: pathlib.Path | None,
+        stream_to: tuple[int, int] | None,
+        view: pathlib.Path | None = None,
+    ):
+        self.policy = policy
+        self.tls = _tls_context()
+        self.discharge = discharge
+        self.root = root
+        self.stream_to = stream_to
+        self.view = view
+
+    def serve(self, conn: socket.socket) -> None:
+        """Serve *conn* -- the host's end of the program's socketpair -- until the program closes
+        it or dies: one framed request at a time, its reply framed back. An oversized frame is
+        answered with an error and ends the connection, since the stream is no longer known to
+        be in sync."""
         try:
-            header = _recv_exact(conn, 4)
-            if header is None:
-                return
-            (length,) = struct.unpack("!I", header)
-            if length > MAX_REQUEST_BYTES:
-                _send_frame(conn, json.dumps({
-                    "ok": False, "error": "broker_error",
-                    "detail": "request frame too large"}).encode())
-                return
-            payload = _recv_exact(conn, length)
-            if payload is None:
-                return
-            reply = self._respond(conn, payload)
-            if reply is not None:
+            while True:
+                header = _recv_exact(conn, 4)
+                if header is None:
+                    return
+                (length,) = struct.unpack("!I", header)
+                if length > MAX_REQUEST_BYTES:
+                    _send_frame(conn, json.dumps({
+                        "ok": False, "error": "broker_error",
+                        "detail": "request frame too large"}).encode())
+                    return
+                payload = _recv_exact(conn, length)
+                if payload is None:
+                    return
+                reply = self.respond(conn, payload)
+                if reply is None:
+                    return  # the client is gone: nobody is left to read it
                 _send_frame(conn, reply)
         except OSError:                  # client went away mid-frame
             return
+        finally:
+            with contextlib.suppress(OSError):
+                conn.close()
 
-    def _respond(self, conn: socket.socket, payload: bytes) -> bytes | None:
-        assert isinstance(self.server, _Server)
+    def respond(self, conn: socket.socket, payload: bytes) -> bytes | None:
         """The framed reply, or None when the client is gone and nobody is left to read it."""
         what = "?"
         try:
@@ -684,18 +712,18 @@ class _Handler(socketserver.BaseRequestHandler):
                 what = "exec " + " ".join([program, *arguments]) + "".join(
                     f" {k}={v!r}" for k, v in keywords.items()
                 )
-                result = _run_exec(self.server.policy, self.server.root, conn,
+                result = _run_exec(self.policy, self.root, conn,
                                    program, arguments, keywords, str(req.get("cwd", "")),
-                                   self.server.discharge, bool(req.get("stream", False)),
-                                   self.server.stream_to, self.server.view)
+                                   self.discharge, bool(req.get("stream", False)),
+                                   self.stream_to, self.view)
             elif req.get("kind") == "check":
                 name = str(req.get("name", "?"))
                 what = f"check {name}"
                 cwd_value = req.get("cwd")
-                result = _run_check(self.server.policy, self.server.root, conn,
+                result = _run_check(self.policy, self.root, conn,
                                     name, dict(req.get("params") or {}),
                                     None if cwd_value is None else str(cwd_value),
-                                    req.get("single"), self.server.view)
+                                    req.get("single"), self.view)
             else:
                 method = str(req.get("method", "GET")).upper()
                 url = req["url"]
@@ -703,7 +731,7 @@ class _Handler(socketserver.BaseRequestHandler):
                 body = (base64.b64decode(req["body_b64"])
                         if req.get("body_b64") else None)
                 timeout = float(req["timeout"]) if req.get("timeout") else None
-                result = _execute(self.server.policy, self.server.tls, self.server.discharge,
+                result = _execute(self.policy, self.tls, self.discharge,
                                   conn, method, url, req.get("headers"), body, timeout)
             return json.dumps({"ok": True, **result}).encode()
         except ClientGone:
@@ -720,30 +748,6 @@ class _Handler(socketserver.BaseRequestHandler):
                                "detail": f"{type(exc).__name__}: {exc}"}).encode()
 
 
-class _Server(socketserver.ThreadingUnixStreamServer):
-    """One thread per connection; one connection is one request."""
-
-    daemon_threads = True
-
-    def __init__(
-        self,
-        socket_path: str,
-        policy: Policy,
-        discharge: Discharge | None,
-        root: pathlib.Path | None,
-        stream_to: tuple[int, int] | None,
-        view: pathlib.Path | None = None,
-    ):
-        self.policy = policy
-        self.tls = _tls_context()
-        self.discharge = discharge
-        self.root = root
-        self.stream_to = stream_to
-        # the FUSE view serving the root for confined children, when the host attached one
-        self.view = view
-        super().__init__(socket_path, _Handler)
-
-
 def terminal_descriptors() -> tuple[int, int] | None:
     """The host's stdout and stderr descriptors, for streaming execs -- None when either is not
     a real descriptor (captured by a test harness, say), in which case streaming is refused."""
@@ -753,97 +757,24 @@ def terminal_descriptors() -> tuple[int, int] | None:
         return None
 
 
-def build_server(
-    socket_path: str | os.PathLike[str],
+def build_broker(
     policy: Policy,
     root: str | os.PathLike[str] | None = None,
     stream_to: tuple[int, int] | None = None,
     view: pathlib.Path | None = None,
-) -> _Server:
-    """A broker server on *socket_path*, enforcing *policy*'s ``network`` rules. The caller
-    runs it (``serve_forever`` on a thread) for the lifetime of one confined program and
-    tears it down after. The socket is created mode 0600 in a 0700 directory: filesystem
-    permission is the authentication. *root* anchors the exec tunnel's relative cwds and
-    enables literal-checker discharge of network rules' ``requires`` atoms
-    (``Policy.discharger``); without it only defined atoms discharge and exec is refused.
-    *stream_to* is where a ``stream=True`` exec's child writes (the host's own stdout and
-    stderr descriptors, ``terminal_descriptors()``); without it streaming execs are refused.
-    *view* is the FUSE mountpoint serving the root for confined children, when attached."""
-    path = os.fspath(socket_path)
-    sock_dir = os.path.dirname(path)
-    if sock_dir:
-        os.makedirs(sock_dir, mode=0o700, exist_ok=True)
-        os.chmod(sock_dir, 0o700)
-    if os.path.exists(path):
-        os.unlink(path)
-    old_umask = os.umask(0o177)
-    try:
-        return _Server(
-            path,
-            policy,
-            None if root is None else policy.discharger(root, view),
-            None if root is None else pathlib.Path(root),
-            stream_to,
-            view,
-        )
-    finally:
-        os.umask(old_umask)
-
-
-def _roundtrip(socket_path: str | os.PathLike[str], payload: dict) -> dict:
-    """One framed request-reply exchange. Closing the socket (a timeout, an exception in the
-    caller) is what cancels the request broker-side."""
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.connect(os.fspath(socket_path))
-        _send_frame(s, json.dumps(payload).encode())
-        header = _recv_exact(s, 4)
-        if header is None:
-            raise BrokerError("broker closed the connection")
-        (length,) = struct.unpack("!I", header)
-        frame = _recv_exact(s, length)
-        if frame is None:
-            raise BrokerError("broker closed mid-frame")
-    return json.loads(frame)
-
-
-def request(
-    socket_path: str | os.PathLike[str],
-    method: str,
-    url: str,
-    *,
-    headers: dict | None = None,
-    body: bytes | None = None,
-    timeout: float | None = None,
-) -> dict:
-    """One brokered network request: the client half of the wire protocol, as the runtime
-    half of ``certora.network`` speaks it."""
-    payload: dict = {"method": method, "url": url}
-    if headers:
-        payload["headers"] = dict(headers)
-    if body is not None:
-        payload["body_b64"] = base64.b64encode(body).decode("ascii")
-    if timeout is not None:
-        payload["timeout"] = timeout
-    return _roundtrip(socket_path, payload)
-
-
-def exec_request(
-    socket_path: str | os.PathLike[str],
-    program: str,
-    arguments: Sequence[str] = (),
-    *,
-    cwd: str,
-    kwargs: dict[str, str | list[str]] | None = None,
-    stream: bool = False,
-) -> dict:
-    """One brokered exec: the client half of the exec tunnel, as ``certora.exec``'s runtime
-    speaks it. *kwargs* bind the holes of a templated form; *stream* asks for the child's
-    output on the host's terminal instead of in the reply."""
-    return _roundtrip(socket_path, {
-        "kind": "exec",
-        "program": program,
-        "arguments": list(arguments),
-        "kwargs": dict(kwargs or {}),
-        "cwd": cwd,
-        "stream": stream,
-    })
+) -> Broker:
+    """The broker for one confined run, enforcing *policy*: the host hands ``Broker.serve`` its
+    end of the program's socketpair, on a thread, for the lifetime of the program. *root*
+    anchors the exec tunnel's relative cwds and enables literal-checker discharge of network
+    rules' ``requires`` atoms (``Policy.discharger``); without it only defined atoms discharge
+    and exec is refused. *stream_to* is where a ``stream=True`` exec's child writes (the host's
+    own stdout and stderr descriptors, ``terminal_descriptors()``); without it streaming execs
+    are refused. *view* is the FUSE mountpoint serving the root for confined children, when
+    attached."""
+    return Broker(
+        policy,
+        None if root is None else policy.discharger(root, view),
+        None if root is None else pathlib.Path(root),
+        stream_to,
+        view,
+    )

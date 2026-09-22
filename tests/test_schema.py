@@ -38,7 +38,7 @@ class TestOneStandsForTheListOfOne(unittest.TestCase):
     def test_every_set_valued_key(self) -> None:
         doc = load(
             'policy-version = 1\n'
-            '[filesystem]\nread = "**"\nwrite = "out/**"\nlist = "**"\nno-write = ".git/**"\n'
+            '[filesystem]\nread = "**"\nwrite = "out/**"\nno-write = ".git/**"\n'
             '[regions]\nblah = { footprint = "thing" }\n'
             '[atoms]\nmy-thing = { reads = "blah" }\n'
             '[[program]]\nname = "git"\nargv = ["git", "push", "${B}", "${F...}"]\ncwd = "repos/*"\n'
@@ -51,7 +51,7 @@ class TestOneStandsForTheListOfOne(unittest.TestCase):
             'requires = "my-thing"\nwrites = "blah"\n'
         )
         fs = doc.filesystem
-        self.assertEqual((fs.read, fs.write, fs.list_, fs.no_write), (["**"], ["out/**"], ["**"], [".git/**"]))
+        self.assertEqual((fs.read, fs.write, fs.no_write), (["**"], ["out/**"], [".git/**"]))
         self.assertEqual(doc.regions["blah"].footprint, ["thing"])  # type: ignore[union-attr]
         self.assertEqual(doc.atoms["my-thing"].reads, ["blah"])
         (rule,) = doc.program
@@ -177,6 +177,7 @@ class TestShapeErrors(unittest.TestCase):
             ('policy-version = 1\n[[validation]]\nname = "v"\nargv = ["t", "${checkers}/x"]\ncwd = "."\n', "head argv[0]"),
             ('policy-version = 1\n[[validation]]\nname = "v"\nargv = ["t", "a${p}"]\nparams = ["p"]\n', "whole arguments"),
             ('policy-version = 1\n[[validation]]\nname = "v"\nargv = ["t"]\neffect-free = true\n', "'effect-free' is no longer a key: spell writes = []"),
+            ('policy-version = 1\n[filesystem]\nread = "**"\nlist = "**"\n', "'list' is no longer a key: listing a directory is reading it"),
             ('policy-version = 1\n[[program]]\nname = "x"\ncwd = "."\nwrite = false\n', "'write' is no longer a key: spell write-fs"),
             ('policy-version = 1\nroot = "x"\n', "absolute path"),
             ('policy-version = 1\n[[apply]]\nruleset = "../x.toml"\n', ".toml file"),

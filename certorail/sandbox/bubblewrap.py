@@ -81,7 +81,7 @@ class BubblewrapSpawner:
         if not section.relative_patterns:
             return cls(NoView("every root-relative location of the section is one path"))
         try:
-            lease = attach(ViewSpec(os.path.realpath(root), section.read, section.write, section.no_write, section.listing))
+            lease = attach(ViewSpec(os.path.realpath(root), section.read, section.write, section.no_write))
         except ViewUnavailable as e:
             return cls(NoView(str(e)))
         return cls(ServedRoot(lease.mountpoint, pathlib.Path(root)), lease)
@@ -109,8 +109,6 @@ class BubblewrapSpawner:
             for loc in locs:
                 if served and not loc.absolute:
                     continue  # the view's: one bind of the root, the daemon behind it
-                if role == "list":
-                    continue  # a bind cannot list a directory without exposing it
                 path = single_path(loc, fs.root)
                 if path is not None:
                     out.append(Bind(path, role))
@@ -130,7 +128,6 @@ class BubblewrapSpawner:
 
         section("read", fs.section.read)
         section("write", fs.section.write)
-        section("list", fs.section.listing)
         additions("mount-read", fs.additions.read)
         additions("mount-write", fs.additions.write)
         section("no-write", fs.section.no_write)  # last: read-only over whatever it lies within

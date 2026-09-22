@@ -363,7 +363,7 @@ def describe(policy: Policy, origin: str, governs: str | None = None) -> str:
     ]
     fs = [
         f"- {kind}: " + (", ".join(pretty_location(loc) for loc in locs) if locs else "nothing")
-        for kind, locs in (("read", policy.read), ("write", policy.write), ("list", policy.listing))
+        for kind, locs in (("read", policy.read), ("write", policy.write))
     ]
     if policy.no_write:
         fs.append(

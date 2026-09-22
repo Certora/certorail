@@ -121,7 +121,7 @@ def rulesets_dir() -> pathlib.Path:
 # root, no programs of its own -- plus the base ruleset, like any root
 _DEFAULT_DOC: dict[str, Any] = {
     "policy-version": 1,
-    "filesystem": {"read": ["**"], "write": ["**"], "list": ["**"]},
+    "filesystem": {"read": ["**"], "write": ["**"]},
 }
 
 
@@ -1007,7 +1007,6 @@ def from_data(data: object, where: str = "<policy>") -> Policy:
         return Policy.allow(
             read=grants(top.filesystem.read),
             write=grants(top.filesystem.write),
-            listing=grants(top.filesystem.list_),
             no_write=_slot(no_write) if no_write else [],
             programs=own + applied, validations=validations, atoms=declared.defined,
             network=net_rules, sources=sources, regions=declared.regions, reads=declared.reads,

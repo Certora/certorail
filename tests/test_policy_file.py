@@ -87,7 +87,6 @@ policy-version = 1
 [filesystem]
 read  = ["**"]
 write = ["repos/**"]
-list  = ["repos/**"]
 
 [atoms]
 org-checkout = {}
@@ -124,7 +123,6 @@ cwd        = "repos/**"
 EXPECTED = Policy.allow(
     read=[markers.within(".")],
     write=[markers.within("repos")],
-    listing=[markers.within("repos")],
     atoms=[atom("no-flag", markers.matches(r"[^-].*"))],
     validations=[
         validation(

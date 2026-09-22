@@ -15,7 +15,6 @@ HEADER = "import pathlib\nimport sys\n"
 OUT_ONLY = Policy.allow(
     read=[markers.within("repos")],
     write=[markers.within("repos/x/out")],
-    listing=[markers.within("repos")],
 )
 
 

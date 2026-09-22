@@ -7,7 +7,7 @@ import tempfile
 import threading
 import unittest
 
-from certorail.broker import build_server, exec_request
+from tests.brokerpath import build_server, exec_request
 from certorail.describe import describe
 from certorail.host import Accepted, Rejected
 from certorail.host import check as host_check
@@ -114,7 +114,6 @@ class TestDefaultAllow(RulesetCase):
         narrow = from_data({"policy-version": 1, "default-allow": True, "filesystem": {"write": [], "read": ["src/**"]}})
         self.assertEqual(narrow.write, ())
         self.assertEqual(len(narrow.read), 1)
-        self.assertEqual(len(narrow.listing), 1)  # unwritten: the root
         # protections still bind
         protected = from_data({"policy-version": 1, "default-allow": True, "filesystem": {"no-write": ["secrets/**"]}})
         outcome = host_check(HEADER + 'pathlib.Path("secrets/k").write_text("x")\n', "<t>", protected)

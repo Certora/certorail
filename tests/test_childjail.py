@@ -16,7 +16,7 @@ import unittest
 from unittest import mock
 
 from certorail import markers
-from certorail.broker import _roundtrip, build_server, exec_request
+from tests.brokerpath import _roundtrip, build_server, exec_request
 from certorail.childjail import (
     UNJAILED,
     Environment,
@@ -412,6 +412,9 @@ class TestGrants(unittest.TestCase):
         mounts = Mounts(reads=(pathlib.Path("/r/src"),), writes=(pathlib.Path("/r/out"),), no_write=(pathlib.Path("/r/out/final"),))
         profile = seatbelt_profile(CONFINED, "/tmp/scratch", mounts, "/usr/bin/cat")
         self.assertIn("(deny file-read-data file-write*)", profile)
+        # every process reads the root directory's entries at startup (measured: without this
+        # `ls` and `cat` abort before main); the top-level names are all it exposes
+        self.assertIn('(allow file-read-data (literal "/"))', profile)
         self.assertIn('(subpath "/usr/bin/cat")', profile)
         self.assertIn('(subpath "/r/src")', profile)
         # under write-fs = false the write grant is readable, and only the scratch dir writable
@@ -421,13 +424,11 @@ class TestGrants(unittest.TestCase):
         self.assertIn("(deny process-fork)", profile)
         writer = Jail(write_fs=True, view=View.POLICY)
         self.assertIn('(allow file-write* (subpath "/r/out")', seatbelt_profile(writer, "/tmp/scratch", mounts, None))
-        # patterns are regex filters, list grants literal directory reads
-        patterned = Mounts(reads=(Regex("^/r/src/(.*/)?[^/]+\\.py$"),), no_write=(Regex("^/r/(.*/)?\\.git(/.*)?$"),),
-                           listings=(pathlib.Path("/r"), Regex("^/r/src/[^/]+$")))
+        # patterns are regex filters
+        patterned = Mounts(reads=(Regex("^/r/src/(.*/)?[^/]+\\.py$"),), no_write=(Regex("^/r/(.*/)?\\.git(/.*)?$"),))
         profile = seatbelt_profile(CONFINED, "/tmp/scratch", patterned, None)
         self.assertIn('(regex #"^/r/src/(.*/)?[^/]+\\.py$")', profile)
         self.assertIn('(deny file-write* (regex #"^/r/(.*/)?\\.git(/.*)?$"))', profile)
-        self.assertIn('(allow file-read-data (literal "/r") (regex #"^/r/src/[^/]+$"))', profile)
         # the host view: today's profile, untouched
         self.assertEqual(seatbelt_profile(Jail(network=False), None, None, None), "(version 1) (allow default) (deny network*)")
 

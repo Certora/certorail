@@ -1,10 +1,9 @@
 """The macOS spawner: Seatbelt through ``sandbox-exec``. No run-scoped state: patterns are
 regex filters, so no view is ever needed, and every plan is a pure function of the confinement.
 
-Lowering (``lower``): a location that is one path is a ``Bind`` (a ``subpath`` filter, or for a
-``list`` grant a ``literal`` one: the directory itself, not its subtree); a pattern is a
-``RegexRule``, anchored over canonical paths, a protection's covering its subtree; a ``<regex>``
-outside the subset Python and ERE share is ``Omitted``.
+Lowering (``lower``): a location that is one path is a ``Bind`` (a ``subpath`` filter); a pattern
+is a ``RegexRule``, anchored over canonical paths, a protection's covering its subtree; a
+``<regex>`` outside the subset Python and ERE share is ``Omitted``.
 
 The regex dialect (``ere_of``): a policy ``<regex>`` is validated at load as a Python regex, and
 Seatbelt reads POSIX ERE. The ERE is generated from Python's own parse of the pattern, node by
@@ -14,11 +13,13 @@ atomic forms; lookarounds; backreferences; inline flags; non-ASCII) refuses the 
 rather than approximating it. The one difference let through: ``.`` in ERE matches a newline,
 Python's does not.
 
-The profile: everything but file data allowed, then the toolchain, the tool, the scratch
-directory and the readable locations allowed for reading, the list grants for reading the
-directory alone, the writable locations (under ``write_fs``) and the scratch directory for
-writing, the protections denied for writing last. Later rules win. Metadata reads stay allowed
-so path resolution works: names are visible, contents are not.
+The profile: everything but file data allowed, then the entries of ``/`` (every process reads
+them at startup: measured 2026-09-22, without this ``ls`` and ``cat`` abort before ``main``),
+the toolchain, the tool, the scratch directory and the readable locations allowed for reading
+(listing a directory is reading it: a read grant covers the directories within it), the
+writable locations (under ``write_fs``) and the scratch directory for writing, the protections
+denied for writing last. Later rules win. Metadata reads stay allowed so path resolution works:
+names are visible, contents are not.
 
 Written against Apple's documented profile language and unrun here; ``scripts/probe_seatbelt.py``
 is the probe a Mac runs.
@@ -275,10 +276,7 @@ def _canonical(path: str | os.PathLike[str]) -> str:
 def _filter(item: str | Bind | RegexRule) -> str:
     if isinstance(item, RegexRule):
         return f'(regex #"{item.pattern}")'
-    if isinstance(item, Bind):
-        kind = "literal" if item.role == "list" else "subpath"
-        return f'({kind} "{_canonical(item.path)}")'
-    return f'(subpath "{_canonical(item)}")'
+    return f'(subpath "{_canonical(item.path if isinstance(item, Bind) else item)}")'
 
 
 class SeatbeltSpawner:
@@ -304,7 +302,6 @@ class SeatbeltSpawner:
 
         each("read", fs.section.read)
         each("write", fs.section.write)
-        each("list", fs.section.listing)
         each("mount-read", fs.additions.read)
         each("mount-write", fs.additions.write)
         each("no-write", fs.section.no_write)
@@ -318,14 +315,12 @@ class SeatbeltSpawner:
         if isinstance(fs, PolicyFilesystem):
             lowered = [x for x in self.lower(fs, c.write_fs) if isinstance(x, (Bind, RegexRule))]
             rules.append("(deny file-read-data file-write*)")
+            rules.append('(allow file-read-data (literal "/"))')
             reads: list[str | Bind | RegexRule] = [*TOOLCHAIN, *([exe] if exe is not None else [])]
             reads += [x for x in lowered if readable(x.role)]
             if scratch is not None:
                 reads.append(scratch)
             rules.append("(allow file-read* " + " ".join(_filter(x) for x in reads) + ")")
-            listings = [x for x in lowered if x.role == "list"]
-            if listings:
-                rules.append("(allow file-read-data " + " ".join(_filter(x) for x in listings) + ")")
             writes: list[str | Bind | RegexRule] = [x for x in lowered if writable(x.role)] if c.write_fs else []
             if scratch is not None:
                 writes.append(scratch)

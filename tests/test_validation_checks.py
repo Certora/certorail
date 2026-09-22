@@ -12,7 +12,7 @@ import threading
 import unittest
 
 from certorail import markers
-from certorail.broker import build_server
+from tests.brokerpath import build_server, channel
 from certorail.analysis import RegexLit, atoms_of
 from certorail.effects import EVERYTHING, NOTHING
 from certorail.host import Accepted, Rejected
@@ -208,7 +208,6 @@ class TestContracts(unittest.TestCase):
 ORG_POLICY = Policy.allow(
     read=[markers.within(".")],
     write=[markers.within(".")],
-    listing=[markers.within(".")],
     programs=[program("git", subcommand="log", cwd=markers.within("repos"), requires=["org-checkout"])],
     validations=[
         validation(
@@ -287,7 +286,6 @@ class TestDefinedAtoms(unittest.TestCase):
 SUB_POLICY = Policy.allow(
     read=[markers.within(".")],
     write=[markers.within(".")],
-    listing=[markers.within(".")],
     validations=[
         validation(
             "not-force-check",
@@ -378,7 +376,6 @@ class TestSubcommands(unittest.TestCase):
         policy = Policy.allow(
             read=[markers.within(".")],
             write=[markers.within(".")],
-            listing=[markers.within(".")],
             programs=[
                 program("git", subcommand="log", cwd=markers.within("repos"), requires=["org-checkout"])
             ],
@@ -415,7 +412,6 @@ class TestSubcommands(unittest.TestCase):
 CWD_FREE_POLICY = Policy.allow(
     read=[markers.within(".")],
     write=[markers.within(".")],
-    listing=[markers.within(".")],
     validations=[
         validation(
             "not-force-check",
@@ -542,7 +538,6 @@ class TestCheckSingle(unittest.TestCase):
 PATHS_POLICY = Policy.allow(
     read=[markers.within(".")],
     write=[markers.within(".")],
-    listing=[markers.within(".")],
     programs=[
         program(
             "git",
@@ -626,11 +621,13 @@ class TestRuntimeCheck(unittest.TestCase):
         cls.sock = os.path.join(tempfile.mkdtemp(), "broker.sock")
         cls.server = build_server(cls.sock, policy, cls.root)
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
-        os.environ["CERTORAIL_BROKER_SOCKET"] = cls.sock
+        cls.program_end = channel(cls.server.broker)
+        os.environ["CERTORAIL_BROKER_FD"] = str(cls.program_end.fileno())
 
     @classmethod
     def tearDownClass(cls) -> None:
-        os.environ.pop("CERTORAIL_BROKER_SOCKET", None)
+        os.environ.pop("CERTORAIL_BROKER_FD", None)
+        cls.program_end.close()
         cls.server.shutdown()
         cls.server.server_close()
 

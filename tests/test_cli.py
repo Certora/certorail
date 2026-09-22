@@ -1,5 +1,5 @@
 """The host CLI: the -c inline-source path (the agentic entry) and its mutex with a file
-argument. Runs go through --no-jail so the suite needs no srt."""
+argument. Runs go through --no-jail so the suite needs no bubblewrap."""
 import pathlib
 import tempfile
 import unittest

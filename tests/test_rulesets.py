@@ -91,7 +91,7 @@ class RulesetCase(unittest.TestCase):
     def root(self, *applies: dict, **extra) -> dict:
         return {
             "policy-version": 1,
-            "filesystem": {"read": ["**"], "write": ["**"], "list": ["**"]},
+            "filesystem": {"read": ["**"], "write": ["**"]},
             "apply": list(applies),
             **extra,
         }

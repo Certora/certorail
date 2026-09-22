@@ -117,7 +117,6 @@ class ViewSpec:
     read: tuple[LocationFact, ...]
     write: tuple[LocationFact, ...]
     no_write: tuple[LocationFact, ...]
-    listing: tuple[LocationFact, ...]
 
     def document(self) -> str:
         body = {
@@ -126,7 +125,6 @@ class ViewSpec:
             "read": [_encode(loc) for loc in self.read],
             "write": [_encode(loc) for loc in self.write],
             "no_write": [_encode(loc) for loc in self.no_write],
-            "list": [_encode(loc) for loc in self.listing],
         }
         return json.dumps(body, sort_keys=True, separators=(",", ":"))
 
@@ -144,7 +142,6 @@ class ViewSpec:
             tuple(_decode(d) for d in body["read"]),
             tuple(_decode(d) for d in body["write"]),
             tuple(_decode(d) for d in body["no_write"]),
-            tuple(_decode(d) for d in body["list"]),
         )
 
 
@@ -319,7 +316,7 @@ def serve(keydir: pathlib.Path, idle: float) -> int:
     raise_fd_limit()
     options = set(pyfuse3.default_options)
     options.add("fsname=certorail-view")
-    view = Tracked(pathlib.Path(spec.root), Filter(spec.read, spec.write, spec.no_write, spec.listing))
+    view = Tracked(pathlib.Path(spec.root), Filter(spec.read, spec.write, spec.no_write))
     pyfuse3.init(view, str(mnt), options)
     (keydir / "pid").write_text(f"{os.getpid()} {int(time.time())}\n")
     print(f"certorail view {keydir.name}: serving {spec.root} at {mnt} (pid {os.getpid()})", flush=True)

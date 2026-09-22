@@ -27,14 +27,13 @@ installer.
 `init` reports what is missing and never runs `sudo` or `npm` itself.
 
 - `uv` installs and runs the tool.
-- `bwrap` (bubblewrap) is the jail around the tools a policy grants: `sudo apt install bubblewrap`
-  on Debian and Ubuntu, or your distribution's package. macOS needs nothing here: the system's
-  `sandbox-exec` does that job.
-- `srt` is the jail around the program certorail runs: `npm install -g @anthropic-ai/sandbox-runtime`.
-  certorail warns and runs unjailed without it.
+- `bwrap` (bubblewrap), on Linux, is the jail: around the program certorail runs and around the
+  tools a policy grants. `sudo apt install bubblewrap` on Debian and Ubuntu, or your
+  distribution's package. macOS needs nothing: the system's Seatbelt does both jobs.
 
-Two jails, two prerequisites. `srt` confines the *program* certorail runs; bubblewrap or
-`sandbox-exec` confines the *tools* a policy grants whenever a rule says `network = false`,
+The program certorail runs is always jailed: no network, writes only within the policy's write
+grants, no processes of its own; on Linux certorail warns and runs the program unjailed when
+`bwrap` is missing. The tools a policy grants are jailed whenever a rule says `network = false`,
 `write-fs = false` or `exec.spawn = false`. Those keys are enforced, not declared: a rule carrying
 one runs its tool inside the jail, and if the jail is missing the tool does not run at all (the
 program gets a broker error naming it) rather than running unconfined. Every rule in the coreutils

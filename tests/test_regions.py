@@ -32,7 +32,7 @@ CLEAN = AtomId("clean")
 def policy_data() -> dict:
     return copy.deepcopy({
         "policy-version": 1,
-        "filesystem": {"read": ["repos/**"], "write": ["repos/**"], "list": ["repos/**"]},
+        "filesystem": {"read": ["repos/**"], "write": ["repos/**"]},
         "regions": REGIONS,
         "atoms": {
             "org-checkout": {"reads": ["git.config"]},

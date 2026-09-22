@@ -14,7 +14,7 @@ import threading
 import unittest
 
 from certorail import markers
-from certorail.broker import build_server, exec_request, request
+from tests.brokerpath import build_server, channel, exec_request, request
 from certorail.policy import Policy, atom, constraint, network, param, program, pure, splice, validation, waived
 from certorail.templates import Each
 
@@ -324,8 +324,11 @@ class TestBrokerExec(unittest.TestCase):
         self.assertTrue(out.endswith("repos/x"), out)
 
     def test_markers_exec_round_trip(self) -> None:
-        os.environ["CERTORAIL_BROKER_SOCKET"] = self.sock
-        self.addCleanup(os.environ.pop, "CERTORAIL_BROKER_SOCKET", None)
+        # the runtime half speaks over the inherited descriptor the host hands the program
+        program_end = channel(self.server.broker)
+        self.addCleanup(program_end.close)
+        os.environ["CERTORAIL_BROKER_FD"] = str(program_end.fileno())
+        self.addCleanup(os.environ.pop, "CERTORAIL_BROKER_FD", None)
         result = markers.exec("echo", "hi there", cwd=".")
         self.assertIsInstance(result, markers.ExecResult)
         self.assertEqual(result.returncode, 0)

@@ -10,8 +10,8 @@ policy file, through the installer.
 2. If a base ruleset is installed (``rulesets/base.toml``): summarise what it applies, from the
    ``description`` of each ruleset it names, and ask whether this root wants it. No writes
    ``base = false`` into the policy. Skipped when there is no base.
-3. Ask whether programs get full read, write and list access under the root. Yes: every
-   ``[filesystem]`` kind is ``["**"]`` and the policy is done.
+3. Ask whether programs get full read and write access under the root. Yes: both
+   ``[filesystem]`` kinds are ``["**"]`` and the policy is done.
 4. Otherwise, ask for the locations of each kind in turn, in the location micro-syntax
    (``src/**``, ``*.md``, ``/srv/data/**``; empty for none), each checked as it is typed.
 5. Ask whether to allow all programs the policy does not name (``default-allow``: any
@@ -48,7 +48,7 @@ type Ask = Callable[[str, bool], bool]   # a yes/no question and its default -> 
 type Prompt = Callable[[str], str]       # a question -> the raw text answered
 type Say = Callable[[str], None]
 
-KINDS = ("read", "write", "list")
+KINDS = ("read", "write")
 
 POLICY_TEXT = """\
 # Ambient policy for {root}, written by `certorail init`. Refine it with `certorail policy
@@ -60,7 +60,6 @@ root = "{root}"
 [filesystem]
 read  = {read}
 write = {write}
-list  = {list}
 """
 
 DEFAULT_ALLOW = """\
@@ -150,12 +149,11 @@ def plugin_marketplace() -> pathlib.Path:
     the tool upgrades it; no repository and no network are involved."""
     return pathlib.Path(str(importlib.resources.files("certorail").joinpath("plugin")))
 
-# what the jails need on the machine, and how to get it when `which` finds nothing
+# what the jails need on the machine, and how to get it when `which` finds nothing (macOS needs
+# nothing: Seatbelt is the system's)
 PREREQUISITES: tuple[tuple[str, str, str], ...] = (
-    ("bwrap", "the jail around the tools a policy grants",
+    ("bwrap", "the jail around the program certorail runs and around the tools a policy grants",
      "sudo apt install bubblewrap (or your distribution's bubblewrap package)"),
-    ("srt", "the jail around the program certorail runs",
-     "npm install -g @anthropic-ai/sandbox-runtime"),
 )
 
 BASE_TEXT = """\
@@ -288,7 +286,7 @@ def interview(*, root: pathlib.Path, ask: Ask, prompt: Prompt, say: Say) -> int:
             say("  (nothing)")
         inherit = ask("Apply the base ruleset to this root?", True)
 
-    if ask(f"Give programs full read, write and list access under {resolved}?", True):
+    if ask(f"Give programs full read and write access under {resolved}?", True):
         grants = {kind: ["**"] for kind in KINDS}
     else:
         say("The location micro-syntax: `src/**` a subtree, `*.md` one name pattern, `docs/**/<.*\\.md>` a")
@@ -314,7 +312,6 @@ def interview(*, root: pathlib.Path, ask: Ask, prompt: Prompt, say: Say) -> int:
         default_allow="\n" + DEFAULT_ALLOW if allow_all else "",
         read=toml_list(grants["read"]),
         write=toml_list(grants["write"]),
-        list=toml_list(grants["list"]),
     )
     with tempfile.TemporaryDirectory(prefix="certorail-init-") as tmp:
         draft = pathlib.Path(tmp) / "policy.toml"

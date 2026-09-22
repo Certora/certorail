@@ -66,7 +66,6 @@ class TestDescribe(unittest.TestCase):
             "governs /srv/work",
             "- read: repos/**, reports/**",
             r"- write: repos/**/</\w+\.md/>",
-            "- list: nothing",
             "- git push origin BRANCH",
             "cwd validated by org-checkout",
             "BRANCH: <validated no-flag>",

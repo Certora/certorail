@@ -1,25 +1,29 @@
-"""Self-imposed process-creation denial for the confined child.
+"""The self-jail: what the confined child's bootstrap installs on itself, first thing.
 
-srt restricts what a process can *reach* (files, network); it exposes nothing about what a
-process can *do*, and in particular nothing about fork/exec. But the bootstrap runs our code
-inside the jail before the program does, and a process may always tighten its own cage:
+A process may always tighten its own cage, and the bootstrap runs our code before the program:
 
   * Linux: a self-installed seccomp filter denying ``execve``/``execveat`` with EPERM
     (``PR_SET_NO_NEW_PRIVS`` makes that legal unprivileged; the filter is inherited by any
     fork, so there is no spawn-then-exec dodge). Fork itself stays permitted: without exec
-    it confers no new capability, only the same jailed image.
-  * macOS: ``sandbox_init()`` -- the in-process Seatbelt API -- with
-    ``(deny process-exec*) (deny process-fork)``. Applied after our own exec already
-    happened, so the denial can be absolute; it intersects with srt's own profile.
+    it confers no new capability, only the same jailed image. The rest of the Linux jail --
+    filesystem and network -- is bubblewrap's, around the interpreter (``host._bwrap_command``);
+    the two compose.
+  * macOS: ``sandbox_init()`` -- the in-process Seatbelt API -- with the *whole* jail: the
+    profile the host wrote for this run (``host._seatbelt_profile``: writes confined to the
+    policy's write surface, no network, no fork, no exec), read from an inherited descriptor to
+    an unlinked file, so nothing on the machine can name it, let alone edit it, between the
+    host writing it and this call. It has to be the whole jail, because a process already
+    inside a Seatbelt sandbox cannot call ``sandbox_init`` again, so nothing may sandbox the
+    interpreter before the bootstrap does. Without a profile, the fork/exec denial alone.
 
-This is pure defense in depth for ``certora.exec``: the subset cannot *name* subprocess, the
-broker is where exec'd children actually run, and this makes local spawning physically
-impossible rather than merely unspellable. Nothing in the child legitimately creates a
-process -- checks, execs and network requests are all brokered over the socket.
+This makes local spawning physically impossible rather than merely unspellable: the subset
+cannot *name* subprocess, and the broker is where exec'd children actually run. Nothing in the
+child legitimately creates a process -- checks, execs and network requests are all brokered over
+the inherited socket.
 
-``deny_process_creation`` returns a warning string when the denial could not be installed
-(unknown architecture, missing API), and None on success: the caller decides how loudly to
-degrade, mirroring the srt-missing behaviour.
+``install`` returns a warning string when the jail could not be installed (unknown architecture,
+missing API, a profile Seatbelt rejects), and None on success: the caller decides how loudly to
+degrade.
 
 The second filter here, ``fork_denial_filter``, is for the children the broker spawns
 (``childjail``): bubblewrap installs a caller-supplied BPF program before it execs the tool, so
@@ -29,6 +33,7 @@ start and stops it spawning anything after. Threads stay possible: ``clone`` wit
 cannot read) answers ENOSYS, which makes glibc fall back to ``clone``.
 """
 import ctypes
+import os
 import platform
 import struct
 import sys
@@ -138,8 +143,10 @@ def _linux_seccomp() -> str | None:
     return None
 
 
-def _darwin_sandbox() -> str | None:
-    profile = b"(version 1) (allow default) (deny process-exec*) (deny process-fork)"
+_FORK_EXEC_ONLY = b"(version 1) (allow default) (deny process-exec*) (deny process-fork)"
+
+
+def _darwin_sandbox(profile: bytes) -> str | None:
     try:
         libsystem = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
     except OSError as exc:
@@ -151,15 +158,24 @@ def _darwin_sandbox() -> str | None:
     return None
 
 
-def deny_process_creation() -> str | None:
-    """Deny this process (and its forks) the ability to exec. Returns a warning when the
-    denial could not be installed, None on success -- except on Windows, which is handled
-    with the gravity it deserves (WSL and --no-jail both exist)."""
+def install(profile_fd: int | None = None) -> str | None:
+    """Jail this process from the inside. Linux: the seccomp exec denial (bubblewrap around the
+    interpreter is the rest). macOS: one ``sandbox_init`` with the profile read from the
+    inherited descriptor *profile_fd*, which the host wrote for this run -- the whole jail -- or
+    the fork/exec denial alone when there is none. Returns a warning when nothing could be
+    installed, None on success -- except on Windows, which is handled with the gravity it
+    deserves (WSL and --no-jail both exist)."""
     if sys.platform == "win32":
         print("here's a nickel kid, get yourself a better computer")
         sys.exit(1)
     if sys.platform == "linux":
         return _linux_seccomp()
     if sys.platform == "darwin":
-        return _darwin_sandbox()
-    return f"no process-creation denial for platform {sys.platform!r}"
+        if profile_fd is None:
+            return _darwin_sandbox(_FORK_EXEC_ONLY)
+        try:
+            with os.fdopen(profile_fd, "rb") as f:
+                return _darwin_sandbox(f.read())
+        except OSError as exc:
+            return f"seatbelt profile unreadable: {exc}"
+    return f"no self-jail for platform {sys.platform!r}"

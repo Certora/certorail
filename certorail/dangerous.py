@@ -329,7 +329,9 @@ ALLOWED_MEMBERS: dict[tuple[str, ...], frozenset[str]] = {
 # ---------------------------------------------------------------------------
 
 # What a sink does to the path, for the security policy: "list" covers listing a directory and
-# probing for existence.
+# probing for existence. The policy has no list grants: listing a directory is reading it, and
+# a "list" sink is held to the read grants (``Policy._evaluate``); the kind survives so the
+# report and a denial can still say what the program did.
 type AccessKind = Literal["read", "write", "list"]
 
 # builtins and module-level functions: dotted callee -> (index of the path argument, kind).

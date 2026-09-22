@@ -60,7 +60,6 @@ class Filter:
         read: tuple[LocationFact, ...],
         write: tuple[LocationFact, ...],
         no_write: tuple[LocationFact, ...],
-        listing: tuple[LocationFact, ...],
     ) -> None:
         def relative(locs: tuple[LocationFact, ...]) -> list[tuple[Item, ...]]:
             return [items_of(loc) for loc in locs if not loc.absolute]
@@ -68,7 +67,6 @@ class Filter:
         self.readable: list[tuple[Item, ...]] = relative(read) + relative(write)
         self.writable: list[tuple[Item, ...]] = relative(write)
         self.protected: list[tuple[Item, ...]] = [(*items, SPLAT) for items in relative(no_write)]
-        self.listable: list[tuple[Item, ...]] = relative(listing)
 
     @staticmethod
     def _items(path: RelPath) -> tuple[Item, ...]:
@@ -81,11 +79,11 @@ class Filter:
 
     @lru_cache(maxsize=200_000)
     def dir_visible(self, path: RelPath) -> bool:
+        # a directory is visible iff some grant has paths below it: listing is reading
         if not path:
             return True
-        items = self._items(path)
-        below = (*items, SPLAT)
-        return any(_intersects(below, g) for g in self.readable) or any(_intersects(items, g) for g in self.listable)
+        below = (*self._items(path), SPLAT)
+        return any(_intersects(below, g) for g in self.readable)
 
     @lru_cache(maxsize=200_000)
     def may_write(self, path: RelPath) -> bool:

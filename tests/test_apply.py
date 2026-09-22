@@ -66,7 +66,6 @@ root = "{root}"
 [filesystem]
 read  = ["**"]
 write = ["**"]
-list  = ["**"]
 """
 
 

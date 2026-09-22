@@ -39,7 +39,6 @@ class FilesystemSection:
     read: tuple[LocationFact, ...] = ()
     write: tuple[LocationFact, ...] = ()
     no_write: tuple[LocationFact, ...] = ()
-    listing: tuple[LocationFact, ...] = ()
 
     @property
     def relative_patterns(self) -> tuple[LocationFact, ...]:

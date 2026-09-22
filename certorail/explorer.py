@@ -471,9 +471,8 @@ def source_card(s: Source) -> RenderableType:
 
 
 _FS_MEANING = {
-    "read": "open / read_text / read_bytes on a proven path within",
+    "read": "open / read_text / read_bytes, directory listings and existence probes on a proven path within",
     "write": "writes and creations on a proven path within",
-    "list": "directory listings and existence probes within",
 }
 
 
@@ -488,7 +487,7 @@ def program_group_card(name: str, rules: tuple[Program, ...]) -> RenderableType:
 
 
 def fs_card(kind: str, policy: Policy) -> RenderableType:
-    locs = {"read": policy.read, "write": policy.write, "list": policy.listing}[kind]
+    locs = {"read": policy.read, "write": policy.write}[kind]
     parts: list[RenderableType] = [_line((kind, LIT), (f"  {_FS_MEANING[kind]}:", DIM)), Text()]
     if not locs:
         parts.append(_line(("nothing", DIM)))
@@ -543,7 +542,7 @@ class ExplorerApp(App[None]):
                                (" and every directory below it with no policy of its own", DIM)))
         parts.append(Text())
         counts = (
-            ("filesystem grants", len(policy.read) + len(policy.write) + len(policy.listing)),
+            ("filesystem grants", len(policy.read) + len(policy.write)),
             ("program rules", len(policy.programs)),
             ("network rules", len(policy.network)),
             ("validations", len(policy.validations)),
@@ -563,7 +562,7 @@ class ExplorerApp(App[None]):
         root.data = self._overview
 
         fs = root.add(Text("filesystem"), data=partial(fs_card, "read", policy))
-        for kind, locs in (("read", policy.read), ("write", policy.write), ("list", policy.listing)):
+        for kind, locs in (("read", policy.read), ("write", policy.write)):
             fs.add_leaf(_line((kind, ""), (f"  ({len(locs)})", DIM)), data=partial(fs_card, kind, policy))
 
         programs = root.add(_line("programs", (f"  ({len(policy.programs)} rules)", DIM)), data=self._overview)

@@ -170,7 +170,7 @@ class TestOpening(unittest.TestCase):
 
 POLICY = from_data({
     "policy-version": 1,
-    "filesystem": {"read": ["repos/**"], "write": ["repos/**"], "list": ["repos/**"]},
+    "filesystem": {"read": ["repos/**"], "write": ["repos/**"]},
     "regions": {"git.config": {"footprint": ".git/config"}},
     "atoms": {"org-checkout": {"reads": ["git.config"]}},
     "validation": [

@@ -8,7 +8,6 @@ policy-version = 1
 
 [filesystem]
 read = ["repos/**", "data/**"]
-list = ["repos/**", "data/**"]
 
 [[flagset]]
 name = "find-ro"

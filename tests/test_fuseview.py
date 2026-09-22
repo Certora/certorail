@@ -58,7 +58,6 @@ class TestFilter(unittest.TestCase):
             read=(loc("src/**/<.*\\.py>"), loc("docs/**")),
             write=(loc("out/**"),),
             no_write=(loc("out/**/.git"),),
-            listing=(loc("."), loc("notes")),
         )
 
     def test_files(self) -> None:
@@ -75,7 +74,7 @@ class TestFilter(unittest.TestCase):
         self.assertTrue(self.f.dir_visible(("src",)))          # a grant has paths below it
         self.assertTrue(self.f.dir_visible(("src", "pkg")))
         self.assertTrue(self.f.dir_visible(("docs",)))
-        self.assertTrue(self.f.dir_visible(("notes",)))        # a list grant names it
+        self.assertFalse(self.f.dir_visible(("notes",)))       # no grant has paths below it: listing is reading
         self.assertFalse(self.f.dir_visible(("notes", "sub")))
         self.assertFalse(self.f.dir_visible(("secrets",)))
 
@@ -94,11 +93,11 @@ class TestFilter(unittest.TestCase):
 
 class TestViewSpec(unittest.TestCase):
     def test_the_document_round_trips_and_keys_by_content(self) -> None:
-        spec = ViewSpec("/r", (loc("src/**/<.*\\.py>"), loc("a/{b,c}/*")), (loc("out/**"),), (loc("**/.git"),), (loc("."),))
+        spec = ViewSpec("/r", (loc("src/**/<.*\\.py>"), loc("a/{b,c}/*")), (loc("out/**"),), (loc("**/.git"),))
         again = ViewSpec.parse(spec.document())
         self.assertEqual(again, spec)
         self.assertEqual(again.key, spec.key)
-        other = ViewSpec("/r", (loc("src/**"),), (loc("out/**"),), (loc("**/.git"),), (loc("."),))
+        other = ViewSpec("/r", (loc("src/**"),), (loc("out/**"),), (loc("**/.git"),))
         self.assertNotEqual(other.key, spec.key)
         self.assertEqual(len(spec.key), 32)
 
@@ -135,7 +134,7 @@ class TestDaemon(unittest.TestCase):
             "CERTORAIL_VIEWS_DIR": str(self.base / "views"), "CERTORAIL_VIEW_IDLE": "1",
         }))
         self.policy = Policy.allow(
-            read=["src/**/<.*\\.py>"], write=["out/**"], no_write=["out/**/.git"], listing=["."],
+            read=["src/**/<.*\\.py>"], write=["out/**"], no_write=["out/**/.git"],
             programs=[program("cat", cwd=".", view=View.POLICY)],
         )
         self.spec = self.policy.view_spec(self.root)

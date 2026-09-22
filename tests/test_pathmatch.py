@@ -133,7 +133,7 @@ NET = Policy.allow(
         )
     ],
 )
-FS = Policy.allow(read=[markers.within("repos")], listing=[markers.within("repos")])
+FS = Policy.allow(read=[markers.within("repos")])
 HEADER = "import os\nimport pathlib\nimport sys\nimport urllib.parse\n"
 
 

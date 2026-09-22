@@ -18,11 +18,17 @@ the plugin's hook, kept out of ``--help``.)
 3. ``rewrite``: ``assert`` hardened, ``@certora.checked`` on contracted functions.
 4. Run: the rewritten source in a fresh interpreter (``-I -P``: no environment, no cwd on
    ``sys.path``) with the sandbox root as cwd, ``certora`` bound to ``certorail.markers`` and
-   ``sys.argv`` set to the program's arguments -- wrapped, when ``srt`` (sandbox-runtime) is
-   installed, in an OS jail: no network, writes confined to the root, the broker's unix
-   socket as the single door out. The static analysis is the primary confinement; the jail
-   is where anything it missed goes to die. Without srt the run proceeds with a loud
-   warning (or quietly with ``--no-jail``).
+   ``sys.argv`` set to the program's arguments -- inside an OS jail: no network, writes
+   confined to the policy's write surface, no fork or exec, and the broker reached over one
+   inherited socket, the single door out. Nothing of the run is a file anyone could name: the
+   bootstrap is the command line (``-c``), and the program source and, on macOS, the Seatbelt
+   profile reach the child as inherited descriptors to unlinked files, so what runs is what
+   was analysed. On Linux the jail is bubblewrap around the interpreter plus the bootstrap's
+   seccomp filter; on macOS the bootstrap itself installs the whole jail with one
+   ``sandbox_init`` (``selfjail``), since a process already inside a Seatbelt sandbox cannot
+   sandbox itself again, so nothing may wrap it first. The static analysis is the primary
+   confinement; the jail is where anything it missed goes to die. Without bubblewrap a Linux
+   run proceeds with a loud warning (or quietly with ``--no-jail``).
 
 The policy is a TOML (or JSON) document (``policyfile``), given with ``--policy`` or discovered
 ambiently for the root (``policydir``); without one, ``policyfile.default_policy`` applies: read,
@@ -32,22 +38,24 @@ status: the program's own when it ran; 1 when rejected; 2 when the program does 
 """
 import argparse
 import ast
-import json
+import contextlib
 import os
 import pathlib
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import IO
 
 from certorail.analysis import Named, StaticPath
 from certorail.childjail import Mounts, View
 from certorail.viewdaemon import Attachment, ViewUnavailable, attach
-from certorail.broker import build_server, terminal_descriptors
+from certorail.broker import build_broker, terminal_descriptors
 from certorail.describe import describe
 from certorail.policy import Denial, Policy, Program
 from certorail.policydir import AmbientPolicyError, find_policy
@@ -115,19 +123,25 @@ def check(
     return Accepted(report, rewrite(tree, contracted))
 
 
-# The child interpreter: bind the marker namespace, set argv, run the program as __main__.
+# The child interpreter, run as `python -I -P -c BOOTSTRAP FILENAME ARGS...`: jail itself, bind
+# the marker namespace, read the program over the descriptor the host handed over, set argv,
+# run it as __main__.
 _BOOTSTRAP = r'''
 import os
 import sys
-program, filename, *args = sys.argv[1:]
+filename, *args = sys.argv[1:]
 sys.path.insert(0, __CERTORAIL_PARENT__)
-import certorail.markers
 if os.environ.get("CERTORAIL_SELF_JAIL"):
+    # first, before anything else runs: on macOS this one call is the whole jail, its profile
+    # read from the descriptor the host handed over
     import certorail.selfjail
-    warning = certorail.selfjail.deny_process_creation()
+    profile_fd = os.environ.get("CERTORAIL_SEATBELT_FD")
+    warning = certorail.selfjail.install(None if profile_fd is None else int(profile_fd))
     if warning is not None:
-        print("certorail: process-creation denial not installed: " + warning, file=sys.stderr)
-with open(program, encoding="utf-8") as f:
+        print("certorail: self-jail not installed: " + warning, file=sys.stderr)
+import certorail.markers
+# the program as the host analysed it, over an inherited descriptor: no file in between
+with os.fdopen(int(os.environ["CERTORAIL_PROGRAM_FD"]), encoding="utf-8") as f:
     source = f.read()
 sys.argv = [filename, *args]
 namespace = {"__name__": "__main__", "__file__": filename, "certora": certorail.markers}
@@ -135,13 +149,23 @@ exec(compile(source, filename, "exec"), namespace)
 '''
 
 
-def _jail_write_paths(policy: Policy, root: pathlib.Path, tmp: pathlib.Path) -> list[str]:
-    """The jail's write allowance: the sandbox root and the run's scratch dir -- which cover
-    every root-relative write location -- plus the concrete prefix of every *absolute* write
-    location the policy grants (a statically-approved ``/srv/checkouts/**`` write must
-    not die in the jail). Coarser than the policy on purpose: precision is the analysis'
-    job, the jail is the backstop."""
-    paths = [str(root), str(tmp)]
+def _handover(prefix: str, text: str) -> IO[bytes]:
+    """*text* in an unlinked temporary file, positioned at its start, for the child to inherit
+    (``pass_fds``) and read: a handover nothing else on the machine can name, so nothing else
+    can edit it on the way."""
+    f = tempfile.TemporaryFile(prefix=prefix)
+    f.write(text.encode("utf-8"))
+    f.flush()
+    f.seek(0)
+    return f
+
+
+def _jail_write_paths(policy: Policy, root: pathlib.Path) -> list[str]:
+    """The jail's write allowance: the sandbox root -- which covers every root-relative write
+    location -- plus the concrete prefix of every *absolute* write location the policy grants
+    (a statically-approved ``/srv/checkouts/**`` write must not die in the jail). Coarser than
+    the policy on purpose: precision is the analysis' job, the jail is the backstop."""
+    paths = [str(root)]
     for loc in policy.write:
         if not loc.absolute:
             continue
@@ -158,8 +182,42 @@ def _jail_write_paths(policy: Policy, root: pathlib.Path, tmp: pathlib.Path) -> 
 def _jail_deny_paths(mounts: Mounts) -> list[str]:
     """The jail's write denials: every protected location (``no-write``) that is one concrete
     path, as ``fsview`` lowered it. A protection with a wildcard in it (``repos/**/.git``) is
-    the analysis' alone: srt denies paths, not patterns."""
+    the analysis' alone: a jail binds paths, not patterns."""
     return [str(p) for p in mounts.no_write]
+
+
+def _bwrap_command(bwrap: str, policy: Policy, root: pathlib.Path, mounts: Mounts, command: list[str]) -> list[str]:
+    """The Linux jail around the interpreter: the host's filesystem read-only, the policy's
+    write surface (``_jail_write_paths``) bound writable, every concrete protection remounted
+    read-only on top (later mounts win), no network. Reads stay open: the interpreter needs its
+    stdlib from everywhere, and read confinement is the analysis' stronger half. Process
+    creation is the bootstrap's own seccomp filter, which composes with these namespaces; the
+    broker's socket is an inherited descriptor, which bubblewrap passes through."""
+    argv = [bwrap, "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"]
+    for path in _jail_write_paths(policy, root):
+        argv += ["--bind-try", path, path]
+    for path in _jail_deny_paths(mounts):
+        argv += ["--ro-bind-try", path, path]
+    argv += ["--unshare-net", "--die-with-parent", "--", *command]
+    return argv
+
+
+def _sb_string(text: str) -> str:
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _seatbelt_profile(policy: Policy, root: pathlib.Path, mounts: Mounts) -> str:
+    """The macOS jail, which the bootstrap installs on itself with one ``sandbox_init`` (a
+    sandboxed process cannot sandbox itself again, so nothing may wrap the interpreter first):
+    everything allowed except writes outside the policy's write surface, the network, fork and
+    exec. Real paths, since Seatbelt matches those (``/var`` is ``/private/var``); later rules
+    win, so the allowances follow the broad denial and the protections come last."""
+    allowed = " ".join(f"(subpath {_sb_string(os.path.realpath(p))})" for p in _jail_write_paths(policy, root))
+    lines = ["(version 1)", "(allow default)", "(deny file-write*)", f"(allow file-write* {allowed})"]
+    for path in _jail_deny_paths(mounts):
+        lines.append(f"(deny file-write* (subpath {_sb_string(os.path.realpath(path))}))")
+    lines += ["(deny network*)", "(deny process-fork)", "(deny process-exec*)"]
+    return "\n".join(lines) + "\n"
 
 
 def _attach_view(policy: Policy, root: pathlib.Path) -> Attachment | None:
@@ -209,38 +267,6 @@ def _announce_view(policy: Policy, root: pathlib.Path, view: pathlib.Path | None
     )
 
 
-def _srt_settings(
-    policy: Policy, root: pathlib.Path, tmp: pathlib.Path, socket_path: pathlib.Path | None
-) -> dict:
-    """The srt (sandbox-runtime) profile for one confined run: no network at all -- the
-    broker socket is the single door -- no local binding, and writes confined to the
-    policy's write surface (``_jail_write_paths``). Reads stay default-allowed: the
-    interpreter needs its stdlib from everywhere, and read confinement is the static
-    analysis' stronger half anyway."""
-    # The deny lists are required by sandbox-runtime's schema even when they are empty, and it
-    # refuses the whole configuration without them rather than defaulting: leaving them out
-    # makes every jailed run die before the program starts.
-    #
-    # Unix sockets: ``allowUnixSockets`` (a path allowlist) is honoured on macOS only; on Linux
-    # srt denies socket() outright, and the only carve-out is ``allowAllUnixSockets``. The
-    # broker socket lives in a per-run private tempdir, so the wider allowance costs little
-    # here; a jail-independent transport (an inherited fd) is the proper fix, see JAILS.md.
-    return {
-        "network": {
-            "allowedDomains": [],
-            "deniedDomains": [],
-            "allowLocalBinding": False,
-            "allowUnixSockets": [str(socket_path)] if socket_path is not None else [],
-            "allowAllUnixSockets": socket_path is not None,
-        },
-        "filesystem": {
-            "allowWrite": _jail_write_paths(policy, root, tmp),
-            "denyWrite": _jail_deny_paths(policy.mounts(root)),
-            "denyRead": [],
-        },
-    }
-
-
 def run(
     source: str,
     filename: str,
@@ -279,61 +305,65 @@ def _run(
     # the runtime halves of check/exec/network all live in the broker: the confined program
     # never sees the policy, only the socket
     bootstrap = _BOOTSTRAP.replace("__CERTORAIL_PARENT__", repr(certorail_parent))
-    with tempfile.TemporaryDirectory(prefix="certorail_") as tmp:
-        tmpdir = pathlib.Path(tmp)
-        program = tmpdir / pathlib.Path(filename).name
-        program.write_text(outcome.source, encoding="utf-8")
-        # the bootstrap goes to a file rather than -c so the jailed command line stays
-        # trivially quotable
-        boot = tmpdir / "_bootstrap.py"
-        boot.write_text(bootstrap, encoding="utf-8")
-        env = dict(os.environ)
-        server = None
-        socket_path = None
-        if policy.network or policy.programs or policy.validations:
-            # the broker: the single, policy-enforcing hole in the wall -- network requests,
-            # exec'd children and check evaluators alike -- for the lifetime of this one
-            # program (broker.py). The child finds it by env var.
-            socket_path = tmpdir / "broker.sock"
-            # a stream=True exec writes to the descriptors this host holds for its terminal
-            server = build_server(socket_path, policy, root, stream_to=terminal_descriptors(), view=view)
-            threading.Thread(
-                target=server.serve_forever, name="certorail-broker", daemon=True
-            ).start()
-            env["CERTORAIL_BROKER_SOCKET"] = str(socket_path)
-        if jail:
-            # the self-jail: process creation denied from inside (seccomp / sandbox_init),
-            # since srt restricts reach, not operations. Everything the program may
-            # legitimately do to the world goes through the broker socket.
-            env["CERTORAIL_SELF_JAIL"] = "1"
-        command = [python, "-I", "-P", str(boot), str(program), filename, *args]
-        if jail:
-            srt = shutil.which("srt")
-            if srt is None:
+    env = dict(os.environ)
+    # what the child inherits -- unlinked files and a socket end, nothing anyone else can name:
+    # the program as analysed, the broker's door and, on macOS, the jail itself. So what runs
+    # is what was analysed, whatever happens on the machine between here and the bootstrap.
+    handover: list[IO[bytes] | socket.socket] = []
+    program = _handover("certorail-program-", outcome.source)
+    handover.append(program)
+    env["CERTORAIL_PROGRAM_FD"] = str(program.fileno())
+    host_end: socket.socket | None = None
+    serving: threading.Thread | None = None
+    if policy.network or policy.programs or policy.validations:
+        # the broker: the single, policy-enforcing hole in the wall -- network requests, exec'd
+        # children and check evaluators alike -- for the lifetime of this one program
+        # (broker.py), over a socketpair: the child finds its end by descriptor number
+        host_end, child_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        handover.append(child_end)
+        # a stream=True exec writes to the descriptors this host holds for its terminal
+        broker = build_broker(policy, root, stream_to=terminal_descriptors(), view=view)
+        serving = threading.Thread(target=broker.serve, args=(host_end,), name="certorail-broker", daemon=True)
+        serving.start()
+        env["CERTORAIL_BROKER_FD"] = str(child_end.fileno())
+    # the bootstrap is the command line itself; the program's name is for tracebacks and argv
+    command = [python, "-I", "-P", "-c", bootstrap, filename, *args]
+    if jail:
+        # the self-jail the bootstrap installs on itself before the program runs: on Linux the
+        # seccomp exec denial inside bubblewrap's namespaces, on macOS the whole Seatbelt
+        # profile, since nothing may sandbox the interpreter before it does
+        env["CERTORAIL_SELF_JAIL"] = "1"
+        if sys.platform == "linux":
+            bwrap = shutil.which("bwrap")
+            if bwrap is None:
                 print(
-                    "certorail: srt not found: running WITHOUT the OS jail "
-                    "(npm install -g @anthropic-ai/sandbox-runtime; or pass --no-jail "
-                    "to accept this)",
+                    "certorail: bwrap not found: running WITHOUT the OS jail "
+                    "(install bubblewrap; or pass --no-jail to accept this)",
                     file=sys.stderr,
                 )
             else:
-                settings = tmpdir / "srt-settings.json"
-                settings.write_text(
-                    json.dumps(_srt_settings(policy, root, tmpdir, socket_path), indent=2),
-                    encoding="utf-8",
-                )
-                # srt's option parser re-serialises the command it parsed and runs it through a
-                # shell -- a piece with a space is split, a piece beginning with ``-`` is read as
-                # an srt option -- unless ``--`` ends its parsing, after which the pieces arrive
-                # verbatim. Nothing after it needs quoting: every piece is a host-chosen path or
-                # flag, except the program's own arguments, which srt now passes through as is.
-                command = [srt, "--settings", str(settings), "--", *command]
+                command = _bwrap_command(bwrap, policy, root, policy.mounts(root), command)
+        elif sys.platform == "darwin":
+            profile = _handover("certorail-seatbelt-", _seatbelt_profile(policy, root, policy.mounts(root)))
+            handover.append(profile)
+            env["CERTORAIL_SEATBELT_FD"] = str(profile.fileno())
+    try:
         try:
-            return subprocess.run(command, cwd=root, env=env, check=False)
+            proc = subprocess.Popen(command, cwd=root, env=env, pass_fds=[h.fileno() for h in handover])
         finally:
-            if server is not None:
-                server.shutdown()
-                server.server_close()
+            # the child holds its own copies now (or nothing does, if the spawn failed): the
+            # socket end's death is EOF to the broker, and the files have no other name anywhere
+            for h in handover:
+                h.close()
+        proc.wait()
+        done: subprocess.CompletedProcess[bytes] = subprocess.CompletedProcess(command, proc.returncode)
+        return done
+    finally:
+        if host_end is not None:
+            with contextlib.suppress(OSError):
+                host_end.close()  # EOF for the serve loop, should the program have left it hanging
+        if serving is not None:
+            serving.join(timeout=5)
 
 
 @dataclass(frozen=True)
@@ -511,7 +541,7 @@ def _parser() -> argparse.ArgumentParser:
     run = verbs.add_parser("run", parents=[where], help="analyse a program, check it against the policy, run it in the jail")
     _program_arguments(run)
     run.add_argument("--no-jail", action="store_true",
-                     help="run without the srt OS jail (the analysis and the broker still apply)")
+                     help="run without the OS jail (the analysis and the broker still apply)")
     _program_arguments(verbs.add_parser("check", parents=[where], help="analyse and evaluate a program; run nothing"))
     verbs.add_parser("describe", parents=[where], help="print what the policy permits, for the program author")
     for verb, text in _FORWARDED.items():  # listed here; dispatched before parsing, with their own parsers

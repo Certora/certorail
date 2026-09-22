@@ -8,7 +8,7 @@ policy allows — run in an isolated interpreter. Anything unprovable is rejecte
 
 ## Getting Started
 
-See the instructions in the [setup guide](SETUP.md). You will need at least `srt` and `uv` plus, on Linux, `bubblewrap`.
+See the instructions in the [setup guide](SETUP.md). You will need `uv` and, on Linux, `bubblewrap`.
 There is no support (yet) for Windows platforms, MacOS and Linux only for now.
 
 ## Usage
@@ -17,6 +17,27 @@ There are two main entry points; `certorail` and `certorail-run`. The former is 
 and is the expect method for you to manage your certorail installation and policies. `certorail-run` is
 how the LLM is expected to execute programs via certorail. As part of the first time
 `certorail init` process, you will have the option to configure Claude Code to whitelist `certorail-run`.
+
+## What certorail does, and does not
+
+certorail confines the programs that are run through it. It does not stop an agent from doing
+anything else. If the agent can run a shell, edit files or call tools outside certorail, none of that
+is checked, so certorail is only as good as the harness that makes `certorail-run` the agent's one
+unprompted way to execute code. Claude Code's permission rules can do that; nothing in certorail
+enforces it.
+
+Programs run with your authority. A policy grant is trust you extend: a program that is allowed to
+write under a directory, run a command or reach a host does so as you, and the tools it runs do
+whatever those tools do. The analysis proves that the Certorail program stays within the grants; it does not
+judge whether the grants were wise. Read the policy as carefully as you would a sudoers file.
+
+A program is rejected before it runs if any operation cannot be proven to stay within the policy.
+The OS jail backs the analysis at run time; on Linux, without `bubblewrap` installed the program
+runs unjailed, and certorail says so. Checkers you install run with your authority and are trusted
+as written.
+
+Programs must be written in certorail's restricted subset of Python. Arbitrary Python, other
+languages and Windows are out of scope.
 
 ## Control Plane
 

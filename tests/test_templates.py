@@ -8,7 +8,7 @@ import unittest
 
 from certorail import markers
 from certorail.analysis import ANY_NAME, DirSplat, Exact, Located, Named, StaticPath, StrFact
-from certorail.broker import build_server, exec_request
+from tests.brokerpath import build_server, channel, exec_request
 from certorail.host import Accepted, Rejected
 from certorail.host import check as host_check
 from certorail.ids import HoleName
@@ -46,7 +46,6 @@ FIND_FLAGS = flagset(
 POLICY = Policy.allow(
     read=[markers.within(".")],
     write=[markers.within(".")],
-    listing=[markers.within(".")],
     atoms=[atom("no-flag", markers.matches(r"[^-].*"))],
     programs=[
         program(
@@ -560,7 +559,6 @@ class TestFlagRequires(unittest.TestCase):
         cls.policy = Policy.allow(
             read=[markers.within(".")],
             write=[markers.within(".")],
-            listing=[markers.within(".")],
             atoms=[atom("feature", markers.matches(r"feature/.*"))],
             validations=[
                 validation("org-repo", argv=("true",), cwd=REPOS, establishes={"cwd": ["org-checkout"]}),
@@ -753,8 +751,10 @@ class TestBrokerRoundTrip(unittest.TestCase):
         self.assertEqual(base64.b64decode(reply["stdout_b64"]), b"a-b\n")
 
     def test_markers_exec_sends_the_bindings(self) -> None:
-        os.environ["CERTORAIL_BROKER_SOCKET"] = self.sock
-        self.addCleanup(os.environ.pop, "CERTORAIL_BROKER_SOCKET", None)
+        program_end = channel(self.server.broker)
+        self.addCleanup(program_end.close)
+        os.environ["CERTORAIL_BROKER_FD"] = str(program_end.fileno())
+        self.addCleanup(os.environ.pop, "CERTORAIL_BROKER_FD", None)
         result = markers.exec("printf", "%s+%s\\n", ARGS=["x", "y"], cwd=".")
         self.assertEqual(result.stdout_lines(), ["x+y"])
         with self.assertRaises(TypeError):
@@ -823,8 +823,10 @@ class TestStreaming(unittest.TestCase):
         self.assertEqual(self.terminal_text(), before)
 
     def test_markers_exec_streams(self) -> None:
-        os.environ["CERTORAIL_BROKER_SOCKET"] = self.sock
-        self.addCleanup(os.environ.pop, "CERTORAIL_BROKER_SOCKET", None)
+        program_end = channel(self.server.broker)
+        self.addCleanup(program_end.close)
+        os.environ["CERTORAIL_BROKER_FD"] = str(program_end.fileno())
+        self.addCleanup(os.environ.pop, "CERTORAIL_BROKER_FD", None)
         result = markers.exec("sh", "-c", "echo live", cwd=".", stream=True)
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b"", b""))
         self.assertIn("live\n", self.terminal_text())

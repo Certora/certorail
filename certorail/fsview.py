@@ -10,10 +10,10 @@ anchored regex over canonical paths (``sandbox.seatbelt.pattern_regex``), so on 
 native; bubblewrap binds paths, so on Linux a pattern is the FUSE view's (``viewdaemon``) or,
 without one, omitted and said so on stderr, loudly. Nothing is ever rounded up.
 
-``list`` grants name directories readable for listing and nothing below them. Seatbelt can say
-"this path alone" (``literal``); a bind exposes contents, so on Linux a list grant never widens
-the view: a directory is visible iff a bind covers it or lies on the way to one (the mountpoint
-chain above a bind is empty directories).
+Listing a directory is reading it: a read grant's bind (or ``subpath``) covers every directory
+within it, so there is nothing separate to lower for listings. On Linux a directory is visible
+iff a bind covers it or lies on the way to one (the mountpoint chain above a bind is empty
+directories).
 
 This module is pure -- paths in, paths and regexes out -- so the lowering is testable without a
 jail. It is the live path; ``certorail.sandbox`` is its successor, built beside it.
@@ -54,7 +54,6 @@ def mounts(
     read: tuple[LocationFact, ...],
     write: tuple[LocationFact, ...],
     no_write: tuple[LocationFact, ...],
-    listing: tuple[LocationFact, ...] = (),
     *,
     patterns: bool = PATTERNS_NATIVE,
     view: Path | None = None,
@@ -62,30 +61,24 @@ def mounts(
     """Lower the policy's grants and protections under *root* to ``Mounts``. Relative locations
     anchor at the root, absolute ones at the filesystem root, as everywhere. With *patterns*
     (Seatbelt) a patterned location is a regex; without (bubblewrap) it is omitted and
-    reported, and ``list`` grants are not lowered at all. With a *view* (the FUSE mountpoint
-    standing for the root) the root-relative locations are the view's to serve: none is a bind,
-    none is omitted, and the view is bound at the root."""
+    reported. With a *view* (the FUSE mountpoint standing for the root) the root-relative
+    locations are the view's to serve: none is a bind, none is omitted, and the view is bound
+    at the root."""
     reads: list[Bind] = []
     writes: list[Bind] = []
     masks: list[Bind] = []
-    listings: list[Bind] = []
     omitted: list[str] = []
     if view is not None:
-        read, write, no_write, listing = (
-            tuple(loc for loc in locs if loc.absolute) for locs in (read, write, no_write, listing)
-        )
+        read, write, no_write = (tuple(loc for loc in locs if loc.absolute) for locs in (read, write, no_write))
     _lower("read", read, root, patterns, False, reads, omitted)
     _lower("write", write, root, patterns, False, writes, omitted)
     _lower("no-write", no_write, root, patterns, True, masks, omitted)
-    if patterns:
-        # the directory itself, whatever shape names it: a pattern with no descendant tail
-        _lower("list", listing, root, patterns, False, listings, [])
     needs_view = view is None and not patterns and any(
         not loc.absolute and single_path(loc, root) is None for loc in (*read, *write, *no_write)
     )
     return Mounts(
-        tuple(reads), tuple(writes), tuple(masks), tuple(listings), tuple(omitted), needs_view,
-        None if view is None else (view, root),
+        reads=tuple(reads), writes=tuple(writes), no_write=tuple(masks), omitted=tuple(omitted),
+        needs_view=needs_view, view=None if view is None else (view, root),
     )
 
 
@@ -104,4 +97,4 @@ def additions(
     omitted: list[str] = []
     _lower("mount-read", mount_read, root, patterns, False, reads, omitted)
     _lower("mount-write", mount_write, root, patterns, False, writes, omitted)
-    return Mounts(tuple(reads), tuple(writes), (), (), tuple(omitted))
+    return Mounts(reads=tuple(reads), writes=tuple(writes), omitted=tuple(omitted))

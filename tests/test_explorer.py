@@ -20,7 +20,7 @@ from certorail.policyfile import from_data
 
 POLICY: dict[str, object] = {
     "policy-version": 1,
-    "filesystem": {"read": ["repos/**"], "write": ["repos/**"], "list": ["repos/**"]},
+    "filesystem": {"read": ["repos/**"], "write": ["repos/**"]},
     "regions": {
         "git.config": {"footprint": ".git/config", "about": "what git reads from config"},
         "git.remote": {"network": True, "about": "the remote repository"},
@@ -100,7 +100,7 @@ def test_atom_index_kinds_and_crossrefs():
 def test_every_card_renders():
     policy = load()
     ix = atom_index(policy)
-    for kind in ("read", "write", "list"):
+    for kind in ("read", "write"):
         assert "repos" in rendered(fs_card(kind, policy))
     for p in policy.programs:
         text = rendered(rule_card(p, ix, policy))

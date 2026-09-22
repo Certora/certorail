@@ -133,7 +133,7 @@ class TestInit(unittest.TestCase):
         s = self.run_init(Script())
         self.assertEqual(
             [q[:25] for q, _ in s.asked],
-            ["Apply the base ruleset to", "Give programs full read, ", "Allow all programs the po"],
+            ["Apply the base ruleset to", "Give programs full read a", "Allow all programs the po"],
         )
         self.assertEqual([d for _, d in s.asked], [True, True, False])  # allow-all defaults to no
         self.assertEqual(s.prompted, [])
@@ -141,7 +141,7 @@ class TestInit(unittest.TestCase):
         self.assertNotIn("base = false", file.read_text())
         self.assertNotIn("default-allow", file.read_text())
         self.assertFalse(policy.default_allow)
-        for kind in ("read", "write", "listing"):
+        for kind in ("read", "write"):
             self.assertEqual([str(loc) for loc in getattr(policy, kind)], [str(loc) for loc in load_policy_file(file).read])
         self.assertIn(BASE_RULESET, policy.applied)
         self.assertIn("true", {p.name for p in policy.programs})  # the base's tool reaches the root
@@ -166,14 +166,13 @@ class TestInit(unittest.TestCase):
     def test_the_quiz_takes_locations_per_kind_and_checks_them(self) -> None:
         s = self.run_init(Script(
             {"full read": False},
-            typed=["src/**, docs/**/<.*\\.md>", "out/**, bad//path", "out/**", "."],
+            typed=["src/**, docs/**/<.*\\.md>", "out/**, bad//path", "out/**"],
         ))
-        self.assertEqual(len(s.prompted), 4)  # read, write (rejected once), write again, list
+        self.assertEqual(len(s.prompted), 3)  # read, write (rejected once), write again
         self.assertIn("'bad//path'", s.transcript())
         _, policy = self.installed()
         self.assertEqual(len(policy.read), 2)
         self.assertEqual(len(policy.write), 1)
-        self.assertEqual(len(policy.listing), 1)
         self.assertTrue(policy.read[1].static_prefix)  # the regex-leaf grant parsed
 
     def test_allow_all_is_opt_in(self) -> None:
@@ -184,9 +183,9 @@ class TestInit(unittest.TestCase):
         self.assertFalse(policy.governed(ProgramName("git")))  # no rule names it: it runs ungoverned
 
     def test_empty_answers_grant_nothing(self) -> None:
-        self.run_init(Script({"full read": False}, typed=["", "", ""]))
+        self.run_init(Script({"full read": False}, typed=["", ""]))
         _, policy = self.installed()
-        self.assertEqual((policy.read, policy.write, policy.listing), ((), (), ()))
+        self.assertEqual((policy.read, policy.write), ((), ()))
 
     def test_already_set_up_does_nothing(self) -> None:
         self.run_init(Script())
@@ -281,33 +280,34 @@ class TestSetup(unittest.TestCase):
         return script
 
     def test_the_defaults_install_the_shipped_pack_and_the_base(self) -> None:
-        s = self.run_setup(Script(), on_path={"bwrap", "srt"})
+        s = self.run_setup(Script(), on_path={"bwrap"})
         self.assertTrue((rulesets_dir() / "coreutils-ro.toml").is_file())
         self.assertIn("coreutils-ro.toml", (rulesets_dir() / BASE_RULESET).read_text())
         self.assertNotIn("missing:", s.transcript())
         self.assertIn("`claude`) is not on PATH", s.transcript())
         self.assertEqual(self.ran, [])
         # idempotent: a second run has nothing left to ask
-        self.assertEqual(self.run_setup(Script(), on_path={"bwrap", "srt"}).asked, [])
+        self.assertEqual(self.run_setup(Script(), on_path={"bwrap"}).asked, [])
 
     def test_missing_prerequisites_are_reported_with_their_install_command(self) -> None:
         s = self.run_setup(Script({"Install the ruleset pack": False}), on_path=set())
         text = s.transcript()
-        self.assertIn("missing: srt", text)
-        self.assertIn("npm install -g @anthropic-ai/sandbox-runtime", text)
         if sys.platform != "darwin":
             self.assertIn("missing: bwrap", text)
+            self.assertIn("bubblewrap", text)
+        else:
+            self.assertNotIn("missing:", text)  # Seatbelt is the system's: nothing to install
         self.assertFalse((rulesets_dir() / "coreutils-ro.toml").exists())
         self.assertFalse(any("base ruleset" in q for q, _ in s.asked))  # nothing to base it on
 
     def test_no_to_the_base_leaves_only_the_pack(self) -> None:
-        self.run_setup(Script({"Give every root": False}), on_path={"bwrap", "srt"})
+        self.run_setup(Script({"Give every root": False}), on_path={"bwrap"})
         self.assertTrue((rulesets_dir() / "coreutils-ro.toml").is_file())
         self.assertFalse((rulesets_dir() / BASE_RULESET).exists())
 
     def test_claude_on_path_offers_the_plugin_and_the_permission_rule(self) -> None:
         self.settings.write_text('{"permissions": {"allow": ["Bash(git status *)"]}, "other": 1}\n')
-        self.run_setup(Script(), on_path={"bwrap", "srt", "claude"})
+        self.run_setup(Script(), on_path={"bwrap", "claude"})
         self.assertEqual(self.ran, [
             ["claude", "plugin", "marketplace", "add", str(plugin_marketplace())],
             ["claude", "plugin", "install", "certorail@certorail"],
@@ -319,12 +319,12 @@ class TestSetup(unittest.TestCase):
         # once the plugin is enabled and the rule present, neither is asked again
         self.settings.write_text(json.dumps({**data, "enabledPlugins": {"certorail@certorail": True}}))
         self.ran.clear()
-        again = self.run_setup(Script(), on_path={"bwrap", "srt", "claude"})
+        again = self.run_setup(Script(), on_path={"bwrap", "claude"})
         self.assertEqual(self.ran, [])
         self.assertFalse(any("Register" in q or "Allow `certorail-run`" in q for q, _ in again.asked))
 
     def test_no_leaves_claude_alone(self) -> None:
-        self.run_setup(Script({"Register": False, "Allow `certorail-run`": False}), on_path={"bwrap", "srt", "claude"})
+        self.run_setup(Script({"Register": False, "Allow `certorail-run`": False}), on_path={"bwrap", "claude"})
         self.assertFalse(self.settings.exists())
         self.assertEqual(self.ran, [])
 

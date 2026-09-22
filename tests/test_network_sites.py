@@ -30,7 +30,6 @@ NET_POLICY = Policy.allow(
 KILL_POLICY = Policy.allow(
     read=[markers.within(".")],
     write=[markers.within(".")],
-    listing=[markers.within(".")],
     validations=[
         validation(
             "org-repo",

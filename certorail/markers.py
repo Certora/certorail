@@ -119,8 +119,7 @@ def exec(
             bindings[name] = [_word(v, f"every element of {name}=") for v in value]
         else:
             bindings[name] = _word(value, f"{name}=")
-    socket_path = os.environ.get("CERTORAIL_BROKER_SOCKET")
-    if socket_path is None:
+    if not _broker.available():
         raise ExecFailed("no broker: the policy permits no programs")
     program, *arguments = words
     if stream:
@@ -132,8 +131,7 @@ def exec(
             except (OSError, ValueError):
                 pass
     try:
-        reply = _broker_roundtrip(
-            socket_path,
+        reply = _broker.call(
             {"kind": "exec", "program": program, "arguments": arguments,
              "kwargs": bindings, "cwd": os.fspath(cwd), "stream": bool(stream)},
             timeout=None,
@@ -191,13 +189,10 @@ def check_single(name: str, value: str, *, cwd: pathlib.Path | str | None = None
 
 
 def _brokered_check(name: str, request: dict[str, Any]) -> None:
-    socket_path = os.environ.get("CERTORAIL_BROKER_SOCKET")
-    if socket_path is None:
+    if not _broker.available():
         raise CheckFailed("check: no broker (the policy declares no validations)")
     try:
-        reply = _broker_roundtrip(
-            socket_path, {"kind": "check", "name": name, **request}, timeout=None
-        )
+        reply = _broker.call({"kind": "check", "name": name, **request}, timeout=None)
     except OSError as exc:
         raise CheckFailed(f"check: broker transport failure: {exc}")
     if not reply.get("ok"):
@@ -237,36 +232,68 @@ def _recv_exact(conn: socket.socket, n: int) -> bytes | None:
     return buf
 
 
-def _broker_roundtrip(
-    socket_path: str, payload: dict[str, Any], timeout: float | None
-) -> dict[str, Any]:
-    """One framed exchange with the host's broker (one connection per request). Transport
-    failures surface as OSError for the caller to wrap; closing the socket -- this timeout,
-    the program dying -- is what cancels the request broker-side."""
-    frame = json.dumps(payload).encode("utf-8")
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+class _BrokerChannel:
+    """The program's one connection to the host's broker: the socketpair end the host handed it
+    at spawn, named by descriptor number in ``CERTORAIL_BROKER_FD``. Requests are sequential (the
+    subset has no threads), so one framed request-reply at a time over one connection. Transport
+    failures surface as OSError for the caller to wrap. A timeout closes the channel -- that is
+    the cancellation the broker acts on -- and every later call fails too: a program that has
+    outlived one of its own requests has no broker any more."""
+
+    def __init__(self) -> None:
+        self._sock: socket.socket | None = None
+        self._fd: int | None = None
+        self._dead: str | None = None
+
+    @staticmethod
+    def available() -> bool:
+        return "CERTORAIL_BROKER_FD" in os.environ
+
+    def _socket(self) -> socket.socket:
+        fd = int(os.environ["CERTORAIL_BROKER_FD"])
+        if self._sock is not None and self._fd != fd:  # a test pointed us elsewhere
+            self._sock.close()
+            self._sock, self._dead = None, None
+        if self._sock is None:
+            # a duplicate: the inherited descriptor itself stays as it was handed over
+            self._sock = socket.socket(fileno=os.dup(fd))
+            self._fd = fd
+        return self._sock
+
+    def call(self, payload: dict[str, Any], timeout: float | None) -> dict[str, Any]:
+        if self._dead is not None:
+            raise ConnectionError(self._dead)
+        sock = self._socket()
+        frame = json.dumps(payload).encode("utf-8")
         # the broker always answers within its own deadlines; the slack keeps its precise
         # timeout error ahead of this blunt one
-        s.settimeout(timeout + 30.0 if timeout is not None else None)
-        s.connect(socket_path)
-        s.sendall(struct.pack("!I", len(frame)) + frame)
-        header = _recv_exact(s, 4)
-        if header is None:
-            raise ConnectionError("the broker closed the connection")
-        (length,) = struct.unpack("!I", header)
-        reply_frame = _recv_exact(s, length)
-        if reply_frame is None:
-            raise ConnectionError("the broker closed mid-frame")
-    return json.loads(reply_frame)
+        sock.settimeout(timeout + 30.0 if timeout is not None else None)
+        try:
+            sock.sendall(struct.pack("!I", len(frame)) + frame)
+            header = _recv_exact(sock, 4)
+            if header is None:
+                raise ConnectionError("the broker closed the connection")
+            (length,) = struct.unpack("!I", header)
+            reply_frame = _recv_exact(sock, length)
+            if reply_frame is None:
+                raise ConnectionError("the broker closed mid-frame")
+        except OSError as exc:
+            self._dead = f"the broker channel is closed after a failed request ({exc})"
+            sock.close()
+            self._sock = None
+            raise
+        return json.loads(reply_frame)
+
+
+_broker = _BrokerChannel()
 
 
 class _Network:
-    """The runtime half of ``certora.network``: one Unix-socket connection to the host's
-    broker per request (the socket path arrives in ``CERTORAIL_BROKER_SOCKET``; absent, the
-    policy granted no network). Closing the connection -- a timeout here, the program dying --
-    is what cancels the in-flight request broker-side. The static half (walker) admits only
-    these methods, a single URL argument whose scheme and netloc are proven, and the
-    enumerated keywords."""
+    """The runtime half of ``certora.network``: a request over the program's one channel to
+    the host's broker (``_BrokerChannel``; no channel, no network). Closing the channel -- a
+    timeout here, the program dying -- is what cancels the in-flight request broker-side. The
+    static half (walker) admits only these methods, a single URL argument whose scheme and
+    netloc are proven, and the enumerated keywords."""
 
     def get(self, url: str, *, headers: dict[str, str] | None = None,
             timeout: float | None = None) -> NetworkResponse:
@@ -300,8 +327,7 @@ class _Network:
         body: bytes | None,
         timeout: float | None,
     ) -> NetworkResponse:
-        socket_path = os.environ.get("CERTORAIL_BROKER_SOCKET")
-        if socket_path is None:
+        if not _broker.available():
             raise NetworkError("no broker: the policy grants no network access")
         payload: dict[str, Any] = {"method": method, "url": url}
         if headers:
@@ -311,7 +337,7 @@ class _Network:
         if timeout is not None:
             payload["timeout"] = timeout
         try:
-            reply = _broker_roundtrip(socket_path, payload, timeout)
+            reply = _broker.call(payload, timeout)
         except OSError as exc:
             raise NetworkError(f"broker transport failure: {exc}")
         if not reply.get("ok"):

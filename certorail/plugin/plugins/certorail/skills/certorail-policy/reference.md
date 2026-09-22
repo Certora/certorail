@@ -105,7 +105,7 @@ The classification is the **leading program name and nothing finer**. That is de
 could say so soundly. Naming a program takes responsibility for all of it.
 
 What the key does not change: the cwd is still a sink that must be proven; the program's own
-filesystem operations are still held to `[filesystem]` (whose `read`/`write`/`list` default to
+filesystem operations are still held to `[filesystem]` (whose `read`/`write` default to
 the whole root under this key, matching an agent's ordinary permissions, while a written `[]`
 stays nothing and `no-write` protections still bind); network is still `[[network]]` only. Every
 run says on stderr that default-allow is on, and `--describe` lists the rule last under
@@ -113,9 +113,10 @@ Programs.
 
 ## `[filesystem]`
 
-`read`, `write`, `list`: lists of locations; absent means nothing of that kind is permitted
-(under `default-allow`, below, absent means the whole root, and a written `[]` still means
-nothing).
+`read`, `write`: lists of locations; absent means nothing of that kind is permitted (under
+`default-allow`, below, absent means the whole root, and a written `[]` still means nothing).
+Listing a directory, or probing whether a path exists, is a read of it: a read grant covering the
+directory permits both, and there is no separate `list` key.
 `no-write`: locations **protected** from program writes whatever `write` grants -- a write whose
 path *may* lie at or below one is denied, by an at-or-below alignment of the two locations. A
 `*` component may be anything, `.git` included, so under `repos/**/.git` a
@@ -248,10 +249,10 @@ exec.view  = "policy"                    # sees only what the policy's [filesyst
 | `exec.env` | list of names and tables | the child's environment is exactly this: a string passes that variable through from the host's environment (skipped if the host lacks it), a table `{ NAME = "value", ... }` sets each key to a literal. A variable is mentioned once, either way; values are literal, no `${...}`; `TMPDIR` may not be listed (the host sets it under `write-fs = false` and under `exec.view = "policy"`). Absent: the host's whole environment; `[]`: an empty one |
 | `exec.spawn` | bool, default true | `false`: the child cannot create processes (no hooks, no `-exec`, no helpers, no shells). It can still replace itself with another program, which is not creation |
 | `exec.mount-read`, `exec.mount-write` | lists of locations | under `exec.view = "policy"` only: what this rule's child sees beyond the policy's `[filesystem]` section, mounted read-only or writable (`mount-write` needs `write-fs = true`; either without the policy view is a load error). The analysis never reads them: they widen the tool's world, not the program's, and a call cannot widen them further. `no-write` still applies on top. Absolute in a root policy; in a ruleset headed by a directory parameter the root binds (`credentials = { kind = "directory" }`, `exec.mount-read = ["${credentials}/**"]`). Patterns follow the platform rule below. `--describe` prints them as `also sees:` on the jail line |
-| `exec.view` | `"host"` (default) or `"policy"` | what the child sees of the filesystem. `"host"`: the host's whole filesystem; the tool is trusted as granted. `"policy"`: an empty world holding the system toolchain, the tool itself, a private `TMPDIR`, the exec's cwd as an empty directory, and the applying policy's `[filesystem]` section as mounts: `read` grants read-only, `write` grants writable iff `write-fs = true`, `no-write` protections remounted read-only on top. Nothing else exists: on Linux a path outside the view is "No such file", not "Permission denied". On macOS Seatbelt takes every location, patterns as anchored regexes (a `<regex>` must stay within the subset Python and ERE share, see "Locations"; one that does not is omitted and reported), and `list` grants as the directory alone. On Linux a literal path or a literal prefix ending in `**` is a bind mount; when the section holds a pattern (`*`, `<regex>`, a `**/leaf` tail) the root is served through the **FUSE view** instead, a long-lived per-(root, policy) mount that filters names, listings and writes by the section exactly (`list` grants make a directory listable there; the `certorail[fuse]` extra plus `fusermount3`; `certorail view status` / `stop`). Without the extra, patterned locations are omitted from the view and the host says so on stderr at startup; absolute patterned locations outside the root are omitted either way |
+| `exec.view` | `"host"` (default) or `"policy"` | what the child sees of the filesystem. `"host"`: the host's whole filesystem; the tool is trusted as granted. `"policy"`: an empty world holding the system toolchain, the tool itself, a private `TMPDIR`, the exec's cwd as an empty directory, and the applying policy's `[filesystem]` section as mounts: `read` grants read-only, `write` grants writable iff `write-fs = true`, `no-write` protections remounted read-only on top. Nothing else exists: on Linux a path outside the view is "No such file", not "Permission denied". On macOS Seatbelt takes every location, patterns as anchored regexes (a `<regex>` must stay within the subset Python and ERE share, see "Locations"; one that does not is omitted and reported); the entries of `/` stay readable there, since every process reads them at startup, and nothing below them. On Linux a literal path or a literal prefix ending in `**` is a bind mount; when the section holds a pattern (`*`, `<regex>`, a `**/leaf` tail) the root is served through the **FUSE view** instead, a long-lived per-(root, policy) mount that filters names, listings and writes by the section exactly (the `certorail[fuse]` extra plus `fusermount3`; `certorail view status` / `stop`). Without the extra, patterned locations are omitted from the view and the host says so on stderr at startup; absolute patterned locations outside the root are omitted either way |
 
 A jailed grant whose sandbox is not installed does not run at all (the program gets a broker
-error), unlike the confined program itself, which runs with a warning when `srt` is missing. So
+error), unlike the confined program itself, which on Linux runs with a warning when `bwrap` is missing. So
 `network = false` on a rule is also a requirement on the host. Tools that write caches or state
 where they run fail under `write-fs = false` unless told not to, or told to use `TMPDIR`: that
 is what the set form of `exec.env` is for (`{ PYTHONDONTWRITEBYTECODE = "1" }`,
@@ -435,7 +436,7 @@ never a literal, never something read elsewhere and massaged. This is the dual o
 A **ruleset** is a reusable, parameterised bundle of exec-side vocabulary in
 `~/.certorail/rulesets/<name>.toml`: `ruleset-version = 1`, `[params]`, `[regions]`, `[atoms]`,
 `[[flagset]]`, `[[program]]`, `[[validation]]`, `[[source]]`, `[[apply]]`, and
-`[filesystem] no-write` (a protection, never a grant). No `read`/`write`/`list`, no
+`[filesystem] no-write` (a protection, never a grant). No `read`/`write`, no
 `[[network]]`, no `root`, no `[[deny]]`; no absolute locations, in footprints included. The root
 policy applies it:
 

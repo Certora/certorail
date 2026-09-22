@@ -29,7 +29,6 @@ REPOS = markers.within("repos")
 POLICY = Policy.allow(
     read=[markers.within(".")],
     write=[markers.within(".")],
-    listing=[markers.within(".")],
     network=[network("api.github.com", methods=["GET"], source="gh-api")],
     programs=[
         program(

@@ -72,7 +72,7 @@ interrogating further:
 
 | Need | Grant |
 |---|---|
-| read / write / list files under a directory | `[filesystem]` `read` / `write` / `list` location lists; `list` covers directory listing and existence probes |
+| read / write files under a directory, list its directories | `[filesystem]` `read` / `write` location lists; a read grant covers directory listing and existence probes within it |
 | only certain file types | a regex leaf: `reports/**/<\w+\.json>` |
 | a directory outside the root | a leading-`/` location (`/srv/data/**`); absolute and relative grants never relate |
 | run a program with fixed words and no arguments | a flat `[[program]]` per (name, subcommand) with the narrowest `cwd`; anything after the words needs a template |

@@ -8,7 +8,6 @@ policy-version = 1
 
 [filesystem]
 read  = ["repos/**", "patches/**"]
-list  = ["repos/**", "patches/**"]
 # Writable: the repositories. The pack itself protects every .git below `where` (git-vocabulary's
 # `no-write`), so the exclusion needs no regex here: a program write that may touch one is denied.
 write = ["repos/*/**", "patches/**"]

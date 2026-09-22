@@ -210,18 +210,18 @@ value derived from the variable carries only what the derivation preserves: a pa
 
 ### Filesystem
 
-The policy grants filesystem access as three lists of locations, *read*, *write* and *list*, printed at the top of the
-description (`- read: data/**, /etc/hosts`); a location listed as *protected* admits no write whatever the write grants say.
-Every filesystem accessor is constrained by these grants: its path must carry a location fact within a location of the
-matching kind.
+The policy grants filesystem access as two lists of locations, *read* and *write*, printed at the top of the description
+(`- read: data/**, /etc/hosts`); a location listed as *protected* admits no write whatever the write grants say. Every
+filesystem accessor is constrained by these grants: its path must carry a location fact within a location of the matching
+kind. Listing a directory, or asking whether a path exists, is a read of it.
 
 - `open(p, mode)`: a mode containing `w`, `a`, `x` or `+` needs *write*, any other mode *read*. The mode is a literal; a
   computed mode counts as a write.
-- `os.listdir(p)`, `os.walk(p)`, `os.path.exists(p)`, `os.path.isfile(p)`, `os.path.isdir(p)`: *list*.
-- `pathlib.Path` methods on `p`: `.open()` (the mode as for `open`), `.read_text()`, `.read_bytes()` need *read*;
-  `.write_text()`, `.write_bytes()`, `.mkdir()`, `.touch()`, `.chmod()`, `.replace(target)` (both `p` and `target`) need
-  *write*; `.iterdir()`, `.glob()`, `.rglob()`, `.exists()`, `.is_file()`, `.is_dir()` need *list*. Each is called fully
-  applied where it is named; `f = p.read_text` is a violation.
+- `os.listdir(p)`, `os.walk(p)`, `os.path.exists(p)`, `os.path.isfile(p)`, `os.path.isdir(p)`: *read*.
+- `pathlib.Path` methods on `p`: `.open()` (the mode as for `open`), `.read_text()`, `.read_bytes()`, `.iterdir()`,
+  `.glob()`, `.rglob()`, `.exists()`, `.is_file()`, `.is_dir()` need *read*; `.write_text()`, `.write_bytes()`, `.mkdir()`,
+  `.touch()`, `.chmod()`, `.replace(target)` (both `p` and `target`) need *write*. Each is called fully applied where it is
+  named; `f = p.read_text` is a violation.
 
 ### Subprocess Exec
 

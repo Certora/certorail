@@ -1,7 +1,7 @@
 """Jailing the children the broker spawns for ``[[program]]`` and ``[[validation]]`` grants
 (JAILS.md, option B: per grant, by what the grant declares).
 
-The confined program runs under srt; the tools and checkers its grants name run host-side, in
+The confined program runs in the host's jail (``host._run``); the tools and checkers its grants name run host-side, in
 the broker, and by default with the host's environment and reach -- the tool is trusted as
 granted. A grant's media keys and its ``exec`` table narrow that, and every narrowing is
 **enforced**, a property of the process rather than a claim::
@@ -84,10 +84,6 @@ class Mounts:
     reads: tuple[Bind, ...] = ()
     writes: tuple[Bind, ...] = ()
     no_write: tuple[Bind, ...] = ()
-    # ``list`` grants: the directories themselves, readable for listing and nothing below them.
-    # Only where the mechanism can say "this path, not its subtree" (Seatbelt); a bind exposes
-    # contents, so on Linux a list grant never widens the view
-    listings: tuple[Bind, ...] = ()
     # the locations the mechanism cannot express, as the policy spelled them, with what they
     # were for
     omitted: tuple[str, ...] = ()
@@ -105,7 +101,7 @@ class Mounts:
 
         return Mounts(
             joined(self.reads, other.reads), joined(self.writes, other.writes),
-            joined(self.no_write, other.no_write), joined(self.listings, other.listings),
+            joined(self.no_write, other.no_write),
             (*self.omitted, *(o for o in other.omitted if o not in self.omitted)),
             self.needs_view or other.needs_view,
             self.view if self.view is not None else other.view,
@@ -118,7 +114,6 @@ class Mounts:
             tuple(p for p in self.reads if isinstance(p, pathlib.Path)),
             tuple(p for p in self.writes if isinstance(p, pathlib.Path)),
             tuple(p for p in self.no_write if isinstance(p, pathlib.Path)),
-            (),
             self.omitted,
             self.needs_view,
             self.view,
@@ -323,34 +318,35 @@ def _canonical(path: str | os.PathLike[str]) -> str:
     return os.path.realpath(path)
 
 
-def _filters(binds: Iterable[str | Bind], *, exactly: bool = False) -> str:
-    """Seatbelt path filters: a path as its subtree (``subpath``), or with *exactly* the path
-    alone (``literal``); a regex as itself, already anchored and canonical."""
+def _filters(binds: Iterable[str | Bind]) -> str:
+    """Seatbelt path filters: a path as its subtree (``subpath``); a regex as itself, already
+    anchored and canonical."""
     out: list[str] = []
     for b in binds:
         if isinstance(b, Regex):
             out.append(f'(regex #"{b.pattern}")')
         else:
-            out.append(f'({"literal" if exactly else "subpath"} "{_canonical(b)}")')
+            out.append(f'(subpath "{_canonical(b)}")')
     return " ".join(out)
 
 
 def seatbelt_profile(jail: Jail, scratch: str | None, mounts: Mounts | None, exe: str | None) -> str:
     """The Seatbelt profile of *jail*. Later rules win, so a policy view is: everything but file
-    data denied, then the toolchain, the tool, the scratch directory and the policy's read
-    grants allowed for reading, the ``list`` grants for reading the directory itself; the write
-    grants (under ``write-fs = true``) and the scratch directory for writing; the protections
-    denied for writing last. Metadata reads stay allowed so path resolution works: names are
-    visible, contents are not."""
+    data denied, then the entries of ``/`` allowed (every process reads them at startup:
+    measured 2026-09-22, without this ``ls`` and ``cat`` abort before ``main``; the top-level
+    names are all it exposes), the toolchain, the tool, the scratch directory and the policy's
+    read grants allowed for reading -- listing a directory is reading it, so a read grant covers
+    the directories within it -- the write grants (under ``write-fs = true``) and the scratch
+    directory for writing, the protections denied for writing last. Metadata reads stay allowed
+    so path resolution works: names are visible, contents are not."""
     rules = ["(version 1)", "(allow default)"]
     if mounts is not None:
         rules.append("(deny file-read-data file-write*)")
+        rules.append('(allow file-read-data (literal "/"))')
         readable: list[str | Bind] = [*_DARWIN_TOOLCHAIN, *([exe] if exe is not None else []), *mounts.reads, *mounts.writes]
         if scratch is not None:
             readable.append(scratch)
         rules.append(f"(allow file-read* {_filters(readable)})")
-        if mounts.listings:
-            rules.append(f"(allow file-read-data {_filters(mounts.listings, exactly=True)})")
         writable: list[str | Bind] = list(mounts.writes) if jail.write_fs else []
         if scratch is not None:
             writable.append(scratch)
