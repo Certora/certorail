@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from certorail.apply import (
+from certorail.control.apply import (
     apply_ruleset,
     base_applies,
     parse_binding,
@@ -15,7 +15,7 @@ from certorail.apply import (
     toml_value,
     unbound,
 )
-from certorail.install import InstallError, install_policy, list_installed, main as policy_main
+from certorail.control.install import InstallError, install_policy, list_installed, main as policy_main
 from certorail.policydir import find_policy
 from certorail.policyfile import BASE_RULESET, load_policy_file, rulesets_dir
 
@@ -217,7 +217,7 @@ class TestApply(unittest.TestCase):
         self.assertIn("pusher.toml: pushes somewhere", full)
 
     def test_the_verbs(self) -> None:
-        with mock.patch("certorail.install._interactive", return_value=False):
+        with mock.patch("certorail.control.install._interactive", return_value=False):
             self.assertEqual(policy_main(["apply", "pusher.toml", "--root", str(self.root), "where=.", 'remote={ one-of = ["origin"] }', "gate=[]"]), 0)
             self.assertIn(("git", "push"), [p.leading_words for p in load_policy_file(self.target).programs])
             self.assertEqual(policy_main(["apply", "tools.toml", "--root", str(self.root)]), 1)  # where unbound, no terminal

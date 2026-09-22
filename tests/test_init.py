@@ -1,15 +1,17 @@
 """``certorail init``: the interview, driven by scripted answers against a scratch config
 directory. It writes one policy file, through the installer, and nothing else."""
+import json
 import pathlib
 import shutil
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
-from certorail import init
+from certorail.control import init
+from certorail.control.init import base_applies, interview, manifest, plugin_marketplace, setup
 from certorail.host import main as certorail_main
 from certorail.ids import ProgramName
-from certorail.init import base_applies, interview, manifest
 from certorail.policydir import find_policy
 from certorail.policyfile import BASE_RULESET, load_policy_file, rulesets_dir
 from certorail.schema import SchemaError, parse_ruleset
@@ -232,18 +234,99 @@ class TestInit(unittest.TestCase):
             parse_ruleset({"ruleset-version": 1, "description": 3}, "<t>")
 
 
-@unittest.skipUnless((SHIPPED / "git").is_dir() and (SHIPPED / "coreutils").is_dir(), "the shipped packs are not in this tree")
 class TestShippedDescriptions(unittest.TestCase):
     def test_every_shipped_ruleset_and_parameter_is_described(self) -> None:
         import tomllib
 
-        for pack in ("coreutils", "git"):
-            for path in sorted((SHIPPED / pack).glob("*.toml")):
+        from certorail.control.install import shipped_packs
+
+        packs = list(shipped_packs().values())  # in the package
+        if (SHIPPED / "git").is_dir():
+            packs.append(SHIPPED / "git")  # in the repository, not the wheel, for now
+        self.assertTrue(packs)
+        for pack in packs:
+            for path in sorted(pack.iterdir(), key=lambda p: p.name):
+                if not path.name.endswith(".toml"):
+                    continue
                 with self.subTest(ruleset=path.name):
                     doc = parse_ruleset(tomllib.loads(path.read_text(encoding="utf-8")), path.name)
                     self.assertTrue(doc.description, f"{path.name} has no description")
                     for name, param in doc.params.items():
                         self.assertTrue(param.description, f"{path.name}: parameter {name} has no description")
+
+
+class TestSetup(unittest.TestCase):
+    """First-run setup against a scratch config directory, with `which`, the command runner and
+    the Claude Code settings path injected and the answers scripted."""
+
+    def setUp(self) -> None:
+        self.config = pathlib.Path(tempfile.mkdtemp(prefix="certorail-setup-config-"))
+        self.enterContext(mock.patch.dict("os.environ", {"CERTORAIL_CONFIG_DIR": str(self.config)}))
+        self.addCleanup(shutil.rmtree, self.config, ignore_errors=True)
+        self.home = pathlib.Path(tempfile.mkdtemp(prefix="certorail-setup-home-"))
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self.settings = self.home / "settings.json"
+        self.ran: list[list[str]] = []
+
+    def run_setup(self, script: Script, *, on_path: set[str]) -> Script:
+        def run(argv: list[str]) -> int:
+            self.ran.append(argv)
+            return 0
+
+        setup(
+            ask=script.ask, say=script.say,
+            which=lambda name: f"/usr/bin/{name}" if name in on_path else None,
+            run=run, settings=self.settings,
+        )
+        return script
+
+    def test_the_defaults_install_the_shipped_pack_and_the_base(self) -> None:
+        s = self.run_setup(Script(), on_path={"bwrap", "srt"})
+        self.assertTrue((rulesets_dir() / "coreutils-ro.toml").is_file())
+        self.assertIn("coreutils-ro.toml", (rulesets_dir() / BASE_RULESET).read_text())
+        self.assertNotIn("missing:", s.transcript())
+        self.assertIn("`claude`) is not on PATH", s.transcript())
+        self.assertEqual(self.ran, [])
+        # idempotent: a second run has nothing left to ask
+        self.assertEqual(self.run_setup(Script(), on_path={"bwrap", "srt"}).asked, [])
+
+    def test_missing_prerequisites_are_reported_with_their_install_command(self) -> None:
+        s = self.run_setup(Script({"Install the ruleset pack": False}), on_path=set())
+        text = s.transcript()
+        self.assertIn("missing: srt", text)
+        self.assertIn("npm install -g @anthropic-ai/sandbox-runtime", text)
+        if sys.platform != "darwin":
+            self.assertIn("missing: bwrap", text)
+        self.assertFalse((rulesets_dir() / "coreutils-ro.toml").exists())
+        self.assertFalse(any("base ruleset" in q for q, _ in s.asked))  # nothing to base it on
+
+    def test_no_to_the_base_leaves_only_the_pack(self) -> None:
+        self.run_setup(Script({"Give every root": False}), on_path={"bwrap", "srt"})
+        self.assertTrue((rulesets_dir() / "coreutils-ro.toml").is_file())
+        self.assertFalse((rulesets_dir() / BASE_RULESET).exists())
+
+    def test_claude_on_path_offers_the_plugin_and_the_permission_rule(self) -> None:
+        self.settings.write_text('{"permissions": {"allow": ["Bash(git status *)"]}, "other": 1}\n')
+        self.run_setup(Script(), on_path={"bwrap", "srt", "claude"})
+        self.assertEqual(self.ran, [
+            ["claude", "plugin", "marketplace", "add", str(plugin_marketplace())],
+            ["claude", "plugin", "install", "certorail@certorail"],
+        ])
+        self.assertTrue((plugin_marketplace() / ".claude-plugin" / "marketplace.json").is_file())
+        data = json.loads(self.settings.read_text())
+        self.assertEqual(data["permissions"]["allow"], ["Bash(git status *)", "Bash(certorail-run *)"])
+        self.assertEqual(data["other"], 1)  # everything else in the file is kept
+        # once the plugin is enabled and the rule present, neither is asked again
+        self.settings.write_text(json.dumps({**data, "enabledPlugins": {"certorail@certorail": True}}))
+        self.ran.clear()
+        again = self.run_setup(Script(), on_path={"bwrap", "srt", "claude"})
+        self.assertEqual(self.ran, [])
+        self.assertFalse(any("Register" in q or "Allow `certorail-run`" in q for q, _ in again.asked))
+
+    def test_no_leaves_claude_alone(self) -> None:
+        self.run_setup(Script({"Register": False, "Allow `certorail-run`": False}), on_path={"bwrap", "srt", "claude"})
+        self.assertFalse(self.settings.exists())
+        self.assertEqual(self.ran, [])
 
 
 if __name__ == "__main__":

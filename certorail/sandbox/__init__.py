@@ -28,12 +28,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
-from ..childjail import JailUnavailable, Spawn
-from ..confinement import Confinement, PolicyFilesystem
-from .lowering import Bind, Lowered, Omitted, RegexRule
+from certorail.childjail import JailUnavailable, Spawn
+from certorail.confinement import Confinement, PolicyFilesystem
+from certorail.sandbox.lowering import Bind, Lowered, Omitted, RegexRule
 
 if TYPE_CHECKING:
-    from ..policy import Policy  # the live path imports this package; policy is a caller, not a dependency
+    from certorail.policy import Policy  # the live path imports this package; policy is a caller, not a dependency
 
 __all__ = [
     "Bind",
@@ -98,11 +98,11 @@ def provision(policy: "Policy", root: Path) -> Spawner:
     """The spawner for this host, its run-scoped resources provisioned for *policy* under
     *root*. Raises ``JailUnavailable`` on a platform with no mechanism."""
     if sys.platform == "linux":
-        from .bubblewrap import BubblewrapSpawner
+        from certorail.sandbox.bubblewrap import BubblewrapSpawner
 
         return BubblewrapSpawner.provision(policy, root)
     if sys.platform == "darwin":
-        from .seatbelt import SeatbeltSpawner
+        from certorail.sandbox.seatbelt import SeatbeltSpawner
 
         return SeatbeltSpawner()
     raise JailUnavailable(f"no child jail for platform {sys.platform!r}")

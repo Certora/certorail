@@ -8,8 +8,8 @@ import builtins
 
 from certorail.terms import lower, Var, Dotted
 
-from .annotations import Contract, InvalidAnnotation, parse_annotation, parse_function
-from .analysis import (
+from certorail.annotations import Contract, InvalidAnnotation, parse_annotation, parse_function
+from certorail.analysis import (
     Container,
     InvalidProgram,
     NameAccess,
@@ -18,7 +18,7 @@ from .analysis import (
     sensitive_builtins,
     unfold_attr,
 )
-from .dangerous import (
+from certorail.dangerous import (
     ALLOWED_BASES,
     ALLOWED_DECORATORS,
     ALLOWED_MEMBERS,

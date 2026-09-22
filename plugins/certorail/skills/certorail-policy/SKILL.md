@@ -263,7 +263,8 @@ A trivial text predicate can be a `test` one-liner with no script at all:
    (`--check` and every rejection print `certorail: policy from …`; an accepted run is quiet);
    `--policy path` bypasses discovery for a one-off. A ruleset
    pack (a directory of ruleset TOML plus its `checkers/`) installs with
-   `certorail policy install-pack DIR` -- shape-checked, the checker closure exact in both
+   `certorail policy install DIR`, and a pack shipped with certorail by name
+   (`certorail policy install coreutils`) -- shape-checked, the checker closure exact in both
    directions, pins verified against the supplied bytes, checkers made executable.
    `certorail policy list` shows what is installed; `certorail policy verify` re-hashes every
    pinned checker; `certorail policy edit --root ROOT` opens the installed policy in the

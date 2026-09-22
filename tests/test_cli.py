@@ -72,7 +72,15 @@ class TestInlineSource(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             prog = pathlib.Path(tmp) / "p.py"
             prog.write_text("x = 1\n", encoding="utf-8")
-            self.assertEqual(main([str(prog), "--check"]), 0)
+            self.assertEqual(main(["check", str(prog)]), 0)
+            self.assertEqual(main(["check", "-c", "x = 1\n"]), 0)
+            # the verb is required: a bare program path is refused with the spelling to use
+            with self.assertRaises(SystemExit) as cm:
+                main([str(prog), "--check"])
+            self.assertEqual(cm.exception.code, 2)
+            # and `run` is the spelling of what the legacy `certorail -c` did
+            self.assertEqual(main(["run", "-c", "print('hi')", "--root", tmp, "--no-jail"]), 0)
+            self.assertEqual(main(["run", str(prog), "--root", tmp, "--no-jail", "--", "a"]), 0)
 
     def test_inline_source_takes_arguments(self) -> None:
         # with -c every positional is an argument for the program, as with `python -c`; `--`

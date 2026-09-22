@@ -63,8 +63,8 @@ from dataclasses import dataclass, field, replace
 from os import PathLike
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from . import markers
-from .analysis import (
+from certorail import markers
+from certorail.analysis import (
     ANY_NAME,
     Alternation,
     Component,
@@ -90,10 +90,10 @@ from .analysis import (
     url_of,
     ValidationFact
 )
-from .childjail import Environment, Jail, JailUnavailable, Mounts, View, confined, environment_spec
-from .confinement import Additions, Confinement, FilesystemSection, HostFilesystem, PolicyFilesystem
-from .effects import EVERYTHING, NOTHING, Effects, Medium, effects_of, whole
-from .ids import (
+from certorail.childjail import Environment, Jail, JailUnavailable, Mounts, View, confined, environment_spec
+from certorail.confinement import Additions, Confinement, FilesystemSection, HostFilesystem, PolicyFilesystem
+from certorail.effects import EVERYTHING, NOTHING, Effects, Medium, effects_of, whole
+from certorail.ids import (
     BUILTIN_ATOMS,
     Atom,
     CheckId,
@@ -106,9 +106,9 @@ from .ids import (
     ValidationName,
     spelled,
 )
-from .integrity import PIN_PATTERN, materialize
-from .locations import parse_location
-from .templates import (
+from certorail.integrity import PIN_PATTERN, materialize
+from certorail.locations import parse_location
+from certorail.templates import (
     BindError,
     Constraint,
     Each,
@@ -126,7 +126,7 @@ from .templates import (
     instantiate,
     matches_leading,
 )
-from .enforcement import (
+from certorail.enforcement import (
     CheckSignature,
     CheckSite,
     Discharge,
@@ -139,11 +139,11 @@ from .enforcement import (
     WriteTable,
     host_matches,
 )
-from . import footprints, fsview
+from certorail import footprints, fsview
 
 if TYPE_CHECKING:
-    from .viewdaemon import ViewSpec
-from .walker import Report
+    from certorail.viewdaemon import ViewSpec
+from certorail.walker import Report
 
 # ---------------------------------------------------------------------------
 # the marker vocabulary -> the location domain (the runtime-object twin of annotations.py)
@@ -1359,7 +1359,7 @@ class Policy:
 
     def view_spec(self, root: pathlib.Path) -> "ViewSpec":
         """What a FUSE view of this policy under *root* serves (``viewdaemon``)."""
-        from .viewdaemon import ViewSpec
+        from certorail.viewdaemon import ViewSpec
 
         return ViewSpec(os.path.realpath(root), self.read, self.write, self.no_write, self.listing)
 
@@ -1603,7 +1603,7 @@ class Policy:
 
 
 # ---------------------------------------------------------------------------
-# the default policy: what ``certorail program.py`` applies when no policy file is given
+# the default policy: what ``certorail run program.py`` applies when no policy file is given
 # ---------------------------------------------------------------------------
 
 # Everything the analysis proves to lie within the root and no programs: tight enough that any

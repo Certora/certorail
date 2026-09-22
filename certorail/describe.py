@@ -1,4 +1,4 @@
-"""``certorail --describe``: the policy as the agent needs it.
+"""``certorail describe``: the policy as the agent needs it.
 
 The TOML is the policy's *implementation* -- reviewer comments, checker paths, redirect modes,
 defaults left implicit, ``[[apply]]`` lines that expand to forty templates. The agent writing
@@ -6,7 +6,7 @@ confined programs needs its *interface*: exactly the set of operations ``Policy.
 accept, in the vocabulary the program has to use (template signatures, hole names, validation
 names and parameters, atom regexes), with every default spelled out. This renders that from the
 loaded ``Policy``, so what the agent reads is what will be enforced. A Claude Code
-``SessionStart`` hook running ``certorail --describe`` puts it into the agent's context.
+``SessionStart`` hook (``certorail session-hook``) puts it into the agent's context.
 
 Values the program supplies are written in one compact notation, explained in the program-author
 guide (``SUBSET_PROMPT.md``, which the session hook injects ahead of this text): ``</re/>`` text
@@ -15,11 +15,11 @@ matching a regex, ``<(a|b)>`` one of, ``<path within L, M>`` a proven path, ``<l
 """
 from collections.abc import Iterable
 
-from .analysis import pretty_location, pretty_regex
-from .effects import EVERYTHING, Effects
-from .ids import BUILTIN_ATOMS, NOT_OPTION, Atom, FlagName, SourceId
-from .policy import NetworkRule, Policy, Program, Validation, literal_slot, pretty_locations
-from .templates import CWD, Constraint, Each, Flags, Flagset, HoleRef, Template, Token
+from certorail.analysis import pretty_location, pretty_regex
+from certorail.effects import EVERYTHING, Effects
+from certorail.ids import BUILTIN_ATOMS, NOT_OPTION, Atom, FlagName, SourceId
+from certorail.policy import NetworkRule, Policy, Program, Validation, literal_slot, pretty_locations
+from certorail.templates import CWD, Constraint, Each, Flags, Flagset, HoleRef, Template, Token
 
 def constraint_phrase(c: Constraint, sources: frozenset[SourceId]) -> str:
     if c.any:

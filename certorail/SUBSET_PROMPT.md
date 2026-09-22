@@ -105,7 +105,7 @@ process, network) follow, each an instance of that vocabulary.
 A policy grants operations: the locations a program may read, write and list; the programs it may run and the command lines it
 may run them with; the hosts it may send requests to. Certorail accepts an operation when a grant covers it and every value
 flowing into the operation provably meets the grant's constraints. The description of the policy in your context (the text
-`certorail --describe` prints) lists every grant in a fixed vocabulary, used throughout this document:
+`certorail describe` prints) lists every grant in a fixed vocabulary, used throughout this document:
 
 - A **constraint** is a requirement on one value flowing into an operation: the path given to `open`, an argument of
   `certora.exec`, the URL of a request. The description writes constraints as `<...>`:

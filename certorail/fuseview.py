@@ -43,8 +43,8 @@ from typing import override
 import pyfuse3
 from pyfuse3 import EntryAttributes, FileHandleT, FileInfo, FileNameT, FlagT, InodeT, ModeT, RequestContext
 
-from .analysis import LocationFact, Named
-from .footprints import SPLAT, Item, _intersects, items_of
+from certorail.analysis import LocationFact, Named
+from certorail.footprints import SPLAT, Item, _intersects, items_of
 
 type NativeFd = int                 # a descriptor of this process (O_PATH or I/O)
 type NativeKey = tuple[int, int]    # (st_dev, st_ino): a backing file's identity

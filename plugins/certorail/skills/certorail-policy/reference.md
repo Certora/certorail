@@ -632,7 +632,7 @@ certorail -c SOURCE [--root DIR] [--policy FILE] [--check] [--no-jail] [-- ARG .
 certorail-run [--check] (-c SOURCE | FILE) [-- ARG ...]
 certorail --describe [--root DIR] [--policy FILE]
 certorail init [--yes] [--root DIR]
-certorail policy install FILE | install-pack DIR | edit [--root DIR | --policy FILE] | list [--root DIR] | verify | pin DIR
+certorail policy install FILE | DIR | NAME [--name N] [--replace] | edit [--root DIR | --policy FILE] | list [--root DIR] | verify | pin DIR
 certorail policy apply RULESET [KEY=VALUE ...] [--root DIR | --policy FILE]
 certorail session-hook
 certorail view [status | stop [KEY]]
@@ -643,8 +643,12 @@ certorail view [status | stop [KEY]]
 places, refuses conflicts instead of overwriting, and is the one path that keeps `verify`
 meaningful.
 
-`certorail init` creates the ambient policy for `--root` as a short deterministic interview,
-and writes nothing else. A directory already governed by a policy gets "already set up". If a
+`certorail init` first does the machine-level half of a first run, idempotent and asked step by
+step: the prerequisites the jails need are reported with their install commands, the ruleset
+packs shipped with certorail are installed (`certorail policy install NAME` does one by hand),
+the base ruleset is offered, and when Claude Code is on PATH so are its certorail plugin and the
+`Bash(certorail-run *)` permission rule. Then it creates the ambient policy for `--root` as a
+short deterministic interview. A directory already governed by a policy gets "already set up". If a
 base ruleset is installed, `init` summarises what it applies from the rulesets' own
 `description` keys and asks whether this root inherits it; no writes `base = false`. Then it
 asks whether programs get full read, write and list access under the root; no leads to one
@@ -652,7 +656,7 @@ question per kind, answered as locations in the micro-syntax and checked as type
 to allow all programs the policy does not name (`default-allow`, default no). It ends by
 listing the installed rulesets the base does not apply, each with its description, its
 parameters, and the `apply` command that brings it in. Installing rulesets is the installer's
-job (`certorail policy install-pack DIR`); applying one is `certorail policy apply RULESET`,
+job (`certorail policy install DIR`, or a shipped pack by name); applying one is `certorail policy apply RULESET`,
 which appends an `[[apply]]` to the policy governing `--root` with the `KEY=VALUE` bindings
 given (VALUE in TOML: `true`, `[]`, `{ one-of = ["origin"] }`; a plain string otherwise, so
 `where=.` works), asks for each parameter the load reports unbound, with the parameter's own

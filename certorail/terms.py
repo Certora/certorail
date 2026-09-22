@@ -25,7 +25,7 @@ import ast
 from dataclasses import dataclass, field
 from types import EllipsisType
 
-from .analysis import KNOWN_MODULES, resolve_callee
+from certorail.analysis import KNOWN_MODULES, resolve_callee
 
 
 @dataclass(frozen=True)

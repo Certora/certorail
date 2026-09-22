@@ -29,8 +29,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import KW_ONLY, dataclass, field, replace
 from typing import Protocol
 
-from . import jqpath
-from .analysis import (
+from certorail import jqpath
+from certorail.analysis import (
     ANY_STR,
     Alternation,
     Container,
@@ -64,8 +64,8 @@ from .analysis import (
     url_of,
     _regex_subsumes,
 )
-from .annotations import Contract, is_plain_type
-from .dangerous import (
+from certorail.annotations import Contract, is_plain_type
+from certorail.dangerous import (
     CHECK_CALLEE,
     CHECK_SINGLE_CALLEE,
     EXEC_CALLEE,
@@ -88,10 +88,10 @@ from .dangerous import (
     AccessKind,
     inert_condition,
 )
-from .effects import EVERYTHING, NOTHING, Effects, Medium, whole
-from .ids import BUILTIN_ATOMS, Atom, CheckId, ParamName, ProgramName, RegionId, SourceId, ValidationName
-from .locations import parse_location
-from .templates import Binding, Elements, Many, Value, matches_leading
+from certorail.effects import EVERYTHING, NOTHING, Effects, Medium, whole
+from certorail.ids import BUILTIN_ATOMS, Atom, CheckId, ParamName, ProgramName, RegionId, SourceId, ValidationName
+from certorail.locations import parse_location
+from certorail.templates import Binding, Elements, Many, Value, matches_leading
 
 # ---------------------------------------------------------------------------
 # the container roster (CONTAINERS.md): the method surface that keeps a tracked list/set tracked

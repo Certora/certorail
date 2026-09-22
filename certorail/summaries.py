@@ -17,8 +17,8 @@ import ast
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from .analysis import Std
-from .enforcement import NO_KILL, OPAQUE, Kill
+from certorail.analysis import Std
+from certorail.enforcement import NO_KILL, OPAQUE, Kill
 
 # ---------------------------------------------------------------------------
 # the lattice

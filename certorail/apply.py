@@ -23,9 +23,9 @@ import tempfile
 import tomllib
 from collections.abc import Callable, Mapping, Sequence
 
-from .install import InstallError, Placement, _place, edit_problems
-from .policydir import AmbientPolicyError, find_policy
-from .policyfile import BASE_RULESET, rulesets_dir
+from certorail.install import InstallError, Placement, _place, edit_problems
+from certorail.policydir import AmbientPolicyError, find_policy
+from certorail.policyfile import BASE_RULESET, rulesets_dir
 
 type Prompt = Callable[[str], str]
 type Say = Callable[[str], None]
@@ -240,7 +240,7 @@ def apply_ruleset(
 def edit_target(root: pathlib.Path | None, policy: pathlib.Path | None) -> tuple[pathlib.Path, pathlib.Path | None]:
     """What ``apply`` edits: the file named, or the ambient policy governing *root* -- and the
     root it must keep declaring. (The same resolution ``edit`` uses.)"""
-    from .install import _edit_target
+    from certorail.install import _edit_target
 
     return _edit_target(root, policy)
 

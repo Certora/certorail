@@ -5,8 +5,8 @@ import shutil
 import tempfile
 from collections.abc import Iterator, Mapping, Sequence
 
-from ..childjail import Environment
-from ..confinement import Confinement
+from certorail.childjail import Environment
+from certorail.confinement import Confinement
 
 
 def environment(env: Environment | None, base: Mapping[str, str], scratch: str | None) -> dict[str, str]:

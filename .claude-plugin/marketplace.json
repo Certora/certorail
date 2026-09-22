@@ -6,8 +6,8 @@
   "plugins": [
     {
       "name": "certorail",
-      "source": "./plugins/certorail",
-      "description": "Ambient certorail policy in every session's context, plus the certorail-policy authoring skill."
+      "source": "./certorail/plugin/plugins/certorail",
+      "description": "The program-author guide and the ambient certorail policy in every session's context, plus the certorail-policy authoring skill."
     }
   ]
 }

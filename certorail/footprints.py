@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from functools import cache
 from typing import Final
 
-from .analysis import (
+from certorail.analysis import (
     AnyName,
     Component,
     DirSplat,

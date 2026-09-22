@@ -43,8 +43,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, override
 
-from .analysis import AnyName, Component, DirSplat, LocationFact, Matching, Named, OneOf, RegexLit, StaticPath
-from .policydir import config_dir
+from certorail.analysis import AnyName, Component, DirSplat, LocationFact, Matching, Named, OneOf, RegexLit, StaticPath
+from certorail.policydir import config_dir
 
 FORMAT = 1
 DEFAULT_IDLE = 600.0     # seconds without a lease or a request before the daemon retires
@@ -289,7 +289,7 @@ def serve(keydir: pathlib.Path, idle: float) -> int:
     import pyfuse3
     import trio
 
-    from .fuseview import Filter, View, raise_fd_limit
+    from certorail.fuseview import Filter, View, raise_fd_limit
 
     spec = ViewSpec.parse((keydir / "view.json").read_text(encoding="utf-8"))
     mnt = keydir / "mnt"

@@ -31,7 +31,7 @@ import shutil
 from collections.abc import Iterator, Sequence
 from re import _parser as _sre  # pyright: ignore[reportAttributeAccessIssue]  -- Python's own regex parser
 
-from ..analysis import (
+from certorail.analysis import (
     Alternation,
     AnyName,
     AnyStr,
@@ -48,11 +48,11 @@ from ..analysis import (
     RegexLit,
     StaticPath,
 )
-from ..childjail import JailUnavailable, Spawn
-from ..confinement import Confinement, HostFilesystem, PolicyFilesystem
-from ..locations import single_path
-from .common import environment, executable, scratch_for
-from .lowering import Bind, Lowered, Omitted, RegexRule, Role, readable, writable
+from certorail.childjail import JailUnavailable, Spawn
+from certorail.confinement import Confinement, HostFilesystem, PolicyFilesystem
+from certorail.locations import single_path
+from certorail.sandbox.common import environment, executable, scratch_for
+from certorail.sandbox.lowering import Bind, Lowered, Omitted, RegexRule, Role, readable, writable
 
 TOOLCHAIN = (
     "/usr", "/bin", "/sbin", "/System", "/Library", "/private/var/db", "/private/etc", "/dev",

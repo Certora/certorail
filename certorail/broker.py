@@ -69,11 +69,11 @@ import time
 import urllib.parse
 from collections.abc import Callable, Sequence
 
-from .analysis import _literal_location, location_le
-from .childjail import Jail, JailUnavailable, Mounts, confined
-from .enforcement import Discharge
-from .integrity import materialize
-from .policy import (
+from certorail.analysis import _literal_location, location_le
+from certorail.childjail import Jail, JailUnavailable, Mounts, confined
+from certorail.enforcement import Discharge
+from certorail.integrity import materialize
+from certorail.policy import (
     NetworkRule,
     Policy,
     Refusal,

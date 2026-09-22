@@ -28,11 +28,11 @@ import sys
 import tempfile
 from collections.abc import Callable, Sequence
 
-from .apply import applied_by, base_applies, description_of, document, installed_rulesets, params_of
-from .install import InstallError, install_policy
-from .locations import parse_location
-from .policydir import AmbientPolicyError, config_dir, find_policy
-from .policyfile import BASE_RULESET, rulesets_dir
+from certorail.apply import applied_by, base_applies, description_of, document, installed_rulesets, params_of
+from certorail.install import InstallError, install_policy
+from certorail.locations import parse_location
+from certorail.policydir import AmbientPolicyError, config_dir, find_policy
+from certorail.policyfile import BASE_RULESET, rulesets_dir
 
 type Ask = Callable[[str, bool], bool]   # a yes/no question and its default -> the answer
 type Prompt = Callable[[str], str]       # a question -> the raw text answered

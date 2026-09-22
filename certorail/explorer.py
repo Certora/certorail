@@ -1,4 +1,4 @@
-"""``certorail-explore``: the loaded policy as an interactive tree.
+"""``certorail explore``: the loaded policy as an interactive tree.
 
 ``--describe`` (``describe.py``) renders the policy's interface as text for the *program
 author*. This renders the same loaded ``Policy`` for the *human auditor*: the grants in a tree
@@ -24,8 +24,8 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Footer, Header, Static, Tree
 
-from .analysis import pretty_location, pretty_regex
-from .describe import (
+from certorail.analysis import pretty_location, pretty_regex
+from certorail.describe import (
     BUILTIN_MEANING,
     constraint_phrase,
     depends_phrase,
@@ -34,10 +34,10 @@ from .describe import (
     flagset_lines,
     writes_phrase,
 )
-from .effects import EVERYTHING
-from .host import load_policy, policy_origin
-from .ids import BUILTIN_ATOMS, Atom, HoleName
-from .policy import (
+from certorail.effects import EVERYTHING
+from certorail.host import load_policy, policy_origin
+from certorail.ids import BUILTIN_ATOMS, Atom, HoleName
+from certorail.policy import (
     NetworkRule,
     Param,
     Policy,
@@ -47,7 +47,7 @@ from .policy import (
     Validation,
     pretty_locations,
 )
-from .templates import CWD, Constraint, Each, Flags, Hole, Template, Token
+from certorail.templates import CWD, Constraint, Each, Flags, Hole, Template, Token
 
 # a node's payload: how to render its detail card
 type Card = Callable[[], RenderableType]
@@ -634,7 +634,7 @@ class ExplorerApp(App[None]):
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="certorail-explore",
+        prog="certorail explore",
         description="Browse what a certorail policy allows: rules, holes, constraints, atoms.",
     )
     parser.add_argument("--policy", type=pathlib.Path, default=None,

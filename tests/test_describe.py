@@ -107,7 +107,7 @@ class TestDescribe(unittest.TestCase):
             )
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                code = main(["--describe", "--policy", str(policy), "--root", tmp])
+                code = main(["describe", "--policy", str(policy), "--root", tmp])
             self.assertEqual(code, 0)
             self.assertIn("## Programs", out.getvalue())
             self.assertIn("- gh\n", out.getvalue())
@@ -116,7 +116,9 @@ class TestDescribe(unittest.TestCase):
 
     def test_describe_takes_no_program(self) -> None:
         with self.assertRaises(SystemExit):
-            main(["--describe", "-c", "pass"])
+            main(["describe", "-c", "pass"])
+        with self.assertRaises(SystemExit):
+            main(["describe", "prog.py"])
 
 
 if __name__ == "__main__":

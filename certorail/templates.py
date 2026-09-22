@@ -16,7 +16,7 @@ import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
-from .analysis import (
+from certorail.analysis import (
     Exact,
     LocationFact,
     PseudoRegex,
@@ -31,8 +31,8 @@ from .analysis import (
     pretty_location,
     pretty_regex,
 )
-from .dangerous import EXEC_CWD, EXEC_RESERVED_KEYWORDS
-from .ids import NOT_OPTION, Atom, FlagName, HoleName
+from certorail.dangerous import EXEC_CWD, EXEC_RESERVED_KEYWORDS
+from certorail.ids import NOT_OPTION, Atom, FlagName, HoleName
 
 __all__ = ["NOT_OPTION", "may_start_with_dash"]  # re-exported for their old importers
 

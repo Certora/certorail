@@ -13,7 +13,7 @@ from certorail.childjail import View
 from certorail.host import Accepted, Rejected
 from certorail.host import check as host_check
 from certorail.ids import HoleName
-from certorail.install import install_pack
+from certorail.control.install import install, install_pack
 from certorail.policy import Command, Policy
 from certorail.policyfile import PolicyFileError, from_data
 from certorail.templates import Constraint, Each, Flags, Token
@@ -394,14 +394,13 @@ class TestGitPack(RulesetCase):
             self.assertIn(shape, shapes)
 
 
-@unittest.skipUnless((SHIPPED / "coreutils").is_dir(), "the shipped coreutils pack is not in this tree")
 class TestCoreutilsRo(RulesetCase):
-    """The shipped read rung of coreutils, as a base.toml would apply it: every rule jailed, the
-    common spellings bind, the excluded operations are unspellable."""
+    """The read rung of coreutils shipped in the package, as a base.toml would apply it: every
+    rule jailed, the common spellings bind, the excluded operations are unspellable."""
 
     def setUp(self) -> None:
         super().setUp()
-        install_pack(SHIPPED / "coreutils")
+        install("coreutils")
         self.ruleset("base.toml", 'ruleset-version = 1\n[[apply]]\nruleset = "coreutils-ro.toml"\nwhere = "."\n')
         self.policy = from_data({"policy-version": 1, "filesystem": {"read": ["**"]}})
 

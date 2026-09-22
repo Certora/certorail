@@ -42,12 +42,12 @@ from pydantic import (
     model_validator,
 )
 
-from .childjail import environment_spec
-from .docpath import DocPath
-from .effects import as_medium
-from .ids import BUILTIN_ATOMS
-from .locations import parse_location
-from .dangerous import EXEC_CWD, EXEC_RESERVED_KEYWORDS
+from certorail.childjail import environment_spec
+from certorail.docpath import DocPath
+from certorail.effects import as_medium
+from certorail.ids import BUILTIN_ATOMS
+from certorail.locations import parse_location
+from certorail.dangerous import EXEC_CWD, EXEC_RESERVED_KEYWORDS
 
 # ---------------------------------------------------------------------------
 # scalars

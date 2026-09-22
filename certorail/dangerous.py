@@ -42,7 +42,7 @@ Categories:
 import builtins
 from typing import Literal
 
-from .markers import NAMESPACE
+from certorail.markers import NAMESPACE
 
 # ---------------------------------------------------------------------------
 # Whole-module bans: no legitimate sandbox use; import is itself a violation.

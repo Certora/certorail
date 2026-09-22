@@ -17,9 +17,9 @@ filesystem medium.
 import pathlib
 from dataclasses import dataclass
 
-from .analysis import LocationFact
-from .childjail import Environment
-from .locations import single_path
+from certorail.analysis import LocationFact
+from certorail.childjail import Environment
+from certorail.locations import single_path
 
 __all__ = [
     "Additions",

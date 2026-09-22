@@ -47,7 +47,7 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import IO
 
-from .selfjail import ARCHES, fork_denial_filter
+from certorail.selfjail import ARCHES, fork_denial_filter
 
 
 class View(enum.Enum):

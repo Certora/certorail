@@ -21,10 +21,10 @@ jail. It is the live path; ``certorail.sandbox`` is its successor, built beside 
 from collections.abc import Iterable
 from pathlib import Path
 
-from .analysis import LocationFact, pretty_location
-from .childjail import PATTERNS_NATIVE, Bind, Mounts, Regex
-from .locations import single_path
-from .sandbox.seatbelt import NOT_ERE, pattern_regex
+from certorail.analysis import LocationFact, pretty_location
+from certorail.childjail import PATTERNS_NATIVE, Bind, Mounts, Regex
+from certorail.locations import single_path
+from certorail.sandbox.seatbelt import NOT_ERE, pattern_regex
 
 __all__ = ["NOT_ERE", "additions", "mounts", "pattern_regex", "single_path"]
 

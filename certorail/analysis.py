@@ -7,8 +7,8 @@ import urllib.parse
 from typing import Any, cast, Callable, Literal, Mapping, Sequence
 from dataclasses import dataclass, is_dataclass, replace
 
-from .dangerous import INERT_BUILTIN_TYPES, INERT_BUILTIN_VALUES, NAMESPACE, inert_condition
-from .ids import (
+from certorail.dangerous import INERT_BUILTIN_TYPES, INERT_BUILTIN_VALUES, NAMESPACE, inert_condition
+from certorail.ids import (
     BUILTIN_ATOMS,
     NO_PARENT_TRAVERSAL,
     NO_SLASH,
@@ -99,15 +99,6 @@ def unfold_attr(e: ast.Attribute) -> NameAccess:
         else:
             return NameAccess(it, list(reversed(attr_path)))  # a computed base
 
-def is_call_to(
-    i: ast.AST
-) -> str | None:
-    if not isinstance(i, ast.Call):
-        return None
-    if not isinstance(i.func, ast.Name):
-        return None
-    return i.func.id
-
 def resolve_callee(
     i: ast.AST
 ) -> NameAccess | None:
@@ -121,33 +112,6 @@ def resolve_callee(
 
 class InvalidConstantForm(Exception):
     ...
-
-def cast_as_const_or_default[T](
-    t: type[T],
-    elem: Any
-) -> T:
-    if not isinstance(elem, ast.expr) and not isinstance(elem, t):
-        raise InvalidConstantForm(f"Unexpected type: {type(elem)}")
-    return as_const_or_default(t, elem)
-
-def as_const_or_default[T](
-    t: type[T],
-    elem: T | ast.expr
-) -> T:
-    if isinstance(elem, t):
-        return elem
-    if not isinstance(elem, ast.Constant):
-        raise InvalidConstantForm(f"Not a constnat expr: {type(elem).__name__}")
-    if not isinstance(elem.value, t):
-        raise InvalidConstantForm(f"Invalid constant type, expected: {t}, got {type(elem.value)}")
-    return elem.value
-
-def as_const[T](t: type[T], elem: ast.expr) -> T:
-    if not isinstance(elem, ast.Constant):
-        raise InvalidConstantForm(f"Expression is not a constant, got: {type(elem)}")
-    if not isinstance(elem.value, t):
-        raise InvalidConstantForm(f"Constant value is not a {t}, got {type(elem.value)}")
-    return elem.value
 
 def as_const_or_null[T](t: type[T], elem: ast.expr) -> T | None:
     if not isinstance(elem, ast.Constant):
@@ -179,20 +143,6 @@ def bind_values[T](spec: type[T], args: Sequence[object], kwargs: Mapping[str, o
     except TypeError:  # any way the binding can fail at runtime
         return None
     return spec(*bound.args, **bound.kwargs)
-
-
-def bind_call_args[T](call: ast.Call, spec: type[T]) -> T | None:
-    """``bind_values`` over a call's argument expressions. Splats defeat static binding."""
-    if any(isinstance(arg, ast.Starred) for arg in call.args):
-        return None
-    kwargs: dict[str, ast.expr] = {}
-    for kw in call.keywords:
-        if kw.arg is None:  # a **splat
-            return None
-        if kw.arg in kwargs:  # impossible in parsed source; hand-built ASTs only
-            return None
-        kwargs[kw.arg] = kw.value
-    return bind_values(spec, call.args, kwargs)
 
 def is_prefix[T](s: Sequence[T], r: Sequence[T]) -> bool:
     if len(s) > len(r):

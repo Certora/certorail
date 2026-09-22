@@ -46,7 +46,7 @@ import tempfile
 import tomllib
 from dataclasses import dataclass
 
-from .policydir import config_dir, policy_dir
+from certorail.policydir import config_dir, policy_dir
 
 PIN_KEY = "pin"
 _CHECKER_HEAD = "${checkers}/"
@@ -176,7 +176,7 @@ class VerifyReport:
 
 
 def _installed_documents() -> list[pathlib.Path]:
-    from .policyfile import rulesets_dir  # deferred: policyfile -> policy -> this module
+    from certorail.policyfile import rulesets_dir  # deferred: policyfile -> policy -> this module
 
     out: list[pathlib.Path] = []
     rdir = rulesets_dir()

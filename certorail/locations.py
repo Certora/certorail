@@ -3,8 +3,8 @@ this converts. Used by the policy loader and by the ``certora.pathmatch`` guard,
 program guards for is, component for component, the location a policy grants."""
 import pathlib
 
-from . import locspec
-from .analysis import ANY_NAME, Component, DirSplat, LocationFact, Matching, Named, OneOf, RegexLit, StaticPath
+from certorail import locspec
+from certorail.analysis import ANY_NAME, Component, DirSplat, LocationFact, Matching, Named, OneOf, RegexLit, StaticPath
 
 
 def _component(c: locspec.Component) -> Component:

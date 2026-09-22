@@ -15,7 +15,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Literal
 
-from .ids import RegionId
+from certorail.ids import RegionId
 
 type Medium = Literal["fs", "network"]
 MEDIA: tuple[Medium, ...] = ("fs", "network")

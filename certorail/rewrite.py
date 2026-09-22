@@ -11,7 +11,7 @@ decorators.
 import ast
 from collections.abc import Iterable
 
-from .markers import NAMESPACE
+from certorail.markers import NAMESPACE
 
 
 def rewrite(tree: ast.Module, contracted: Iterable[str]) -> str:

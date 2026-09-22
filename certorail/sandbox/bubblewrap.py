@@ -28,17 +28,17 @@ from typing import IO
 
 from typing import TYPE_CHECKING
 
-from ..childjail import JailUnavailable, Spawn
-from ..confinement import Confinement, HostFilesystem, PolicyFilesystem
-from ..locations import single_path
-from ..selfjail import ARCHES, fork_denial_filter
-from ..viewdaemon import Attachment, ViewSpec, ViewUnavailable, attach
-from . import NoView, ServedRoot
-from .common import environment, executable, scratch_for
-from .lowering import Bind, Lowered, Omitted, Role, readable, writable
+from certorail.childjail import JailUnavailable, Spawn
+from certorail.confinement import Confinement, HostFilesystem, PolicyFilesystem
+from certorail.locations import single_path
+from certorail.selfjail import ARCHES, fork_denial_filter
+from certorail.viewdaemon import Attachment, ViewSpec, ViewUnavailable, attach
+from certorail.sandbox import NoView, ServedRoot
+from certorail.sandbox.common import environment, executable, scratch_for
+from certorail.sandbox.lowering import Bind, Lowered, Omitted, Role, readable, writable
 
 if TYPE_CHECKING:
-    from ..policy import Policy
+    from certorail.policy import Policy
 
 # The toolchain a policy world holds besides the policy's own binds: where programs, their
 # libraries, the loader's cache and the name databases ``ls -l`` reads live. Read-only, each only

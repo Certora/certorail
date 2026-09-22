@@ -9,7 +9,9 @@ order that keeps the tree loadable at every instant -- checkers and notes first,
 each file written beside its target and ``os.replace``d, because the loader fails closed on a
 missing checker but not on an extra one.
 
-Two installable units, deliberately different:
+One verb, ``certorail policy install TARGET``, over two installable units, deliberately
+different (a ``.toml`` file is a root policy; a directory, or the bare name of a pack shipped in
+this package under ``certorail/rulesets/``, is a pack):
 
 - a **ruleset pack**: a directory of ruleset ``*.toml`` documents plus the ``checkers/``
   executables they reference (and ``<name>.md`` program-author notes). Rulesets are rootless
@@ -26,6 +28,7 @@ No ledger, no signatures, no hashes yet (INSTALL.md defers them): this is the ro
 those would sit on.
 """
 import argparse
+import importlib.resources
 import os
 import pathlib
 import shlex
@@ -35,11 +38,12 @@ import tempfile
 import tomllib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from importlib.resources.abc import Traversable
 
-from .integrity import CheckerIntegrityError, Pin, digest, document_pins, verify_all
-from .policydir import AmbientPolicyError, config_dir, find_policy, munge, policy_dir
-from .policyfile import PolicyFileError, from_data, load_policy_file, rulesets_dir
-from .schema import RulesetDoc, SchemaError, parse_ruleset
+from certorail.integrity import CheckerIntegrityError, Pin, digest, document_pins, verify_all
+from certorail.policydir import AmbientPolicyError, config_dir, find_policy, munge, policy_dir
+from certorail.policyfile import PolicyFileError, from_data, load_policy_file, rulesets_dir
+from certorail.schema import RulesetDoc, SchemaError, parse_ruleset
 
 _CHECKER_HEAD = "${checkers}/"
 
@@ -511,7 +515,7 @@ def list_installed(root: pathlib.Path | None = None) -> str:
     """What the config directory holds, by section, with each policy's declared root, and every
     ruleset described with its parameters and who applies it (the policy governing *root* among
     them, when given)."""
-    from .apply import ruleset_lines  # the inventory lives with `apply`; imported here to avoid a cycle
+    from certorail.apply import ruleset_lines  # the inventory lives with `apply`; imported here to avoid a cycle
 
     cfg = config_dir()
     out = [f"config directory: {cfg}"]
@@ -613,7 +617,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             target, prefix = _edit_target(ns.root, ns.policy)
             return edit_policy(target, prefix, editor=_spawn_editor, prompt=_tty_prompt)
         elif ns.command == "apply":
-            from .apply import apply_ruleset, parse_binding
+            from certorail.apply import apply_ruleset, parse_binding
 
             target, prefix = _edit_target(ns.root, ns.policy)
             bound = dict(parse_binding(b) for b in bindings)

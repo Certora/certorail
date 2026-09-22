@@ -35,7 +35,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from .analysis import (
+from certorail.analysis import (
     Container,
     Data,
     InvalidProgram,
@@ -53,9 +53,9 @@ from .analysis import (
     is_path_typed,
     resolve_callee,
 )
-from .annotations import Contract, bind_arguments, default_of, is_plain_type, parse_annotation
-from .ids import Atom, SourceId
-from .dangerous import (
+from certorail.annotations import Contract, bind_arguments, default_of, is_plain_type, parse_annotation
+from certorail.ids import Atom, SourceId
+from certorail.dangerous import (
     CHECK_CALLEE,
     EXEC_CALLEE,
     EXEC_RESERVED_KEYWORDS,
@@ -63,7 +63,7 @@ from .dangerous import (
     LINES_CALLEE,
     REVEAL_CALLEE,
 )
-from .enforcement import (
+from certorail.enforcement import (
     CONTAINER_METHODS,
     CONTAINER_READ_CALLS,
     METHOD_KINDS,
@@ -91,9 +91,9 @@ from .enforcement import (
     describe_value,
     host_matches,
 )
-from .guards import apply, recognize
-from .markers import NAMESPACE
-from .safepy import (
+from certorail.guards import apply, recognize
+from certorail.markers import NAMESPACE
+from certorail.safepy import (
     ClassAnalysis,
     ContainerClosureAnalysis,
     FunctionAnalysis,
@@ -101,7 +101,7 @@ from .safepy import (
     InheritanceAnalysis,
     ValidationAnalysis,
 )
-from .summaries import (
+from certorail.summaries import (
     BOTTOM,
     HAVOC,
     NEVER,
@@ -112,8 +112,8 @@ from .summaries import (
     module_functions,
     property_names,
 )
-from .templates import Binding, Elements, Many
-from .terms import Call, Method, lower
+from certorail.templates import Binding, Elements, Many
+from certorail.terms import Call, Method, lower
 
 __all__ = [
     "Argument", "Audit", "Callsite", "CheckSignature", "CheckSite", "Enforcement", "ExecSite",

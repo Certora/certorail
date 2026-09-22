@@ -11,8 +11,8 @@ import pathlib
 
 import pytest
 
-from certorail import session_hook
-from certorail.install import InstallError, install_pack, install_policy, main, suggest_pins
+from certorail.control import session_hook
+from certorail.control.install import InstallError, install, install_pack, install_policy, main, suggest_pins
 from certorail.integrity import (
     CheckerIntegrityError,
     digest,
@@ -133,7 +133,7 @@ def test_policy_install_discovery_and_collisions(cfg, tmp_path):
     report = install_policy(src)
     found = find_policy(sandbox)
     assert found is not None and found[0].name == "dev.toml"
-    assert any("--describe" in n for n in report.notes)
+    assert any("certorail describe" in n for n in report.notes)
     # a second file claiming the same root is refused outright
     other = tmp_path / "other.toml"
     other.write_text(POLICY_TMPL.format(root=root))
@@ -241,7 +241,7 @@ def test_cli_pin_and_verify(cfg, tmp_path, capsys):
 def test_edit_lands_only_a_loadable_policy(cfg, tmp_path, capsys):
     """``certorail policy edit``: the editor works on a copy; a broken edit shows its problems
     and offers to edit again or give up; a good edit rotates into place; the root cannot move."""
-    from certorail.install import edit_policy
+    from certorail.control.install import edit_policy
 
     install_pack(make_pack(tmp_path))
     root = tmp_path / "work"
@@ -306,7 +306,7 @@ def load_policy_file_ok(path: pathlib.Path):
 
 
 def test_edit_target_resolution(cfg, tmp_path):
-    from certorail.install import _edit_target
+    from certorail.control.install import _edit_target
 
     with pytest.raises(InstallError, match="no ambient policy governs"):
         _edit_target(tmp_path, None)
@@ -331,10 +331,40 @@ def test_edit_target_resolution(cfg, tmp_path):
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
 
-@pytest.mark.skipif(not (REPO / "rulesets" / "git").is_dir(), reason="the shipped packs are not in this tree")
+def test_install_dispatches_on_the_target(cfg, tmp_path):
+    """One verb: a directory is a pack, a .toml file a root policy, a bare name a pack shipped in
+    the package; anything else is refused with the shipped names listed."""
+    report = install(str(make_pack(tmp_path)))
+    assert any(t.endswith("mini.toml") for t in report.installed)
+    report = install("coreutils")
+    assert any(t.endswith("coreutils-ro.toml") for t in report.installed)
+    assert (cfg / "rulesets" / "coreutils-ro.toml").is_file()
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    src = tmp_path / "dev.toml"
+    src.write_text(POLICY_TMPL.format(root=str(sandbox.resolve())))
+    report = install(str(src))
+    assert any(t.endswith("dev.toml") for t in report.installed)
+    with pytest.raises(InstallError) as e:
+        install("no-such-pack")
+    assert "shipped: coreutils" in str(e.value)
+    with pytest.raises(InstallError):
+        install("coreutils", name="x.toml")  # --name is a policy's
+
+
+def test_list_names_the_shipped_packs_not_yet_installed(cfg):
+    from certorail.control.install import list_installed
+
+    assert "shipped with certorail, not installed: coreutils (certorail policy install coreutils)" in list_installed()
+    install("coreutils")
+    assert "not installed" not in list_installed()
+
+
+@pytest.mark.skipif(not (REPO / "rulesets" / "git").is_dir(), reason="the git pack is not in this tree")
 def test_shipped_packs_install(cfg):
-    """The repo's git and coreutils packs are installable units: closure exact, seven checkers
-    placed executable, and the fixture root policy composes them with evaluator bytes captured."""
+    """The repo's git pack and the shipped coreutils pack are installable units: closure exact,
+    seven checkers placed executable, and the fixture root policy composes them with evaluator
+    bytes captured."""
     import tomllib
 
     from certorail.policyfile import from_data
@@ -342,7 +372,7 @@ def test_shipped_packs_install(cfg):
     report = install_pack(REPO / "rulesets" / "git")
     assert len([t for t in report.installed if "/checkers/" in t]) == 7
     assert any(t.endswith("git.md") for t in report.installed)
-    install_pack(REPO / "rulesets" / "coreutils")
+    install("coreutils")
     # the fixture root policy also runs a root-authored checker of its own, outside any pack
     org = cfg / "checkers" / "org-checkout"
     org.write_text(CHECKER)
@@ -352,21 +382,27 @@ def test_shipped_packs_install(cfg):
     assert any(v.evaluator is not None for v in policy.validations)
 
 
-def test_plugin_ships_the_skill_and_hook():
-    """The plugin ships the policy-authoring skill (SKILL.md and reference.md; the program-author
-    guide is package data the hook injects, not a skill file), an executable hook script, and
-    manifests that parse."""
+def test_plugin_ships_in_the_package():
+    """The Claude Code plugin is package data: a marketplace directory (certorail/plugin/) whose
+    manifest names the plugin beside it, with the hook and the policy-authoring skill (SKILL.md
+    and reference.md; the program-author guide is separate package data the hook injects). The
+    repository's own marketplace manifest points at the same plugin, for the GitHub route."""
+    import importlib.resources
     import json
 
-    plugin = REPO / "plugins" / "certorail"
-    shipped = {p.name for p in (plugin / "skills" / "certorail-policy").iterdir() if p.is_file()}
-    assert {"SKILL.md", "reference.md"} <= shipped
-    assert os.access(plugin / "hooks" / "session-start.sh", os.X_OK)
-    json.loads((plugin / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
-    hooks = json.loads((plugin / "hooks" / "hooks.json").read_text(encoding="utf-8"))
-    assert "SessionStart" in hooks["hooks"]
-    market = json.loads((REPO / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))
+    market_dir = importlib.resources.files("certorail").joinpath("plugin")
+    market = json.loads(market_dir.joinpath(".claude-plugin", "marketplace.json").read_text(encoding="utf-8"))
+    assert market["name"] == "certorail"
     assert market["plugins"][0]["source"] == "./plugins/certorail"
+    plugin = market_dir.joinpath("plugins", "certorail")
+    json.loads(plugin.joinpath(".claude-plugin", "plugin.json").read_text(encoding="utf-8"))
+    hooks = json.loads(plugin.joinpath("hooks", "hooks.json").read_text(encoding="utf-8"))
+    assert "SessionStart" in hooks["hooks"]
+    assert plugin.joinpath("hooks", "session-start.sh").is_file()
+    skill = {p.name for p in plugin.joinpath("skills", "certorail-policy").iterdir()}
+    assert {"SKILL.md", "reference.md"} <= skill
+    repo_market = json.loads((REPO / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))
+    assert repo_market["plugins"][0]["source"] == "./certorail/plugin/plugins/certorail"
 
 
 def test_the_guide_is_package_data():

@@ -1,10 +1,15 @@
 """The host: analyse a program, evaluate the security policy, rewrite, run -- jailed.
 
-    certorail program.py [--root DIR] [--policy policy.py] [--check] [--no-jail] [-- ARG ...]
-    certorail -c SOURCE  [same options]     # inline source: the agentic path
+    certorail run      (FILE | -c SOURCE) [--root DIR] [--policy FILE] [--no-jail] [-- ARG ...]
+    certorail check    (FILE | -c SOURCE) [--root DIR] [--policy FILE]
+    certorail describe [--root DIR] [--policy FILE]
+    certorail explore | init | policy … | view …     # their own parsers (explorer, certorail.control, viewdaemon)
+    certorail-run [--check] (-c SOURCE | FILE) [-- ARG ...]   # the agent's closed entry point (run_main)
 
-(``certorail`` is the ``[project.scripts]`` entry point, installed by ``uv tool install .``;
-``python -m certorail.host`` is the same thing.)
+(``certorail`` and ``certorail-run`` are the ``[project.scripts]`` entry points, installed by
+``uv tool install .``; ``python -m certorail.host`` is the first. ``certorail -c SOURCE …`` with
+the old flat options still works as a legacy spelling of ``run``/``check``; ``session-hook`` is
+the plugin's hook, kept out of ``--help``.)
 
 1. ``walker.analyze``: the lexical rules and the dataflow. Any violation, or any sink whose
    location is not proven, rejects the program with the messages.
@@ -39,17 +44,17 @@ import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-from .analysis import Named, StaticPath
-from .childjail import Mounts, View
-from .viewdaemon import Attachment, ViewUnavailable, attach
-from .broker import build_server, terminal_descriptors
-from .describe import describe
-from .policy import Denial, Policy, Program
-from .policydir import AmbientPolicyError, find_policy
-from .policyfile import BASE_RULESET, PolicyFileError, default_policy, load_policy_file
-from .rewrite import rewrite
-from .safepy import FunctionAnalysis
-from .walker import Report, analyze, describe_sink, where
+from certorail.analysis import Named, StaticPath
+from certorail.childjail import Mounts, View
+from certorail.viewdaemon import Attachment, ViewUnavailable, attach
+from certorail.broker import build_server, terminal_descriptors
+from certorail.describe import describe
+from certorail.policy import Denial, Policy, Program
+from certorail.policydir import AmbientPolicyError, find_policy
+from certorail.policyfile import BASE_RULESET, PolicyFileError, default_policy, load_policy_file
+from certorail.rewrite import rewrite
+from certorail.safepy import FunctionAnalysis
+from certorail.walker import Report, analyze, describe_sink, where
 
 
 @dataclass(frozen=True)
@@ -402,93 +407,147 @@ def policy_origin(path: pathlib.Path | None, root: pathlib.Path) -> tuple[str, s
     return "the built-in default policy", None
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    # verbs, dispatched before the run parser: ``policy`` is a reserved first word
-    # (INSTALL.md) -- a program literally named ``policy`` is spelled ``./policy``. Imported
-    # lazily so a plain run never pays for the installer.
-    args = list(sys.argv[1:] if argv is None else argv)
-    if args and args[0] == "policy":
-        from .install import main as policy_main
+# the verbs that own a parser of their own (certorail.control, viewdaemon, explorer): listed by
+# `certorail --help`, handed the rest of the command line untouched, imported lazily so a run
+# never pays for them
+_FORWARDED: dict[str, str] = {
+    "init": "set up this machine and the current directory's policy, as a short interview",
+    "policy": "install policies and ruleset packs; apply a ruleset; edit, list, verify",
+    "view": "the FUSE view daemons: status, stop",
+    "explore": "the policy as a navigable tree (a terminal UI)",
+}
+_PARSED = ("run", "check", "describe")
 
-        return policy_main(args[1:])
-    if args and args[0] == "session-hook":
-        # the Claude Code SessionStart hook: the ambient policy into the session's context
-        from .session_hook import main as hook_main
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args[:1] == ["-c"]:
+        # legacy: `certorail -c SOURCE …` as spelled before the verbs, kept because shell
+        # allow-rules were written against that prefix; `certorail run -c` is the spelling
+        return _legacy(args)
+    if args[:1] == ["session-hook"]:
+        # the Claude Code SessionStart hook: plumbing the plugin runs, not a verb in --help
+        from certorail.control.session_hook import main as hook_main
 
         return hook_main()
-    if args and args[0] == "view":
-        # the FUSE view daemons: status, stop (MOUNTS.md)
-        from .viewdaemon import main as view_main
-
-        return view_main(args[1:])
-    if args and args[0] == "init":
-        # first-run setup: the base, the packs, a policy for the root -- as an interview
-        from .init import main as init_main
-
-        return init_main(args[1:])
-    parser = argparse.ArgumentParser(
-        prog="certorail", description="Analyse a program, check it against a policy, and run it."
-    )
-    parser.add_argument(
-        "program", type=pathlib.Path, nargs="?", default=None, help="the Python source file"
-    )
-    parser.add_argument(
-        "-c",
-        "--command",
-        metavar="SOURCE",
-        default=None,
-        help="run the program given inline instead of from a file (the agentic path)",
-    )
-    parser.add_argument("--root", type=pathlib.Path, default=pathlib.Path.cwd(), help="the sandbox root (cwd of the program)")
-    parser.add_argument(
-        "--policy",
-        type=pathlib.Path,
-        default=None,
-        help="a policy: a .toml or .json document "
-        "(default: the nearest ambient policy under ~/.certorail/policy for this root, "
-        "else the built-in policy)",
-    )
-    parser.add_argument("--check", action="store_true", help="analyse and evaluate only; do not run")
-    parser.add_argument(
-        "--describe",
-        action="store_true",
-        help="print what the policy for --root permits, for the program author (no program)",
-    )
-    parser.add_argument(
-        "--no-jail",
-        action="store_true",
-        help="run without the srt OS jail (the static analysis and the broker still apply)",
-    )
-    # not REMAINDER: that would swallow every option after the program path (`prog.py --check`
-    # would RUN prog.py with argv ["--check"] under the default policy). With "*", argparse
-    # keeps parsing options anywhere, and `--` is the documented way to pass option-like
-    # arguments through to the program.
-    parser.add_argument("args", nargs="*", help="arguments for the program (after --)")
-    ns = parser.parse_args(args)
-
-    if ns.describe:
-        if ns.program is not None or ns.command is not None or ns.args:
-            parser.error("--describe takes no program")
+    if args and args[0] in _FORWARDED:
+        return _forward(args[0], args[1:])
+    parser = _parser()
+    if args and not args[0].startswith("-") and args[0] not in _PARSED:
+        parser.error(f"unknown verb {args[0]!r}; a program is run with `certorail run {args[0]}`")
+    head, tail = _split_at_dashdash(args)
+    ns = parser.parse_args(head)
+    if ns.verb == "describe":
+        if tail:
+            parser.error("describe takes no program arguments")
         root = ns.root.resolve()
         loaded = load_policy(ns.policy, root)
         for line in loaded.provenance:
             print(line, file=sys.stderr)
         print(describe(loaded.policy, *policy_origin(ns.policy, root)))
         return 0
+    source, filename, program_args = _program(parser, ns, tail)
+    return _execute(
+        source, filename, program_args,
+        root=ns.root.resolve(), policy_path=ns.policy,
+        check_only=ns.verb == "check", jail=not getattr(ns, "no_jail", False),
+    )
+
+
+def _forward(verb: str, rest: list[str]) -> int:
+    if verb == "init":
+        from certorail.control.init import main as init_main
+
+        return init_main(rest)
+    if verb == "policy":
+        from certorail.control.install import main as policy_main
+
+        return policy_main(rest)
+    if verb == "view":
+        from certorail.viewdaemon import main as view_main
+
+        return view_main(rest)
+    from certorail.explorer import main as explore_main
+
+    return explore_main(rest)
+
+
+def _where() -> argparse.ArgumentParser:
+    """``--root`` and ``--policy``, which policy: shared by every verb that reads one."""
+    where = argparse.ArgumentParser(add_help=False)
+    where.add_argument("--root", type=pathlib.Path, default=pathlib.Path.cwd(),
+                       help="the sandbox root, the program's working directory (default: the current directory)")
+    where.add_argument("--policy", type=pathlib.Path, default=None,
+                       help="a policy document (.toml or .json) instead of the ambient one for the root")
+    return where
+
+
+def _split_at_dashdash(args: list[str]) -> tuple[list[str], list[str]]:
+    """The command line before the first ``--`` and everything after it: the latter is the
+    program's, option-like or not, and never reaches argparse (whose own ``--`` handling differs
+    between a flat parser and a subparser)."""
+    if "--" in args:
+        at = args.index("--")
+        return args[:at], args[at + 1:]
+    return args, []
+
+
+def _program_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument("program", type=pathlib.Path, nargs="?", default=None, help="the Python source file")
+    p.add_argument("-c", "--command", metavar="SOURCE", default=None, help="the program inline, instead of a file")
+    # not REMAINDER: that would swallow every option after the program path. With "*", argparse
+    # keeps parsing options anywhere; option-like program arguments go after `--`, which is
+    # split off before parsing (_split_at_dashdash)
+    p.add_argument("args", nargs="*", help="arguments for the program (option-like ones after --)")
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="certorail",
+        description="Analyse Python programs against a security policy and run them jailed.",
+    )
+    verbs = parser.add_subparsers(dest="verb", required=True, metavar="VERB")
+    where = _where()
+    run = verbs.add_parser("run", parents=[where], help="analyse a program, check it against the policy, run it in the jail")
+    _program_arguments(run)
+    run.add_argument("--no-jail", action="store_true",
+                     help="run without the srt OS jail (the analysis and the broker still apply)")
+    _program_arguments(verbs.add_parser("check", parents=[where], help="analyse and evaluate a program; run nothing"))
+    verbs.add_parser("describe", parents=[where], help="print what the policy permits, for the program author")
+    for verb, text in _FORWARDED.items():  # listed here; dispatched before parsing, with their own parsers
+        verbs.add_parser(verb, help=text, add_help=False)
+    return parser
+
+
+def _program(parser: argparse.ArgumentParser, ns: argparse.Namespace, tail: list[str]) -> tuple[str, str, list[str]]:
+    """The program of a run or a check -- a file, or inline source -- with its arguments: the
+    positionals argparse collected, then everything that followed ``--``."""
     if ns.program is None and ns.command is None:
         parser.error("exactly one of PROGRAM or -c SOURCE is required")
-    args = ns.args[1:] if ns.args[:1] == ["--"] else ns.args
+    args: list[str] = [*ns.args, *tail]
     if ns.command is not None:
-        source, filename = ns.command, "<command>"
         if ns.program is not None:
             # with -c there is no program file: every positional is an argument for the
-            # program, as with `python -c` (`certorail -c SOURCE -- a b`)
+            # program, as with `python -c` (`certorail run -c SOURCE a -- -b`)
             args = [str(ns.program), *args]
-    else:
-        assert ns.program is not None  # the pair-is-required check above
-        source, filename = ns.program.read_text(encoding="utf-8"), str(ns.program)
+        return ns.command, "<command>", args
+    assert ns.program is not None  # the pair-is-required check above
+    return ns.program.read_text(encoding="utf-8"), str(ns.program), args
+
+
+def _legacy(args: list[str]) -> int:
+    """``certorail -c SOURCE [--root DIR] [--policy FILE] [--check] [--no-jail] [-- ARG ...]``:
+    the spelling before the verbs, kept because shell allow-rules were written against it. New
+    text says ``certorail run -c`` and ``certorail check -c``."""
+    parser = argparse.ArgumentParser(prog="certorail -c", parents=[_where()], add_help=False)
+    _program_arguments(parser)
+    parser.add_argument("--check", action="store_true")
+    parser.add_argument("--no-jail", action="store_true")
+    head, tail = _split_at_dashdash(args)
+    ns = parser.parse_args(head)
+    source, filename, program_args = _program(parser, ns, tail)
     return _execute(
-        source, filename, args,
+        source, filename, program_args,
         root=ns.root.resolve(), policy_path=ns.policy, check_only=ns.check, jail=not ns.no_jail,
     )
 

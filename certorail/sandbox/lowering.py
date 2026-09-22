@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from ..analysis import LocationFact
+from certorail.analysis import LocationFact
 
 __all__ = ["Bind", "Lowered", "Omitted", "RegexRule", "Role", "readable", "writable"]
 

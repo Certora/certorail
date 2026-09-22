@@ -33,15 +33,15 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypedDict, overload
 
-from . import markers
-from .analysis import Exact, RegexLit, StaticPath, alternation, is_prefix
-from .dangerous import EXEC_CWD
-from .docpath import DocPath, Keyed, Path
-from .childjail import View
-from .ids import BUILTIN_ATOMS, Atom, CheckId, FlagName, FlagsetId, HoleName, ParamName, SourceId
-from .integrity import digest
-from .locations import parse_location
-from .policy import (
+from certorail import markers
+from certorail.analysis import Exact, RegexLit, StaticPath, alternation, is_prefix
+from certorail.dangerous import EXEC_CWD
+from certorail.docpath import DocPath, Keyed, Path
+from certorail.childjail import View
+from certorail.ids import BUILTIN_ATOMS, Atom, CheckId, FlagName, FlagsetId, HoleName, ParamName, SourceId
+from certorail.integrity import digest
+from certorail.locations import parse_location
+from certorail.policy import (
     AtomDef,
     NetworkRule,
     Param,
@@ -59,8 +59,8 @@ from .policy import (
     source,
     validation,
 )
-from .policydir import config_dir
-from .schema import (
+from certorail.policydir import config_dir
+from certorail.schema import (
     ApplyDecl,
     AtomDecl,
     ConstraintFields,
@@ -88,7 +88,7 @@ from .schema import (
     parse_ruleset,
     reference,
 )
-from .templates import Constraint, Demands, Each, Flags, Flagset, Hole, HoleRef, Piece, Token
+from certorail.templates import Constraint, Demands, Each, Flags, Flagset, Hole, HoleRef, Piece, Token
 
 # the location micro-syntax lives in ``locspec`` and ``locations``; ``parse_location`` is
 # re-exported here for its callers

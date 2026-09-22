@@ -20,7 +20,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Literal
 
-from .analysis import (
+from certorail.analysis import (
     ANY_NAME,
     ANY_STR,
     AtomicFact,
@@ -49,9 +49,9 @@ from .analysis import (
     is_safe_name,
     splat_under,
 )
-from .ids import NOT_OPTION, Atom, AtomId, SourceId, spelled
-from .markers import NAMESPACE
-from .terms import Call, Dotted, Items, Subscript, Term, Var, lower
+from certorail.ids import NOT_OPTION, Atom, AtomId, SourceId, spelled
+from certorail.markers import NAMESPACE
+from certorail.terms import Call, Dotted, Items, Subscript, Term, Var, lower
 
 
 class InvalidAnnotation(InvalidProgram):

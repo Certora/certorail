@@ -377,7 +377,7 @@ def _scalar(value: object, path: str) -> str:
 
 
 def _select(x: object, path: str, want_plural: bool) -> object:
-    from . import jqpath  # stdlib-only; imported lazily to keep the namespace's import light
+    from certorail import jqpath  # stdlib-only; imported lazily to keep the namespace's import light
 
     try:
         steps = jqpath.parse(path)
@@ -448,7 +448,7 @@ def pathmatch(text: str, location: str) -> bool:
     matcher on the concrete text. A ``..`` anywhere is within nothing."""
     if not isinstance(text, str):
         raise TypeError("pathmatch: the path must be a str (use str(p) for a pathlib path)")
-    from . import locspec  # stdlib-only
+    from certorail import locspec  # stdlib-only
 
     return locspec.matches(locspec.parse(location), text)
 

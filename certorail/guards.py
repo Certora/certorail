@@ -21,7 +21,7 @@ import ast
 from dataclasses import dataclass, replace
 from typing import Literal, Sequence
 
-from .analysis import (
+from certorail.analysis import (
     ANY_STR,
     PATH_ATOMS,
     Alternation,
@@ -48,10 +48,10 @@ from .analysis import (
     location_of,
     splat_under,
 )
-from .ids import NO_PARENT_TRAVERSAL, NO_SLASH, NOT_ABSOLUTE, NOT_DOT_DOT, NOT_OPTION, Atom, AtomId
-from .locations import parse_location
-from .markers import NAMESPACE
-from .terms import (
+from certorail.ids import NO_PARENT_TRAVERSAL, NO_SLASH, NOT_ABSOLUTE, NOT_DOT_DOT, NOT_OPTION, Atom, AtomId
+from certorail.locations import parse_location
+from certorail.markers import NAMESPACE
+from certorail.terms import (
     Attr,
     BinOp,
     Bool,
