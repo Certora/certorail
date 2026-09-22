@@ -18,8 +18,11 @@ them at startup: measured 2026-09-22, without this ``ls`` and ``cat`` abort befo
 the toolchain, the tool, the scratch directory and the readable locations allowed for reading
 (listing a directory is reading it: a read grant covers the directories within it), the
 writable locations (under ``write_fs``) and the scratch directory for writing, the protections
-denied for writing last. Later rules win. Metadata reads stay allowed so path resolution works:
-names are visible, contents are not.
+denied for writing last. Metadata reads stay allowed so path resolution works: names are
+visible, contents are not. Seatbelt's matching, measured on a Mac 2026-09-22: within one
+operation later rules win, and a rule on a specific operation shadows every rule on its wildcard
+-- with ``file-read-data`` denied an allow on ``file-read*`` never applies -- so the read
+allowances are spelled on ``file-read-data`` itself.
 
 Written against Apple's documented profile language and unrun here; ``scripts/probe_seatbelt.py``
 is the probe a Mac runs.
@@ -315,12 +318,11 @@ class SeatbeltSpawner:
         if isinstance(fs, PolicyFilesystem):
             lowered = [x for x in self.lower(fs, c.write_fs) if isinstance(x, (Bind, RegexRule))]
             rules.append("(deny file-read-data file-write*)")
-            rules.append('(allow file-read-data (literal "/"))')
             reads: list[str | Bind | RegexRule] = [*TOOLCHAIN, *([exe] if exe is not None else [])]
             reads += [x for x in lowered if readable(x.role)]
             if scratch is not None:
                 reads.append(scratch)
-            rules.append("(allow file-read* " + " ".join(_filter(x) for x in reads) + ")")
+            rules.append('(allow file-read-data (literal "/") ' + " ".join(_filter(x) for x in reads) + ")")
             writes: list[str | Bind | RegexRule] = [x for x in lowered if writable(x.role)] if c.write_fs else []
             if scratch is not None:
                 writes.append(scratch)

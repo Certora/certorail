@@ -331,22 +331,27 @@ def _filters(binds: Iterable[str | Bind]) -> str:
 
 
 def seatbelt_profile(jail: Jail, scratch: str | None, mounts: Mounts | None, exe: str | None) -> str:
-    """The Seatbelt profile of *jail*. Later rules win, so a policy view is: everything but file
-    data denied, then the entries of ``/`` allowed (every process reads them at startup:
-    measured 2026-09-22, without this ``ls`` and ``cat`` abort before ``main``; the top-level
-    names are all it exposes), the toolchain, the tool, the scratch directory and the policy's
-    read grants allowed for reading -- listing a directory is reading it, so a read grant covers
-    the directories within it -- the write grants (under ``write-fs = true``) and the scratch
-    directory for writing, the protections denied for writing last. Metadata reads stay allowed
-    so path resolution works: names are visible, contents are not."""
+    """The Seatbelt profile of *jail*. A policy view is: file data and writes denied, then the
+    entries of ``/`` allowed (every process reads them at startup: measured 2026-09-22, without
+    this ``ls`` and ``cat`` abort before ``main``; the top-level names are all it exposes), the
+    toolchain, the tool, the scratch directory and the policy's read grants allowed for reading
+    -- listing a directory is reading it, so a read grant covers the directories within it --
+    the write grants (under ``write-fs = true``) and the scratch directory for writing, the
+    protections denied for writing last. Metadata reads stay allowed so path resolution works:
+    names are visible, contents are not.
+
+    Two facts of Seatbelt's rule matching, both measured on a Mac (2026-09-22): within one
+    operation later rules win, and a rule on a specific operation shadows every rule on its
+    wildcard -- with ``file-read-data`` denied, an allow spelled on ``file-read*`` never applies
+    (``ls`` got EPERM on its own directory), so every allowance here is spelled on
+    ``file-read-data`` itself."""
     rules = ["(version 1)", "(allow default)"]
     if mounts is not None:
         rules.append("(deny file-read-data file-write*)")
-        rules.append('(allow file-read-data (literal "/"))')
         readable: list[str | Bind] = [*_DARWIN_TOOLCHAIN, *([exe] if exe is not None else []), *mounts.reads, *mounts.writes]
         if scratch is not None:
             readable.append(scratch)
-        rules.append(f"(allow file-read* {_filters(readable)})")
+        rules.append(f'(allow file-read-data (literal "/") {_filters(readable)})')
         writable: list[str | Bind] = list(mounts.writes) if jail.write_fs else []
         if scratch is not None:
             writable.append(scratch)

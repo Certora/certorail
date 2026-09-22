@@ -412,9 +412,11 @@ class TestGrants(unittest.TestCase):
         mounts = Mounts(reads=(pathlib.Path("/r/src"),), writes=(pathlib.Path("/r/out"),), no_write=(pathlib.Path("/r/out/final"),))
         profile = seatbelt_profile(CONFINED, "/tmp/scratch", mounts, "/usr/bin/cat")
         self.assertIn("(deny file-read-data file-write*)", profile)
-        # every process reads the root directory's entries at startup (measured: without this
-        # `ls` and `cat` abort before main); the top-level names are all it exposes
-        self.assertIn('(allow file-read-data (literal "/"))', profile)
+        # the allowances are on file-read-data itself (an allow on file-read* never reaches a
+        # denied file-read-data: measured), opening with the root's entries, which every process
+        # reads at startup (without it `ls` and `cat` abort before main)
+        self.assertIn('(allow file-read-data (literal "/") (subpath "/usr")', profile)
+        self.assertNotIn("(allow file-read* ", profile)
         self.assertIn('(subpath "/usr/bin/cat")', profile)
         self.assertIn('(subpath "/r/src")', profile)
         # under write-fs = false the write grant is readable, and only the scratch dir writable

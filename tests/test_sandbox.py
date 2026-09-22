@@ -208,7 +208,10 @@ class TestSeatbelt(unittest.TestCase):
         c = Confinement(network=False, write_fs=False, spawn=False, filesystem=fs)
         profile = spawner.profile(c, "/tmp/scratch", "/usr/bin/cat")
         self.assertIn("(deny file-read-data file-write*)", profile)
-        self.assertIn('(allow file-read-data (literal "/"))', profile)  # every process reads the root's entries at startup
+        # on file-read-data itself, not file-read* (a specific operation shadows its wildcard), opening
+        # with the root's entries, which every process reads at startup
+        self.assertIn('(allow file-read-data (literal "/") (subpath "/usr")', profile)
+        self.assertNotIn("(allow file-read* ", profile)
         self.assertIn('(subpath "/usr/bin/cat")', profile)
         self.assertIn('(subpath "/sandbox/src")', profile)
         self.assertIn('(regex #"', profile)
