@@ -1,0 +1,5 @@
+# written by a real (non-`--check`) run of the examples
+/reports/summary.md
+/workspace/reports/audit.md
+/checkout/*
+!/checkout/.keep

@@ -1,0 +1,40 @@
+# Ported from nono: platform-conditional group inclusion and the filesystem grants beside it.
+#
+# The nono fragment (nono-packs/claude/policy.json, trimmed to the shape):
+#
+#     {
+#       "groups": {
+#         "include": [
+#           { "name": "claude_code_macos", "when": "macos" },
+#           { "name": "claude_code_linux", "when": "linux" },
+#           "node_runtime",
+#           "git_config",
+#           "unlink_protection"
+#         ]
+#       },
+#       "filesystem": {
+#         "allow": ["$HOME/.agent"],
+#         "read":  ["$NONO_PACKAGES", "$NONO_CONFIG/profiles"]
+#       }
+#     }
+#
+# What carries over: the path grants. certorail splits them three ways where nono splits
+# them two -- `list` is its own kind here, because listing a directory leaks the names in it.
+#
+# What becomes a static proof: nono turns a grant into a kernel rule (Landlock, Seatbelt) and
+# a live process is stopped at the open(2). certorail proves, before anything runs, that every
+# read/write/list site in the program names a path inside a granted location. A program with
+# one site it cannot place is rejected whole and never starts.
+#
+# What certorail cannot say at all: `when` predicates -- there is no platform conditional, so
+# a per-platform policy is a separate document; named groups and `extends` -- a policy is one
+# document and nothing composes; `groups.exclude` and `filesystem.deny` -- there is no removal
+# and no negative rule, only the absence of a grant; and `$HOME` / `$XDG_CONFIG_HOME` /
+# `$NONO_CONFIG` -- there is no variable expansion. A location is relative to the sandbox root,
+# or absolute; the two anchors never relate.
+policy-version = 1
+
+[filesystem]
+read  = ["config/**", "src/**"]
+write = ['reports/**/<\w+\.md>']
+list  = ["src/**"]
