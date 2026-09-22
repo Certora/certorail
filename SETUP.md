@@ -90,9 +90,11 @@ the same root. Otherwise you see the problems and choose to edit again or discar
 
 ## 4. Claude Code integration
 
-The plugin ships the two pieces an agent needs -- the ambient policy injected into every
-session's context (a `SessionStart` hook running `certorail session-hook`, silent in projects
-no policy governs), and the `certorail-policy` authoring skill:
+The plugin ships two pieces for two readers. For the agent that writes programs: a
+`SessionStart` hook running `certorail session-hook`, which injects the program-author guide
+(the confined subset and the policy vocabulary) followed by the ambient policy's description,
+and stays silent in projects no policy governs. For whoever writes policies: the
+`certorail-policy` authoring skill.
 
 ```
 claude plugin marketplace add certora/certorail     # or the path to your checkout

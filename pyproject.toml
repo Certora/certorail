@@ -40,6 +40,11 @@ certorail-explore = "certorail.explorer:main"
 [tool.setuptools.packages.find]
 include = ["certorail*"]
 
+# the program-author guide the session hook injects (certorail/SUBSET_PROMPT.md): read through
+# importlib.resources, so it ships in the wheel
+[tool.setuptools.package-data]
+certorail = ["SUBSET_PROMPT.md"]
+
 
 [tool.pyright]
 enableExperimentalFeatures=true

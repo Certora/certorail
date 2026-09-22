@@ -353,23 +353,29 @@ def test_shipped_packs_install(cfg):
 
 
 def test_plugin_ships_the_skill_and_hook():
-    """One skill, two homes: the plugin's copy is byte-identical to the repo's canonical one
-    (sync is a test, not a memory), the hook script is executable, and every manifest parses."""
+    """The plugin ships the policy-authoring skill (SKILL.md and reference.md; the program-author
+    guide is package data the hook injects, not a skill file), an executable hook script, and
+    manifests that parse."""
     import json
 
     plugin = REPO / "plugins" / "certorail"
-    canonical = REPO / ".claude" / "skills" / "certorail-policy"
-    shipped = plugin / "skills" / "certorail-policy"
-    ours = {p.name: p.read_bytes() for p in canonical.iterdir() if p.is_file()}
-    theirs = {p.name: p.read_bytes() for p in shipped.iterdir() if p.is_file()}
-    assert ours == theirs
-    assert {"SKILL.md", "reference.md", "SUBSET_PROMPT.md"} <= set(ours)
+    shipped = {p.name for p in (plugin / "skills" / "certorail-policy").iterdir() if p.is_file()}
+    assert {"SKILL.md", "reference.md"} <= shipped
     assert os.access(plugin / "hooks" / "session-start.sh", os.X_OK)
     json.loads((plugin / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
     hooks = json.loads((plugin / "hooks" / "hooks.json").read_text(encoding="utf-8"))
     assert "SessionStart" in hooks["hooks"]
     market = json.loads((REPO / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))
     assert market["plugins"][0]["source"] == "./plugins/certorail"
+
+
+def test_the_guide_is_package_data():
+    """The program-author guide ships inside the package, where the hook reads it."""
+    import importlib.resources
+
+    text = importlib.resources.files("certorail").joinpath("SUBSET_PROMPT.md").read_text(encoding="utf-8")
+    assert "## The SafePy Dialect" in text and "## Policy Enforcement" in text
+    assert session_hook.guide() == text
 
 
 def test_verbs_dispatch_under_certorail(cfg, tmp_path, capsys):
@@ -394,8 +400,10 @@ def test_session_hook_output_and_silence(cfg, tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "certorail governs" in out
     assert 'certora.check("clean"' in out
-    # the agent is told the subset, and what to do when denied: edit THIS file, never bypass
-    assert "## The subset" in out and "certora.exec(program, *args, cwd=" in out
+    # the agent gets the program-author guide (the subset, then the policy vocabulary) and is told
+    # what to do when denied: edit THIS file, never bypass
+    assert "## The SafePy Dialect" in out and "## Policy Enforcement" in out
+    assert out.index("## The SafePy Dialect") < out.index('certora.check("clean"')  # guide, then policy
     assert "## When you are denied" in out
     installed_policy = cfg / "policy"
     assert str(installed_policy) in out  # the policy file's path, so the agent edits the right thing

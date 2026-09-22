@@ -12,8 +12,9 @@ what their scripts are *allowed* to do. You are helping them write it, plus the 
 programs ("checkers") that its runtime validations execute.
 
 Read `reference.md` (next to this file) for the exact schema and the checker runtime contract.
-Read `SUBSET_PROMPT.md` (also next to this file) when you need to write a probe program in the
-confined subset.
+The program-author guide, `SUBSET_PROMPT.md` in the certorail package, is what the session hook
+injects for whoever writes confined programs; read it when you need to write a probe program in
+the confined subset.
 
 ## What you deliver
 
@@ -29,8 +30,8 @@ confined subset.
    the exact bytes, then places them for the file's declared `root`), or `--policy path` for a
    one-off.
 5. A program-author note: the validation names, parameters, atoms and regexes programs must use.
-   Whoever writes the confined programs (usually a model prompted with `SUBSET_PROMPT.md`) needs
-   this vocabulary appended to their prompt.
+   Whoever writes the confined programs (usually a model whose session the hook has primed with
+   the program-author guide and this policy's description) needs this vocabulary.
 
 ## Principles
 
@@ -247,7 +248,8 @@ A trivial text predicate can be a `test` one-liner with no script at all:
    error is reported at once; fix them all.
 2. **Checkers.** Run each directly with a good and a bad input; confirm exit codes and the stderr
    line.
-3. **Probes.** Write a small program in the subset per grant (see `SUBSET_PROMPT.md`) and
+3. **Probes.** Write a small program in the subset per grant (the program-author guide,
+   `SUBSET_PROMPT.md` in the certorail package) and
    `certorail probe.py --check --policy policy.toml --root ROOT`. The accepted report lists every
    sink with its proven location: read it. Then write one probe that oversteps each grant and
    confirm the `denied:` line. Literal checkers run during `--check` under `--root`, so the root
@@ -274,8 +276,9 @@ A trivial text predicate can be a `test` one-liner with no script at all:
    policy list` describes what is installed and who applies it.
 5. **Put the policy in the agent's context.** `certorail --describe --root ROOT` renders the
    loaded policy as the program author's interface. The certorail Claude Code plugin ships a
-   `SessionStart` hook that injects it automatically (and stays silent in projects no policy
-   governs); without the plugin, register `certorail session-hook` yourself (the JSON is in
+   `SessionStart` hook that injects the program-author guide and this rendering automatically
+   (and stays silent in projects no policy governs); without the plugin, register
+   `certorail session-hook` yourself (the JSON is in
    `reference.md`). Either way, every session, resume and compaction re-reads what is
    permitted instead of guessing.
 6. **Hand over.** The commented TOML, the checkers, the run commands, and an explicit list of

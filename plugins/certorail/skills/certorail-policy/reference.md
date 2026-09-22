@@ -606,7 +606,8 @@ kill it.
 
 ## Program-side vocabulary (for writing probes)
 
-Full rules in `SUBSET_PROMPT.md` (next to this file). The parts a policy author needs:
+Full rules in the program-author guide, `SUBSET_PROMPT.md` in the certorail package, which the
+session hook injects for program authors. The parts a policy author needs:
 
 - `certora.exec(program, *args, cwd=<proven path>, HOLE=value, …, stream=False)`: literal program name,
   string arguments, no splats, `cwd` mandatory; keyword arguments bind a template's holes by

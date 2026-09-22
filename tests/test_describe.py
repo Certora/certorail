@@ -67,7 +67,6 @@ class TestDescribe(unittest.TestCase):
             "- read: repos/**, reports/**",
             r"- write: repos/**/</\w+\.md/>",
             "- list: nothing",
-            "Notation: <...> marks a value",
             "- git push origin BRANCH",
             "cwd validated by org-checkout",
             "BRANCH: <validated no-flag>",

@@ -8,9 +8,10 @@ names and parameters, atom regexes), with every default spelled out. This render
 loaded ``Policy``, so what the agent reads is what will be enforced. A Claude Code
 ``SessionStart`` hook running ``certorail --describe`` puts it into the agent's context.
 
-Values the program supplies are written in one compact notation, explained once in the header:
-``</re/>`` text matching a regex, ``<(a|b)>`` one of, ``<path within L, M>`` a proven path,
-``<literal>``, ``<any>``, ``<... validated X>``. So a flag reads ``-atime </[+-]?\\d+/>``.
+Values the program supplies are written in one compact notation, explained in the program-author
+guide (``SUBSET_PROMPT.md``, which the session hook injects ahead of this text): ``</re/>`` text
+matching a regex, ``<(a|b)>`` one of, ``<path within L, M>`` a proven path, ``<literal>``,
+``<any>``, ``<... validated X>``. So a flag reads ``-atime </[+-]?\\d+/>``.
 """
 from collections.abc import Iterable
 
@@ -19,22 +20,6 @@ from .effects import EVERYTHING, Effects
 from .ids import BUILTIN_ATOMS, NOT_OPTION, Atom, FlagName, SourceId
 from .policy import NetworkRule, Policy, Program, Validation, literal_slot, pretty_locations
 from .templates import CWD, Constraint, Each, Flags, Flagset, HoleRef, Template, Token
-
-NOTATION = (
-    "Notation: <...> marks a value the program supplies. </re/> text known to match the regex "
-    "(a literal, or a variable guarded by re.fullmatch with that regex); <(a|b)> one of; "
-    "<path within L, M> a proven path within one of the locations; <literal> text the program "
-    "itself names (a literal or a constant), never a value read from a file, argv or an API; "
-    "<any> anything, unknown values included; <... validated X> also carries the atom X (a "
-    "check, a guard, or a built-in property of the text); <... from S> came, unmodified, from "
-    "the source S. Claims combine: </dev-\\w+/ literal> is a named database of that shape. NAME... "
-    "takes a list. A flags list is flag names in order, each valued flag followed by its value; "
-    "only the flags listed exist. Locations are spelled repos/** (at or below), repos/*/x (one "
-    "arbitrary component), <re> (a component matching re), {a,b} (one of), a leading / for the "
-    "filesystem root; a program proves a dynamic path is at a location with "
-    'assert certora.pathmatch(p, "<that spelling>") -- for a URL, on urllib.parse.urlsplit(u).path.'
-)
-
 
 def constraint_phrase(c: Constraint, sources: frozenset[SourceId]) -> str:
     if c.any:
@@ -368,8 +353,7 @@ def describe(policy: Policy, origin: str, governs: str | None = None) -> str:
         ),
         "Programs are analysed before they run; every operation not listed here is denied. "
         "Locations are relative to the sandbox root (the working directory) unless they begin "
-        "with '/'. Check without running: certorail -c SOURCE --check",
-        NOTATION,
+        "with '/'. Check without running: certorail-run --check -c SOURCE",
         *(
             [f"Rulesets composed into this policy: {', '.join(policy.applied)}"
              + (" (base.toml is the config directory's base ruleset; base = false opts out)" if "base.toml" in policy.applied else "")]
