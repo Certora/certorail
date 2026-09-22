@@ -439,8 +439,7 @@ def region_card(r: Region, policy: Policy) -> RenderableType:
     if r.medium == "network":
         parts.append(_line("remote state"))
     else:
-        parts.append(_line("on disk at ", (pretty_locations(r.footprint), LOC),
-                           (" below the establishing check's cwd, and everything under it", DIM)))
+        parts.append(_line("on disk at ", (pretty_locations(r.footprint), LOC)))
     if r.about:
         parts.append(_line((r.about, "italic")))
     readers = sorted(name for name, e in policy.reads.items() if r.name in e.regions)

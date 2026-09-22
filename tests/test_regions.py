@@ -307,14 +307,13 @@ class TestDescribe(unittest.TestCase):
     def test_regions_effects_and_dies_on(self) -> None:
         text = describe(load(policy_data()), "<t>")
         self.assertIn("## Regions", text)
-        self.assertIn("git.config (on disk at .git/config below the check's cwd, and everything under it)", text)
+        self.assertIn("git.config (on disk at .git/config)", text)
         self.assertIn("git.remote (remote): the remote repository", text)
         self.assertIn("effects: writes git.index (no network)", text)
         self.assertIn("effects: none (effect-free: kills no facts)", text)
         self.assertIn("effects: writes anything on the filesystem, anything remote", text)
         feature = next(line for line in text.splitlines() if line.startswith("- on-feature:"))
-        self.assertIn("depends on git.head; dies on: git checkout; cargo build; check is-clean; "
-                      "file writes under .git/HEAD (below the check's cwd)", feature)
+        self.assertIn("depends on git.head; dies on: git checkout; cargo build; check is-clean; any file write", feature)
         org = next(line for line in text.splitlines() if line.startswith("- org-checkout:"))
         self.assertNotIn("git commit", org)
         self.assertNotIn("git push", org)

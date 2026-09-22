@@ -143,9 +143,9 @@ only where the two meet. Skip this step when the tasks are check-then-act pairs;
 checked fact must outlive an intervening command, or when the same fact gates several commands.
 
 1. **Name the state.** One `[regions]` entry per piece of state a checker can observe and a
-   command can change, each with one medium: a `footprint` (where it lives, relative to the
-   checking validation's cwd, that path and everything below: `.git/config`, `.git/refs`, `.`
-   for the whole working tree) or `network = true`. Give each an `about` line; `--describe`
+   command can change, each with one medium: a `footprint` (where it lives, for the reader:
+   `.git/config`, `.git/refs`, `.` for the whole working tree) or `network = true`. Give each an
+   `about` line; `--describe`
    prints it. Reuse a shipped vocabulary when one exists (the git pack's `git.*` regions) rather
    than coining a second name for the same state: two names for one piece of state is a missed
    kill.
@@ -333,10 +333,10 @@ write = ["repos/**", 'reports/**/<\w+\.md>'] # clones + markdown reports only
 list  = ["repos/**", "reports/**"]
 
 [regions]                                    # step 3b: the state the checks depend on
-git.config = { footprint = ".git/config", about = "remotes, hooks: everything git reads from config" }
-git.refs   = { footprint = [".git/refs", ".git/packed-refs"], about = "local and remote-tracking refs" }
-git.index  = { footprint = ".git/index",  about = "the staging area" }
-git.remote = { network = true, about = "the remote repository" }
+"git.config" = { footprint = ".git/config", about = "remotes, hooks: everything git reads from config" }
+"git.refs"   = { footprint = [".git/refs", ".git/packed-refs"], about = "local and remote-tracking refs" }
+"git.index"  = { footprint = ".git/index",  about = "the staging area" }
+"git.remote" = { network = true, about = "the remote repository" }
 
 [atoms]
 org-checkout = { reads = ["git.config"] }    # C: dies only when git.config may have changed
@@ -401,9 +401,9 @@ host    = "api.github.com"
 methods = ["GET"]                            # GET/HEAD only: writes nothing by default
 ```
 
-`--describe` then reports, for `org-checkout`, `depends on git.config; dies on: git clone; file
-writes under .git/config (below the check's cwd)`: the commit and the push are not on the list,
-so `check("org-repo")`, `git add`, `git commit`, `git push` is one accepted sequence.
+`--describe` then reports, for `org-checkout`, `depends on git.config; dies on: git clone; any
+file write`: the commit and the push are not on the list, so `check("org-repo")`, `git add`,
+`git commit`, `git push` is one accepted sequence.
 
 Program-author note to append to their prompt (the rest is `--describe`'s output): *"Call
 `certora.check("org-repo", cwd=<path under repos/>)` once per repository before the git

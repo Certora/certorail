@@ -17,7 +17,7 @@ from collections.abc import Iterable
 from .analysis import pretty_location, pretty_regex
 from .effects import EVERYTHING, Effects
 from .ids import BUILTIN_ATOMS, NOT_OPTION, Atom, FlagName, SourceId
-from .policy import NetworkRule, Policy, Program, Validation, pretty_locations
+from .policy import NetworkRule, Policy, Program, Validation, literal_slot, pretty_locations
 from .templates import CWD, Constraint, Each, Flags, Flagset, HoleRef, Template, Token
 
 NOTATION = (
@@ -175,17 +175,8 @@ def dies_on(policy: Policy, atom_name: Atom) -> str:
         if policy.kills(v, atom_name):
             hits.append(f"check {v.name}")
     state = policy.read_set(atom_name)
-    if "fs" in state.media:
+    if "fs" in state.media or any(r.medium == "fs" and r.name in state.regions for r in policy.regions):
         hits.append("any file write")
-    else:
-        under = [
-            pretty_location(loc)
-            for r in policy.regions
-            if r.medium == "fs" and r.name in state.regions
-            for loc in r.footprint
-        ]
-        if under:
-            hits.append(f"file writes under {', '.join(under)} (below the check's cwd)")
     return "; ".join(hits) if hits else "nothing this policy permits"
 
 
@@ -195,10 +186,7 @@ def _regions(policy: Policy) -> list[str]:
         if r.medium == "network":
             where = "remote"
         else:
-            where = (
-                "on disk at " + ", ".join(pretty_location(loc) for loc in r.footprint)
-                + " below the check's cwd, and everything under it"
-            )
+            where = "on disk at " + ", ".join(pretty_location(loc) for loc in r.footprint)
         out.append(f"- {r.name} ({where})" + (f": {r.about}" if r.about else ""))
     return out
 
@@ -275,6 +263,12 @@ def _validation(v: Validation, policy: Policy, defined: frozenset[Atom]) -> list
         out.append(f"    {jailed}")
     if len(v.params) == 1:
         out.append(f'    also as an expression: certora.check_single("{v.name}", value)')
+    on_literals = sorted(a for atoms in v.establishes.values() for a in atoms if literal_slot(v, a) is not None)
+    if on_literals:
+        out.append(
+            f"    on a literal: no check needed -- a literal (or a value whose text is exactly known) "
+            f"where {', '.join(on_literals)} is required is checked at analysis time and carries it"
+        )
     return out
 
 
@@ -302,7 +296,11 @@ def _atoms(policy: Policy) -> list[str]:
         out.append(f"- {name}: <{pretty_regex(defined[name])}> -- a literal has it; so does a variable after "
                    "assert re.fullmatch with that exact regex")
     for name in sorted(pure):
-        out.append(f"- {name}: a property of the value's text, established by a check; survives calls")
+        literal = any(literal_slot(v, name) is not None for v in policy.validations)
+        out.append(
+            f"- {name}: a property of the value's text, established by a check; survives calls"
+            + ("; a literal carries it without a check (checked at analysis time)" if literal else "")
+        )
     out.append(
         "- built in (every policy; a literal or a guard such as assert not s.startswith('-') "
         "establishes them, and a check may vouch for one): "

@@ -1,15 +1,14 @@
-"""Footprints: where a filesystem region lives, and whether a file write can touch it (EFFECTS.md,
-"File writes: derived").
+"""Footprints: a location as a component sequence, and whether two locations can name a common
+path (``overlaps``).
 
-A region's ``footprint`` is spelled relative to the cwd of a validation that establishes an atom
-reading it (``.git/config``), or absolute. Its **instantiation** joins the validation's cwd
-location onto it -- ``repos/**`` and ``.git/config`` give ``repos/**/.git/config`` -- and denotes
-that path and every descendant. The location grammar allows one ``**`` and only as the last
-component or before one leaf, so an instantiation is not a ``LocationFact``: it is its own
-sequence of components and splats, and the write-location test is intersection non-emptiness of
-two such sequences -- does some concrete path lie in both what the write may name and what the
-footprint (with its implicit trailing descendants) may name? Both sides have finitely many
-splats, each standing for any run of components, so the test is a small alignment.
+A ``Footprint`` is a location as components and splats, denoting the paths the sequence spells
+and every descendant. ``overlaps`` asks whether some concrete path lies in both what a write may
+name and what a footprint may name; both sides have finitely many splats, each standing for any
+run of components, so the test is a small alignment. It serves the ``no-write`` protection
+(``Policy.protected``) and the FUSE view's filter (``fuseview``). A region's declared
+``footprint`` keeps its shape for the reader and for a per-program write jail if one comes; the
+kill of environmental atoms does not consult it -- a program's file write is a write of the whole
+filesystem medium (EFFECTS.md).
 
 Component equality folds case and normalises Unicode -- NFC, then casefold -- unconditionally:
 whether two spellings name one file is a property of the mount (APFS is case- and
@@ -54,15 +53,11 @@ type Item = Component | _Splat
 
 @dataclass(frozen=True)
 class Footprint:
-    """An instantiated footprint: components and splats, anchored at the sandbox root or the
-    filesystem root, denoting the paths the sequence spells *and every descendant*."""
+    """A location as components and splats, anchored at the sandbox root or the filesystem
+    root, denoting the paths the sequence spells *and every descendant*."""
 
     items: tuple[Item, ...]
     absolute: bool = False
-
-
-# a footprint no cwd anchors: it may lie anywhere, at either anchor
-ANYWHERE: Final = (Footprint((SPLAT,), absolute=False), Footprint((SPLAT,), absolute=True))
 
 
 def fold(name: str) -> str:
@@ -137,13 +132,9 @@ def items_of(loc: LocationFact) -> tuple[Item, ...]:
             return (*ps, SPLAT) if leaf is None else (*ps, SPLAT, leaf)
 
 
-def instantiate(base: LocationFact | None, footprint: LocationFact) -> Footprint:
-    """The footprint given its base: the cwd of the establishing validation for a relative
-    footprint, nothing for an absolute one (which takes no base). *base* None with a relative
-    footprint is the unanchored case; callers use ``ANYWHERE`` instead."""
-    if footprint.absolute or base is None:
-        return Footprint(items_of(footprint), footprint.absolute)
-    return Footprint(items_of(base) + items_of(footprint), base.absolute)
+def footprint_of(loc: LocationFact) -> Footprint:
+    """*loc* as a footprint: its components, anchored where it is."""
+    return Footprint(items_of(loc), loc.absolute)
 
 
 def overlaps(write: LocationFact, footprint: Footprint) -> bool:

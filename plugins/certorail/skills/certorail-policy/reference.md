@@ -117,8 +117,8 @@ Programs.
 (under `default-allow`, below, absent means the whole root, and a written `[]` still means
 nothing).
 `no-write`: locations **protected** from program writes whatever `write` grants -- a write whose
-path *may* lie at or below one is denied, by the same at-or-below alignment the kill uses for
-footprints. A `*` component may be anything, `.git` included, so under `repos/**/.git` a
+path *may* lie at or below one is denied, by an at-or-below alignment of the two locations. A
+`*` component may be anything, `.git` included, so under `repos/**/.git` a
 dynamic component needs a regex that cannot spell the name in any case: prove the path with
 `certora.pathmatch(p, r"repos/x/<\w+>")` or `"repos/<[^.].*>/README.md"`, not `"repos/x/*"`.
 An applied ruleset may protect
@@ -147,7 +147,7 @@ an error.
 
 | Key | Type | Meaning |
 |---|---|---|
-| `footprint` | location or list | the region's medium is the **filesystem**: where its state lives, spelled relative to the cwd of a validation that establishes an atom reading it (`.git/config`), or absolute. A footprint means that path *and every descendant*: write `.git/refs`, never `.git/refs/**` |
+| `footprint` | location or list | the region's medium is the **filesystem**: where its state lives (`.git/config`), for the reader. A footprint means that path *and every descendant*: write `.git/refs`, never `.git/refs/**`. The kill does not consult it: a program's own file write is a write of the whole filesystem medium, wherever it lands |
 | `network` | `true` | the region's medium is the **network**: its state is remote |
 | `about` | string | one line for `--describe` |
 
@@ -216,8 +216,8 @@ need no such condition: the jail does not depend on the arguments.
 
 A `[[network]]` rule is network medium by construction. Its default write set is every network
 region; a rule whose methods are only `GET` and `HEAD` defaults to writing nothing. The
-program's own file writes are filesystem medium; today they write every filesystem region (the
-footprint-based derivation is not yet in). `--describe` renders the result per rule
+program's own file writes are filesystem medium: each writes every filesystem region, wherever
+it lands. `--describe` renders the result per rule
 (`effects: writes git.refs (no network)`, then `jailed (enforced by the OS): no network`) and
 per environmental atom the computed `dies on:` list, which is what the program author reads.
 
@@ -628,6 +628,7 @@ Full rules in `SUBSET_PROMPT.md` (next to this file). The parts a policy author 
 ```
 certorail [--root DIR] [--policy FILE] [--check] [--no-jail] PROGRAM [-- ARG ...]
 certorail -c SOURCE [--root DIR] [--policy FILE] [--check] [--no-jail] [-- ARG ...]
+certorail-run [--check] (-c SOURCE | FILE) [-- ARG ...]
 certorail --describe [--root DIR] [--policy FILE]
 certorail init [--yes] [--root DIR]
 certorail policy install FILE | install-pack DIR | edit [--root DIR | --policy FILE] | list [--root DIR] | verify | pin DIR
@@ -663,6 +664,14 @@ governing `--root` (or `--policy FILE`) in `$VISUAL` / `$EDITOR` on a copy; when
 exits the copy is loaded against the installed tree, and it replaces the original only if it
 loads and still declares the same root. Otherwise the problems are printed and you choose to
 edit again or discard, as in `git add -p`.
+
+`certorail-run [--check] (-c SOURCE | FILE) [-- ARG ...]` is the entry point to allow an agent.
+Its interface is closed: `--check` is the only option and comes first, the program is inline or a
+file, the policy is the ambient one for the working directory, the jail is always on, and
+everything after the source or the file is an argument for the program, options included. A
+permission rule on its prefix (`Bash(certorail-run *)`) therefore admits a program and its
+arguments and nothing else, where a rule on `certorail -c` also admits `--policy`, `--root` and
+`--no-jail`.
 
 `--check` analyses and evaluates without running and prints every sink with its proven
 location. `certora.reveal_fact(x)` in the program -- a bare name, nothing else -- makes the

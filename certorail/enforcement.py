@@ -88,8 +88,7 @@ from .dangerous import (
     AccessKind,
     inert_condition,
 )
-from .effects import EVERYTHING, NOTHING, Effects, Medium
-from .footprints import Footprint, overlaps
+from .effects import EVERYTHING, NOTHING, Effects, Medium, whole
 from .ids import BUILTIN_ATOMS, Atom, CheckId, ParamName, ProgramName, RegionId, SourceId, ValidationName
 from .locations import parse_location
 from .templates import Binding, Elements, Many, Value, matches_leading
@@ -134,31 +133,27 @@ class Kill:
     handles: program code may have run inside it, so any list, dict, set or unknown-kind value
     may now hold a program object through an alias, or a non-inert value was stored into one.
 
-    ``file_writes`` are the program's own writes to proven locations, which write no named
-    region as such: what they kill is *derived* -- an atom dies when a write can lie at or below
-    one of the footprints instantiated for it (``footprints.py``), or when the atom depends on
-    everything or on the whole filesystem. A write to an unproven location is ``EVERYTHING``
-    instead (and the sink audit rejects the program anyway)."""
+    The program's own file writes write the whole filesystem medium: every atom reading a
+    filesystem region dies at one, wherever the write lands. (A derivation from the write's
+    proven location against per-atom region footprints was tried and removed: nothing confines a
+    program's writes to a footprint's neighbourhood, and the write grants and protections keep
+    footprints out of reach where it mattered.)"""
 
     writes: Effects
     opens: bool
-    file_writes: tuple[LocationFact, ...] = ()
 
     @property
     def nothing(self) -> bool:
-        return self.writes.empty and not self.opens and not self.file_writes
+        return self.writes.empty and not self.opens
 
     def __or__(self, other: "Kill") -> "Kill":
-        writes = list(self.file_writes)
-        for w in other.file_writes:
-            if w not in writes:  # locations are not hashable (a regex holds lists): dedupe by equality
-                writes.append(w)
-        return Kill(self.writes | other.writes, self.opens or other.opens, tuple(writes))
+        return Kill(self.writes | other.writes, self.opens or other.opens)
 
 
 NO_KILL = Kill(NOTHING, opens=False)  # the interpreter's own code over inert values
 OPENING = Kill(NOTHING, opens=True)  # a store that may put a program object into a standard value
 OPAQUE = Kill(EVERYTHING, opens=True)  # program code may run: anything may happen
+FILE_WRITE = Kill(whole(("fs",)), opens=False)  # the program's own write to a file: the filesystem medium
 
 
 @dataclass(frozen=True)
@@ -354,11 +349,6 @@ class Vocabulary:
     reads: Mapping[Atom, Effects] = field(default_factory=dict)
     writes: WriteTable = field(default_factory=WriteTable)
     medium_of: Mapping[RegionId, Medium] = field(default_factory=dict)
-    # per environmental atom, the instantiated footprints of the filesystem regions it reads:
-    # each region's footprint joined onto the cwd of each validation establishing the atom (an
-    # atom absent here reads no filesystem region by name; ``ANYWHERE`` when a footprint has no
-    # cwd to anchor it)
-    footprints: Mapping[Atom, tuple[Footprint, ...]] = field(default_factory=dict)
 
     def decidable_from_text(self) -> frozenset[Atom]:
         """The atoms a string alone can be shown to carry, by kind: the built-ins (structure),
@@ -749,7 +739,7 @@ class Enforcement:
 
         The ``certora`` calls and the file sinks are effects with a known medium that run no
         program code: a check writes what its signature declares, an exec or a request what the
-        rule it falls under writes, a file write everything (until footprints are derived), a
+        rule it falls under writes, a file write the whole filesystem medium, a
         read nothing. A roster builtin or module function whose argument condition is
         satisfied (``dangerous.INERT_CALLEES``: every argument inert, or only the keywords and
         the splats) and a method on an inert receiver with inert arguments are the interpreter's
@@ -773,13 +763,13 @@ class Enforcement:
                 bound = _bind(OpenCall, site)
                 if bound is None:
                     return OPAQUE if not (site.inert_keywords and site.inert_splats) else Kill(EVERYTHING, opens=False)
-                return self._open_kill(site, bound.mode, bound.file)
+                return self._open_kill(site, bound.mode)
             if full == ("print",):
                 # print(..., file=f) writes through the handle: a file write at its location.
                 # (A write handle is inert, so the roster condition alone would let it pass.)
                 target = site.handle_of("file")
                 if target is not None and target.writes is not None:
-                    return self._handle_write(target) if site.inert_keywords and site.inert_splats else OPAQUE
+                    return FILE_WRITE if site.inert_keywords and site.inert_splats else OPAQUE
             condition = inert_condition(full, self.modules)
             if condition is not None:
                 satisfied = (
@@ -806,65 +796,48 @@ class Enforcement:
                 bound = _bind(PathOpenCall, site)
                 if bound is None:
                     return OPAQUE if not (site.inert_keywords and site.inert_splats) else Kill(EVERYTHING, opens=False)
-                return self._open_kill(site, bound.mode, path)
+                return self._open_kill(site, bound.mode)
             if not site.inert_arguments:
                 return OPAQUE
             if PATH_SINK_METHODS[method] != "write":
                 return NO_KILL  # a read or a listing on a proven path changes nothing
-            # a write is an effect on the file, and on the target for the two methods that
-            # write a second path; what it kills is derived from the locations
-            if method in PATH_SINK_METHOD_TARGETS:
-                keyword, _ = PATH_SINK_METHOD_TARGETS[method]
-                target = site.keyword(keyword) if keyword in site.keywords else (site.args[0] if site.args else None)
-                return self._file_write(path, target)
-            return self._file_write(path)
+            return FILE_WRITE  # a write is an effect on the filesystem, wherever the file is
         if isinstance(receiver, Container):
             # a roster mutation runs no program code and its obligation was applied; an
             # off-roster method is the container's escape, reported by the walker
             return NO_KILL if method in CONTAINER_METHODS else OPAQUE
         if isinstance(receiver, Data) and receiver.writes is not None and method in FILE_WRITE_METHODS:
-            # a write through a handle opened for writing: a file write at its location
-            return self._handle_write(receiver) if site.inert_arguments else OPAQUE
+            # a write through a handle opened for writing: a file write
+            return FILE_WRITE if site.inert_arguments else OPAQUE
         if inert_receiver(receiver):
             if method in HASH_IDENTITY_METHODS and site.inert_keywords and site.inert_splats:
                 return NO_KILL if site.inert_arguments else OPENING
             return NO_KILL if site.inert_arguments else OPAQUE
         return OPAQUE
 
-    def _open_kill(self, site: Callsite, mode: Value, path: Value) -> Kill:
+    def _open_kill(self, site: Callsite, mode: Value) -> Kill:
         """``open`` / ``Path.open``: opening for writing truncates or creates the file -- a file
-        write at *path*, its kill derived -- and opening for reading changes nothing. Either way
-        the interpreter's code, unless a keyword (``opener=``) or a splat is not inert; an
-        unknown mode is taken as a write."""
+        write -- and opening for reading changes nothing. Either way the interpreter's code,
+        unless a keyword (``opener=``) or a splat is not inert; an unknown mode is taken as a
+        write."""
         if not (site.inert_keywords and site.inert_splats):
             return OPAQUE
         if _open_kind(_mode_text(mode, "r")) == "write":
-            return self._file_write(path)
+            return FILE_WRITE
         return NO_KILL
 
     def survivors(self, atoms: frozenset[Atom], kill: Kill) -> frozenset[Atom]:
         """The atoms of *atoms* that outlive *kill*: every built-in (a property of the text),
         every pure atom, and every environmental atom whose state the kill misses. An atom the
-        policy gave no ``reads`` depends on everything, so any effect kills it; one reading the
-        whole filesystem dies at any file write; one reading named filesystem regions dies at a
-        file write that can lie at or below a footprint instantiated for it."""
-        if kill.writes.empty and not kill.file_writes:
+        policy gave no ``reads`` depends on everything, so any effect kills it."""
+        if kill.writes.empty:
             return atoms
         vocabulary = self.vocabulary
         pure = vocabulary.pure_atoms
 
         def dies(a: Atom) -> bool:
             reads = vocabulary.reads.get(a)
-            if reads is None:
-                return True  # depends on everything: any effect
-            if kill.writes.meets(reads, vocabulary.medium_of):
-                return True
-            if not kill.file_writes:
-                return False
-            if "fs" in reads.media:
-                return True
-            footprints = vocabulary.footprints.get(a, ())
-            return any(overlaps(w, fp) for w in kill.file_writes for fp in footprints)
+            return reads is None or kill.writes.meets(reads, vocabulary.medium_of)
 
         return frozenset(a for a in atoms if a in BUILTIN_ATOMS or a in pure or not dies(a))
 
@@ -872,26 +845,6 @@ class Enforcement:
         """*fact* after *kill*."""
         kept = self.survivors(fact.atoms, kill)
         return fact if kept == fact.atoms else replace(fact, atoms=kept)
-
-    def _file_write(self, *paths: Value) -> Kill:
-        """The kill of the program's own write to *paths*: derived from the proven locations,
-        everything when one is not proven (the sink audit rejects the program then anyway)."""
-        located: list[LocationFact] = []
-        for p in paths:
-            found = locate(_as_fact(p))
-            if found is None:
-                return Kill(EVERYTHING, opens=False)
-            located.append(found.location)
-        return Kill(NOTHING, opens=False, file_writes=tuple(located))
-
-    @staticmethod
-    def _handle_write(handle: Data) -> Kill:
-        """The kill of a write through a handle: a file write at each location the file may be
-        at; everything for a handle whose location was lost (none is built today)."""
-        assert handle.writes is not None
-        if not handle.writes:
-            return Kill(EVERYTHING, opens=False)
-        return Kill(NOTHING, opens=False, file_writes=handle.writes)
 
     def _exec_writes(self, site: Callsite) -> Effects:
         """What the rule this exec selects writes: by the literal program and the leading words,

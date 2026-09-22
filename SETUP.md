@@ -107,9 +107,11 @@ installing. Without the plugin, register the hook yourself in `.claude/settings.
   "hooks": [{"type": "command", "command": "certorail session-hook"}]}]}}
 ```
 
-A useful pairing in your permission settings: allow `certorail -c` (running work through the
-jail should be the path of least resistance) and leave `certorail policy` prompting (changing
-what is trusted should never be frictionless).
+A useful pairing in your permission settings: allow `certorail-run` (running work through the
+jail should be the path of least resistance, and its interface is closed: `Bash(certorail-run *)`
+admits a program and its arguments and nothing else, where `certorail -c` would also admit
+`--policy`, `--root` and `--no-jail`) and leave `certorail policy` prompting (changing what is
+trusted should never be frictionless).
 
 ## Day two
 

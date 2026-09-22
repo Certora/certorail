@@ -487,26 +487,85 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         assert ns.program is not None  # the pair-is-required check above
         source, filename = ns.program.read_text(encoding="utf-8"), str(ns.program)
-    root = ns.root.resolve()
-    loaded = load_policy(ns.policy, root)
+    return _execute(
+        source, filename, args,
+        root=ns.root.resolve(), policy_path=ns.policy, check_only=ns.check, jail=not ns.no_jail,
+    )
+
+
+_RUN_USAGE = "usage: certorail-run [--check] (-c SOURCE | FILE) [-- ARG ...]"
+
+
+def run_main(argv: Sequence[str] | None = None) -> int:
+    """``certorail-run [--check] (-c SOURCE | FILE) [-- ARG ...]``: the agentic entry point, with
+    a closed interface. The program is inline or a file, the policy is the ambient one for the
+    working directory, the jail is on. ``--check`` is the only option and comes first; there is
+    no ``--policy``, ``--root`` or ``--no-jail`` to reach, so a shell allow-rule on this
+    command's prefix admits a program and its arguments and nothing else. Everything after the
+    source or the file is an argument for the program, options included (``--`` may precede
+    them, as with ``certorail``). Parsed by hand: argparse would read an option after
+    ``-c SOURCE`` as its own."""
+    words = list(sys.argv[1:] if argv is None else argv)
+    if words[:1] in (["-h"], ["--help"]):
+        print(_RUN_USAGE)
+        return 0
+    check_only = False
+    if words[:1] == ["--check"]:
+        check_only = True
+        words = words[1:]
+    if words[:1] in (["-c"], ["--command"]):
+        if len(words) < 2:
+            print(_RUN_USAGE, file=sys.stderr)
+            return 2
+        source, filename, rest = words[1], "<command>", words[2:]
+    elif words and not words[0].startswith("-"):
+        program = pathlib.Path(words[0])
+        try:
+            source = program.read_text(encoding="utf-8")
+        except OSError as e:
+            print(f"certorail-run: {e}", file=sys.stderr)
+            return 2
+        filename, rest = str(program), words[1:]
+    else:
+        print(_RUN_USAGE, file=sys.stderr)
+        return 2
+    args = rest[1:] if rest[:1] == ["--"] else rest
+    return _execute(
+        source, filename, args,
+        root=pathlib.Path.cwd().resolve(), policy_path=None, check_only=check_only, jail=True,
+    )
+
+
+def _execute(
+    source: str,
+    filename: str,
+    args: Sequence[str],
+    *,
+    root: pathlib.Path,
+    policy_path: pathlib.Path | None,
+    check_only: bool,
+    jail: bool,
+) -> int:
+    """Load the policy, check (and run) the program, report; the exit status."""
+    loaded = load_policy(policy_path, root)
     policy = loaded.policy
-    if ns.check:
+    if check_only:
         for line in loaded.provenance:
             print(line, file=sys.stderr)
     try:
-        if ns.check:
+        if check_only:
             outcome: Accepted | Rejected | subprocess.CompletedProcess[bytes] = check(
                 source, filename, policy, root
             )
         else:
-            outcome = run(source, filename, policy, root, args, jail=not ns.no_jail)
+            outcome = run(source, filename, policy, root, args, jail=jail)
     except SyntaxError as e:
         print(f"{filename}:{e.lineno}: syntax error: {e.msg}", file=sys.stderr)
         return 2
 
     match outcome:
         case Rejected():
-            if not ns.check:
+            if not check_only:
                 for line in loaded.provenance:  # the denial says "edit the policy": name it
                     print(line, file=sys.stderr)
             print(f"{filename}: rejected", file=sys.stderr)

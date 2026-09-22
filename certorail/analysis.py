@@ -1072,10 +1072,13 @@ class Data:
     ``writes`` makes the handle a *file opened for writing* at a proven location (EFFECTS.md,
     "File writes"): None for a read handle (and a source); a tuple of the locations the file
     may be at otherwise -- one for ``f = open(p, "w")``, several after a join. A write through
-    it (``f.write``, ``print(file=f)``) is a file write at those locations, killed by footprint
-    like ``p.write_text()``. This is what keeps a file object out of the inert set by accident:
-    a write-mode ``open`` at an *unproven* location binds no handle at all, so the object is
-    unknown and every method on it opaque."""
+    it (``f.write``, ``print(file=f)``) is a file write like ``p.write_text()``: a write of the
+    whole filesystem medium. **The locations themselves are not load-bearing**: no kill and no
+    audit reads them (the open was audited at its sink, and a write through the handle writes
+    the whole medium whatever they say); only ``reveal_fact``'s wording and the join's union
+    touch them. What matters is None versus not-None. This is what keeps a file object out of
+    the inert set by accident: a write-mode ``open`` at an *unproven* location binds no handle
+    at all, so the object is unknown and every method on it opaque."""
     sources: frozenset[SourceId] = frozenset()
     closed: bool = True
     writes: tuple[LocationFact, ...] | None = None

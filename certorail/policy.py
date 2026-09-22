@@ -42,8 +42,8 @@ everything in this file. ``program(..., requires=[...])`` consumes atoms: the ex
 carry them, live, at the site.
 
 *Regions* (EFFECTS.md) make "any potentially-effectful call" precise. ``region()`` names a piece
-of state with one medium -- ``fs``, by a footprint relative to the cwd of a validation whose atom
-depends on it (that path and everything below), or ``network`` -- and rules say what they
+of state with one medium -- ``fs``, with a footprint saying where it lives, or ``network`` -- and
+rules say what they
 **write** (``writes=[...]``, within the media they reach: ``network=False``, ``write_fs=False``)
 while environmental atoms say what they depend on (``reads={atom: [...]}``). An effect kills an
 atom exactly when the two sets meet; undeclared means everything, so a policy that says nothing
@@ -143,7 +143,6 @@ from . import footprints, fsview
 
 if TYPE_CHECKING:
     from .viewdaemon import ViewSpec
-from .footprints import Footprint
 from .walker import Report
 
 # ---------------------------------------------------------------------------
@@ -831,9 +830,10 @@ def source(name: str, location: Where | Iterable[Where]) -> Source:
 @dataclass(frozen=True)
 class Region:
     """A piece of state a checker can observe and a command can change, with exactly one
-    medium. ``fs``: the *footprint* says where it lives, one or more locations relative to the
-    cwd of a validation that establishes an atom depending on it (or absolute), each meaning that
-    path and every descendant. ``network``: remote state, no footprint."""
+    medium. ``fs``: the *footprint* says where it lives, one or more locations each meaning that
+    path and every descendant -- for the reader, and for a per-program write jail if one comes;
+    the kill does not consult it (a program's file write is a write of the whole medium).
+    ``network``: remote state, no footprint."""
 
     name: RegionId
     medium: Medium
@@ -928,7 +928,7 @@ class Refusal:
 # ---------------------------------------------------------------------------
 
 
-def _literal_slot(v: Validation, atom_name: Atom) -> str | None:
+def literal_slot(v: Validation, atom_name: Atom) -> str | None:
     """The single input slot through which *v* can establish *atom_name* on a literal, if it is a
     literal checker at all: effect-free (an empty write set: safe to run at check time), the atom
     pure (the result stays valid), and exactly one input -- one declared parameter, or none plus
@@ -1151,7 +1151,7 @@ class Policy:
             for v in vals
             for established in v.establishes.values()
             for a in established
-            if _literal_slot(v, a) is not None
+            if literal_slot(v, a) is not None
         }
         net_rules = []
         for r in net_in:
@@ -1192,10 +1192,10 @@ class Policy:
 
     def protected(self, loc: LocationFact) -> LocationFact | None:
         """The first ``no_write`` location a write at *loc* may touch -- a path the write may name
-        lying at or below one the protection names (``footprints.overlaps``, the same alignment
-        the kill uses) -- or None when the write provably stays outside every one."""
+        lying at or below one the protection names (``footprints.overlaps``) -- or None when the
+        write provably stays outside every one."""
         for guarded in self.no_write:
-            if footprints.overlaps(loc, footprints.instantiate(None, guarded)):
+            if footprints.overlaps(loc, footprints.footprint_of(guarded)):
                 return guarded
         return None
 
@@ -1252,7 +1252,7 @@ class Policy:
                 for v in self.validations
                 for established in v.establishes.values()
                 for a in established
-                if a not in BUILTIN_ATOMS and _literal_slot(v, a) is not None
+                if a not in BUILTIN_ATOMS and literal_slot(v, a) is not None
             ),
             sources=SourceTable(
                 exec=tuple(
@@ -1271,36 +1271,7 @@ class Policy:
                 network=tuple((r.host, r.methods, self.write_set(r)) for r in self.network),
             ),
             medium_of=self.medium_of,
-            footprints=self.footprints(),
         )
-
-    def footprints(self) -> dict[Atom, tuple[Footprint, ...]]:
-        """Per environmental atom with declared ``reads``, the instantiated footprints of the
-        filesystem regions it reads (EFFECTS.md, "File writes: derived"): each region's
-        footprint joined onto each cwd of each validation that establishes the atom -- the
-        place the check observes from -- flattened into one any-of list. An absolute footprint
-        takes no base. A relative footprint under a validation with no cwd has no place; it is
-        taken to lie anywhere, so any file write kills the atom."""
-        by_name = {r.name: r for r in self.regions}
-        out: dict[Atom, tuple[Footprint, ...]] = {}
-        for atom_name, reads in self.reads.items():
-            regions = [by_name[r] for r in reads.regions if by_name[r].medium == "fs"]
-            if not regions:
-                continue
-            found: list[Footprint] = []
-            for v in self.validations:
-                if not any(atom_name in atoms for atoms in v.establishes.values()):
-                    continue
-                for r in regions:
-                    for f in r.footprint:
-                        if f.absolute:
-                            found.append(footprints.instantiate(None, f))
-                        elif v.cwd is None:
-                            found.extend(footprints.ANYWHERE)
-                        else:
-                            found.extend(footprints.instantiate(c, f) for c in v.cwd)
-            out[atom_name] = tuple(found)
-        return out
 
     def exec_command(
         self,
@@ -1422,7 +1393,7 @@ class Policy:
                 cache[key] = any(
                     _run_literal_checker(v, slot, text, rootpath, self.mounts(rootpath, v, view))
                     for v in self.validations
-                    if (slot := _literal_slot(v, atom)) is not None
+                    if (slot := literal_slot(v, atom)) is not None
                 )
             return cache[key]
 

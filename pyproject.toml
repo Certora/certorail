@@ -28,9 +28,13 @@ fuse = ["pyfuse3; sys_platform == 'linux'", "trio; sys_platform == 'linux'"]
 dev = ["pytest"]
 
 # `uv tool install .` puts `certorail` on the PATH: analyse, check against the default
-# policy, and run --  `certorail program.py [--root DIR] [--check] [-- ARG ...]`
+# policy, and run --  `certorail program.py [--root DIR] [--check] [-- ARG ...]`.
+# `certorail-run [--check] (-c SOURCE | FILE) [-- ARG ...]` is the agent's entry point: the
+# ambient policy only, always jailed -- no --policy/--root/--no-jail exists, so a shell
+# allow-rule on its prefix admits nothing but a program and its arguments
 [project.scripts]
 certorail = "certorail.host:main"
+certorail-run = "certorail.host:run_main"
 certorail-explore = "certorail.explorer:main"
 
 [tool.setuptools.packages.find]

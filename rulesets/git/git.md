@@ -176,8 +176,8 @@ record of a wrong turn):
 8. `[filesystem] no-write = ["${where}/**/.git"]` in a ruleset (`git-vocabulary.toml` carries
    it). As proposed it was a load-time check on the root's write grants; as built it is a
    **protection**: a program write whose path may lie at or below the location is denied at
-   analysis time whatever `write` grants, by the same at-or-below alignment EFFECTS.md uses for
-   footprints. The load-time reading was unsatisfiable: a root granting `repos/*/**` always
+   analysis time whatever `write` grants, by an at-or-below alignment of the two locations
+   (`footprints.overlaps`). The load-time reading was unsatisfiable: a root granting `repos/*/**` always
    *can* name `.git`, and the regex exclusion the example wrote (`<(?!\.git\Z).+>`) is opaque to
    the conservative component match. So the pack imposes the exclusion rather than asking for
    it, and the root grants `repos/*/**` plainly. The cost is precision: a `*` component may be

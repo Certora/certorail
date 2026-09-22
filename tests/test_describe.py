@@ -85,13 +85,19 @@ class TestDescribe(unittest.TestCase):
             "establishes on cwd: org-checkout (environmental)",
             'certora.check("vetted", value=<str>)',
             'certora.check_single("vetted", value)',
+            "on a literal: no check needed -- a literal (or a value whose text is exactly known) where vetted is "
+            "required is checked at analysis time and carries it",
             "- no-flag: </[^-].*/>",
-            "- vetted: a property of the value's text",
+            "- vetted: a property of the value's text, established by a check; survives calls; a literal carries "
+            "it without a check (checked at analysis time)",
             "- org-checkout: a property of the environment",
             "- GET https://api.github.com; the URL must be validated by vetted",
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, self.text)
+        # only the literal checker says so: org-repo is environmental, and its atom is never
+        # discharged on a literal
+        self.assertEqual(self.text.count("on a literal:"), 1)
 
     def test_the_cli_flag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
