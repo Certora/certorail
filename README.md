@@ -8,7 +8,7 @@ policy allows — run in an isolated interpreter. Anything unprovable is rejecte
 
 ## Getting Started
 
-See the instructions in the [setup guide](SETUP.md). You will need at least `srt` and, on Linux, `bubblewrap`.
+See the instructions in the [setup guide](SETUP.md). You will need at least `srt` and `uv` plus, on Linux, `bubblewrap`.
 There is no support (yet) for Windows platforms, MacOS and Linux only for now.
 
 ## Usage
