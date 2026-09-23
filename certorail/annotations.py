@@ -42,7 +42,7 @@ from certorail.analysis import (
     UrlString,
     UrlString,
     ValidationFact,
-    _literal_location,
+    _literal_static,
     _safe_path_extension,
     alternation,
     concat,
@@ -244,7 +244,7 @@ def _location_of(t: Term, name: str, args: Args, kwargs: Kwargs) -> LocationFact
             if prefix_str in (".", ""):
                 prefix: tuple[Component, ...] = ()
             elif prefix_str is not None and prefix_str.startswith("/"):
-                base = _literal_location(prefix_str)
+                base = _literal_static(prefix_str)
                 if base is None:
                     raise _err(t, f"absolute path {prefix_str!r} must be free of '..'")
                 prefix = base.path_components
@@ -280,7 +280,7 @@ def _url_fact(t: Term, args: Args, kwargs: Kwargs) -> UrlString:
         prefix = path_t.as_str()
         if prefix is None or not prefix.startswith("/"):
             raise _err(path_t, 'url(path_within=...) must be a string literal starting with "/"')
-        loc = _literal_location(prefix)
+        loc = _literal_static(prefix)
         if loc is None:
             raise _err(path_t, "url(path_within=...) must be free of '..'")
         path = splat_under(loc)

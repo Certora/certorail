@@ -5,7 +5,7 @@ A ``Footprint`` is a location as components and splats, denoting the paths the s
 and every descendant. ``overlaps`` asks whether some concrete path lies in both what a write may
 name and what a footprint may name; both sides have finitely many splats, each standing for any
 run of components, so the test is a small alignment. It serves the ``no-write`` protection
-(``Policy.protected``) and the FUSE view's filter (``fuseview``). A region's declared
+(``Policy.protected``). A region's declared
 ``footprint`` keeps its shape for the reader and for a per-program write jail if one comes; the
 kill of environmental atoms does not consult it -- a program's file write is a write of the whole
 filesystem medium (EFFECTS.md).
@@ -142,10 +142,10 @@ def overlaps(write: LocationFact, footprint: Footprint) -> bool:
     never relate, as everywhere in the location domain."""
     if write.absolute != footprint.absolute:
         return False
-    return _intersects(items_of(write), footprint.items + (SPLAT,))
+    return intersect(items_of(write), footprint.items + (SPLAT,))
 
 
-def _intersects(a: tuple[Item, ...], b: tuple[Item, ...]) -> bool:
+def intersect(a: tuple[Item, ...], b: tuple[Item, ...]) -> bool:
     """Is some concrete component sequence in both languages? A splat consumes any run of the
     other side's items (a component denotes at least one name, so consuming it is always
     possible); two components must be able to name the same thing."""

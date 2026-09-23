@@ -77,7 +77,7 @@ from certorail.analysis import (
     PseudoRegex,
     RegexLit,
     StaticPath,
-    _literal_location,
+    _literal_static,
     _safe_path_extension,
     alternation,
     concat,
@@ -89,7 +89,7 @@ from certorail.analysis import (
     url_of,
     ValidationFact
 )
-from certorail.childjail import Environment, Jail, JailUnavailable, Mounts, View, confined, environment_spec
+from certorail.childjail import Environment, Jail, JailUnavailable, View, environment_spec
 from certorail.confinement import Additions, Confinement, FilesystemSection, HostFilesystem, PolicyFilesystem
 from certorail.effects import EVERYTHING, NOTHING, Effects, Medium, effects_of, whole
 from certorail.ids import (
@@ -106,7 +106,7 @@ from certorail.ids import (
     spelled,
 )
 from certorail.integrity import PIN_PATTERN, materialize
-from certorail.locations import parse_location
+from certorail.locations import absolute_prefix_problem, parse_location
 from certorail.templates import (
     BindError,
     Constraint,
@@ -138,9 +138,10 @@ from certorail.enforcement import (
     WriteTable,
     host_matches,
 )
-from certorail import footprints, fsview
+from certorail import footprints
 
 if TYPE_CHECKING:
+    from certorail.sandbox import Spawner
     from certorail.viewdaemon import ViewSpec
 from certorail.walker import Report
 
@@ -181,7 +182,7 @@ def _components_of(fragment: markers.Fragment) -> tuple[Component, ...]:
 
 def _absolute_prefix(s: str) -> StaticPath:
     """A leading-"/" literal as an absolute location."""
-    loc = _literal_location(s)
+    loc = _literal_static(s)
     if loc is None:
         raise ValueError(f"absolute path {s!r} must be free of '..'")
     return loc
@@ -745,7 +746,8 @@ class NetworkRule:
     # the source atom responses from this rule yield (PROVENANCE.md)
     source: SourceId | None = None
     # the URL paths this rule admits, server-absolute (a leading "/"), any-of; empty: any path.
-    # Checked statically on the proven URL path, and by the broker on every hop, percent-decoded
+    # Checked statically on the proven URL path, and by the broker on every hop, both reading the
+    # path as sent (``url_path_location``)
     paths: tuple[LocationFact, ...] = ()
     # the network regions requests under this rule write (EFFECTS.md); None: undeclared -- the
     # whole network medium, or nothing when the rule admits only GET and HEAD
@@ -794,6 +796,43 @@ def network(
         path_locs,
         None if writes is None else effects_of(writes),
     )
+
+
+def _hosts_overlap(a: str, b: str) -> bool:
+    """May one host name match both host patterns (an exact name, or ``*.suffix``)?"""
+    if a.startswith("*.") and b.startswith("*."):
+        sa, sb = a[2:], b[2:]
+        return sa == sb or sa.endswith("." + sb) or sb.endswith("." + sa)
+    if a.startswith("*."):
+        return b.endswith("." + a[2:])
+    if b.startswith("*."):
+        return a.endswith("." + b[2:])
+    return a == b
+
+
+def _endpoints(rule: NetworkRule) -> frozenset[tuple[str, int]]:
+    """The (scheme, port) pairs a rule admits."""
+    return frozenset(
+        (s, p) for s in rule.schemes for p in (rule.ports or frozenset({default_port(s)}))
+    )
+
+
+def networks_overlap(a: NetworkRule, b: NetworkRule) -> bool:
+    """May one request match both rules? Then which rule governs it -- its atoms, its source, its
+    caps -- would depend on the order of the rules, so the policy refuses the pair. Host,
+    scheme and port, method, and path must all be able to coincide; no ``path`` is every path."""
+    if not _hosts_overlap(a.host, b.host):
+        return False
+    if not (_endpoints(a) & _endpoints(b)):
+        return False
+    if a.methods and b.methods and not (a.methods & b.methods):
+        return False
+    if a.paths and b.paths:
+        return any(
+            footprints.intersect(footprints.items_of(p), footprints.items_of(q))
+            for p in a.paths for q in b.paths
+        )
+    return True
 
 
 def path_permitted(rule: NetworkRule, url_path: LocationFact | None) -> bool:
@@ -941,11 +980,13 @@ def literal_slot(v: Validation, atom_name: Atom) -> str | None:
     return None
 
 
-def _run_literal_checker(v: Validation, slot: str, text: str, root: pathlib.Path, mounts: Mounts) -> bool:
+def _run_literal_checker(
+    v: Validation, slot: str, text: str, root: pathlib.Path, confinement: Confinement, spawner: "Spawner",
+) -> bool:
     """One evaluator run with *text* bound to *slot*: argv substitution for a parameter slot,
     ``cwd=root/text`` for the cwd slot (a pure text predicate should not care where it runs, so a
-    parameter-slot checker runs at the root). *mounts* is the policy's view, for a confined
-    evaluator."""
+    parameter-slot checker runs at the root), under the validation's *confinement* as *spawner*
+    realises it."""
     argv = [piece if isinstance(piece, str) else text for piece in v.argv]
     if v.evaluator is not None:
         # exec the load-time snapshot: what was (pin-)verified at load is what runs
@@ -954,7 +995,7 @@ def _run_literal_checker(v: Validation, slot: str, text: str, root: pathlib.Path
     if not cwd.is_dir():
         return False
     try:
-        with confined(argv, v.jail, mounts=mounts, cwd=cwd) as spawn:
+        with spawner.spawn(confinement, argv, cwd) as spawn:
             result = subprocess.run(
                 spawn.argv, cwd=cwd, env=spawn.env, pass_fds=spawn.pass_fds, shell=False,
                 capture_output=True, check=False,
@@ -996,6 +1037,10 @@ class Policy:
     # program name and nothing finer -- the one classification of an exec that is decidable
     # (`git -C x push` is a `git push`, and no shape matching would say so)
     default_allow: bool = False
+    # strict: a confined grant whose jail cannot express the policy exactly refuses the run
+    # (``host.run``) and a spawn with a protection not there to bind (``sandbox``), instead of
+    # warning and running
+    strict: bool = False
     # the programs `[[deny]]` named, by leading name: named, so governed; with no rule of their
     # own, refused outright -- the first-verb blacklist under default-allow
     denied: frozenset[ProgramName] = frozenset()
@@ -1026,6 +1071,7 @@ class Policy:
         applied: Iterable[str] = (),
         default_allow: bool = False,
         denied: Iterable[str] = (),
+        strict: bool = False,
     ) -> "Policy":
         vals = tuple(validations)
         names = [v.name for v in vals]
@@ -1076,6 +1122,15 @@ class Policy:
                             f"program {pname!r}: forms {' '.join(a.leading_words)!r} and "
                             f"{' '.join(b.leading_words)!r} overlap; the applicable rule must be unique"
                         )
+        # the same for network rules: one request, one governing rule -- its atoms, its source,
+        # its caps -- decided by the URL alone, identically by the analysis and the broker
+        for i, a in enumerate(net_in):
+            for b in net_in[i + 1 :]:
+                if networks_overlap(a, b):
+                    raise ValueError(
+                        f"network rules for {a.host!r} and {b.host!r} overlap: a request could match "
+                        "both; narrow the hosts, schemes, ports, methods or paths so exactly one applies"
+                    )
         # an atom means one thing: pure in one declaration and environmental in another is a bug.
         # A defined atom is pure by construction, however it is established; so are the
         # built-ins (properties of the text), which a checker may establish without pure()
@@ -1169,11 +1224,22 @@ class Policy:
                 else:
                     resolved.add(ra)
             net_rules.append(replace(r, requires=frozenset(resolved)))
+        read_l, write_l, no_write_l = _locations(read), _locations(write), _locations(no_write)
+        # what the jails lower: the filesystem section and the rules' own mounts
+        jailed = [("read", read_l), ("write", write_l), ("no-write", no_write_l)] + [
+            (f"{' '.join(r.leading_words) if isinstance(r, Program) else r.name} {kind}", locs)
+            for r in (*progs, *vals)
+            for kind, locs in (("mount-read", r.mount_read), ("mount-write", r.mount_write))
+        ]
+        for what, locs in jailed:
+            for loc in locs:
+                if (problem := absolute_prefix_problem(loc)) is not None:
+                    raise ValueError(f"{what} {pretty_location(loc)!r}: {problem}")
         return cls(
-            read=_locations(read), write=_locations(write),
-            no_write=_locations(no_write), programs=progs, validations=vals, atoms=atoms_t,
+            read=read_l, write=write_l,
+            no_write=no_write_l, programs=progs, validations=vals, atoms=atoms_t,
             network=tuple(net_rules), sources=srcs, regions=regs, reads=reads_m, applied=tuple(applied),
-            default_allow=default_allow, denied=frozenset(ProgramName(d) for d in denied),
+            default_allow=default_allow, denied=frozenset(ProgramName(d) for d in denied), strict=strict,
         )
 
     def governed(self, name: str) -> bool:
@@ -1269,7 +1335,43 @@ class Policy:
                 network=tuple((r.host, r.methods, self.write_set(r)) for r in self.network),
             ),
             medium_of=self.medium_of,
+            network_sources=self.network_sources,
         )
+
+    def governing_rules(self, method: str, url: "ValidationFact | str | None") -> list[NetworkRule] | None:
+        """The rule governing each request a proven URL may denote -- one per request, since
+        overlapping rules are refused at load -- or None when the scheme, the netloc or a
+        governing rule is not known. Found exactly as ``evaluate`` finds the rule it proves."""
+        lifted = url_of(url)
+        if lifted is None or lifted.scheme is None or lifted.netloc is None:
+            return None
+        endpoints = _netloc_endpoints(lifted.netloc)
+        if endpoints is None:
+            return None
+        found: list[NetworkRule] = []
+        for host, port in endpoints:
+            resolved = port if port is not None else default_port(lifted.scheme)
+            rules = [
+                r for r in self.network
+                if matches_endpoint(r, lifted.scheme, host, resolved, method) and path_permitted(r, lifted.path)
+            ]
+            if len(rules) != 1:
+                return None
+            found.append(rules[0])
+        return found
+
+    def network_sources(self, method: str, url: "ValidationFact | None") -> frozenset[SourceId]:
+        """The source atoms a response carries: the ``source`` of the rule governing the request,
+        when every request the URL may denote is governed by a rule naming that same source;
+        nothing otherwise."""
+        rules = self.governing_rules(method, url)
+        if not rules:
+            return frozenset()
+        named = {r.source for r in rules}
+        if len(named) != 1:
+            return frozenset()
+        (only,) = named
+        return frozenset() if only is None else frozenset({only})
 
     def exec_command(
         self,
@@ -1291,7 +1393,7 @@ class Policy:
         guard, textual atoms -- run again on the strings. The template, not the program,
         then composes the argv."""
         rules = [p for p in self.programs if p.name == program_name]
-        cwd_loc = _literal_location(cwd)
+        cwd_loc = _literal_static(cwd)
         if cwd_loc is None:
             return Refusal(f"cwd {cwd!r} has no safe location")
         if not rules:
@@ -1337,19 +1439,6 @@ class Policy:
         outcome = self.exec_command(program_name, arguments, {}, cwd)
         return outcome.reason if isinstance(outcome, Refusal) else None
 
-    def mounts(
-        self, root: pathlib.Path, rule: "Program | Validation | None" = None, view: pathlib.Path | None = None,
-    ) -> Mounts:
-        """The filesystem section lowered to the binds a confined child gets (``fsview``,
-        MOUNTS.md): the same grants and protections the program is held to, under *root*, plus
-        what *rule* mounts for itself (``exec.mount-read`` / ``exec.mount-write``). With *view*,
-        the FUSE mountpoint serving the root (``viewdaemon``), the root-relative section is the
-        view's and only the absolute locations and the rule's additions are binds."""
-        base = fsview.mounts(root, self.read, self.write, self.no_write, view=view)
-        if rule is None or not (rule.mount_read or rule.mount_write):
-            return base
-        return base | fsview.additions(root, rule.mount_read, rule.mount_write)
-
     @property
     def confines(self) -> bool:
         """Does some grant run its child under the policy view (``exec.view = "policy"``)?"""
@@ -1376,12 +1465,12 @@ class Policy:
         )
         return Confinement(rule.env, rule.network, rule.write_fs, rule.spawn, filesystem)
 
-    def discharger(self, root: PathLike[str] | str, view: pathlib.Path | None = None) -> Discharge:
+    def discharger(self, root: PathLike[str] | str, spawner: "Spawner") -> Discharge:
         """A runner for literal checkers: ``discharge(atom, text)`` is True when some effect-free
         validation establishing the pure *atom* through a single slot accepts the exact *text*,
-        run right now under *root* (a confined one under the policy view, *view* being the FUSE
-        mountpoint when one is attached). Cached per (atom, text); handed to ``evaluate`` and to
-        ``analyze`` so constants need neither a ``certora.check`` nor a regex definition."""
+        run right now under *root*, confined as its rule says by *spawner* (the run's, with its
+        FUSE view). Cached per (atom, text); handed to ``evaluate`` and to ``analyze`` so
+        constants need neither a ``certora.check`` nor a regex definition."""
         rootpath = pathlib.Path(root)
         cache: dict[tuple[Atom, str], bool] = {}
 
@@ -1389,7 +1478,7 @@ class Policy:
             key = (atom, text)
             if key not in cache:
                 cache[key] = any(
-                    _run_literal_checker(v, slot, text, rootpath, self.mounts(rootpath, v, view))
+                    _run_literal_checker(v, slot, text, rootpath, self.confinement(v, rootpath), spawner)
                     for v in self.validations
                     if (slot := literal_slot(v, atom)) is not None
                 )

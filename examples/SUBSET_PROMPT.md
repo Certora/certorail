@@ -76,7 +76,7 @@ that kind of access there; otherwise the program is rejected: `open(path, …)`,
 `.write_text()`, `.write_bytes()`, `.iterdir()`, `.glob()`, `.rglob()`, `.exists()`, `.is_file()`, `.is_dir()`,
 `.mkdir()`, `.touch()`, `.chmod()`, `.replace(target)` (both the path and `target` are writes). These methods may
 only be called, never referenced (`f = p.read_text` is a violation). The mode of `open` decides read vs write;
-listing and existence probes count as `list`.
+listing and existence probes count as reads.
 
 Locations are relative to the sandbox root (the working directory); `"."` is the root. A literal beginning
 with `/` names a location under the *filesystem* root instead. It is accepted only where the policy grants

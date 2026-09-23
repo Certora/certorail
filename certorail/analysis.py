@@ -177,6 +177,13 @@ class AnyStr:
     """
 
 @dataclass(frozen=True)
+class AnyComponent:
+    """Any one safe path component: a string with no "/" that is none of "", "." or ".." (see
+    ``is_safe_name``). The text an ``AnyName`` component spells, and what a directory listing
+    yields -- the text domain's name for it, so text and location convert structurally both
+    ways."""
+
+@dataclass(frozen=True)
 class Both:
     """The intersection of its parts: every conjunct holds of the value. Built by ``both`` when
     two independent readings of one value's text meet -- the shape an f-string gave it and the
@@ -186,9 +193,10 @@ class Both:
     conjunctions are structurally equal (``walker._join`` compares facts for equality)."""
     all_of: list["PseudoRegex"]
 
-type PseudoRegex = Alternation | Concat | RegexLit | Exact | AnyStr | Both
+type PseudoRegex = Alternation | Concat | RegexLit | Exact | AnyStr | AnyComponent | Both
 
 ANY_STR = AnyStr()
+ANY_COMPONENT = AnyComponent()
 
 # ---------------------------------------------------------------------------
 # Path components
@@ -327,12 +335,10 @@ type LocationFact = StaticPath | DirSplat
 SLASH = Exact("/")
 ROOT = Exact(".")                    # canonical spelling of the empty relative path
 
-# One safe component (see ``is_safe_name``) as a regex, written without anchors so it can sit
-# anywhere inside a Concat:   [^.]...  |  .[^.]...  |  ..[at least one more char]
+# Zero or more safe components (see ``is_safe_name``), each followed by "/". PseudoRegex has no
+# repetition node, so this is the one place the translation is a literal rather than structural.
+# One component, unanchored:   [^.]...  |  .[^.]...  |  ..[at least one more char]
 _COMPONENT_RE = r"(?:[^/.][^/]*|\.[^/.][^/]*|\.\.[^/]+)"
-COMPONENT = RegexLit(_COMPONENT_RE)
-# Zero or more such components, each followed by "/". PseudoRegex has no repetition node, so this
-# is the one place the translation is a literal rather than structural.
 DESCENDANTS = RegexLit(f"(?:{_COMPONENT_RE}/)*")
 
 
@@ -426,7 +432,7 @@ def component_to_regex(c: Component) -> PseudoRegex:
         case Named(name=name):
             return Exact(name)
         case AnyName():
-            return COMPONENT
+            return ANY_COMPONENT
         case Matching(regex=regex):
             return regex
         case OneOf(names=names):
@@ -476,6 +482,8 @@ def pretty_regex(p: PseudoRegex) -> str:
             return s
         case AnyStr():
             return ".*"
+        case AnyComponent():
+            return "*"
         case RegexLit(reg=r):
             return f"/{r}/"
         case Concat(seq=pieces):
@@ -539,6 +547,8 @@ def _regex_accepts(p: PseudoRegex, s: str) -> bool:
     match p:
         case AnyStr():
             return True
+        case AnyComponent():
+            return is_safe_name(s)
         case Exact(exact_str=e):
             return e == s
         case RegexLit(reg=r):
@@ -603,7 +613,7 @@ def _normalize_component(c: Component) -> Component:
     """Fold a Matching with a finite language into the equivalent Named/OneOf, and a singleton
     OneOf into a Named, so the structural cases below see one spelling per meaning."""
     match c:
-        case Matching(regex=AnyStr()):
+        case Matching(regex=AnyStr() | AnyComponent()):
             return ANY_NAME
         case Matching(regex=Exact(exact_str=s)) if is_safe_name(s):
             return Named(s)
@@ -666,6 +676,8 @@ def carried(atoms: frozenset[Atom]) -> frozenset[Atom]:
 
 def _explicit_check_no_parent(regex: PseudoRegex) -> bool:
     match regex:
+        case AnyComponent():
+            return True
         case Alternation():
             return all(_explicit_check_no_parent(p) for p in regex.any_of)
         case Exact():
@@ -679,6 +691,8 @@ def _explicit_check_no_parent(regex: PseudoRegex) -> bool:
 
 def _explicit_check_no_slash(regex: PseudoRegex) -> bool:
     match regex:
+        case AnyComponent():
+            return True
         case Alternation():
             return all(_explicit_check_no_slash(p) for p in regex.any_of)
         case Exact():
@@ -690,21 +704,10 @@ def _explicit_check_no_slash(regex: PseudoRegex) -> bool:
         case Both(all_of=parts):
             return any(_explicit_check_no_slash(p) for p in parts)
 
-def _explicit_check_not_absolute(regex: PseudoRegex) -> bool:
-    match regex:
-        case Alternation():
-            return all(_explicit_check_not_absolute(p) for p in regex.any_of)
-        case Exact():
-            return not regex.exact_str.startswith("/")
-        case RegexLit() | AnyStr():
-            return False
-        case Concat():
-            return _explicit_check_not_absolute(regex.seq[0])
-        case Both(all_of=parts):
-            return any(_explicit_check_not_absolute(p) for p in parts)
-
 def _explicit_check_not_dot_dot(regex: PseudoRegex) -> bool:
     match regex:
+        case AnyComponent():
+            return True
         case Alternation():
             return all(_explicit_check_not_dot_dot(p) for p in regex.any_of)
         case Exact():
@@ -721,101 +724,132 @@ def _explicit_check_not_dot_dot(regex: PseudoRegex) -> bool:
 # typed Any; it is the one parser whose reading of a pattern is the reading that will be enforced.
 _RE_PARSER: Any = getattr(re, "_parser")
 _RE_CONSTANTS: Any = getattr(re, "_constants")
-_DASH = ord("-")
+
+# the character classes a parsed ``\d`` & co. stand for, by the parser's category name
+_CATEGORY_ESCAPES = {
+    "DIGIT": r"\d", "NOT_DIGIT": r"\D", "SPACE": r"\s", "NOT_SPACE": r"\S",
+    "WORD": r"\w", "NOT_WORD": r"\W",
+}
 
 
-def _charset_has_dash(items: Any) -> bool:
-    """Does a bracket class (the ``IN`` operand) admit ``-``? Literals, ranges and the ``\\d``,
-    ``\\w``, ``\\s`` categories (their negations admit it), under an optional ``NEGATE``."""
+def _charset_admits(items: Any, ch: str) -> bool:
+    """Does a bracket class (the ``IN`` operand) admit *ch*? Literals, ranges and the
+    categories, under an optional ``NEGATE``; anything unforeseen: may."""
     negate = False
     hit = False
+    code = ord(ch)
     for op, av in items:
         if op is _RE_CONSTANTS.NEGATE:
             negate = True
         elif op is _RE_CONSTANTS.LITERAL:
-            hit = hit or av == _DASH
+            hit = hit or av == code
         elif op is _RE_CONSTANTS.RANGE:
             lo, hi = av
-            hit = hit or lo <= _DASH <= hi
+            hit = hit or lo <= code <= hi
         elif op is _RE_CONSTANTS.CATEGORY:
-            hit = hit or "NOT" in str(av)  # \D \W \S match "-"; \d \w \s do not
+            escape = _CATEGORY_ESCAPES.get(str(av).removeprefix("CATEGORY_"))
+            if escape is None:
+                return True
+            hit = hit or re.fullmatch(escape, ch) is not None
         else:
-            return True  # anything unforeseen: may
+            return True
     return hit != negate
 
 
-def _first(sub: Any) -> tuple[bool, bool]:
-    """Of a parsed (sub)pattern: (may its first matched character be ``-``, can it match the
+def _first(sub: Any, ch: str) -> tuple[bool, bool]:
+    """Of a parsed (sub)pattern: (may its first matched character be *ch*, can it match the
     empty string). A sequence's first character comes from its first non-nullable item and
     everything nullable before it."""
     may = False
     for op, av in sub:
-        item_may, item_nullable = _first_item(op, av)
+        item_may, item_nullable = _first_item(op, av, ch)
         may = may or item_may
         if not item_nullable:
             return may, False
     return may, True
 
 
-def _first_item(op: Any, av: Any) -> tuple[bool, bool]:
+def _first_item(op: Any, av: Any, ch: str) -> tuple[bool, bool]:
     c = _RE_CONSTANTS
     if op is c.LITERAL:
-        return av == _DASH, False
+        return av == ord(ch), False
     if op is c.NOT_LITERAL:
-        return av != _DASH, False
+        return av != ord(ch), False
     if op is c.ANY:
         return True, False
     if op is c.IN:
-        return _charset_has_dash(av), False
+        return _charset_admits(av, ch), False
     if op is c.AT or op is c.ASSERT or op is c.ASSERT_NOT:
         return False, True  # zero-width; ignoring a lookaround only widens "may": sound
     if op is c.SUBPATTERN:
-        return _first(av[3])
+        return _first(av[3], ch)
     if op is c.ATOMIC_GROUP:
-        return _first(av)
+        return _first(av, ch)
     if op is c.BRANCH:
-        results = [_first(b) for b in av[1]]
+        results = [_first(b, ch) for b in av[1]]
         return any(m for m, _ in results), any(n for _, n in results)
     if op in (c.MAX_REPEAT, c.MIN_REPEAT, c.POSSESSIVE_REPEAT):
         lo, _, body = av
-        body_may, body_nullable = _first(body)
+        body_may, body_nullable = _first(body, ch)
         return body_may, lo == 0 or body_nullable
     if op is c.GROUPREF_EXISTS:
         _, yes, no = av
-        yes_may, yes_nullable = _first(yes)
-        no_may, no_nullable = _first(no) if no is not None else (False, True)
+        yes_may, yes_nullable = _first(yes, ch)
+        no_may, no_nullable = _first(no, ch) if no is not None else (False, True)
         return yes_may or no_may, yes_nullable or no_nullable
     return True, True  # GROUPREF and anything unforeseen: may, and may be empty
 
 
-def _literal_regex_may_start_with_dash(reg: str) -> bool:
-    """Could a string this regex fullmatches begin with ``-``? Decided on the parse tree the
-    ``re`` module itself builds; an unparsable pattern is "may"."""
+def _literal_regex_may_start_with(reg: str, prefix: str) -> bool:
+    """Could a string this regex fullmatches begin with *prefix*? Decided on the parse tree the
+    ``re`` module itself builds, for a one-character, caseless prefix (``/``, ``-``); anything
+    else -- an unparsable pattern, a longer prefix, a letter a case-insensitive flag could
+    match either way -- is "may"."""
+    if len(prefix) != 1 or prefix.lower() != prefix.upper():
+        return True
     try:
         parsed = _RE_PARSER.parse(reg)
     except re.error:
         return True
-    may, _ = _first(parsed)
+    may, _ = _first(parsed, prefix)
     return may
 
 
-def _regex_may_start_with_dash(r: PseudoRegex) -> bool:
-    match r:
-        case Exact(exact_str=s):
-            return s.startswith("-")
-        case Alternation(any_of=branches):
-            return any(_regex_may_start_with_dash(b) for b in branches)
-        case Concat(seq=pieces):
-            head = pieces[0]
-            if head == Exact(""):
-                return _regex_may_start_with_dash(concat(*pieces[1:])) if len(pieces) > 1 else False
-            return _regex_may_start_with_dash(head)
-        case Both(all_of=parts):
-            return all(_regex_may_start_with_dash(p) for p in parts)
-        case RegexLit(reg=reg):
-            return _literal_regex_may_start_with_dash(reg)
+def may_start_with(p: PseudoRegex, prefix: str) -> bool:
+    """Could some string in the language of *p* begin with *prefix*? Conservative: True unless
+    the structure shows otherwise.
+
+    A concatenation is read piece by piece. A piece either produces a string that begins with
+    what is left of the prefix -- and then so may the whole -- or matches a proper part of that
+    remainder exactly, the empty string included, and hands the rest on to the next piece. So
+    ``"" + x`` asks about ``x``, and a piece that may be empty never decides the question
+    alone."""
+    if not prefix:
+        return True
+    match p:
         case AnyStr():
             return True
+        case AnyComponent():
+            return "/" not in prefix  # "." and ".." extend to safe names (".x", "..x")
+        case Exact(exact_str=s):
+            return s.startswith(prefix)
+        case Alternation(any_of=branches):
+            return any(may_start_with(b, prefix) for b in branches)
+        case Both(all_of=parts):
+            return all(may_start_with(q, prefix) for q in parts)  # an intersection: every part must
+        case RegexLit(reg=reg):
+            return _literal_regex_may_start_with(reg, prefix)
+        case Concat(seq=pieces):
+            remainders = {prefix}
+            for piece in pieces:
+                if any(may_start_with(piece, r) for r in remainders):
+                    return True
+                remainders = {
+                    r[k:] for r in remainders for k in range(len(r)) if _regex_accepts(piece, r[:k])
+                }
+                if not remainders:
+                    return False
+            return False  # every string of the whole is a proper part of the prefix
 
 
 def _explicit_check(other: AtomId, regex: PseudoRegex) -> bool:
@@ -825,11 +859,11 @@ def _explicit_check(other: AtomId, regex: PseudoRegex) -> bool:
     if other == NO_SLASH:
         return _explicit_check_no_slash(regex)
     if other == NOT_ABSOLUTE:
-        return _explicit_check_not_absolute(regex)
+        return not may_start_with(regex, "/")
     if other == NOT_DOT_DOT:
         return _explicit_check_not_dot_dot(regex)
     if other == NOT_OPTION:
-        return not _regex_may_start_with_dash(regex)
+        return not may_start_with(regex, "-")
     return False
 
 
@@ -1166,14 +1200,19 @@ def as_component(fact: StrFact | PathFact) -> Component | None:
     """Lift a text value to a single path component, if its atoms allow it.
 
     This is the only place the text atoms are consumed on behalf of the location domain: a value
-    is a component iff it has no "/" and no ".." (``_holds`` supplies the derived forms of both).
-    The regex, if any, then decides how precise the component is.
+    is a component iff it has no "/" and no ".." (``_holds`` supplies the derived forms of both)
+    and its regex rules out "" and "." -- a join with either stays where it is, so neither names
+    a component. The regex then decides how precise the component is, constructor for
+    constructor: ``AnyComponent`` is any name, an ``Exact`` one name, an alternation of them a
+    set of names, and any other regex restricts the name.
     """
     if not ("no-slash" in fact and "no-parent-traversal" in fact):
         return None
     regex = fact.regex if isinstance(fact, StrFact) else ANY_STR
+    if _regex_accepts(regex, "") or _regex_accepts(regex, "."):
+        return None
     match regex:
-        case AnyStr():
+        case AnyComponent():
             return ANY_NAME
         case Exact(exact_str=s):
             return Named(s) if is_safe_name(s) else None
@@ -1183,7 +1222,22 @@ def as_component(fact: StrFact | PathFact) -> Component | None:
         case _:
             return Matching(regex)
 
-def _literal_location(s: str) -> StaticPath | None:
+@dataclass(frozen=True)
+class EmptyText:
+    """The literal ``""`` read as a path: it names nothing. What that means is the caller's to
+    say -- a concatenation adds no text, ``pathlib`` and ``os.path.join`` add no component, a
+    bare filesystem sink has no location -- so ``_literal_location`` hands it back instead of
+    choosing. It is not the root: ``"" + "/x"`` is the absolute ``/x``."""
+
+
+EMPTY_TEXT = EmptyText()
+
+
+def _literal_location(s: str) -> StaticPath | EmptyText | None:
+    """A literal's path reading: a location, ``EMPTY_TEXT`` for ``""``, or None for a text that
+    is not a safe path (a ``..`` part)."""
+    if s == "":
+        return EMPTY_TEXT
     as_path = pathlib.PurePath(s)
     if as_path.is_absolute():
         rest = as_path.parts[1:]  # parts[0] is the "/" anchor
@@ -1191,9 +1245,16 @@ def _literal_location(s: str) -> StaticPath | None:
             return None
         return StaticPath(tuple(Named(p) for p in rest), absolute=True)
     if not as_path.parts:
-        return StaticPath(())  # "", ".", "./": the current directory, i.e. the sandbox root
+        return StaticPath(())  # ".", "./": the current directory, i.e. the sandbox root
     parts = _safe_path_extension(s)
     return None if parts is None else StaticPath(tuple(Named(p) for p in parts))
+
+
+def _literal_static(s: str) -> StaticPath | None:
+    """A literal's location where ``""`` names nothing to place: a bare sink, a cwd, a guard's
+    or a marker's operand."""
+    loc = _literal_location(s)
+    return loc if isinstance(loc, StaticPath) else None
 
 def locate(fact: ValidationFact | None) -> Located | None:
     """The path reading of a value, if it has one.
@@ -1212,7 +1273,7 @@ def locate(fact: ValidationFact | None) -> Located | None:
             rp: Repr = "str" if isinstance(fact, StrFact) else "path"
             kept = carried(fact.atoms)  # the path reading derives its own built-ins
             if isinstance(fact, StrFact) and isinstance(fact.regex, Exact):
-                loc = _literal_location(fact.regex.exact_str)
+                loc = _literal_static(fact.regex.exact_str)  # "" on its own has no location
                 return None if loc is None else Located(loc, rp, kept)
             if isinstance(fact, StrFact) and isinstance(fact.regex, Alternation) and all(
                 isinstance(b, Exact) for b in fact.regex.any_of
@@ -1232,16 +1293,28 @@ def locate(fact: ValidationFact | None) -> Located | None:
 
 def _literal_locations_joined(texts: Sequence[str]) -> LocationFact | None:
     """The one location covering every literal in *texts* (``join_loc`` folded), or None when
-    some literal is not a safe path or the literals mix anchors."""
+    some literal is not a safe path, is ``""`` (which names nothing), or the literals mix
+    anchors."""
     joined: LocationFact | None = None
     for text in texts:
-        loc = _literal_location(text)
+        loc = _literal_static(text)
         if loc is None:
             return None
         joined = loc if joined is None else join_loc(joined, loc)
         if joined is None:
             return None
     return joined
+
+
+def url_path_location(path: str) -> StaticPath | None:
+    """The location of a URL's path as ``urlsplit`` gives it: the one reading the analysis and
+    the broker share. An empty path is the server root. A path whose percent-decoding would
+    spell something else -- a ``..`` segment, or a separator -- has no location, since the
+    origin may read it either way."""
+    decoded = urllib.parse.unquote(path)
+    if decoded.count("/") != path.count("/") or ".." in decoded.split("/"):
+        return None
+    return _literal_static(path or "/")
 
 
 def url_of(value: str | ValidationFact | None) -> UrlString | None:
@@ -1257,10 +1330,11 @@ def url_of(value: str | ValidationFact | None) -> UrlString | None:
     except ValueError:
         return None
     scheme = parts.scheme if parts.scheme in ("http", "https") else None
-    # a ".."-bearing path has no location (lexical claims only); the netloc stays exact
+    # a path that is, or decodes to, ".."-bearing has no location (lexical claims only); the
+    # netloc stays exact
     return UrlString(
         netloc=Exact(parts.netloc),
-        path=_literal_location(parts.path),
+        path=url_path_location(parts.path),
         scheme=scheme,
         atoms=carried(atoms_of(value)) if not isinstance(value, str) else frozenset(),
     )
@@ -1438,13 +1512,17 @@ def as_str_value(fact: ValidationFact | None) -> ValidationFact | None:
 type _Chunk = str | StrFact | PathFact  # what accumulates inside one component
 
 def _component_token(c: Component) -> _Chunk:
-    """A component spelled as text: a literal, or a text fact that ``as_component`` lifts back."""
+    """A component spelled as text: a literal, or a text fact that ``as_component`` lifts back.
+    A component is never "" or ".", so its text says so (``AnyComponent``, or a ``Matching``
+    regex met with it where the regex alone would admit either)."""
     match c:
         case Named(name=n):
             return n
         case AnyName():
-            return StrFact(atoms=PATH_ATOMS)
+            return StrFact(regex=ANY_COMPONENT, atoms=PATH_ATOMS)
         case Matching(regex=r):
+            if _regex_accepts(r, "") or _regex_accepts(r, "."):
+                r = both(r, ANY_COMPONENT)
             return StrFact(regex=r, atoms=PATH_ATOMS)
         case OneOf(names=ns):
             return StrFact(regex=alternation(*(Exact(n) for n in sorted(ns))), atoms=PATH_ATOMS)
@@ -1527,6 +1605,8 @@ class _Spelling:
                 return self.located(loc)
             case UrlString():
                 return self.unknown()  # nothing is tracked about a URL-read value's text
+            case StrFact(regex=Exact(exact_str=s)):
+                return self.piece(s)  # exactly-known text reads as the literal it is ("" adds nothing)
             case StrFact() | PathFact():
                 return self.chunk(p)
 
@@ -1591,8 +1671,15 @@ class _Open(_Spelling):
         return _Open(self.prefix, (*self.chunks, c))
 
     def sep(self) -> _Spelling:
+        if self.prefix is None and self._may_be_empty():
+            return _DEAD  # the text so far may be "", and then this "/" is a leading one
         loc = self._close()
         return _DEAD if loc is None else _Boundary(loc)
+
+    def _may_be_empty(self) -> bool:
+        """Can the component's text so far be ""? Only if every chunk can: a literal chunk never
+        is (``piece`` skips empty literals), a text fact may be."""
+        return all(isinstance(c, StrFact) and _regex_accepts(c.regex, "") for c in self.chunks)
 
     def splat(self) -> _Spelling:
         return _DEAD  # text glued onto "**" has no location
@@ -1671,12 +1758,16 @@ def scalar(entry: Entry | None) -> ValidationFact | None:
     -- those domains are the walker's, and only their touchpoints reach into them."""
     return None if isinstance(entry, (Container, Data, Std)) else entry
 
-def _head_location(v: str | ValidationFact | None) -> LocationFact | None:
+def _head_location(v: str | ValidationFact | None) -> LocationFact | EmptyText | None:
+    """Where a join starts: a literal's reading (``EMPTY_TEXT`` for ``""``, known or spelled),
+    or a value's containment."""
     match v:
         case None:
             return None
-        case str():
-            return _literal_location(v)
+        case str() | StrFact(regex=Exact()):
+            text = known_text(v)
+            assert text is not None
+            return _literal_location(text)
         case _:
             return containment_of(v)
 
@@ -1751,7 +1842,7 @@ def _module_call(call: NameAccess, modules: frozenset[str], *path: str) -> bool:
     return call.matches(*path) and path[0] in modules
 
 # the names the loop variable can never have from a listing: never ".", never "..", never a "/"
-_LISTED_NAME = StrFact(atoms=PATH_ATOMS)
+_LISTED_NAME = StrFact(regex=ANY_COMPONENT, atoms=PATH_ATOMS)
 
 _ELEMENT_WRAPPERS = ("sorted", "list", "tuple", "reversed", "iter")
 
@@ -1938,15 +2029,20 @@ class Interpreter:
                     out.append(None)  # ``!r`` / ``:spec`` rewrite the text unpredictably
         return out
 
-    def _join_args(self, args: Sequence[ast.expr]) -> LocationFact | None:
+    def _join_args(self, args: Sequence[ast.expr], empty: LocationFact | None) -> LocationFact | None:
         """``pathlib.Path(a, b, ...)`` / ``os.path.join(a, b, ...)``: the first argument's
-        location, extended by the rest."""
+        location, extended by the rest. A leading ``""`` adds nothing, so the next argument
+        starts the join; a join of nothing but ``""`` is *empty* -- the root for ``pathlib``
+        (``Path("")`` is ``.``), no location for ``os.path.join`` (the result is ``""``)."""
         loc = _head_location(self.operand(args[0]))
         for a in args[1:]:
-            if loc is None:
+            if isinstance(loc, EmptyText):
+                loc = _head_location(self.operand(a))
+            elif loc is None:
                 return None
-            loc = combine_containment(loc, self.operand(a))
-        return loc
+            else:
+                loc = combine_containment(loc, self.operand(a))
+        return empty if isinstance(loc, EmptyText) else loc
 
     def _comprehension_inert(
         self, exprs: Sequence[ast.expr], generators: Sequence[ast.comprehension]
@@ -1987,10 +2083,10 @@ class Interpreter:
             full = call.full_path
             # -- the path and text constructors: a fact
             if plain and args and any(_module_call(call, modules, "pathlib", c) for c in _PATH_CONSTRUCTORS):
-                loc = self._join_args(args)
+                loc = self._join_args(args, empty=StaticPath(()))
                 return PathFact() if loc is None else Located(loc, "path")
             if plain and args and _module_call(call, modules, "os", "path", "join"):
-                loc = self._join_args(args)
+                loc = self._join_args(args, empty=None)
                 return None if loc is None else Located(loc, "str")
             if plain and len(args) == 1 and call.matches("str"):
                 # ``str(x)`` is a str whatever x is; of a path or text it keeps the claims
@@ -2145,7 +2241,9 @@ class Interpreter:
                     n.id: Std("list") for n in (dirnames, filenames) if isinstance(n, ast.Name)
                 }
                 loc = _head_location(self.operand(top))
-                return lists if loc is None else {dirpath: Located(splat_under(loc), "str"), **lists}
+                if not isinstance(loc, (StaticPath, DirSplat)):
+                    return lists  # an unplaced top, or os.walk(""), which yields nothing
+                return {dirpath: Located(splat_under(loc), "str"), **lists}
             case _:
                 std = self.element_std(iterable)
                 return {} if std is None else dict(destructure(target, std))

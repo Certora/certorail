@@ -29,8 +29,13 @@ type Role = Literal["read", "write", "no-write", "mount-read", "mount-write"]
 
 @dataclass(frozen=True)
 class Bind:
+    """One concrete path: with *subtree*, the path and everything below it (``dir/**``);
+    without, the path alone (a literal location). A bind mount cannot say "alone" for a
+    directory; Seatbelt can (``literal``)."""
+
     path: Path
     role: Role
+    subtree: bool = True
 
 
 @dataclass(frozen=True)

@@ -509,6 +509,10 @@ branches: list[typing.Annotated[str, certora.validated("not-force")]] = [
   mutators that add nothing, `x.remove(v)`, `x.discard(v)`, `x.clear()` and `x.sort()`, are permitted and check nothing.
 - The name is used in those ways only; aliasing it (`y = x`), storing it in another container, passing it to a parameter
   that is not itself a typed container, `x[i] += v` and `x[1:] = …` are violations.
+- Code that runs later may not name it: a nested `def` or a `lambda` that uses `x` from an enclosing scope is a violation
+  (pass `x` as a parameter), and so is a generator expression that uses `x` anywhere after its first `for`, since that
+  part runs when the generator is consumed (`sum(1 for e in x)` is fine; for `any(v in x for v in items)`, use a list
+  comprehension).
 - Passing moves or borrows: a `list[P]` argument binds to a `list[P]` parameter with the same element type (the callee may
   write), or to a `typing.Sequence[Q]` parameter with `P` at least as strong as `Q`, read-only inside the function. A local
   typed container is returned against `-> list[…]` / `-> set[…]` with the same element type and moves to the caller's

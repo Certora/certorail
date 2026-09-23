@@ -864,6 +864,9 @@ class PolicyDoc(_Vocabulary):
     # a named program keeps its shapes (fail closed). A `[filesystem]` kind left unwritten is
     # then `**`. Root policies only: a ruleset has no such key
     default_allow: bool = False
+    # refuse a run whose confined grants the jail cannot express exactly (a location it would
+    # omit, a protection not there to bind yet) instead of warning and running. Root only
+    strict: bool = False
     filesystem: Filesystem = Field(default_factory=Filesystem)
     network: list[NetworkDecl] = Field(default_factory=list)
     deny: list[DenyDecl] = Field(default_factory=list)

@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from importlib.resources.abc import Traversable
 
 from certorail.integrity import CheckerIntegrityError, Pin, digest, document_pins, verify_all
+from certorail.lint import lint
 from certorail.policydir import AmbientPolicyError, config_dir, find_policy, munge, policy_dir
 from certorail.policyfile import PolicyFileError, from_data, load_policy_file, rulesets_dir
 from certorail.schema import RulesetDoc, SchemaError, parse_ruleset
@@ -293,10 +294,11 @@ def install_policy(src: pathlib.Path, *, name: str | None = None, replace: bool 
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
         raise InstallError([f"{src}: {e}"])
     try:
-        from_data(data, str(src))  # loads against the installed tree: packs install first
+        policy = from_data(data, str(src))  # loads against the installed tree: packs install first
     except PolicyFileError as e:
         raise InstallError(str(e).splitlines())
     root = _declared_root(data, str(src))
+    lints = [finding.line() for finding in lint(policy, pathlib.Path(root))]
     basename = name if name is not None else src.name
     if "/" in basename or not basename.endswith(".toml"):
         raise InstallError([f"--name {basename!r}: a bare *.toml file name"])
@@ -339,7 +341,7 @@ def install_policy(src: pathlib.Path, *, name: str | None = None, replace: bool 
     if pin_problems:
         raise InstallError(pin_problems)
     report = _place([Placement(target, data_bytes)], replace)
-    notes = [f"governs {root} and every directory below it without a policy of its own"]
+    notes = [f"governs {root} and every directory below it without a policy of its own", *lints]
     try:
         found = find_policy(pathlib.Path(root))
     except AmbientPolicyError as e:

@@ -30,7 +30,20 @@ Programs run with your authority. A policy grant is trust you extend: a program 
 write under a directory, run a command or reach a host does so as you, and the tools it runs do
 whatever those tools do. The analysis proves that the Certorail program stays within the grants; it does not
 judge whether the grants were wise. Read the policy as carefully as you would a sudoers file. For
-information on how to lockdown programs launched via certorail, see the (grants guide)[GRANTS.md].
+information on how to lockdown programs launched via certorail, see the [grants guide](GRANTS.md).
+
+A policy talks about names, not objects. A grant or a protection constrains the path a program
+spells, never the file that path ends up at. The rule of thumb has three consequences worth
+knowing:
+
+- A symbolic link inside a granted tree is followed. A read through it reaches wherever the link
+  points; the OS jail confines writes to the root and does not confine reads.
+- A relative `no-write` protection does not cover an absolute spelling of the same file. If the
+  policy also grants an absolute write over the root, the protection holds only for relative
+  names.
+- A location hole in a program rule constrains how the argument is spelled, not how the tool
+  resolves it. A network rule's `source` tags whatever comes back through that URL, redirects
+  included.
 
 A program is rejected before it runs if any operation cannot be proven to stay within the policy.
 The OS jail backs the analysis at run time; on Linux, without `bubblewrap` installed the program

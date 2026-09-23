@@ -1,0 +1,7 @@
+# Refused at load: `list` was retired. Listing a directory is reading it.
+policy-version = 1
+base = false
+
+[filesystem]
+read = ["src/**"]
+list = ["catalog/**"]

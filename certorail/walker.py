@@ -283,27 +283,36 @@ def _assigned_names(nodes: Iterable[ast.AST]) -> set[str]:
     return out
 
 
-def _module_scope_binds(body: Sequence[ast.stmt]) -> dict[str, int]:
-    """How many times each name is bound at module scope, not descending into function/class
-    bodies or comprehensions (each a fresh scope). Over-approximate is safe: it only makes the
-    single-assignment test for a constant stricter, never looser."""
+def _program_binds(tree: ast.AST) -> dict[str, int]:
+    """How many times each name is bound anywhere in the program, in any scope and by any form:
+    assignment and deletion, ``for``/``with``/``except`` targets, comprehension targets, ``match``
+    captures, parameters, type parameters, ``def``/``class`` names, import aliases. A module constant is a name
+    bound exactly once in the whole program -- deliberately blunt: a program that reuses the name
+    in some function merely loses the constant."""
     counts: dict[str, int] = {}
-    stack: list[ast.AST] = list(body)
-    while stack:
-        node = stack.pop()
+
+    def bind(name: str) -> None:
+        counts[name] = counts.get(name, 0) + 1
+
+    for node in ast.walk(tree):
         match node:
-            case ast.FunctionDef(name=name) | ast.AsyncFunctionDef(name=name) | ast.ClassDef(name=name):
-                counts[name] = counts.get(name, 0) + 1  # binds its own name; body is a separate scope
-                continue
-            case ast.Lambda() | ast.ListComp() | ast.SetComp() | ast.DictComp() | ast.GeneratorExp():
-                continue  # a separate scope: binds nothing at module level
             case ast.Name(id=name, ctx=ast.Store() | ast.Del()):
-                counts[name] = counts.get(name, 0) + 1
+                bind(name)
             case ast.ExceptHandler(name=str() as name):
-                counts[name] = counts.get(name, 0) + 1
+                bind(name)
+            case ast.FunctionDef(name=name) | ast.AsyncFunctionDef(name=name) | ast.ClassDef(name=name):
+                bind(name)
+            case ast.arg(arg=name):
+                bind(name)  # every parameter kind: positional-only, keyword-only, *args, **kwargs, lambda
+            case ast.TypeVar(name=name) | ast.ParamSpec(name=name) | ast.TypeVarTuple(name=name):
+                bind(name)  # a PEP 695 type parameter: def f[T](), class C[T], type X[T] = ...
+            case ast.alias(name=name, asname=asname):
+                bind(asname if asname is not None else name.split(".")[0])
+            case ast.match_case(pattern=pattern):
+                for name in _pattern_names(pattern):
+                    bind(name)
             case _:
                 pass
-        stack.extend(ast.iter_child_nodes(node))
     return counts
 
 
@@ -689,7 +698,11 @@ class ValidationWalker(ast.NodeVisitor):
         (its name is bound once and never rebound, so the call is that function's); a class
         instantiated, a nested function, a lambda or a parameter called havocs the world."""
         verdict = self.enforcement.kill_of(site)
-        return verdict if isinstance(verdict, Kill) else self._program_summary(verdict).kill
+        if isinstance(verdict, Kill):
+            return verdict
+        if not site.inert_splats:
+            return OPAQUE  # ``f(*g)``, ``f(**m)``: the splat runs g, or m's keys(), before f does
+        return self._program_summary(verdict).kill
 
     def _program_summary(self, call: ProgramCall) -> Summary:
         return self.summaries.get(call.name, HAVOC)
@@ -726,16 +739,24 @@ class ValidationWalker(ast.NodeVisitor):
             if extra is not None:
                 local.add(extra.arg)
         local |= _assigned_names(node.body)
-        seed: State = {
-            k: v if isinstance(v, Std) else self.enforcement.forget(v, OPAQUE)
-            for k, v in self.module_constants.items()
-            if k not in local
-        }
+        seed = self._deferred_scope(local)
         if contract is not None:
             for k, v in contract.params.items():
                 # a container parameter arrives with param provenance: its escape is an error
                 seed[k] = replace(v, param=True) if isinstance(v, Container) else v
         return seed
+
+    def _deferred_scope(self, local: set[str]) -> State:
+        """What code that runs later -- a function body, a lambda body, the lazy part of a
+        generator expression -- may rely on from outside itself: the module constants it does
+        not shadow, their environmental atoms forgotten (a check is anchored to a program point).
+        Nothing else of the state where it is written: any other name may be rebound before it
+        runs."""
+        return {
+            k: v if isinstance(v, Std) else self.enforcement.forget(v, OPAQUE)
+            for k, v in self.module_constants.items()
+            if k not in local
+        }
 
     def _summarize(self, node: ast.FunctionDef) -> Summary:
         """What one call of the module-level function *node* does, walked from its seed with the
@@ -844,6 +865,9 @@ class ValidationWalker(ast.NodeVisitor):
         elif isinstance(target, (ast.Tuple, ast.List)) and self._interpreter().is_inert(value):
             self.visit(target)  # the rebinding kills, then each name is an element of an inert value
             self.state.update(destructure(target, Std()))
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            self._consume(value)  # unpacking iterates the value: a generator's body runs here
+            self.visit(target)
         else:
             self.visit(target)  # tuple/attribute targets: kill the names involved; an attribute store opens
 
@@ -1069,56 +1093,69 @@ class ValidationWalker(ast.NodeVisitor):
     def visit_Lambda(self, node: ast.Lambda) -> Any:
         # the defaults are evaluated now. The body runs only when the lambda is called, which
         # havocs, so its kills do not count here; but its sinks and its roster obligations (a
-        # write to a container it closes over) are audited now, in a scope of its own with the
-        # parameters unknown
+        # write to a container it closes over) are audited now, in a scope of its own: the
+        # parameters unknown, and of the outside only what holds whenever it runs (the module
+        # constants), since a name it reads may be rebound before the call
         for d in [*node.args.defaults, *node.args.kw_defaults]:
             if d is not None:
                 self.visit(d)
         a = node.args
-        params = [p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)]
-        params += [extra.arg for extra in (a.vararg, a.kwarg) if extra is not None]
+        params = {p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
+        params |= {extra.arg for extra in (a.vararg, a.kwarg) if extra is not None}
         with self.state_snapshot(), self._measuring(counted=False):
-            for name in params:
-                self.state.pop(name, None)
+            self.state = self._deferred_scope(params)
             self.visit(node.body)
 
-    # -- comprehensions: their own scope, eager --------------------------------------------------
+    # -- comprehensions: their own scope, nested loops ----------------------------------------------
 
     def _comprehension(
-        self, generators: Sequence[ast.comprehension], body: Sequence[ast.expr]
+        self, generators: Sequence[ast.comprehension], body: Sequence[ast.expr], *, lazy: bool = False
     ) -> None:
-        """Walk a comprehension in its own scope: each iterable in the state so far, then the
-        ``if`` clauses and the element expressions under the iteration bindings, so that a call
-        inside sees what its receiver is (``[x.strip() for x in lines]``). Eager for a generator
-        expression too: its body's kills are applied at creation (EFFECTS.md). The scope's names
-        return to their outer values afterwards, and the state takes what every iteration may
-        do (``_every_iteration``)."""
-        outer = self.state
-        self.state = dict(outer)
-        bound: set[str] = set()
+        """Walk a comprehension as the nested loops it is, in its own scope. The first iterable
+        is evaluated once, where the comprehension is written. One *iteration* is then a single
+        path through the loops: each later iterable, each target bound (``iteration_bindings``),
+        each ``if`` applied as a guard (``_refine``), then the element -- so a call inside sees
+        what its receiver and arguments are (``[x.strip() for x in lines]``, ``[open(p) for p in
+        ps if ok(p)]``). Every iteration starts from what the ones before it may have done, so,
+        as for a loop body (``_loop``), the iteration is first rehearsed to learn that
+        (``_every_iteration``), and the recorded walk -- the one whose sites and verdicts count --
+        starts from the state it leaves. Afterwards the state is the one before the iterations,
+        with every iteration's kill: the targets are the comprehension's own, and a filter or a
+        check inside holds only where an iteration ran, which it may never have.
+
+        *lazy* (a generator expression): everything after the first iterable runs when the
+        generator is consumed, so it is walked in the scope deferred code gets
+        (``_deferred_scope``) plus the first target's bindings; its kill is still applied here,
+        at creation, and consuming the generator later is an unknown call (``_consume``)."""
+        first = generators[0]
+        self.visit(first.iter)
+        if not lazy:
+            self._consume(first.iter)  # an eager comprehension iterates it here and now
+        entry = self.state
 
         def iteration() -> None:
-            for gen in generators:
-                self.visit(gen.iter)
+            for i, gen in enumerate(generators):
+                if i:
+                    self.visit(gen.iter)
+                    self._consume(gen.iter)
                 names = {n.id for n in ast.walk(gen.target) if isinstance(n, ast.Name)}
-                bound.update(names)
                 for name in names:
                     self.state.pop(name, None)
-                self.state.update(self._interpreter().iteration_bindings(gen.target, gen.iter))
+                bindings = self._interpreter().iteration_bindings(gen.target, gen.iter)
+                if lazy and i == 0:
+                    self.state = self._deferred_scope(names)
+                self.state.update(bindings)
                 for cond in gen.ifs:
                     self.visit(cond)
                     self.state = self._refine(self.state, cond)
             for e in body:
                 self.visit(e)
 
+        every = self._every_iteration(iteration, entry)
+        self.state = self._killed(dict(entry), every)
         once = self._measure(iteration)
-        if once.opens:
-            # the first iteration is the walked one; the later ones start from what it opened
-            once = once | self._rehearse(iteration, self._killed(dict(outer), once))
-        self.state = {k: v for k, v in self.state.items() if k not in bound} | {
-            k: v for k, v in outer.items() if k in bound
-        }
-        self._kill_state(once)
+        self.state = dict(entry)
+        self._kill_state(every | once)
 
     def visit_ListComp(self, node: ast.ListComp) -> Any:
         self._comprehension(node.generators, [node.elt])
@@ -1127,7 +1164,7 @@ class ValidationWalker(ast.NodeVisitor):
         self._comprehension(node.generators, [node.elt])
 
     def visit_GeneratorExp(self, node: ast.GeneratorExp) -> Any:
-        self._comprehension(node.generators, [node.elt])
+        self._comprehension(node.generators, [node.elt], lazy=True)
 
     def visit_DictComp(self, node: ast.DictComp) -> Any:
         self._comprehension(node.generators, [node.key, node.value])
@@ -1370,8 +1407,23 @@ class ValidationWalker(ast.NodeVisitor):
                     else:
                         self.state[name] = now
 
+    def _consume(self, iterable: ast.expr) -> None:
+        """Iterating *iterable* where it stands: a non-inert one -- a generator, a program
+        object, a carrier over one -- runs program code on every step, so it is an unknown call
+        (EFFECTS.md, laziness). A ``for`` needs this once, before the loop: every iteration
+        boundary starts from the pre-loop state, so the kill reaches every later step too."""
+        if not self._interpreter().is_inert(iterable):
+            self._kill_state(OPAQUE)
+
+    def visit_Compare(self, node: ast.Compare) -> Any:
+        self.generic_visit(node)
+        for op, right in zip(node.ops, node.comparators):
+            if isinstance(op, (ast.In, ast.NotIn)):
+                self._consume(right)  # membership in a generator iterates it
+
     def visit_For(self, node: ast.For) -> Any:
         self.visit(node.iter)
+        self._consume(node.iter)
         # a Name target is a rebinding kill; a subscript target reaches visit_Name, so
         # ``for x[0] in ...`` is the container escape it deserves to be
         self.visit(node.target)
@@ -1461,9 +1513,20 @@ class ValidationWalker(ast.NodeVisitor):
                 self._block(h.body)
                 if _falls_through(h.body):
                     ends.append(self.state)
-        self.state = _join_all(ends)
-        # ``finally`` runs on every path, in the joined state
-        self._block(node.finalbody)
+        normal = _join_all(ends)
+        if not node.finalbody:
+            self.state = normal
+            return
+        # ``finally`` runs on every path, the exceptional ones included: an exception may leave the
+        # body (or a handler) at any point, before anything it established. So it is audited from
+        # the join of the normal ends and that exception-entry state; the walk that continues
+        # past the statement -- which only the normal ends reach -- records nothing a second time
+        with self.state_snapshot():
+            self.state = _join(normal, handler_entry)
+            self._block(node.finalbody)
+        self.state = normal
+        with self._unrecorded():
+            self._block(node.finalbody)
 
     def visit_Try(self, node: ast.Try) -> Any:
         self._try(node, handlers_chain=False)
@@ -1495,9 +1558,9 @@ class ValidationWalker(ast.NodeVisitor):
     def visit_Module(self, node: ast.Module) -> Any:
         # container-roster positions, classified once, syntactically, for the whole tree
         self._blessed = _roster_blessings(node, self.contracts)
-        # a module-level constant (a name bound by exactly one unconditional top-level assignment)
-        # is immutable: module-level reassignment is forbidden and `global` is banned, so no code
-        # can rebind it. Its fact therefore holds in every function body and may seed it.
+        # a module-level constant (a name bound by exactly one unconditional top-level assignment
+        # and by nothing else in the program) is immutable: nothing rebinds or shadows it, so
+        # its fact holds in every function body and may seed it.
         self.module_constants = self._module_constants(node)
         # the callee analysis' summaries, before any call is walked: a module-level function may
         # be called before its definition is reached
@@ -1508,9 +1571,10 @@ class ValidationWalker(ast.NodeVisitor):
 
     def _module_constants(self, module: ast.Module) -> dict[str, ValidationFact | Std]:
         """The module-level constants every function body may rely on: a name bound by exactly
-        one unconditional top-level assignment, to a value nothing can change. Scalars only: a
-        container is mutable, and a body may not close over one at all (``safepy``, CONTAINERS.md)."""
-        counts = _module_scope_binds(module.body)
+        one unconditional top-level assignment -- and nowhere else in the program -- to a value
+        nothing can change. Scalars only: a container is mutable, and a body may not close over
+        one at all (``safepy``, CONTAINERS.md)."""
+        counts = _program_binds(module)
         state: dict[str, ValidationFact | Std] = {}
         for s in module.body:
             if isinstance(s, ast.Assign) and len(s.targets) == 1 and isinstance(s.targets[0], ast.Name):
@@ -1520,7 +1584,7 @@ class ValidationWalker(ast.NodeVisitor):
             else:
                 continue
             if counts.get(name, 0) != 1:
-                continue  # bound more than once at module scope: not a constant
+                continue  # bound again somewhere in the program: not a constant
             try:
                 # earlier constants are in scope for later ones
                 fact = self._interpreter(state).interpret(value)

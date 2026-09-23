@@ -5,7 +5,9 @@ import unittest
 
 from certorail import markers
 from certorail.analysis import DirSplat, Named, StaticPath
-from certorail.host import Accepted, Rejected, _jail_deny_paths
+from certorail.host import Accepted, Rejected
+from certorail.sandbox.lowering import Bind
+from certorail.sandbox.program import lower_program
 from certorail.host import check as host_check
 from certorail.policy import Policy
 from certorail.policyfile import PolicyFileError, from_data
@@ -211,7 +213,12 @@ class TestNoWrite(RulesetCase):
             no_write=[markers.within("secrets"), markers.within("/etc/certorail"), markers.within("repos", leaf=markers.matches(r"\.git"))],
         )
         # the wildcard one is the analysis' alone
-        self.assertEqual(_jail_deny_paths(policy.mounts(pathlib.Path("/work"))), ["/work/secrets", "/etc/certorail"])
+        jail = lower_program(policy, pathlib.Path("/work"), patterns=False)
+        self.assertEqual(
+            [g.path for g in jail.protected if isinstance(g, Bind)],
+            [pathlib.Path("/work/secrets"), pathlib.Path("/etc/certorail")],
+        )
+        self.assertEqual(len(jail.omitted), 1)  # the wildcard one is the analysis' alone
 
     def test_a_ruleset_spells_no_absolute_protection(self) -> None:
         self.ruleset("abs.toml", 'ruleset-version = 1\n[filesystem]\nno-write = ["/etc/**"]\n')

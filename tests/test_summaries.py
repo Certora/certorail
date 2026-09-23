@@ -87,6 +87,46 @@ class TestSummaries(unittest.TestCase):
             LIVE,
         )
 
+    def test_consuming_a_generator_after_the_check_kills(self) -> None:
+        # the body ran nothing at creation (above the check); it runs where it is consumed
+        for definitions in (
+            'g = (certora.exec("git", "log", cwd=repo) for _ in range(1))\n',
+            'def gen():\n    certora.exec("git", "log", cwd=repo)\n    yield 1\ng = gen()\n',
+        ):
+            for between in (
+                "list(g)\n", "for _ in g:\n    pass\n", "(a,) = g\n", "a, *rest = g\n", "print([x for x in g])\n",
+                "print(*g)\n", "print(1 in g)\n", "take(*g)\n", "for _ in relay(g):\n    pass\n",
+            ):
+                with self.subTest(definitions=definitions, between=between):
+                    helpers = "def take(*a):\n    return 1\ndef relay(it):\n    yield from it\n"
+                    self.assertEqual(atoms_at_exec(helpers + definitions, between), DEAD)
+
+    def test_iterating_a_parameter_of_unknown_type_is_an_unknown_call(self) -> None:
+        # the parameter may be a generator, so the loop header may run program code; a typed
+        # container parameter is inert, and iterating it is free
+        self.assertEqual(atoms_at_exec("def show(lines):\n    for l in lines:\n        print(l)\n", 'show(["a"])\n'), DEAD)
+        typed = (
+            "import typing\n"
+            "def show(lines: typing.Sequence[typing.Annotated[str, certora.no_slash]]):\n"
+            "    for l in lines:\n        print(l)\n"
+            'names: list[typing.Annotated[str, certora.no_slash]] = ["a"]\n'
+        )
+        self.assertEqual(atoms_at_exec(typed, "show(names)\n"), LIVE)
+
+    def test_a_later_iteration_sees_what_an_earlier_one_killed(self) -> None:
+        # the second exec runs after the first killed the check: a comprehension's element is
+        # judged as every iteration's, as a loop body is
+        for src in (
+            'for _ in range(2):\n    certora.exec("git", "log", cwd=repo)\n',
+            'print([certora.exec("git", "log", cwd=repo) for _ in range(2)])\n',
+            'print(list(certora.exec("git", "log", cwd=repo) for _ in range(2)))\n',
+        ):
+            with self.subTest(src=src):
+                report = analyze(PRELUDE + CHECK + src, vocabulary=VOCAB)
+                self.assertEqual(report.violations, [])
+                execs = [s for s in report.sinks if isinstance(s, ExecSite)]
+                self.assertEqual(atoms_of(execs[-1].cwd), DEAD)
+
     def test_opening_inside_opens_the_caller(self) -> None:
         # the callee opens (an attribute store): the caller's standard values are opened, and a
         # later call over one of their elements is no longer exempt

@@ -103,7 +103,7 @@ class TestBubblewrapLowering(unittest.TestCase):
             Bind(ROOT / "out", "write"),
             # the list grant: no bind can list without exposing; silently nothing
             Bind(pathlib.Path("/srv/keys"), "mount-read"),
-            Omitted(loc("cfg/*"), "mount-read", "a rule's addition must be one path: a pattern has no bind mount"),
+            Omitted(loc("cfg/*"), "mount-read", "a rule's addition must be concrete paths: a pattern has no bind mount"),
             Bind(ROOT / ".git", "mount-write"),
             Bind(ROOT / "out" / "final", "no-write"),
             Omitted(loc("out/**/.git"), "no-write", "a pattern has no bind mount, and this run has no view: pyfuse3 is not installed"),

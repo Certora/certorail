@@ -285,6 +285,20 @@ DANGEROUS_MEMBERS: dict[tuple[str, ...], frozenset[str]] = {
 # ---------------------------------------------------------------------------
 
 ALLOWED_MEMBERS: dict[tuple[str, ...], frozenset[str]] = {
+    # the host's namespace is closed: at run time ``certora`` is the whole ``certorail.markers``
+    # module, whose own imports (``os``, ``subprocess``, ``socket``, ``sys``) and private helpers
+    # (``_broker``, ``network._request``) would otherwise be reachable through it, unanalysed.
+    # Exactly the vocabulary the analysis models (the callees below, the annotation markers, the
+    # atoms) and the exception and result types a program may name in ``except`` or an annotation.
+    (NAMESPACE,): frozenset({
+        "exec", "check", "check_single", "network",
+        "extract", "extract_all", "lines", "field", "pathmatch", "reveal_fact",
+        "within", "exactly", "matches", "one_of", "seq", "validated", "source", "url",
+        "no_slash", "no_parent_traversal", "not_absolute", "not_dot_dot", "not_option",
+        "CalledProcessError", "ExecFailed", "ExecResult", "CheckFailed", "ContractViolation",
+        "NetworkError", "NetworkResponse", "ExtractError",
+    }),
+    (NAMESPACE, "network"): frozenset({"get", "head", "delete", "post", "put", "patch"}),
     ("os",): frozenset({
         "path", "sep", "pathsep", "linesep", "fspath", "PathLike",
         "listdir", "walk",

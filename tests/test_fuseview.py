@@ -14,9 +14,13 @@ import unittest
 from unittest import mock
 
 from certorail import viewdaemon
-from certorail.childjail import Jail, View, confined
+from certorail.childjail import Jail, View
+from certorail.confinement import Confinement, PolicyFilesystem
 from certorail.locations import parse_location as loc
 from certorail.policy import Policy, program
+from certorail.sandbox import NoView, ServedRoot
+from certorail.sandbox.bubblewrap import BubblewrapSpawner
+from certorail.sandbox.lowering import Omitted
 from certorail.viewdaemon import ViewSpec, liveness
 
 try:
@@ -61,20 +65,20 @@ class TestFilter(unittest.TestCase):
         )
 
     def test_files(self) -> None:
-        self.assertTrue(self.f.file_visible(("src", "a.py")))
-        self.assertTrue(self.f.file_visible(("src", "pkg", "deep", "b.py")))
-        self.assertFalse(self.f.file_visible(("src", "a.txt")))
-        self.assertTrue(self.f.file_visible(("docs", "x", "y.txt")))
-        self.assertTrue(self.f.file_visible(("out", "artifact")))  # a write grant reads too
-        self.assertFalse(self.f.file_visible(("secrets", "key.pem")))
-        self.assertFalse(self.f.file_visible(("a.py",)))
+        self.assertTrue(self.f.readable(("src", "a.py")))
+        self.assertTrue(self.f.readable(("src", "pkg", "deep", "b.py")))
+        self.assertFalse(self.f.readable(("src", "a.txt")))
+        self.assertTrue(self.f.readable(("docs", "x", "y.txt")))
+        self.assertTrue(self.f.readable(("out", "artifact")))  # a write grant reads too
+        self.assertFalse(self.f.readable(("secrets", "key.pem")))
+        self.assertFalse(self.f.readable(("a.py",)))
 
     def test_directories(self) -> None:
         self.assertTrue(self.f.dir_visible(()))
         self.assertTrue(self.f.dir_visible(("src",)))          # a grant has paths below it
         self.assertTrue(self.f.dir_visible(("src", "pkg")))
         self.assertTrue(self.f.dir_visible(("docs",)))
-        self.assertFalse(self.f.dir_visible(("notes",)))       # no grant has paths below it: listing is reading
+        self.assertFalse(self.f.dir_visible(("notes",)))       # no grant has paths below it
         self.assertFalse(self.f.dir_visible(("notes", "sub")))
         self.assertFalse(self.f.dir_visible(("secrets",)))
 
@@ -86,9 +90,99 @@ class TestFilter(unittest.TestCase):
         self.assertFalse(self.f.may_write(("src", "a.py")))                 # a read grant is not writable
         self.assertFalse(self.f.may_write(("elsewhere",)))
 
-    def test_names_fold_as_the_analysis_folds(self) -> None:
-        self.assertFalse(self.f.may_write(("out", ".GIT")))  # APFS would make that .git
-        self.assertTrue(self.f.file_visible(("DOCS", "readme")))
+    def test_names_are_matched_exactly(self) -> None:
+        # a grant or a protection names names as spelled: no folding here (the view refuses a
+        # name the directory does not list verbatim, so a folding filesystem cannot alias one)
+        self.assertFalse(self.f.readable(("DOCS", "readme")))
+        long = "abcdefghijklmnopqrstuvwxyz.py"
+        self.assertTrue(self.f.readable(("src", long)))
+        narrow = Filter(read=(loc("pub/<[a-z]\\.txt>"),), write=(), no_write=())
+        self.assertFalse(narrow.readable(("pub", "A.txt")))
+        self.assertFalse(narrow.readable(("pub", "abcdefghijklmnopqrstuvwxyz.txt")))
+
+    def test_a_literal_directory_lists_its_names_but_opens_none(self) -> None:
+        f = Filter(read=(loc("src"),), write=(), no_write=())
+        self.assertTrue(f.readable(("src",)))                    # it lists
+        self.assertTrue(f.visible(("src", "a.py"), is_dir=False))  # its entries show, by name
+        self.assertFalse(f.readable(("src", "a.py")))            # but do not open
+        self.assertFalse(f.visible(("src", "sub", "b.py"), is_dir=False))
+
+
+@unittest.skipUnless(HAS_PYFUSE3 and sys.platform == "linux", NO_PYFUSE3 or "the view is Linux's")
+class TestStoredSpelling(unittest.TestCase):
+    """A name that resolves is the directory's own spelling where the filesystem declares its
+    lookups exact; elsewhere the listing decides. No mount needed: the question is asked of the
+    backing directory."""
+
+    def setUp(self) -> None:
+        import pyfuse3
+        from certorail.fuseview import Filter, View as FuseView
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        (pathlib.Path(tmp.name) / "Notes.txt").write_text("x\n")
+        self.view = FuseView(pathlib.Path(tmp.name), Filter(read=(), write=(), no_write=()))
+        self.root = pyfuse3.ROOT_INODE
+
+    def test_an_exact_directory_needs_no_listing(self) -> None:
+        with mock.patch("certorail.fuseview.exact_lookups", return_value=True), \
+                mock.patch("certorail.fuseview.os.listdir") as listdir:
+            self.assertTrue(self.view.spelled_as_stored(self.root, b"Notes.txt"))
+        listdir.assert_not_called()
+
+    def test_elsewhere_the_listing_decides(self) -> None:
+        with mock.patch("certorail.fuseview.exact_lookups", return_value=False):
+            self.assertTrue(self.view.spelled_as_stored(self.root, b"Notes.txt"))
+            # what a folding directory would resolve, but does not store
+            self.assertFalse(self.view.spelled_as_stored(self.root, b"notes.txt"))
+
+
+@unittest.skipUnless(HAS_PYFUSE3 and sys.platform == "linux", NO_PYFUSE3 or "the view is Linux's")
+class TestInodeIdentity(unittest.TestCase):
+    """The view keys what the kernel holds by (device, inode number) and reuses an entry only
+    where it is recorded: a number a deleted file freed, or an entry moved behind the view's
+    back, gets a new inode, since the filter judges the recorded place."""
+
+    def setUp(self) -> None:
+        import pyfuse3
+        from certorail.fuseview import Filter, View as FuseView
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = pathlib.Path(tmp.name)
+        (self.root / "out").mkdir()
+        (self.root / "out" / "x.txt").write_text("x\n")
+        (self.root / "src" / "sub").mkdir(parents=True)
+        self.view = FuseView(self.root, Filter(read=(loc("src/**"),), write=(loc("out/**"),), no_write=()))
+        self.top = pyfuse3.ROOT_INODE
+
+    def ino(self, parent: int, name: bytes) -> int:
+        return self.view.admit(parent, name).st_ino  # pyright: ignore[reportArgumentType]
+
+    def test_a_recycled_number_is_a_new_inode(self) -> None:
+        out = self.ino(self.top, b"out")
+        old = self.ino(out, b"x.txt")
+        src = self.ino(self.top, b"src")
+        # as if the filesystem handed a deleted file's number to a new directory
+        (self.root / "src" / "fresh").mkdir()
+        st = os.stat(self.root / "src" / "fresh")
+        self.view.by_key[(st.st_dev, st.st_ino)] = old  # pyright: ignore[reportArgumentType]
+        fresh = self.ino(src, b"fresh")
+        self.assertNotEqual(fresh, old)
+        self.assertEqual(self.view.path_of(fresh), ("src", "fresh"))  # pyright: ignore[reportArgumentType]
+        self.assertEqual(self.view.path_of(old), ("out", "x.txt"))  # pyright: ignore[reportArgumentType]
+
+    def test_a_directory_moved_behind_the_views_back_is_judged_where_it_is(self) -> None:
+        src = self.ino(self.top, b"src")
+        sub = self.ino(src, b"sub")
+        out = self.ino(self.top, b"out")
+        os.rename(self.root / "src" / "sub", self.root / "out" / "sub")  # the same inode, elsewhere
+        moved = self.ino(out, b"sub")
+        self.assertNotEqual(moved, sub)
+        self.assertEqual(self.view.path_of(moved), ("out", "sub"))  # pyright: ignore[reportArgumentType]
+        # the kernel forgetting the stale inode leaves the new one findable
+        self.view.drop(sub, 1)  # pyright: ignore[reportArgumentType]
+        self.assertEqual(self.ino(out, b"sub"), moved)
 
 
 class TestViewSpec(unittest.TestCase):
@@ -104,14 +198,18 @@ class TestViewSpec(unittest.TestCase):
     def test_the_policy_says_when_it_needs_the_view(self) -> None:
         root = pathlib.Path("/r")
         patterned = Policy.allow(read=["src/**/<.*\\.py>"], programs=[program("cat", cwd=".", view=View.POLICY)])
-        self.assertTrue(patterned.mounts(root).needs_view)
+        self.assertTrue(patterned.section().relative_patterns)
         self.assertEqual(patterned.view_spec(root).read, patterned.read)
         plain = Policy.allow(read=["src/**"], programs=[program("cat", cwd=".", view=View.POLICY)])
-        self.assertFalse(plain.mounts(root).needs_view)
-        # with a view attached the root-relative section is the view's: no binds, no omissions
-        served = patterned.mounts(root, view=pathlib.Path("/mnt/v"))
-        self.assertEqual((served.reads, served.omitted, served.view), ((), (), (pathlib.Path("/mnt/v"), root)))
-        self.assertFalse(served.needs_view)
+        self.assertFalse(plain.section().relative_patterns)
+        # with a view serving the root, the root-relative section is the view's: nothing lowered
+        rule = patterned.programs[0]
+        fs = patterned.confinement(rule, root).filesystem
+        assert isinstance(fs, PolicyFilesystem)
+        served = BubblewrapSpawner(ServedRoot(pathlib.Path("/mnt/v"), root))
+        self.assertEqual(served.lower(fs, write_fs=False), ())
+        unserved = BubblewrapSpawner(NoView("no view here"))
+        self.assertTrue(all(isinstance(x, Omitted) for x in unserved.lower(fs, write_fs=False)))
 
 
 @unittest.skipUnless(HAS_FUSE, NO_PYFUSE3 or "/dev/fuse and fusermount3 are the Linux view")
@@ -161,8 +259,10 @@ class TestDaemon(unittest.TestCase):
             self.assertTrue((self.root / "out" / "new").exists())
             with self.assertRaises(PermissionError):
                 (a.mountpoint / "out" / ".git" / "config").write_text("no")
-            with self.assertRaises(PermissionError):
-                (a.mountpoint / "out" / ".GIT").mkdir()
+            # names are the directory's own: on this case-sensitive filesystem ".GIT" is another
+            # name than the protected ".git" (a folding one would refuse it as an alias: EEXIST)
+            (a.mountpoint / "out" / ".GIT").mkdir()
+            self.assertTrue((self.root / "out" / ".git" / "config").exists())
             with self.assertRaises(PermissionError):
                 (a.mountpoint / "src" / "new.py").write_text("no")
             # a second attach finds it
@@ -198,6 +298,32 @@ class TestDaemon(unittest.TestCase):
         finally:
             b.close()
 
+    def test_a_new_name_cannot_make_a_protected_file_writable(self) -> None:
+        a = viewdaemon.attach(self.spec)
+        try:
+            with self.assertRaises(PermissionError):
+                os.link(a.mountpoint / "out" / ".git" / "config", a.mountpoint / "out" / "alias")
+            self.assertFalse((self.root / "out" / "alias").exists())
+            # a file that already has two names is not written through either of them
+            (self.root / "out" / "one").write_text("x\n")
+            os.link(self.root / "out" / "one", self.root / "out" / "two")
+            with self.assertRaises(PermissionError):
+                (a.mountpoint / "out" / "one").write_text("y\n")
+            self.assertEqual((self.root / "out" / "one").read_text(), "x\n")
+        finally:
+            a.close()
+
+    def test_a_literal_directory_shows_its_names_not_their_contents(self) -> None:
+        spec = ViewSpec(os.path.realpath(self.root), (loc("secrets"), loc("src/**/<.*\\.py>")), (), ())
+        a = viewdaemon.attach(spec)
+        try:
+            self.assertEqual(os.listdir(a.mountpoint / "secrets"), ["key.pem"])
+            os.stat(a.mountpoint / "secrets" / "key.pem")  # metadata: fine
+            with self.assertRaises(PermissionError):
+                (a.mountpoint / "secrets" / "key.pem").read_text()
+        finally:
+            a.close()
+
     def test_unavailable_is_an_error_not_a_half_mount(self) -> None:
         with mock.patch("certorail.viewdaemon.unavailable", return_value="no fuse here"):
             with self.assertRaisesRegex(viewdaemon.ViewUnavailable, "no fuse here"):
@@ -207,13 +333,14 @@ class TestDaemon(unittest.TestCase):
     def test_a_confined_child_sees_the_view_at_the_roots_real_path(self) -> None:
         a = viewdaemon.attach(self.spec)
         try:
-            rule = self.policy.programs[0]
-            mounts = self.policy.mounts(self.root, rule, a.mountpoint)
-            self.assertEqual(mounts.view, (a.mountpoint, self.root))
+            fs = self.policy.confinement(self.policy.programs[0], self.root).filesystem
+            assert isinstance(fs, PolicyFilesystem)
+            spawner = BubblewrapSpawner(ServedRoot(a.mountpoint, self.root))
             base = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
 
             def run(argv: list[str], jail: Jail) -> subprocess.CompletedProcess[bytes]:
-                with confined(argv, jail, base_env=base, mounts=mounts, cwd=self.root) as spawn:
+                c = Confinement(jail.env, jail.network, jail.write_fs, jail.spawn, fs)
+                with spawner.spawn(c, argv, self.root, base_env=base) as spawn:
                     return subprocess.run(spawn.argv, cwd=self.root, env=spawn.env, pass_fds=spawn.pass_fds, capture_output=True)
 
             reader = Jail(network=False, write_fs=False, spawn=False, view=View.POLICY)

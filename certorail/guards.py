@@ -39,7 +39,8 @@ from certorail.analysis import (
     StrFact,
     UrlString,
     ValidationFact,
-    _literal_location,
+    _literal_static,
+    url_path_location,
     alternation,
     both,
     concat,
@@ -316,7 +317,7 @@ def _location_of(t: Term, st: StateMap) -> LocationFact | None:
     (``BASE.resolve()``, ``str(BASE)``, ``os.path.realpath(BASE)``)."""
     match t:
         case Const(str() as s):
-            return _literal_location(s)
+            return _literal_static(s)  # "" names no location to compare against
         case Method(inner, "resolve", (), ()):
             return _location_of(inner, st)
         case Call(
@@ -340,7 +341,7 @@ def _prefix_location(t: Term, st: StateMap) -> LocationFact | None:
         case Const(str() as s):
             if not s.endswith("/"):
                 return None
-            return _literal_location(s)  # PurePath drops the trailing slash
+            return _literal_static(s)  # PurePath drops the trailing slash
         case BinOp(left, ast.Add, right) if _is_sep(right):
             return _location_of(left, st)
         case _:
@@ -395,7 +396,7 @@ def _url_refinement(comp: str, from_split: bool, value: str) -> Refinement | Non
         case "scheme" if value in ("http", "https"):
             return Refinement(type_info="str", url=UrlString(scheme=value))
         case "path" if from_split:
-            loc = _literal_location(value)  # rejects ".." (lexical claims only)
+            loc = url_path_location(value)  # the shared URL path reading
             return None if loc is None else Refinement(type_info="str", url=UrlString(path=loc))
         case _:
             return None
@@ -808,7 +809,7 @@ def _method(
         prefix = args[0].as_str()
         if prefix is None or not prefix.endswith("/"):
             return []  # "/data" also prefixes "/database"
-        loc = _literal_location(prefix)  # PurePath drops the trailing slash
+        loc = _literal_static(prefix)  # PurePath drops the trailing slash
         if loc is None or not loc.absolute:
             return []  # a URL path with a netloc is server-absolute; anything else is exotic
         return _guard(

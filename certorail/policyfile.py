@@ -1012,6 +1012,7 @@ def from_data(data: object, where: str = "<policy>") -> Policy:
             network=net_rules, sources=sources, regions=declared.regions, reads=declared.reads,
             applied=[d.label for d in documents[1:]],
             default_allow=top.default_allow,
+            strict=top.strict,
             denied=[d.argv[0] for d in top.deny],
         )
     except ValueError as e:

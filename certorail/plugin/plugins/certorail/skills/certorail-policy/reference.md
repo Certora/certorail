@@ -11,11 +11,11 @@ policy-version = 1
 root = "/srv/work/repo"            # ambient policies only: the sandbox root this file governs
 base = true                        # the default: the installed base ruleset applies (below)
 default-allow = false              # the default: a program the policy does not name is denied (below)
+strict = false                     # the default: a grant the OS jail cannot express warns and runs (below)
 
 [filesystem]
 read  = ["**"]
 write = ["repos/**"]
-list  = ["repos/**"]
 
 [regions]                          # the state checks depend on and commands change (quote dotted names)
 "git.config" = { footprint = ".git/config", about = "remotes, hooks: everything git reads from config" }
@@ -61,14 +61,17 @@ Components separated by `/`. Each component is a literal name, `*` (any one name
 that `*.py` is a literal name: only a bare `*` is a wildcard, so "any `.py` file" is
 `<.*\.py>`.
 
-A `<regex>` is a Python regex. Under `exec.view = "policy"` on macOS it is also handed to
-Seatbelt, which reads POSIX ERE, and the two dialects agree only on a subset: literals, `.`,
-`[...]` of literals and ranges, `|`, plain groups, greedy `* + ? {n,m}`, `^` and `$`. A `<regex>`
-using anything else (`\d`, `\w`, `\s`, `(?...)`, lookarounds, backreferences, lazy or
-possessive quantifiers, non-ASCII) has no Seatbelt spelling: the location is omitted from the
-view and the host says so at startup. Write `[0-9]` where you would write `\d`. The translation
-is generated from Python's own parse of the pattern, so what does translate means the same
-thing on both sides, with one known exception: `.` in ERE also matches a newline.
+A `<regex>` is a Python regex, matched against one whole name. On macOS it is also handed to
+Seatbelt (under `exec.view = "policy"`, and for `no-write` protections around the program
+itself), which reads POSIX ERE, and the two dialects agree only on a subset: literals, `.`,
+`[...]` of literals and ranges, `|`, plain groups, greedy `* + ? {n,m}`, and `^`/`$` at the
+pattern's edges (where a full match makes them redundant). A `<regex>` using anything else
+(`\d`, `\w`, `\s`, `(?...)`, lookarounds, backreferences, lazy or possessive quantifiers, an
+anchor in the middle, non-ASCII, a `"`) has no Seatbelt spelling: the location is omitted from
+the jail and the host says so at startup (or refuses to run, under `strict`). Write `[0-9]` where
+you would write `\d`. The translation is generated from Python's own parse of the pattern, so what
+does translate means the same thing on both sides: `.` and a negated `[^...]` never match a `/`,
+because a component never contains one. One known exception: `.` in ERE also matches a newline.
 
 | Spelling | Meaning |
 |---|---|
@@ -88,6 +91,13 @@ empty components. Programs use the same spelling to prove a dynamic path is at a
 text to quote. A relative location is under the sandbox root (`--root`, the program's working
 directory). Absolute and relative locations never relate: an absolute grant says nothing about
 relative paths and vice versa. A program's literal beginning with `/` is an absolute path.
+
+An absolute location the OS jail lowers (a `read`, `write` or `no-write` entry, a rule's
+`exec.mount-read`/`mount-write`) must begin with at least one literal name or `{a,b}` set, before any `*`, `**` or `<regex>`: the
+OS jail mounts each such prefix, exploding the sets (`/{srv,opt}/data/**` mounts `/srv/data` and
+`/opt/data`). `/**`, `/*/data` and `/<regex>/data` are errors, since the only mount that could
+serve them is `/` itself. URL paths (`[[network]] path`) are not filesystem locations and are
+not affected.
 
 ## `default-allow`
 
@@ -111,6 +121,18 @@ stays nothing and `no-write` protections still bind); network is still `[[networ
 run says on stderr that default-allow is on, and `--describe` lists the rule last under
 Programs.
 
+## `strict`
+
+The static check is what holds a program to the policy; the OS jail is the backstop behind it,
+and cannot express every location exactly (a `<regex>` outside the shared dialect on macOS, an
+absolute pattern on Linux). By default such a location is omitted from the jail, the host says
+so on stderr, and the run goes ahead with the backstop wider there than the policy. Likewise an
+exec'd tool whose `no-write` protection names a path that does not exist yet, inside a writable
+tree: there is nothing to mount over, so the tool could create it, and the broker says so and
+spawns it. `strict = true` at the top of a root policy (a ruleset has no such key) turns the
+first into a refusal of the run before anything runs, naming the locations, and the second into
+a refusal of that exec.
+
 ## `[filesystem]`
 
 `read`, `write`: lists of locations; absent means nothing of that kind is permitted (under
@@ -124,18 +146,47 @@ dynamic component needs a regex that cannot spell the name in any case: prove th
 `certora.pathmatch(p, r"repos/x/<\w+>")` or `"repos/<[^.].*>/README.md"`, not `"repos/x/*"`.
 An applied ruleset may protect
 too (`[filesystem] no-write = ["${where}/**/.git"]`), which is how the git pack keeps a program
-out of repository configuration and hooks without asking the root to spell the exclusion; a
-protection that is one concrete directory is also lowered into the OS jail's write denials.
+out of repository configuration and hooks without asking the root to spell the exclusion.
+Protections are also lowered into the OS jail's write denials: on Linux those that are one
+concrete path, on macOS every one the regex subset (Locations) can spell.
+
+**Grants read narrow, protections read wide.** A grant covers exactly the paths its location
+spells: `write = ["foo"]` permits writing `foo` and refuses `foo/bar`. A protection covers the
+paths its location spells *and everything below them*: `no-write = ["foo"]` refuses `foo` and
+`foo/bar` alike, so `foo` and `foo/**` are the same protection. Neither reading depends on what
+is on disk: whether `foo` exists, or is a file or a directory, changes nothing about what a
+location covers. The asymmetry is deliberate, since a spelling read either way errs toward
+refusal, and it is what lets `**/.git` keep writes out of `.git/config`: `**` may appear only
+once, so `**/.git/**` cannot be written.
+
+A literal grant names exactly that path. `read = ["src"]` for a directory permits listing
+`src` and probing it, and none of the files in it: `src/**` is the tree, and `certorail
+describe` flags the literal spelling (lint `literal-directory`). Under `exec.view = "policy"` a
+tool sees the same: the directory's entries, not their contents.
+
 The kinds, as the analysis classifies program operations:
 
 | Kind | Operations |
 |---|---|
-| read | `open` for reading, `Path.open` for reading, `read_text`, `read_bytes` |
+| read | `open` for reading, `Path.open` for reading, `read_text`, `read_bytes`; listing and probing: `os.listdir`, `os.walk`, `os.path.exists/isfile/isdir`, `iterdir`, `glob`, `rglob`, `exists`, `is_file`, `is_dir` |
 | write | `open` with a writing mode, `write_text`, `write_bytes`, `mkdir`, `touch`, `chmod`, `replace` (the path *and* its target), `link_to` (the target) |
-| list | `os.listdir`, `os.walk`, `os.path.exists/isfile/isdir`, `iterdir`, `glob`, `rglob`, `exists`, `is_file`, `is_dir` |
 
 Everything else on the filesystem (`unlink`, `rename`, `shutil`, archives, …) is unavailable to
 programs regardless of policy.
+
+**Names, not objects.** Every location constrains the *name* a program spells, never the file
+behind it:
+
+- A relative `no-write` (`secrets/**`) does not cover an absolute spelling of the same files. If
+  an absolute `write` grant reaches into the root, the protection holds only for relative
+  spellings: `describe` flags the pair (lint `shadowed-protection`). Protect the absolute
+  spelling too, or keep absolute write grants out of the root.
+- A symlink inside a granted tree is followed: a read grant on `vendor/**` permits reading
+  through `vendor/link`, wherever it points. The OS jail around the program confines its writes
+  to the root and the absolute write grants; it does not confine reads.
+- On macOS the jail matches a name as the directory stores it. A policy spelling `.git` where
+  the directory stores `.Git` names a path the jail does not match, though the filesystem would
+  open it: `describe` flags it (lint `spelling`). Spell names as they are stored.
 
 ## `[regions]`
 
@@ -249,7 +300,7 @@ exec.view  = "policy"                    # sees only what the policy's [filesyst
 | `exec.env` | list of names and tables | the child's environment is exactly this: a string passes that variable through from the host's environment (skipped if the host lacks it), a table `{ NAME = "value", ... }` sets each key to a literal. A variable is mentioned once, either way; values are literal, no `${...}`; `TMPDIR` may not be listed (the host sets it under `write-fs = false` and under `exec.view = "policy"`). Absent: the host's whole environment; `[]`: an empty one |
 | `exec.spawn` | bool, default true | `false`: the child cannot create processes (no hooks, no `-exec`, no helpers, no shells). It can still replace itself with another program, which is not creation |
 | `exec.mount-read`, `exec.mount-write` | lists of locations | under `exec.view = "policy"` only: what this rule's child sees beyond the policy's `[filesystem]` section, mounted read-only or writable (`mount-write` needs `write-fs = true`; either without the policy view is a load error). The analysis never reads them: they widen the tool's world, not the program's, and a call cannot widen them further. `no-write` still applies on top. Absolute in a root policy; in a ruleset headed by a directory parameter the root binds (`credentials = { kind = "directory" }`, `exec.mount-read = ["${credentials}/**"]`). Patterns follow the platform rule below. `--describe` prints them as `also sees:` on the jail line |
-| `exec.view` | `"host"` (default) or `"policy"` | what the child sees of the filesystem. `"host"`: the host's whole filesystem; the tool is trusted as granted. `"policy"`: an empty world holding the system toolchain, the tool itself, a private `TMPDIR`, the exec's cwd as an empty directory, and the applying policy's `[filesystem]` section as mounts: `read` grants read-only, `write` grants writable iff `write-fs = true`, `no-write` protections remounted read-only on top. Nothing else exists: on Linux a path outside the view is "No such file", not "Permission denied". On macOS Seatbelt takes every location, patterns as anchored regexes (a `<regex>` must stay within the subset Python and ERE share, see "Locations"; one that does not is omitted and reported); the entries of `/` stay readable there, since every process reads them at startup, and nothing below them. On Linux a literal path or a literal prefix ending in `**` is a bind mount; when the section holds a pattern (`*`, `<regex>`, a `**/leaf` tail) the root is served through the **FUSE view** instead, a long-lived per-(root, policy) mount that filters names, listings and writes by the section exactly (the `certorail[fuse]` extra plus `fusermount3`; `certorail view status` / `stop`). Without the extra, patterned locations are omitted from the view and the host says so on stderr at startup; absolute patterned locations outside the root are omitted either way |
+| `exec.view` | `"host"` (default) or `"policy"` | what the child sees of the filesystem. `"host"`: the host's whole filesystem; the tool is trusted as granted. `"policy"`: an empty world holding the system toolchain, the tool itself, a private `TMPDIR`, the exec's cwd as an empty directory, and the applying policy's `[filesystem]` section as mounts: `read` grants read-only, `write` grants writable iff `write-fs = true`, `no-write` protections remounted read-only on top. Nothing else exists: on Linux a path outside the view is "No such file", not "Permission denied". On macOS Seatbelt takes every location, patterns as anchored regexes (a `<regex>` must stay within the subset Python and ERE share, see "Locations"; one that does not is omitted and reported); the entries of `/` stay readable there, since every process reads them at startup, and nothing below them. On Linux a literal file or a literal prefix ending in `**` is a bind mount; when the section holds a pattern (`*`, `<regex>`, a `**/leaf` tail) or a literal directory (which grants its listing alone) the root is served through the **FUSE view** instead, a long-lived per-(root, policy) mount that filters names, listings and writes by the section exactly (the `certorail[fuse]` extra plus `fusermount3`; `certorail view status` / `stop`). Without the extra, patterned locations are omitted from the view and the host says so on stderr at startup; absolute patterned locations outside the root are omitted either way |
 
 A jailed grant whose sandbox is not installed does not run at all (the program gets a broker
 error), unlike the confined program itself, which on Linux runs with a warning when `bwrap` is missing. So
@@ -541,10 +592,10 @@ network use is not governed here; it is folded into their `[[program]]` grant.
 | `schemes` | list, default `["https"]` | among `http`, `https` |
 | `ports` | list of ints, default empty | empty means the scheme's default port only |
 | `methods` | list, default empty | empty means any method |
-| `allow-nonpublic` | bool, default false | permit loopback, RFC1918, link-local and metadata addresses |
-| `path` | location or list, server-absolute | the URL's path must be proven within one of them (a literal URL, or `urlsplit(u).path` guards); checked again on every redirect hop, percent-decoded. Absent: any path |
+| `allow-nonpublic` | bool, default false | permit loopback, RFC1918, link-local and metadata addresses. Without it the broker resolves the host before each hop and refuses a non-public answer; the connection then resolves the name again, so a name that answers differently from one lookup to the next is not defended against |
+| `path` | location or list, server-absolute | the URL's path must be proven within one of them (a literal URL, or `urlsplit(u).path` guards); checked again on every redirect hop. Both checks read the path as sent, not percent-decoded, and a path whose percent-escapes decode to a `/` or a `..` component has no location, so matches no `path` rule. Absent: any path |
 | `requires` | list | atoms the URL value must carry at the call site: `"atom"`, or `{ atom = "…", on-redirect = "recheck" \| "stop" \| "waive" }` |
-| `source` | atom name | responses yield this pure atom on extraction |
+| `source` | atom name | responses to requests this rule governs yield this pure atom on extraction, including a response reached by following a redirect: the tag belongs to the URL the program named. Rules for one host may not overlap (a request matches at most one rule), so the governing rule, and with it the tag, is decided by scheme, host, port, method and path together |
 | `writes` | list of network regions | what a request may change remotely; default every network region, or nothing for a `GET`/`HEAD`-only rule |
 | `read-timeout`, `total-timeout` | number (s) | per-destination overrides of the broker caps (600 s silence, 900 s total) |
 | `max-response-bytes` | int | per-destination override of the 16 MiB cap |
@@ -553,8 +604,8 @@ network use is not governed here; it is folded into their `[[program]]` grant.
 `recheck` re-establishes it from the hop URL's text (defined atoms and literal checkers only),
 `stop` refuses hops under this rule, `waive` asks nothing of hops. A bare name defaults to
 `recheck` when the atom is textual and `stop` otherwise; an explicit `recheck` of a non-textual
-atom is an error. The broker follows at most 5 redirects and drops `Authorization`/`Cookie`
-when the host changes.
+atom is an error. The broker follows at most 5 redirects and, as curl does, drops
+`Authorization`/`Cookie` from a hop whose scheme, host or port differs from the first request's.
 
 ## The checker runtime contract
 

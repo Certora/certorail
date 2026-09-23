@@ -1,0 +1,25 @@
+# Refused at load: both rules govern GET http://127.0.0.1:8765/pub/x, so which one's `source`
+# tags the response would depend on the order they were written in.
+policy-version = 1
+base = false
+
+[atoms]
+first  = { pure = true }
+second = { pure = true }
+
+[[network]]
+host            = "127.0.0.1"
+schemes         = ["http"]
+ports           = [8765]
+allow-nonpublic = true
+path            = "/pub/**"
+source          = "first"
+
+[[network]]
+host            = "127.0.0.1"
+schemes         = ["http"]
+ports           = [8765]
+methods         = ["GET"]
+allow-nonpublic = true
+path            = "/pub/x"
+source          = "second"

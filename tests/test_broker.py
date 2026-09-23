@@ -53,6 +53,8 @@ class _Origin(http.server.BaseHTTPRequestHandler):
             case "/hop-unlisted":
                 self._reply(302, headers=[
                     ("Location", f"http://127.0.0.1:{self.server.server_address[1]}/ok")])
+            case "/hop-port":
+                self._reply(302, headers=[("Location", f"http://localhost:{self.other_port}/auth")])
             case _:
                 self._reply(404)
 
@@ -154,6 +156,41 @@ class TestBroker(unittest.TestCase):
         self.assertFalse(reply["ok"])
         self.assertEqual(reply["error"], "policy_denied")
         self.assertIn("non-public", reply["detail"])
+
+
+class TestRedirectOrigin(unittest.TestCase):
+    """Credentials follow a redirect only within one origin: the same host on another port is
+    another origin, as it is for curl."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.origin1 = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Origin)
+        cls.origin2 = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Origin)
+        cls.p1 = cls.origin1.server_address[1]
+        cls.p2 = cls.origin2.server_address[1]
+        for origin in (cls.origin1, cls.origin2):
+            threading.Thread(target=origin.serve_forever, daemon=True).start()
+        policy = Policy.allow(network=[
+            network("localhost", schemes=["http"], ports=[cls.p1, cls.p2], methods=["GET"], allow_nonpublic=True),
+        ])
+        cls.sock = os.path.join(tempfile.mkdtemp(), "broker.sock")
+        cls.server = build_server(cls.sock, policy)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.origin1.shutdown()
+        cls.origin2.shutdown()
+
+    def test_a_port_change_strips_credentials(self) -> None:
+        self.addCleanup(setattr, _Origin, "other_port", _Origin.other_port)
+        _Origin.other_port = self.p2
+        reply = request(self.sock, "GET", f"http://localhost:{self.p1}/hop-port",
+                        headers={"Authorization": "token placeholder"})
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(_body(reply), b"anon")
 
 
 class TestBrokerRequires(unittest.TestCase):

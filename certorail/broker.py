@@ -69,9 +69,12 @@ import threading
 import time
 import urllib.parse
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
-from certorail.analysis import _literal_location, location_le
-from certorail.childjail import Jail, JailUnavailable, Mounts, confined
+from certorail.analysis import _literal_static, location_le, url_path_location
+from certorail.childjail import JailUnavailable
+from certorail.confinement import Confinement
+from certorail.sandbox import Spawner, unprovisioned
 from certorail.enforcement import Discharge
 from certorail.integrity import materialize
 from certorail.policy import (
@@ -91,7 +94,8 @@ _STRIPPED_HEADERS = {
     "upgrade", "te", "trailer", "expect", "proxy-authorization",
     "proxy-connection",
 }
-# Headers additionally dropped on any redirect hop whose host differs from the original.
+# Headers additionally dropped on any redirect hop whose origin -- scheme, host or port --
+# differs from the original, as curl does (``proxy-authorization`` never passes at all).
 _CREDENTIAL_HEADERS = {"authorization", "cookie"}
 
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
@@ -187,9 +191,9 @@ def _check(
         raise PolicyDenied(f"invalid port in URL {url!r}")
     port = port or (443 if scheme == "https" else 80)
     refusal: str | None = None
-    # the path as the origin will most plausibly read it: percent-decoded, then placed. A ".."
-    # that appears after decoding has no location and satisfies no path-restricted rule.
-    url_path = _literal_location(urllib.parse.unquote(parts.path) or "/")
+    # the path read exactly as the analysis reads it (``url_path_location``): one reading, so
+    # the rule the broker finds is the rule the analysis proved
+    url_path = url_path_location(parts.path)
     for rule in policy.network:
         if not matches_endpoint(rule, scheme, host, port, method):
             continue
@@ -394,7 +398,7 @@ def _execute(
     headers = {k: v for k, v in (headers or {}).items()
                if k.lower() not in _STRIPPED_HEADERS}
     current, hops = url, 0
-    first_host: str | None = None
+    first_origin: tuple[str, str, int] | None = None
     deadline: float | None = None
     total_cap = TOTAL_TIMEOUT
     while True:
@@ -402,8 +406,8 @@ def _execute(
         scheme, host, port, rule = _check(policy, method, current, hops == 0, discharge)
         if not rule.allow_nonpublic:
             _screen_addresses(host, port)
-        if first_host is None:
-            first_host = host
+        if first_origin is None:
+            first_origin = (scheme, host, port)
         if deadline is None:
             # the wall-clock budget is fixed by the first hop's rule and spans redirects:
             # read_timeout bounds only *silence*, so on its own a trickling origin could
@@ -419,9 +423,10 @@ def _execute(
         read_timeout = min(timeout_hint, read_cap) if timeout_hint else read_cap
         read_timeout = min(read_timeout, remaining)
         hop_headers = headers
-        if host != first_host:
-            # credentials never survive a change of host: a token for the API must not follow
-            # a redirect to the CDN (the redirect URL carries its own authorization)
+        if (scheme, host, port) != first_origin:
+            # credentials never survive a change of origin: a token for the API must not follow
+            # a redirect to the CDN, nor go out in the clear after a downgrade to http or a move
+            # to another port (the redirect URL carries its own authorization)
             hop_headers = {k: v for k, v in headers.items()
                            if k.lower() not in _CREDENTIAL_HEADERS}
         parts = urllib.parse.urlsplit(current)
@@ -468,23 +473,23 @@ def _spawn_drained(
     client: socket.socket,
     argv: list[str],
     workdir: pathlib.Path,
-    jail: Jail,
-    mounts: Mounts | None,
+    confinement: Confinement,
+    spawner: Spawner,
     stream_to: tuple[int, int] | None = None,
 ) -> tuple[int, bytes, bytes]:
-    """Spawn host-side, under the grant's *jail* (``childjail``: the OS-enforced reach the
-    grant's ``exec`` table allows the child; *mounts* is the policy's filesystem view for a
-    confined one), and drain the output wholesale -- or, with *stream_to* (the host's stdout
-    and stderr descriptors), let the child write straight to them and return empty output. A
-    client hangup kills the child's whole process group (it gets its own, so descendants die
-    with it). A jail the platform cannot enforce is a broker error before anything runs."""
+    """Spawn host-side, under the grant's *confinement* as this run's *spawner* realises it (the
+    OS-enforced reach the grant's media and ``exec`` table allow the child), and drain the output
+    wholesale -- or, with *stream_to* (the host's stdout and stderr descriptors), let the child
+    write straight to them and return empty output. A client hangup kills the child's whole
+    process group (it gets its own, so descendants die with it). A confinement the platform
+    cannot enforce is a broker error before anything runs."""
     if stream_to is not None:
         # the host's own buffered output goes first, so the terminal reads in order
         for stream in (sys.stdout, sys.stderr):
             with contextlib.suppress(Exception):
                 stream.flush()
     try:
-        with confined(argv, jail, mounts=mounts, cwd=workdir) as spawn:
+        with spawner.spawn(confinement, argv, workdir) as spawn:
             try:
                 proc = subprocess.Popen(
                     spawn.argv,
@@ -531,9 +536,9 @@ def _run_exec(
     keywords: dict[str, str | list[str]],
     cwd: str,
     discharge: Discharge | None,
-    stream: bool = False,
-    stream_to: tuple[int, int] | None = None,
-    view: pathlib.Path | None = None,
+    stream: bool,
+    stream_to: tuple[int, int] | None,
+    spawner: Spawner,
 ) -> dict:
     """One brokered ``certora.exec``: re-check the decidable half of the exec rules
     (``Policy.exec_command`` -- defense in depth; the full rules were enforced statically),
@@ -549,8 +554,8 @@ def _run_exec(
     if stream and stream_to is None:
         raise BrokerError("stream: the host has no terminal to stream to")
     returncode, out, err = _spawn_drained(
-        client, command.argv, _resolve(root, cwd), command.rule.jail, policy.mounts(root, command.rule, view),
-        stream_to if stream else None,
+        client, command.argv, _resolve(root, cwd), policy.confinement(command.rule, root),
+        spawner, stream_to if stream else None,
     )
     log.info("EXEC %s (cwd=%s) -> %d (%s)",
              " ".join(command.argv), cwd, returncode,
@@ -562,15 +567,47 @@ def _run_exec(
     }
 
 
+@dataclass(frozen=True)
+class ByName:
+    """``certora.check(name, **params)``: every declared parameter, by name."""
+    params: dict[str, str]
+
+
+@dataclass(frozen=True)
+class Single:
+    """``certora.check_single(name, value)``: the value binds the one declared parameter."""
+    value: str
+
+
+type CheckArguments = ByName | Single
+
+
+def _check_arguments(name: str, req: dict) -> CheckArguments:
+    """The arguments of a check frame, decoded once at the edge: the single-value form or the
+    by-name form, str values only. Anything else is a malformed frame."""
+    single, params = req.get("single"), req.get("params") or {}
+    if single is not None:
+        if params:
+            raise BadRequest(f"check {name!r}: the single-value form takes no other parameters")
+        if not isinstance(single, str):
+            raise BadRequest(f"check {name!r}: the value must be a str")
+        return Single(single)
+    if not isinstance(params, dict):
+        raise BadRequest(f"check {name!r}: the parameters must be a mapping")
+    typed = {k: v for k, v in params.items() if isinstance(k, str) and isinstance(v, str)}
+    if len(typed) != len(params):
+        raise BadRequest(f"check {name!r}: every parameter must be a str")
+    return ByName(typed)
+
+
 def _run_check(
     policy: Policy,
     root: pathlib.Path | None,
     client: socket.socket,
     name: str,
-    params: dict,
+    arguments: CheckArguments,
     cwd: str | None,
-    single: object = None,
-    view: pathlib.Path | None = None,
+    spawner: Spawner,
 ) -> dict:
     """One brokered ``certora.check``: run the declared evaluator host-side -- outside the
     jail, where whatever it consults (an inventory service, credentials, the org's tooling)
@@ -581,21 +618,17 @@ def _run_check(
     declared = next((v for v in policy.validations if v.name == name), None)
     if declared is None:
         raise PolicyDenied(f"check: no validation named {name!r}")
-    if single is not None:
-        # the check_single form: the value binds the one declared parameter by position
-        if params:
-            raise BadRequest(f"check {name!r}: the single-value form takes no other parameters")
-        if len(declared.params) != 1:
-            raise BadRequest(
-                f"check {name!r}: check_single needs exactly one declared parameter, "
-                f"it has {len(declared.params)}"
-            )
-        if not isinstance(single, str):
-            raise BadRequest(f"check {name!r}: the value must be a str")
-        params = {declared.params[0]: single}
-    if set(params) != set(declared.params) or not all(
-        isinstance(v, str) for v in params.values()
-    ):
+    match arguments:
+        case Single(value=value):
+            if len(declared.params) != 1:
+                raise BadRequest(
+                    f"check {name!r}: check_single needs exactly one declared parameter, "
+                    f"it has {len(declared.params)}"
+                )
+            params = {declared.params[0]: value}
+        case ByName(params=params):
+            pass
+    if set(params) != set(declared.params):
         raise BadRequest(
             f"check {name!r}: expected str arguments {sorted(declared.params)}, "
             f"got {sorted(params)}"
@@ -605,7 +638,7 @@ def _run_check(
     if declared.cwd is not None:
         if cwd is None:
             raise PolicyDenied(f"check {name!r}: cwd= is required")
-        loc = _literal_location(cwd)
+        loc = _literal_static(cwd)
         if loc is None or not any(location_le(loc, allowed) for allowed in declared.cwd):
             raise PolicyDenied(
                 f"check {name!r} may not run at {cwd!r} "
@@ -618,7 +651,7 @@ def _run_check(
         # exec the load-time snapshot: the installed checker drifting mid-run changes nothing,
         # because the file in checkers/ is not what runs (integrity.materialize)
         argv[0] = materialize(declared.evaluator)
-    returncode, _, err = _spawn_drained(client, argv, workdir, declared.jail, policy.mounts(root, declared, view))
+    returncode, _, err = _spawn_drained(client, argv, workdir, policy.confinement(declared, root), spawner)
     log.info("CHECK %s (cwd=%s) -> %d", name, cwd if cwd is not None else ".", returncode)
     return {
         "returncode": returncode,
@@ -649,9 +682,9 @@ def _send_frame(conn: socket.socket, payload: bytes) -> None:
 
 class Broker:
     """The host-side half for one confined run: the policy, the TLS context, the literal
-    discharger, where a streamed exec writes, and the FUSE view serving the root for confined
-    children when one is attached. ``serve`` speaks the wire protocol on one connected socket
-    until the peer closes it."""
+    discharger, where a streamed exec writes, and the run's spawner (``certorail.sandbox``: the
+    platform mechanism with the run's FUSE view, when one is attached). ``serve`` speaks the wire
+    protocol on one connected socket until the peer closes it."""
 
     def __init__(
         self,
@@ -659,14 +692,14 @@ class Broker:
         discharge: Discharge | None,
         root: pathlib.Path | None,
         stream_to: tuple[int, int] | None,
-        view: pathlib.Path | None = None,
+        spawner: Spawner,
     ):
         self.policy = policy
         self.tls = _tls_context()
         self.discharge = discharge
         self.root = root
         self.stream_to = stream_to
-        self.view = view
+        self.spawner = spawner
 
     def serve(self, conn: socket.socket) -> None:
         """Serve *conn* -- the host's end of the program's socketpair -- until the program closes
@@ -715,15 +748,15 @@ class Broker:
                 result = _run_exec(self.policy, self.root, conn,
                                    program, arguments, keywords, str(req.get("cwd", "")),
                                    self.discharge, bool(req.get("stream", False)),
-                                   self.stream_to, self.view)
+                                   self.stream_to, self.spawner)
             elif req.get("kind") == "check":
                 name = str(req.get("name", "?"))
                 what = f"check {name}"
                 cwd_value = req.get("cwd")
+                if cwd_value is not None and not isinstance(cwd_value, str):
+                    raise BadRequest(f"check {name!r}: cwd must be a str")
                 result = _run_check(self.policy, self.root, conn,
-                                    name, dict(req.get("params") or {}),
-                                    None if cwd_value is None else str(cwd_value),
-                                    req.get("single"), self.view)
+                                    name, _check_arguments(name, req), cwd_value, self.spawner)
             else:
                 method = str(req.get("method", "GET")).upper()
                 url = req["url"]
@@ -761,7 +794,7 @@ def build_broker(
     policy: Policy,
     root: str | os.PathLike[str] | None = None,
     stream_to: tuple[int, int] | None = None,
-    view: pathlib.Path | None = None,
+    spawner: Spawner | None = None,
 ) -> Broker:
     """The broker for one confined run, enforcing *policy*: the host hands ``Broker.serve`` its
     end of the program's socketpair, on a thread, for the lifetime of the program. *root*
@@ -769,12 +802,13 @@ def build_broker(
     rules' ``requires`` atoms (``Policy.discharger``); without it only defined atoms discharge
     and exec is refused. *stream_to* is where a ``stream=True`` exec's child writes (the host's
     own stdout and stderr descriptors, ``terminal_descriptors()``); without it streaming execs
-    are refused. *view* is the FUSE mountpoint serving the root for confined children, when
-    attached."""
+    are refused. *spawner* is the run's (``sandbox.provision``); without one, children are
+    spawned by ``sandbox.unprovisioned()``, with no FUSE view."""
+    runner = spawner if spawner is not None else unprovisioned()
     return Broker(
         policy,
-        None if root is None else policy.discharger(root, view),
+        None if root is None else policy.discharger(root, runner),
         None if root is None else pathlib.Path(root),
         stream_to,
-        view,
+        runner,
     )

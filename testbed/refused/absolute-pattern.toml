@@ -1,0 +1,7 @@
+# Refused at load: an absolute location must begin with a literal name or a {a,b} set. The only
+# bind that could serve a pattern in the first component is "/" itself.
+policy-version = 1
+base = false
+
+[filesystem]
+read = ['/<[a-z]+>/data/**']

@@ -34,6 +34,51 @@ def parse_location(text: str) -> LocationFact:
     return to_location(locspec.parse(text))
 
 
+def enumerable_prefixes(loc: LocationFact) -> list[tuple[str, ...]]:
+    """The literal prefixes a location's leading run of names and ``{a,b}`` sets spells,
+    exploded: ``/{usr,opt}/data/<x.*>`` is ``/usr/data`` and ``/opt/data``. Every prefix has the
+    same length; ``[()]`` when the first component is already a pattern."""
+    parts = loc.path_components if isinstance(loc, StaticPath) else loc.static_prefix
+    prefixes: list[tuple[str, ...]] = [()]
+    for c in parts:
+        match c:
+            case Named(name=n):
+                prefixes = [p + (n,) for p in prefixes]
+            case OneOf(names=ns):
+                prefixes = [p + (n,) for p in prefixes for n in sorted(ns)]
+            case _:
+                break
+    return prefixes
+
+
+def absolute_prefix_problem(loc: LocationFact) -> str | None:
+    """Why an absolute filesystem location cannot be granted or protected: it must begin with a
+    literal name or a ``{a,b}`` set, so the jail can bind (or confine) exactly the prefixes it
+    spells. None for a relative location, or an absolute one that does."""
+    if not loc.absolute or enumerable_prefixes(loc)[0]:
+        return None
+    return (
+        "an absolute location must begin with a literal name or a {a,b} set, so the jail can "
+        "express it: '/', '/**', '/*/x' and '/<regex>/x' cannot be granted or protected"
+    )
+
+
+def bindable_paths(loc: LocationFact, root: pathlib.Path) -> tuple[pathlib.Path, ...] | None:
+    """The concrete paths *loc* is exactly the union of -- literal paths, or the tops of literal
+    subtrees, each ``{a,b}`` set exploded (``/srv/{a,b}/**`` is ``/srv/a`` and ``/srv/b``) -- under
+    *root*, or at the filesystem root for an absolute location; None when a pattern remains (a
+    ``*``, a ``<regex>``, a ``**/leaf`` tail), which no set of bind mounts says exactly."""
+    match loc:
+        case StaticPath(path_components=parts) | DirSplat(static_prefix=parts, final_component=None):
+            pass
+        case _:
+            return None
+    if not all(isinstance(c, (Named, OneOf)) for c in parts):
+        return None
+    base = pathlib.Path("/") if loc.absolute else root
+    return tuple(base.joinpath(*p) for p in enumerable_prefixes(loc))
+
+
 def single_path(loc: LocationFact, root: pathlib.Path) -> pathlib.Path | None:
     """The one concrete path *loc* denotes -- a literal path, or the top of a literal subtree
     (``a/b/**``) -- under *root*, or at the filesystem root for an absolute location; None when

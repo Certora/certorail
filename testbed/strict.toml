@@ -1,0 +1,21 @@
+# strict = true: a grant runs under the policy view, and the section holds a location neither
+# jail can express -- absolute and patterned (no bind on Linux, no view outside the root), with
+# \d (outside the regex subset Seatbelt shares with Python). The run is refused before anything
+# runs. Delete the `strict` line and the same run warns on stderr and goes ahead.
+policy-version = 1
+base   = false
+strict = true
+
+[filesystem]
+read = ["src/**", '/tmp/certorail-testbed-outside/abs/<\d+\.txt>']
+
+[[program]]
+name = "cat"
+argv = ["cat", "${FLAGS...}", "--", "${FILES...}"]
+cwd  = "."
+holes.FLAGS = { kind = "flags", bare = ["-n"] }
+holes.FILES = { kind = "each", location = "**", min = 1 }
+network    = false
+write-fs   = false
+exec.spawn = false
+exec.view  = "policy"

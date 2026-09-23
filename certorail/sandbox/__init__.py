@@ -94,6 +94,21 @@ def omissions(spawner: Spawner, policy: "Policy", root: Path) -> tuple[Omitted, 
     return tuple(out)
 
 
+def unprovisioned() -> Spawner:
+    """This host's spawner with no run-scoped resources -- no FUSE view: for a spawn outside a
+    run (a literal checker at analysis time, a broker built without a run). A patterned policy
+    location then has no view to be served by, and is omitted as always."""
+    if sys.platform == "linux":
+        from certorail.sandbox.bubblewrap import BubblewrapSpawner
+
+        return BubblewrapSpawner(NoView("no run provisioned a view"))
+    if sys.platform == "darwin":
+        from certorail.sandbox.seatbelt import SeatbeltSpawner
+
+        return SeatbeltSpawner()
+    raise JailUnavailable(f"no child jail for platform {sys.platform!r}")
+
+
 def provision(policy: "Policy", root: Path) -> Spawner:
     """The spawner for this host, its run-scoped resources provisioned for *policy* under
     *root*. Raises ``JailUnavailable`` on a platform with no mechanism."""

@@ -52,11 +52,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import IO
 
-from certorail.analysis import Named, StaticPath
-from certorail.childjail import Mounts, View
-from certorail.viewdaemon import Attachment, ViewUnavailable, attach
+from certorail.analysis import pretty_location
 from certorail.broker import build_broker, terminal_descriptors
+from certorail.sandbox import Omitted, Spawner, omissions, provision, unprovisioned
+from certorail.sandbox.program import bwrap_argv, lower_program, seatbelt_profile
 from certorail.describe import describe
+from certorail.lint import lint
 from certorail.policy import Denial, Policy, Program
 from certorail.policydir import AmbientPolicyError, find_policy
 from certorail.policyfile import BASE_RULESET, PolicyFileError, default_policy, load_policy_file
@@ -99,15 +100,15 @@ class Accepted:
 
 def check(
     source: str, filename: str, policy: Policy, root: pathlib.Path | None = None,
-    view: pathlib.Path | None = None,
+    spawner: Spawner | None = None,
 ) -> Accepted | Rejected:
     """Analyse and evaluate; on success, the program as it will run. Raises ``SyntaxError``.
 
-    With *root*, the policy's literal checkers may run (under it, a confined one through the
-    FUSE *view* when attached) to discharge pure atoms on statically-known text; without it,
-    only regex-defined atoms are discharged statically."""
+    With *root*, the policy's literal checkers may run (under it, a confined one by the run's
+    *spawner* when given) to discharge pure atoms on statically-known text; without it, only
+    regex-defined atoms are discharged statically."""
     tree = ast.parse(source, filename)
-    discharge = None if root is None else policy.discharger(root, view)
+    discharge = None if root is None else policy.discharger(root, spawner if spawner is not None else unprovisioned())
     report = analyze(source, filename, policy.vocabulary(), discharge)
     if report.violations:
         return Rejected(report, violations=report.violations)
@@ -160,111 +161,34 @@ def _handover(prefix: str, text: str) -> IO[bytes]:
     return f
 
 
-def _jail_write_paths(policy: Policy, root: pathlib.Path) -> list[str]:
-    """The jail's write allowance: the sandbox root -- which covers every root-relative write
-    location -- plus the concrete prefix of every *absolute* write location the policy grants
-    (a statically-approved ``/srv/checkouts/**`` write must not die in the jail). Coarser than
-    the policy on purpose: precision is the analysis' job, the jail is the backstop."""
-    paths = [str(root)]
-    for loc in policy.write:
-        if not loc.absolute:
-            continue
-        parts = loc.path_components if isinstance(loc, StaticPath) else loc.static_prefix
-        names = []
-        for component in parts:
-            if not isinstance(component, Named):
-                break  # the concrete prefix ends at the first wildcard-ish component
-            names.append(component.name)
-        paths.append("/" + "/".join(names))
-    return paths
+@dataclass(frozen=True)
+class JailRefused:
+    """A strict policy's run refused before anything ran: what the confined grants' jail could
+    not express."""
+
+    omitted: tuple[Omitted, ...]
+
+    def describe(self) -> list[str]:
+        return [
+            "certorail: strict: a grant runs under the policy filesystem view, and the jail here "
+            "cannot express these locations, so the run is refused:"
+        ] + [f"certorail:   {o.role} {pretty_location(o.location)}: {o.reason}" for o in self.omitted]
 
 
-def _jail_deny_paths(mounts: Mounts) -> list[str]:
-    """The jail's write denials: every protected location (``no-write``) that is one concrete
-    path, as ``fsview`` lowered it. A protection with a wildcard in it (``repos/**/.git``) is
-    the analysis' alone: a jail binds paths, not patterns."""
-    return [str(p) for p in mounts.no_write]
-
-
-def _bwrap_command(bwrap: str, policy: Policy, root: pathlib.Path, mounts: Mounts, command: list[str]) -> list[str]:
-    """The Linux jail around the interpreter: the host's filesystem read-only, the policy's
-    write surface (``_jail_write_paths``) bound writable, every concrete protection remounted
-    read-only on top (later mounts win), no network. Reads stay open: the interpreter needs its
-    stdlib from everywhere, and read confinement is the analysis' stronger half. Process
-    creation is the bootstrap's own seccomp filter, which composes with these namespaces; the
-    broker's socket is an inherited descriptor, which bubblewrap passes through."""
-    argv = [bwrap, "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"]
-    for path in _jail_write_paths(policy, root):
-        argv += ["--bind-try", path, path]
-    for path in _jail_deny_paths(mounts):
-        argv += ["--ro-bind-try", path, path]
-    argv += ["--unshare-net", "--die-with-parent", "--", *command]
-    return argv
-
-
-def _sb_string(text: str) -> str:
-    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-def _seatbelt_profile(policy: Policy, root: pathlib.Path, mounts: Mounts) -> str:
-    """The macOS jail, which the bootstrap installs on itself with one ``sandbox_init`` (a
-    sandboxed process cannot sandbox itself again, so nothing may wrap the interpreter first):
-    everything allowed except writes outside the policy's write surface, the network, fork and
-    exec. Real paths, since Seatbelt matches those (``/var`` is ``/private/var``); later rules
-    win, so the allowances follow the broad denial and the protections come last."""
-    allowed = " ".join(f"(subpath {_sb_string(os.path.realpath(p))})" for p in _jail_write_paths(policy, root))
-    lines = ["(version 1)", "(allow default)", "(deny file-write*)", f"(allow file-write* {allowed})"]
-    for path in _jail_deny_paths(mounts):
-        lines.append(f"(deny file-write* (subpath {_sb_string(os.path.realpath(path))}))")
-    lines += ["(deny network*)", "(deny process-fork)", "(deny process-exec*)"]
-    return "\n".join(lines) + "\n"
-
-
-def _attach_view(policy: Policy, root: pathlib.Path) -> Attachment | None:
-    """The FUSE view of the root for this run, when a confined grant needs one (a root-relative
-    pattern in the filesystem section that no bind expresses) and the host can serve it; None
-    otherwise, with the reason on stderr when it was needed (MOUNTS.md, ``viewdaemon``)."""
-    if not (policy.confines and policy.mounts(root).needs_view):
-        return None
-    try:
-        attached = attach(policy.view_spec(root))
-    except ViewUnavailable as e:
-        print(f"certorail: the policy filesystem view cannot be served here ({e}):", file=sys.stderr)
-        return None
-    return attached  # a spawn is not news: `certorail view status` shows the daemons
-
-
-def _announce_view(policy: Policy, root: pathlib.Path, view: pathlib.Path | None) -> None:
-    """A confined grant's view is the policy's filesystem section as binds (or the FUSE view of
-    the root, *view*), plus the rule's own mounts; whatever neither expresses is absent from it,
+def _announce_omissions(omitted: tuple[Omitted, ...]) -> None:
+    """A confined grant's world is what this run's mechanism can express of the policy's
+    filesystem section and the rule's own mounts; whatever it cannot is absent from the world,
     and that is never silent (MOUNTS.md)."""
-    if not policy.confines:
-        return
-    base = policy.mounts(root, view=view)
-    per_rule = [
-        (" ".join(rule.leading_words) if isinstance(rule, Program) else f"validation {rule.name}", extra)
-        for rule in (*policy.programs, *policy.validations)
-        if rule.view is View.POLICY
-        for extra in [tuple(o for o in policy.mounts(root, rule, view).omitted if o not in base.omitted)]
-        if extra
-    ]
-    if not (base.omitted or per_rule):
+    if not omitted:
         return
     print(
         "certorail: a grant runs under the policy filesystem view (exec.view = \"policy\"), and "
-        "these locations have no native mount, so the view OMITS them:",
+        "these locations cannot be expressed by the jail here, so its world OMITS them "
+        "(strict = true in the policy refuses such a run instead):",
         file=sys.stderr,
     )
-    for entry in base.omitted:
-        print(f"certorail:   {entry}", file=sys.stderr)
-    for name, extras in per_rule:
-        for entry in extras:
-            print(f"certorail:   {name}: {entry}", file=sys.stderr)
-    print(
-        "certorail:   (a literal path or a literal prefix ending in ** is mountable; a pattern "
-        + ("outside the root has no view)" if view is not None else "needs the FUSE view: the certorail[fuse] extra)"),
-        file=sys.stderr,
-    )
+    for o in omitted:
+        print(f"certorail:   {o.role} {pretty_location(o.location)}: {o.reason}", file=sys.stderr)
 
 
 def run(
@@ -275,15 +199,15 @@ def run(
     args: Sequence[str] = (),
     python: str = sys.executable,
     jail: bool = True,
-) -> subprocess.CompletedProcess[bytes] | Rejected:
-    attached = _attach_view(policy, root)
-    view = None if attached is None else attached.mountpoint
-    _announce_view(policy, root, view)
-    try:
-        return _run(source, filename, policy, root, args, python, jail, view)
-    finally:
-        if attached is not None:
-            attached.close()  # the lease: the daemon may retire once no run holds one
+) -> subprocess.CompletedProcess[bytes] | Rejected | JailRefused:
+    # the run's mechanism for confined children, with its run-scoped resources (the FUSE view
+    # of the root, when the policy needs one): leased for the run, released after
+    with provision(policy, root) as spawner:
+        omitted = omissions(spawner, policy, root) if policy.confines else ()
+        if omitted and policy.strict:
+            return JailRefused(omitted)
+        _announce_omissions(omitted)
+        return _run(source, filename, policy, root, args, python, jail, spawner)
 
 
 def _run(
@@ -294,9 +218,9 @@ def _run(
     args: Sequence[str],
     python: str,
     jail: bool,
-    view: pathlib.Path | None,
+    spawner: Spawner,
 ) -> subprocess.CompletedProcess[bytes] | Rejected:
-    outcome = check(source, filename, policy, root, view)
+    outcome = check(source, filename, policy, root, spawner)
     if isinstance(outcome, Rejected):
         return outcome
     for line in reveal_lines(outcome.report, filename):
@@ -322,7 +246,7 @@ def _run(
         host_end, child_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         handover.append(child_end)
         # a stream=True exec writes to the descriptors this host holds for its terminal
-        broker = build_broker(policy, root, stream_to=terminal_descriptors(), view=view)
+        broker = build_broker(policy, root, stream_to=terminal_descriptors(), spawner=spawner)
         serving = threading.Thread(target=broker.serve, args=(host_end,), name="certorail-broker", daemon=True)
         serving.start()
         env["CERTORAIL_BROKER_FD"] = str(child_end.fileno())
@@ -333,6 +257,7 @@ def _run(
         # seccomp exec denial inside bubblewrap's namespaces, on macOS the whole Seatbelt
         # profile, since nothing may sandbox the interpreter before it does
         env["CERTORAIL_SELF_JAIL"] = "1"
+        program_jail = lower_program(policy, root, patterns=sys.platform == "darwin")
         if sys.platform == "linux":
             bwrap = shutil.which("bwrap")
             if bwrap is None:
@@ -342,9 +267,9 @@ def _run(
                     file=sys.stderr,
                 )
             else:
-                command = _bwrap_command(bwrap, policy, root, policy.mounts(root), command)
+                command = bwrap_argv(program_jail, bwrap, command)
         elif sys.platform == "darwin":
-            profile = _handover("certorail-seatbelt-", _seatbelt_profile(policy, root, policy.mounts(root)))
+            profile = _handover("certorail-seatbelt-", seatbelt_profile(program_jail))
             handover.append(profile)
             env["CERTORAIL_SEATBELT_FD"] = str(profile.fileno())
     try:
@@ -474,6 +399,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         loaded = load_policy(ns.policy, root)
         for line in loaded.provenance:
             print(line, file=sys.stderr)
+        for finding in lint(loaded.policy, root):  # for the policy's author, not the program's
+            print(f"certorail: {finding.line()}", file=sys.stderr)
         print(describe(loaded.policy, *policy_origin(ns.policy, root)))
         return 0
     source, filename, program_args = _program(parser, ns, tail)
@@ -643,7 +570,7 @@ def _execute(
             print(line, file=sys.stderr)
     try:
         if check_only:
-            outcome: Accepted | Rejected | subprocess.CompletedProcess[bytes] = check(
+            outcome: Accepted | Rejected | JailRefused | subprocess.CompletedProcess[bytes] = check(
                 source, filename, policy, root
             )
         else:
@@ -666,6 +593,10 @@ def _execute(
             for line in outcome.describe(filename):
                 print(line)
             return 0
+        case JailRefused():
+            for line in outcome.describe():
+                print(line, file=sys.stderr)
+            return 1
         case _:
             return outcome.returncode
 

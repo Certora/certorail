@@ -279,6 +279,26 @@ class TestClosures(unittest.TestCase):
         got = violations(f"def g():\n    ys: list[{P}] = []\n    h = lambda: len(ys)\n")
         self.assertTrue(any(self.CLOSED in v for v in got), got)
 
+    def test_a_generator_expressions_lazy_part_is_a_closure(self) -> None:
+        # everything after the first iterable runs when the generator is consumed: a container
+        # named there is reached from deferred code, exactly as from a lambda (the elements
+        # appended are well-formed, so only the closure rule can refuse them)
+        for src in (
+            f'def g():\n    ys: list[{P}] = []\n    gen = (ys.append(v) for v in ["c"])\n    print(list(gen))\n',
+            f'def g():\n    ys: list[{P}] = []\n    gen = (ys.append(v) for v in ["c/d"])\n    print(list(gen))\n',
+            DECL + 'gen = (xs.append(v) for v in ["c"])\nprint(list(gen))\n',
+            DECL + 'gen = (v for v in ["c"] if v in xs)\nprint(list(gen))\n',
+            DECL + 'gen = (w for v in ["c"] for w in xs)\nprint(list(gen))\n',
+        ):
+            with self.subTest(src=src):
+                got = violations(src)
+                self.assertTrue(any(self.CLOSED in v for v in got), got)
+
+    def test_a_generator_expressions_first_iterable_is_not(self) -> None:
+        # the first iterable is evaluated where the expression is written: a roster read
+        self.assertEqual(violations(DECL + "n = sum(1 for x in xs)\n"), [])
+        self.assertEqual(violations(f'def g():\n    ys: list[{P}] = ["a"]\n    print(sum(1 for y in ys))\n'), [])
+
     def test_passing_it_is_the_way(self) -> None:
         self.assertEqual(violations(USE + DECL + f"def f(zs: list[{P}]):\n    zs.append(\"c\")\nf(xs)\n"), [])
 

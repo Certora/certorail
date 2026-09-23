@@ -16,6 +16,7 @@ import ast
 import unittest
 
 from certorail.analysis import (
+    ANY_COMPONENT,
     ANY_STR,
     Alternation,
     AnyName,
@@ -71,10 +72,32 @@ def validated(*atoms: AtomicFact, regex: PseudoRegex | None = None) -> StrFact:
     return StrFact(regex=ANY_STR if regex is None else regex, atoms=frozenset(atoms))
 
 
+# One name, as a directory listing yields it: no "/", and never "", "." or "..". The atoms alone
+# do not say so -- "" and "." carry no-slash and not-dot-dot too -- the regex does.
+NAME = validated("no-slash", "no-parent-traversal", regex=ANY_COMPONENT)
+
+
 # A path known to be exactly ``base``.
 BASE = path_of(static("base"))
 # A path known to be somewhere at or below ``base/``.
 UNDER_BASE = path_of(splat("base"))
+
+
+class TestAnyComponent(unittest.TestCase):
+    """The text of one arbitrary name: what a listing yields and what ``*`` spells, so text and
+    location convert both ways by constructor."""
+
+    def test_the_path_atoms_follow_from_the_text(self) -> None:
+        bare = StrFact(regex=ANY_COMPONENT)  # no atoms stated
+        for atom in ("no-slash", "no-parent-traversal", "not-dot-dot", "not-absolute"):
+            with self.subTest(atom=atom):
+                self.assertIn(atom, bare)
+        self.assertNotIn("not-option", bare)  # a name may begin with "-"
+        self.assertEqual(evaluate('pathlib.Path("base") / s', {"s": bare}), path_of(static("base", ANY)))
+
+    def test_a_wildcard_component_round_trips_through_text(self) -> None:
+        p = path_of(static("base", ANY))
+        self.assertEqual(evaluate('f"{p}/x"', {"p": p}), Located(static("base", ANY, "x"), "str"))
 
 
 class TestNames(unittest.TestCase):
@@ -138,8 +161,12 @@ class TestPathFromName(unittest.TestCase):
         self.assertEqual(evaluate("pathlib.Path(d)", {"d": UNDER_BASE}), UNDER_BASE)
 
     def test_single_component_string_is_located_under_the_root(self) -> None:
+        self.assertEqual(evaluate("pathlib.Path(s)", {"s": NAME}), path_of(static(ANY)))
+
+    def test_a_string_that_may_be_empty_or_dot_is_no_component(self) -> None:
+        # "" and "." satisfy no-slash and not-dot-dot, and name the root itself
         st: State = {"s": validated("no-slash", "no-parent-traversal")}
-        self.assertEqual(evaluate("pathlib.Path(s)", st), path_of(static(ANY)))
+        self.assertEqual(evaluate("pathlib.Path(s)", st), path_of(splat()))
 
     def test_unvalidated_string_is_a_path_of_unknown_location(self) -> None:
         self.assertEqual(evaluate("pathlib.Path(s)", {"s": validated()}), PathFact())
@@ -213,8 +240,16 @@ class TestPathFromMultipleArgs(unittest.TestCase):
         self.assertEqual(evaluate("pathlib.Path(p, q)", st), path_of(static("base", "x", "y")))
 
     def test_literal_then_single_component_string(self) -> None:
-        st: State = {"s": validated("no-slash", "no-parent-traversal")}
-        self.assertEqual(evaluate('pathlib.Path("a", s)', st), path_of(static("a", ANY)))
+        self.assertEqual(evaluate('pathlib.Path("a", s)', {"s": NAME}), path_of(static("a", ANY)))
+
+    def test_an_empty_head_adds_nothing(self) -> None:
+        # Path("", x) is Path(x); os.path.join("", x) is x; Path("") alone is the root, but
+        # os.path.join("") is "" and names nothing
+        self.assertEqual(evaluate('pathlib.Path("", "a")'), path_of(static("a")))
+        self.assertEqual(evaluate('pathlib.Path("")'), path_of(static()))
+        self.assertEqual(evaluate('os.path.join("", "a")'), Located(static("a"), "str"))
+        self.assertIsNone(evaluate('os.path.join("")'))
+        self.assertEqual(evaluate('pathlib.Path("", "/srv/x")'), path_of(StaticPath((Named("srv"), Named("x")), absolute=True)))
 
     def test_literal_then_relative_string_becomes_splat(self) -> None:
         st: State = {"s": validated("no-parent-traversal", "not-absolute")}
@@ -365,8 +400,15 @@ class TestJoinWithValidatedString(unittest.TestCase):
     """The right operand is a string-typed fact carrying atoms, no containment."""
 
     def test_single_component_extends_with_wildcard(self) -> None:
-        st: State = {"p": BASE, "s": validated("no-slash", "no-parent-traversal")}
+        st: State = {"p": BASE, "s": NAME}
         self.assertEqual(evaluate("p / s", st), path_of(static("base", ANY)))
+
+    def test_a_possibly_empty_string_widens_instead_of_deepening(self) -> None:
+        # base / "" and base / "." are base itself: the join is at or below base, not one deeper
+        st: State = {"p": BASE, "s": validated("no-slash", "no-parent-traversal")}
+        self.assertEqual(evaluate("p / s", st), path_of(splat("base")))
+        dotted: State = {"p": BASE, "s": validated("no-slash", "no-parent-traversal", regex=RegexLit(r"[a-z.]*"))}
+        self.assertEqual(evaluate("p / s", dotted), path_of(splat("base")))
 
     def test_single_component_carries_its_regex(self) -> None:
         r = RegexLit(r"\w+\.txt")
@@ -385,7 +427,7 @@ class TestJoinWithValidatedString(unittest.TestCase):
     def test_all_atoms_prefers_single_component(self) -> None:
         st: State = {
             "p": BASE,
-            "s": validated("no-slash", "no-parent-traversal", "not-absolute"),
+            "s": validated("no-slash", "no-parent-traversal", "not-absolute", regex=ANY_COMPONENT),
         }
         self.assertEqual(evaluate("p / s", st), path_of(static("base", ANY)))
 

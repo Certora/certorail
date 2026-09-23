@@ -8,15 +8,26 @@ backing-file reference, from ``scripts/probe_fuse_view.py`` where it was measure
 inode holds an ``O_PATH`` descriptor (the anchor for every ``*at`` call), a file inode holds the
 directory it was found in and its name there and is re-resolved on demand with an identity check,
 an open handle is a real descriptor. What this module adds is the **filter**: every name the
-kernel is shown or asked to create is decided against the policy, by the location machinery the
-analysis uses (``footprints._intersects``, so concrete names fold exactly as they do there):
+kernel is shown or asked to create is decided against the policy by the analysis' own ordering
+(``location_le``) on the concrete path -- exact, since one side is always a real path:
 
-- a file is visible iff it lies within some ``read`` or ``write`` grant;
-- a directory is visible iff some grant has a path at or below it, or a ``list`` grant names it
-  (the root always is);
+- a path is *readable* iff it lies within some ``read`` or ``write`` grant: a file's contents
+  open, a directory lists every entry by name (listing a directory is reading it);
+- an entry is *visible* -- it looks up, it is listed -- iff it is readable, its directory is, or
+  (for a directory) some grant names a path below it; a name visible only because its directory
+  is readable shows its metadata, never its contents;
 - a name may be created, changed or removed iff its path lies within some ``write`` grant and at
   or below no ``no-write`` protection. Whether the child may write at all is bubblewrap's
   read-only bind, per rule (``write-fs``); the filesystem itself is always mounted writable.
+
+Names are the directory's own: a lookup must name an entry exactly as the directory stores it, and
+no operation may introduce a name the backing filesystem resolves to a differently spelled entry
+(a case- or normalisation-folding filesystem would otherwise let ``.GIT`` reach ``.git``). Where
+the directory's filesystem declares its lookups exact (``folding``), a name that resolves is so
+stored; anywhere else, folding or unable to say, the name must appear in the directory's listing,
+read afresh each time -- no cache, so nothing to go stale. A file
+with several names cannot be written through the view, and a hard link may be made only to a file
+that may be written: which of its names the policy would judge is not knowable.
 
 A directory cannot be renamed through the view (EPERM): a file inode's visibility is a function
 of its path, and moving a subtree would change every path beneath it under the kernel's cached
@@ -43,17 +54,31 @@ from typing import override
 import pyfuse3
 from pyfuse3 import EntryAttributes, FileHandleT, FileInfo, FileNameT, FlagT, InodeT, ModeT, RequestContext
 
-from certorail.analysis import LocationFact, Named
-from certorail.footprints import SPLAT, Item, _intersects, items_of
+from certorail.analysis import DirSplat, LocationFact, Named, StaticPath, location_le, subsumes
+from certorail.folding import exact_lookups
 
 type NativeFd = int                 # a descriptor of this process (O_PATH or I/O)
 type NativeKey = tuple[int, int]    # (st_dev, st_ino): a backing file's identity
 type RelPath = tuple[str, ...]      # a path relative to the root, as component names
 
 
+def _at(path: RelPath) -> StaticPath:
+    return StaticPath(tuple(Named(n) for n in path))
+
+
+def _names_below(path: RelPath, loc: LocationFact) -> bool:
+    """Does *loc* denote some path strictly below *path*?"""
+    match loc:
+        case StaticPath(path_components=cs):
+            return len(cs) > len(path) and all(subsumes(c, Named(n)) for c, n in zip(cs, path))
+        case DirSplat(static_prefix=ps):
+            return all(subsumes(c, Named(n)) for c, n in zip(ps, path))
+
+
 class Filter:
-    """The policy's filesystem section, asked about concrete paths relative to the root.
-    Absolute locations are not the view's business: they are binds beside it."""
+    """The policy's filesystem section, asked about concrete paths relative to the root, by the
+    analysis' own ordering. Absolute locations are not the view's business: they are binds
+    beside it."""
 
     def __init__(
         self,
@@ -61,39 +86,39 @@ class Filter:
         write: tuple[LocationFact, ...],
         no_write: tuple[LocationFact, ...],
     ) -> None:
-        def relative(locs: tuple[LocationFact, ...]) -> list[tuple[Item, ...]]:
-            return [items_of(loc) for loc in locs if not loc.absolute]
+        def relative(locs: tuple[LocationFact, ...]) -> tuple[LocationFact, ...]:
+            return tuple(loc for loc in locs if not loc.absolute)
 
-        self.readable: list[tuple[Item, ...]] = relative(read) + relative(write)
-        self.writable: list[tuple[Item, ...]] = relative(write)
-        self.protected: list[tuple[Item, ...]] = [(*items, SPLAT) for items in relative(no_write)]
-
-    @staticmethod
-    def _items(path: RelPath) -> tuple[Item, ...]:
-        return tuple(Named(n) for n in path)
+        self.grants: tuple[LocationFact, ...] = relative(read) + relative(write)
+        self.writes: tuple[LocationFact, ...] = relative(write)
+        self.protections: tuple[LocationFact, ...] = relative(no_write)
 
     @lru_cache(maxsize=200_000)
-    def file_visible(self, path: RelPath) -> bool:
-        items = self._items(path)
-        return any(_intersects(items, g) for g in self.readable)
+    def readable(self, path: RelPath) -> bool:
+        """Within some grant: a file's contents open, a directory lists every name."""
+        return any(location_le(_at(path), g) for g in self.grants)
 
     @lru_cache(maxsize=200_000)
     def dir_visible(self, path: RelPath) -> bool:
-        # a directory is visible iff some grant has paths below it: listing is reading
-        if not path:
+        """A directory exists for the child iff it is readable or some grant names a path below
+        it (the root always does)."""
+        return not path or self.readable(path) or any(_names_below(path, g) for g in self.grants)
+
+    def visible(self, path: RelPath, is_dir: bool) -> bool:
+        """Does the entry look up and list? Readable, under a readable directory (its name
+        only), or a directory on the way to a grant."""
+        if path and self.readable(path[:-1]):
             return True
-        below = (*self._items(path), SPLAT)
-        return any(_intersects(below, g) for g in self.readable)
+        return self.dir_visible(path) if is_dir else self.readable(path)
 
     @lru_cache(maxsize=200_000)
     def may_write(self, path: RelPath) -> bool:
-        items = self._items(path)
-        return any(_intersects(items, w) for w in self.writable) and not any(
-            _intersects(items, p) for p in self.protected
+        """Within some write grant, and at or below no protection."""
+        if not path or not any(location_le(_at(path), w) for w in self.writes):
+            return False
+        return not any(
+            location_le(_at(path[:k]), p) for p in self.protections for k in range(1, len(path) + 1)
         )
-
-    def visible(self, path: RelPath, is_dir: bool) -> bool:
-        return self.dir_visible(path) if is_dir else self.file_visible(path)
 
 
 class Inode:
@@ -170,8 +195,30 @@ class View(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EPERM)
 
     def writable_inode(self, inode: InodeT) -> None:
+        """The file itself may be written: its one name may, or EPERM. A file with several
+        names is never written through the view -- the policy judges names, and which of this
+        one's names it would judge is not knowable."""
         if inode == pyfuse3.ROOT_INODE or not self.rules.may_write(self.path_of(inode)):
             raise pyfuse3.FUSEError(errno.EPERM)
+        st = self.stat_of(inode)
+        if not statmod.S_ISDIR(st.st_mode) and st.st_nlink > 1:
+            raise pyfuse3.FUSEError(errno.EPERM)
+
+    def spelled_as_stored(self, parent: InodeT, name: FileNameT) -> bool:
+        """Is *name*, which resolves under *parent*, the spelling the directory stores? Where the
+        directory's lookups are exact, resolving says so; elsewhere only its listing does."""
+        fd = self.parent_fd(parent)
+        return exact_lookups(fd) or _name(name) in os.listdir(_proc(fd))
+
+    def refuse_alias(self, parent: InodeT, name: FileNameT) -> None:
+        """EEXIST when the backing filesystem resolves *name* to an entry it stores under another
+        spelling: a folding filesystem would otherwise let a new name land on an existing one."""
+        try:
+            os.stat(name, dir_fd=self.parent_fd(parent), follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if not self.spelled_as_stored(parent, name):
+            raise pyfuse3.FUSEError(errno.EEXIST)
 
     def parent_fd(self, parent: InodeT) -> NativeFd:
         fd = self.inodes[parent].fd
@@ -232,9 +279,20 @@ class View(pyfuse3.Operations):
         entry.attr_timeout = 1
         return entry
 
+    def recorded_at(self, node: Inode, parent: InodeT, name: FileNameT, st: os.stat_result) -> bool:
+        """Is *node* the entry *name* under *parent*, as the view recorded it: the same kind of
+        entry, at the same place? Sharing a key is not enough. A file holds no descriptor, so
+        once deleted its inode number is free for a new file or directory; and anything may be
+        moved behind the view's back. The filter judges the recorded place."""
+        if statmod.S_ISDIR(st.st_mode):
+            return node.fd is not None and node.path == self.child_path(parent, name)
+        return node.fd is None and node.parent == parent and node.name == name
+
     def admit(self, parent: InodeT, name: FileNameT, st: os.stat_result | None = None) -> EntryAttributes:
         """The entry *name* under the directory inode *parent* as an inode the kernel may hold:
-        reuse it by identity or make it, bump the count, return its attributes."""
+        reuse the one recorded for it, or make one, bump the count, return its attributes. A
+        key whose inode is recorded elsewhere gets a new inode, and the old one stays, unfindable
+        by key, until the kernel forgets it."""
         parent_fd = self.parent_fd(parent)
         if st is None:
             try:
@@ -243,7 +301,7 @@ class View(pyfuse3.Operations):
                 raise pyfuse3.FUSEError(errno.ENOENT) from None
         key = _identity(st)
         inode = self.by_key.get(key)
-        if inode is not None:
+        if inode is not None and self.recorded_at(self.inodes[inode], parent, name, st):
             self.inodes[inode].refs += 1
             return self.attrs_from(st, inode)
         inode = self.next_inode
@@ -269,7 +327,8 @@ class View(pyfuse3.Operations):
         node.refs -= count
         if node.refs <= 0:
             del self.inodes[inode]
-            del self.by_key[node.key]
+            if self.by_key.get(node.key) == inode:  # not if a newer inode took the key
+                del self.by_key[node.key]
             if node.fd is not None:
                 os.close(node.fd)
             if node.parent is not None:
@@ -283,6 +342,8 @@ class View(pyfuse3.Operations):
             st = os.stat(name, dir_fd=self.parent_fd(parent_inode), follow_symlinks=False)
         except FileNotFoundError:
             raise pyfuse3.FUSEError(errno.ENOENT) from None
+        if not self.spelled_as_stored(parent_inode, name):
+            raise pyfuse3.FUSEError(errno.ENOENT)  # another spelling of an entry: not this name
         if not self.rules.visible(self.child_path(parent_inode, name), statmod.S_ISDIR(st.st_mode)):
             raise pyfuse3.FUSEError(errno.ENOENT)  # the name does not exist, not "may not"
         return self.admit(parent_inode, name, st)
@@ -334,6 +395,7 @@ class View(pyfuse3.Operations):
         self, parent_inode: InodeT, name: FileNameT, mode: ModeT, flags: FlagT, ctx: RequestContext,
     ) -> tuple[FileInfo, EntryAttributes]:
         self.writable_name(parent_inode, name)
+        self.refuse_alias(parent_inode, name)
         fd: NativeFd = os.open(name, flags | os.O_CREAT | os.O_EXCL, mode, dir_fd=self.fd_of(parent_inode))
         entry = self.admit(parent_inode, name)
         return FileInfo(fh=FileHandleT(fd)), entry
@@ -341,6 +403,7 @@ class View(pyfuse3.Operations):
     @override
     async def mkdir(self, parent_inode: InodeT, name: FileNameT, mode: ModeT, ctx: RequestContext) -> EntryAttributes:
         self.writable_name(parent_inode, name)
+        self.refuse_alias(parent_inode, name)
         os.mkdir(name, mode, dir_fd=self.fd_of(parent_inode))
         return self.admit(parent_inode, name)
 
@@ -349,6 +412,7 @@ class View(pyfuse3.Operations):
         self, parent_inode: InodeT, name: FileNameT, target: FileNameT, ctx: RequestContext,
     ) -> EntryAttributes:
         self.writable_name(parent_inode, name)
+        self.refuse_alias(parent_inode, name)
         os.symlink(target, name, dir_fd=self.fd_of(parent_inode))
         return self.admit(parent_inode, name)
 
@@ -357,6 +421,9 @@ class View(pyfuse3.Operations):
         self, inode: InodeT, new_parent_inode: InodeT, new_name: FileNameT, ctx: RequestContext,
     ) -> EntryAttributes:
         self.writable_name(new_parent_inode, new_name)
+        self.refuse_alias(new_parent_inode, new_name)
+        # a new name for a file is a way to write it later: only for a file that may be written
+        self.writable_inode(inode)
         fd = self.fd_of(inode)
         try:
             os.link(_proc(fd), new_name, dst_dir_fd=self.fd_of(new_parent_inode), follow_symlinks=True)
@@ -373,6 +440,7 @@ class View(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EINVAL)
         self.writable_name(parent_inode_old, name_old)  # removing the old name is a write there
         self.writable_name(parent_inode_new, name_new)
+        self.refuse_alias(parent_inode_new, name_new)  # renaming onto another spelling replaces that entry
         old_fd = self.fd_of(parent_inode_old)
         try:
             st = os.stat(name_old, dir_fd=old_fd, follow_symlinks=False)
@@ -382,12 +450,11 @@ class View(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EPERM)  # a directory's path is every path beneath it
         os.rename(name_old, name_new, src_dir_fd=old_fd, dst_dir_fd=self.fd_of(parent_inode_new))
         inode = self.by_key.get(_identity(st))
-        if inode is not None:
+        if inode is not None and self.recorded_at(self.inodes[inode], parent_inode_old, name_old, st):
             node = self.inodes[inode]
-            if node.fd is None and node.parent is not None:
-                self.drop(node.parent, 1)
-                node.parent, node.name = parent_inode_new, name_new
-                self.inodes[parent_inode_new].refs += 1
+            self.drop(parent_inode_old, 1)
+            node.parent, node.name = parent_inode_new, name_new
+            self.inodes[parent_inode_new].refs += 1
 
     @override
     async def unlink(self, parent_inode: InodeT, name: FileNameT, ctx: RequestContext) -> None:
@@ -441,6 +508,8 @@ class View(pyfuse3.Operations):
     async def open(self, inode: InodeT, flags: FlagT, ctx: RequestContext) -> FileInfo:
         if flags & (os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_TRUNC):
             self.writable_inode(inode)
+        elif not self.rules.readable(self.path_of(inode)):
+            raise pyfuse3.FUSEError(errno.EACCES)  # listed by name under a readable directory only
         # promote the reference to an I/O descriptor: the open handle then keeps the file alive
         # by itself, whatever happens to its names
         node = self.inodes[inode]

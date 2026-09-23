@@ -36,6 +36,7 @@ from certorail.ids import (
     spelled,
 )
 from certorail.policy import Policy, atom, constraint, hole, param, program, pure, validation
+from certorail.sandbox import unprovisioned
 from certorail.walker import analyze
 
 HEADER = "import pathlib\nimport sys\n"
@@ -151,13 +152,13 @@ class TestMissing(unittest.TestCase):
 
     def test_a_checkable_atom_needs_the_discharger(self) -> None:
         self.assertEqual(self.missing("abc", "lower"), frozenset({"lower"}))  # weaker, never wrong
-        discharge = self.policy.discharger(self.config)
+        discharge = self.policy.discharger(self.config, unprovisioned())
         self.assertEqual(self.missing("abc", "lower", discharge=discharge), frozenset())
         self.assertEqual(self.missing("ABC", "lower", discharge=discharge), frozenset({"lower"}))
         self.assertEqual(self.missing(StrFact(regex=RegexLit("[a-z]+")), "lower", discharge=discharge), frozenset({"lower"}))  # not exact text
 
     def test_an_environmental_atom_and_a_source_are_never_inferred(self) -> None:
-        discharge = self.policy.discharger(self.config)
+        discharge = self.policy.discharger(self.config, unprovisioned())
         self.assertEqual(self.missing("repos/x", "org-checkout", discharge=discharge), frozenset({"org-checkout"}))
         self.assertEqual(self.missing("main", "gh-api", discharge=discharge), frozenset({"gh-api"}))
 

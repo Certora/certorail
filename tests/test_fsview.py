@@ -1,15 +1,21 @@
-"""The policy filesystem section lowered to mounts (fsview, MOUNTS.md): pure, no jail."""
+"""The policy filesystem section lowered for the jails (MOUNTS.md): the one path a bind can say,
+the ERE a Seatbelt filter takes, and each spawner's typed lowering. Pure, no jail."""
 import os
 import pathlib
 import re
+import tempfile
 import unittest
 
-from certorail.childjail import Mounts, Regex, View
-from certorail.fsview import additions, mounts
+from certorail.analysis import pretty_location
+from certorail.childjail import View
+from certorail.confinement import Additions, FilesystemSection, PolicyFilesystem
 from certorail.locations import parse_location as loc
 from certorail.locations import single_path as bind_path
 from certorail.policy import Policy, program
-from certorail.sandbox.seatbelt import NOT_ERE, ere_of, pattern_regex
+from certorail.sandbox import NoView
+from certorail.sandbox.bubblewrap import BubblewrapSpawner
+from certorail.sandbox.lowering import Bind, Omitted, RegexRule
+from certorail.sandbox.seatbelt import NOT_ERE, SeatbeltSpawner, ere_of, pattern_regex
 
 ROOT = pathlib.Path("/sandbox")
 REAL = re.escape(os.path.realpath(ROOT))  # what a regex over canonical paths starts with
@@ -43,18 +49,20 @@ class TestEreOf(unittest.TestCase):
             ("a+b*c?", "a+b*c?"),
             ("[a-z0-9_]+\\.txt", "[a-z0-9_]+\\.txt"),
             ("[^/]+", "[^/]+"),
-            ("[^.]", "[^.]"),
+            ("[^.]", "[^./]"),         # a component never holds "/": a negated class excludes it
+            ("[!-~]", "[!-.0-~]"),     # ... and a positive one loses it, split around it
             ("(ab|cd)*", "(ab|cd)*"),
             ("a{2}b{3,}c{1,4}", "a{2}b{3,}c{1,4}"),
-            (".*", ".*"),
-            ("^x$", "^x$"),
-            ("\\Ax\\Z", "^x$"),
+            (".*", "[^/]*"),           # "." is any character of one name
+            ("^x$", "x"),              # edge anchors say nothing under fullmatch
+            ("\\Ax\\Z", "x"),
             ("[]a]", "[]a]"),          # a leading ] is literal in both dialects
             ("[a-]", "[a-]"),          # a trailing - too
             ("[a^]", "[a^]"),          # ^ is literal when not leading
+            ("[^^]", "[^/^]"),         # with "/" leading, a lone ^ can be placed
             ("\\*\\+\\?", "\\*\\+\\?"),
-            ("\\/", "/"),              # an escaped non-special is the character
             ("(?:ab)+", "(ab)+"),      # a non-capturing group is a plain group
+            ("(?:a+)*", "(a+)*"),      # a quantified quantifier is grouped first
             # rendered from the parse, not the text: Python read these as {a, z, -} and as A
             ("[a\\-z]", "[az-]"),
             ("\\x41", "A"),
@@ -67,23 +75,22 @@ class TestEreOf(unittest.TestCase):
         for pattern in (
             "\\d+", "\\w", "\\s", "x\\d", "[\\d]", "\\bx", "a*?", "a+?", "a??", "a{2,}?",
             "(?i)x", "(?i:x)y", "(?=a)b", "(?!a)b", "(?<=a)b", "(a)\\1", "(?P<n>a)(?P=n)",
-            "a++", "(?>a)", "[^]", "[^^]", "é", "[à-ÿ]", "\\n",
+            "a++", "(?>a)", "[^]", "é", "[à-ÿ]", "\\n",
+            "\\/", "a/b",              # a component never holds "/"
+            "a^b", "a$b", "(^a)",      # an anchor anywhere but the edges
         ):
             with self.subTest(pattern=pattern):
                 self.assertIsNone(ere_of(pattern))
 
     def test_a_refused_regex_is_omitted_with_the_reason_under_patterns(self) -> None:
-        m = mounts(ROOT, read=(loc("logs/**/<\\d+\\.log>"),), write=(), no_write=(loc("<(?i)secret>"),), patterns=True)
-        self.assertEqual(m.reads, ())
-        self.assertEqual(m.no_write, ())
-        self.assertEqual(len(m.omitted), 2)
-        self.assertTrue(all(NOT_ERE in entry for entry in m.omitted), m.omitted)
-        self.assertTrue(m.omitted[0].startswith("read logs/**/<"))
-        self.assertTrue(m.omitted[1].startswith("no-write <"))
+        section = FilesystemSection(read=(loc("logs/**/<\\d+\\.log>"),), no_write=(loc("<(?i)secret>"),))
+        lowered = SeatbeltSpawner().lower(PolicyFilesystem(ROOT, section), write_fs=False)
+        self.assertEqual([(o.role, o.reason) for o in lowered if isinstance(o, Omitted)],
+                         [("read", NOT_ERE), ("no-write", NOT_ERE)])
+        self.assertEqual(len(lowered), 2)
         # the same shape spelled in the shared subset lowers
-        ok = mounts(ROOT, read=(loc("logs/**/<[0-9]+\\.log>"),), write=(), no_write=(), patterns=True)
-        self.assertEqual(ok.reads, (Regex(f"^{REAL}/logs/(.*/)?([0-9]+\\.log)$"),))
-        self.assertEqual(ok.omitted, ())
+        ok = SeatbeltSpawner().lower(PolicyFilesystem(ROOT, FilesystemSection(read=(loc("logs/**/<[0-9]+\\.log>"),))), write_fs=False)
+        self.assertEqual(ok, (RegexRule(f"^{os.path.realpath(ROOT)}/logs/(.*/)?([0-9]+\\.log)$", "read"),))
 
 
 class TestPatternRegex(unittest.TestCase):
@@ -95,7 +102,7 @@ class TestPatternRegex(unittest.TestCase):
         return r
 
     def test_the_shapes(self) -> None:
-        self.assertEqual(self.regex("src/**/<.*\\.py>"), f"^{REAL}/src/(.*/)?(.*\\.py)$")
+        self.assertEqual(self.regex("src/**/<.*\\.py>"), f"^{REAL}/src/(.*/)?([^/]*\\.py)$")
         # `*.py` is a literal name in the micro-syntax (only a bare `*` is a wildcard): escaped
         self.assertEqual(self.regex("src/**/*.py"), f"^{REAL}/src/(.*/)?\\*\\.py$")
         self.assertEqual(self.regex("repos/*/**"), f"^{REAL}/repos/[^/]+(/.*)?$")
@@ -125,68 +132,71 @@ class TestPatternRegex(unittest.TestCase):
         self.assertFalse(guard.search(f"{real}/repos/x/.gitignore"))
 
 
-class TestMounts(unittest.TestCase):
-    def test_grants_and_protections_are_kept_apart_and_deduplicated(self) -> None:
-        m = mounts(
-            ROOT,
-            read=(loc("**"), loc("/usr/share/data/**"), loc(".")),
-            write=(loc("build/**"),),
-            no_write=(loc("build/keep.txt"),),
-            patterns=False,
-        )
-        self.assertEqual(m, Mounts(
-            reads=(ROOT, pathlib.Path("/usr/share/data")),
-            writes=(ROOT / "build",),
-            no_write=(ROOT / "build" / "keep.txt",),
-        ))
+def fs(read: tuple = (), write: tuple = (), no_write: tuple = (), additions: Additions = Additions()) -> PolicyFilesystem:
+    return PolicyFilesystem(ROOT, FilesystemSection(read, write, no_write), additions)
 
-    def test_without_patterns_what_no_bind_expresses_is_reported_not_rounded(self) -> None:
-        m = mounts(
-            ROOT,
-            read=(loc("src/**/<.*\\.py>"), loc("docs/**")),
-            write=(loc("repos/*/**"),),
-            no_write=(loc("repos/**/.git"),),
-            patterns=False,
-        )
-        self.assertEqual(m.reads, (ROOT / "docs",))
-        self.assertEqual(m.writes, ())
-        self.assertEqual(m.no_write, ())
-        self.assertEqual(m.omitted, ("read src/**/</.*\\.py/>", "write repos/*/**", "no-write repos/**/.git"))
 
-    def test_with_patterns_everything_lowers(self) -> None:
-        m = mounts(
-            ROOT,
-            read=(loc("src/**/<.*\\.py>"), loc("docs/**")),
-            write=(loc("repos/*/**"),),
-            no_write=(loc("repos/**/.git"),),
-            patterns=True,
-        )
-        self.assertEqual(m.reads, (Regex(f"^{REAL}/src/(.*/)?(.*\\.py)$"), ROOT / "docs"))
-        self.assertEqual(m.writes, (Regex(f"^{REAL}/repos/[^/]+(/.*)?$"),))
-        self.assertEqual(m.no_write, (Regex(f"^{REAL}/repos/(.*/)?\\.git(/.*)?$"),))
-        self.assertEqual(m.omitted, ())
-        # the bind-mountable part drops the regexes
-        self.assertEqual(m.paths, Mounts(reads=(ROOT / "docs",)))
+class TestLowering(unittest.TestCase):
+    """What each mechanism does with each location: a typed ``Lowered`` value per location, with
+    its role, never a string."""
 
-    def test_a_rules_additions_join_the_view_under_their_own_names(self) -> None:
-        base = mounts(ROOT, read=(loc("src/**"),), write=(loc("out/**"),), no_write=(loc("out/final"),), patterns=False)
-        extra = additions(ROOT, mount_read=(loc("/srv/keys/**"), loc("src/**"), loc("cfg/*")), mount_write=(loc(".git/**"),), patterns=False)
-        self.assertEqual(extra.omitted, ("mount-read cfg/*",))
-        joined = base | extra
-        self.assertEqual(joined.reads, (ROOT / "src", pathlib.Path("/srv/keys")))  # src once
-        self.assertEqual(joined.writes, (ROOT / "out", ROOT / ".git"))
-        self.assertEqual(joined.no_write, (ROOT / "out" / "final",))
-        self.assertEqual(joined.omitted, ("mount-read cfg/*",))
+    def test_without_patterns_what_no_bind_expresses_is_omitted_not_rounded(self) -> None:
+        lowered = BubblewrapSpawner(NoView("a test serves no view")).lower(fs(
+            read=(loc("src/**/<.*\\.py>"), loc("docs/**")), write=(loc("repos/*/**"),), no_write=(loc("repos/**/.git"),),
+        ), write_fs=True)
+        self.assertEqual([x for x in lowered if isinstance(x, Bind)], [Bind(ROOT / "docs", "read")])
+        self.assertEqual([(o.role, pretty_location(o.location)) for o in lowered if isinstance(o, Omitted)],
+                         [("read", "src/**/</.*\\.py/>"), ("write", "repos/*/**"), ("no-write", "repos/**/.git")])
+
+    def test_seatbelt_lowers_everything_it_can_spell(self) -> None:
+        lowered = SeatbeltSpawner().lower(fs(
+            read=(loc("src/**/<.*\\.py>"), loc("docs/**"), loc("README.md")), write=(loc("repos/*/**"),),
+            no_write=(loc("repos/**/.git"), loc("out/final")),
+        ), write_fs=True)
+        self.assertIn(RegexRule(f"^{os.path.realpath(ROOT)}/src/(.*/)?([^/]*\\.py)$", "read"), lowered)
+        self.assertIn(Bind(ROOT / "docs", "read", subtree=True), lowered)
+        self.assertIn(Bind(ROOT / "README.md", "read", subtree=False), lowered)  # a literal is that path alone
+        self.assertIn(Bind(ROOT / "out" / "final", "no-write", subtree=True), lowered)  # a protection guards below
+        self.assertFalse([x for x in lowered if isinstance(x, Omitted)])
+
+    def test_a_set_of_names_is_one_bind_per_name(self) -> None:
+        # {a,b} is exactly two paths; a pattern after it is not, and a grant is never widened
+        lowered = BubblewrapSpawner(NoView("a test serves no view")).lower(fs(
+            read=(loc("/srv/{alpha,beta}/**"), loc("/srv/{alpha,beta}/<x.*>")), no_write=(loc("{out,dist}/final"),),
+        ), write_fs=True)
+        self.assertEqual([x for x in lowered if isinstance(x, Bind)], [
+            Bind(pathlib.Path("/srv/alpha"), "read"), Bind(pathlib.Path("/srv/beta"), "read"),
+            Bind(ROOT / "dist" / "final", "no-write"), Bind(ROOT / "out" / "final", "no-write"),
+        ])
+        self.assertEqual([pretty_location(o.location) for o in lowered if isinstance(o, Omitted)], ["/srv/{alpha,beta}/</x.*/>"])
+
+    def test_a_rules_additions_lower_under_their_own_names(self) -> None:
+        lowered = BubblewrapSpawner(NoView("a test serves no view")).lower(fs(
+            read=(loc("src/**"),), additions=Additions(read=(loc("/srv/keys/**"), loc("cfg/*")), write=(loc(".git/**"),)),
+        ), write_fs=True)
+        self.assertIn(Bind(pathlib.Path("/srv/keys"), "mount-read"), lowered)
+        self.assertIn(Bind(ROOT / ".git", "mount-write"), lowered)
+        self.assertEqual([(o.role, pretty_location(o.location)) for o in lowered if isinstance(o, Omitted)],
+                         [("mount-read", "cfg/*")])
+
+    def test_a_literal_directory_is_the_views_or_nothing_under_bubblewrap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "src").mkdir()
+            (root / "README.md").write_text("x\n")
+            section = FilesystemSection(read=(loc("src"), loc("README.md")))
+            lowered = BubblewrapSpawner(NoView("a test serves no view")).lower(PolicyFilesystem(root, section), write_fs=False)
+            # a file binds exactly; a directory named alone cannot be bound without its contents
+            self.assertIn(Bind(root / "README.md", "read"), lowered)
+            self.assertEqual([pretty_location(o.location) for o in lowered if isinstance(o, Omitted)], ["src"])
+
+    def test_the_policy_builds_the_confinement_the_lowering_reads(self) -> None:
         rule = program("git", cwd=".", view=View.POLICY, mount_read=["/srv/keys/**"], mount_write=[".git/**"])
         policy = Policy.allow(read=["src/**"], write=["out/**"], no_write=["out/final"], programs=[rule])
-        self.assertEqual(policy.mounts(ROOT, rule).writes, (ROOT / "out", ROOT / ".git"))
-        self.assertEqual(policy.mounts(ROOT).writes, (ROOT / "out",))  # the base alone, without a rule
-
-    def test_the_policy_lowers_its_own_section(self) -> None:
-        policy = Policy.allow(read=["src/**"], write=["out/**"], no_write=["out/final"], programs=[program("cat", cwd=".")])
-        m = policy.mounts(ROOT)
-        self.assertEqual((m.reads, m.writes, m.no_write), ((ROOT / "src",), (ROOT / "out",), (ROOT / "out" / "final",)))
-        self.assertFalse(policy.confines)
+        c = policy.confinement(rule, ROOT)
+        assert isinstance(c.filesystem, PolicyFilesystem)
+        self.assertEqual(c.filesystem.section, FilesystemSection(policy.read, policy.write, policy.no_write))
+        self.assertEqual(c.filesystem.additions, Additions(rule.mount_read, rule.mount_write))
 
 
 if __name__ == "__main__":

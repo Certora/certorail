@@ -1,0 +1,18 @@
+# Legal, and probably not what the author meant: `certorail describe --policy lints.toml --root
+# ROOT` prints each as a `lint (...)` line on stderr. Names, not objects, three ways.
+#
+# The absolute write grant below spells the default testbed root; if the root is mounted
+# elsewhere, change it to match or the shadowed-protection lint has nothing to say.
+policy-version = 1
+base = false
+
+[filesystem]
+read = [
+    "catalog",          # literal-directory: grants the listing of catalog, none of its files
+    "cf/stored.txt",    # spelling (macOS only): the directory stores Stored.txt
+]
+write = [
+    "out/**",
+    "/mnt/certorail-testbed/out/**",    # shadowed-protection: writes the same files by absolute name
+]
+no-write = ["out/keep"]                 # ... so this relative protection covers relative spellings only

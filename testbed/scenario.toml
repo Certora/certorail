@@ -1,0 +1,465 @@
+# What every piece of the testbed must do. run.py executes this against a built root;
+# tests/test_testbed.py asserts the static half (`check`, `refused`) on every commit.
+#
+# [[probe]]      a program under probes/, run with `certorail run --root ROOT --policy <policy>`
+#   policy       default policy.toml
+#   args         the program's arguments
+#   covers       what it demonstrates, one line
+#   needs        "network" (run.py starts serve.py), "casefold" (cf/ must fold)
+#   platforms    where it applies, when not everywhere
+#   check        the analysis' verdict: "accepted", "denied" or "violation"
+#   because      for a rejection: text its reason must contain
+#   [probe.run]  once accepted, what the run must do: exit, stdout-has, stdout-lacks, stderr-has
+#   [probe.darwin]  replaces [probe.run] on macOS, where Seatbelt, not the FUSE view, is the jail
+# [[refused]]    a policy that must not load: `error` is text the load error must contain
+# [[lint]]       `certorail describe` of a policy must print these lint kinds ([lint.darwin]: macOS)
+
+# ---------------------------------------------------------------------------------------------
+# the program's own filesystem operations: decided by the analysis
+
+[[probe]]
+name    = "read-tree"
+program = "probes/read_tree.py"
+covers  = "a read inside a tree grant"
+check   = "accepted"
+[probe.run]
+exit       = 0
+stdout-has = ['print("hello from src")']
+
+[[probe]]
+name    = "read-ungranted"
+program = "probes/read_ungranted.py"
+covers  = "a read under no grant"
+check   = "denied"
+because = "read of private/journal.txt is not permitted"
+
+[[probe]]
+name    = "list-literal-dir"
+program = "probes/list_literal_dir.py"
+covers  = "a literal directory grant permits listing it"
+check   = "accepted"
+[probe.run]
+exit       = 0
+stdout-has = ["item-a.txt", "item-b.txt"]
+
+[[probe]]
+name    = "read-literal-dir-file"
+program = "probes/read_literal_dir_file.py"
+covers  = "... and no file in it"
+check   = "denied"
+because = "read of catalog/item-a.txt is not permitted"
+
+[[probe]]
+name    = "listed-names"
+program = "probes/listed_names.py"
+covers  = "a listed name is one component: drop/* covers drop/<name>"
+check   = "accepted"
+[probe.run]
+exit         = 0
+stdout-has   = ["one", "two"]
+stdout-lacks = ["three"]
+
+[[probe]]
+name    = "read-pattern"
+program = "probes/read_pattern.py"
+covers  = "a pattern grant admits a matching name"
+check   = "accepted"
+[probe.run]
+exit       = 0
+stdout-has = ["the pattern admits me"]
+
+[[probe]]
+name    = "read-pattern-miss"
+program = "probes/read_pattern_miss.py"
+covers  = "... and not a name outside it"
+check   = "denied"
+because = "read of notes/deep/NO.txt is not permitted"
+
+[[probe]]
+name    = "read-symlink"
+program = "probes/read_symlink.py"
+covers  = "names, not objects: a granted name whose file is outside every grant"
+check   = "accepted"
+[probe.run]
+exit       = 0
+stdout-has = ["outside every grant"]
+
+[[probe]]
+name    = "write-granted"
+program = "probes/write_granted.py"
+covers  = "a write inside a write grant"
+check   = "accepted"
+[probe.run]
+exit       = 0
+stdout-has = ["wrote out/new.txt"]
+
+[[probe]]
+name    = "write-protected"
+program = "probes/write_protected.py"
+covers  = "a concrete protection inside a write grant"
+check   = "denied"
+because = "may touch out/keep, which is protected"
+
+[[probe]]
+name    = "write-git"
+program = "probes/write_git.py"
+covers  = "a patterned protection (**/.git)"
+check   = "denied"
+because = "write of repos/alpha/.git/config may touch **/.git, which is protected"
+
+[[probe]]
+name    = "write-folded-git"
+program = "probes/write_folded_git.py"
+covers  = "the analysis compares names folded: .GIT is .git to the protection"
+check   = "denied"
+because = "write of cf/.GIT/config may touch **/.git, which is protected"
+
+[[probe]]
+name    = "write-absolute"
+program = "probes/write_absolute.py"
+covers  = "an absolute grant with a {a,b} head, exploded into two binds"
+check   = "accepted"
+[probe.run]
+exit       = 0
+stdout-has = ["wrote abs/hello.txt and alt/hello.txt"]
+
+[[probe]]
+name    = "write-absolute-ungranted"
+program = "probes/write_absolute_ungranted.py"
+covers  = "beside the absolute grant, not in it"
+check   = "denied"
+because = "write of /tmp/certorail-testbed-outside/elsewhere.txt is not permitted"
+
+# ---------------------------------------------------------------------------------------------
+# the analysis' corner cases
+
+[[probe]]
+name    = "empty-prefix"
+program = "probes/empty_prefix.py"
+covers  = "an empty constant in front adds no text: the path stays absolute"
+check   = "denied"
+because = "read of /etc/hostname is not permitted"
+
+[[probe]]
+name    = "empty-component"
+program = "probes/empty_component.py"
+args    = ["alpha"]
+covers  = "text that may be \"\" or \".\" is not one component (it may be any number: data/**/x.txt)"
+check   = "denied"
+because = "write of data/**/x.txt is not permitted"
+
+[[probe]]
+name    = "one-component"
+program = "probes/one_component.py"
+args    = ["alpha"]
+covers  = "text that is never \"\" or \".\" is one component"
+check   = "accepted"
+[probe.run]
+exit       = 0
+stdout-has = ["wrote data/alpha/x.txt"]
+
+[[probe]]
+name    = "lambda-scope"
+program = "probes/lambda_scope.py"
+covers  = "a lambda body sees module constants only"
+check   = "denied"
+because = "the location of the path is not proven"
+
+[[probe]]
+name    = "generator-scope"
+program = "probes/generator_scope.py"
+covers  = "a generator expression's element sees module constants only"
+check   = "denied"
+because = "the location of the path is not proven"
+
+[[probe]]
+name    = "finally-path"
+program = "probes/finally_path.py"
+covers  = "`finally` is reached from the raising path too: two paths join to an unknown one"
+check   = "denied"
+because = "the location of the path is not proven"
+
+[[probe]]
+name    = "match-shadow"
+program = "probes/match_shadow.py"
+covers  = "a match capture is a binding: the name is no constant"
+check   = "denied"
+because = "the location of the path is not proven"
+
+[[probe]]
+name    = "namespace"
+program = "probes/namespace.py"
+covers  = "the certora namespace is a closed vocabulary"
+check   = "violation"
+because = "certora.os is not an allowed member"
+
+# ---------------------------------------------------------------------------------------------
+# tools under the policy view: the analysis accepts every call (the holes say **); the view
+# decides what exists. On Linux that is the FUSE view, on macOS Seatbelt.
+
+[[probe]]
+name    = "view-read"
+program = "probes/view_read.py"
+covers  = "readers: tree, pattern and literal-directory grants; no grant; a link out"
+check   = "accepted"
+[probe.run]
+exit = 0
+stdout-has = [
+    "cat src/main.py: exit 0",
+    "cat private/journal.txt: exit 1",
+    "cat notes/deep/ok.txt: exit 0",
+    "cat notes/deep/NO.txt: exit 1",
+    "cat catalog/item-a.txt: exit 1",
+    "cat src/link-out: exit 1",
+]
+
+[[probe]]
+name    = "view-list"
+program = "probes/view_list.py"
+covers  = "listings show exactly what is readable or on the way to a grant"
+check   = "accepted"
+[probe.run]
+exit = 0
+stdout-has = [
+    "ls .: catalog cf data drop notes out repos src",
+    "ls catalog: item-a.txt item-b.txt",
+    "ls drop/sub: three.txt",
+    "cat drop/sub/three.txt: exit 1",
+]
+stdout-lacks = ["private"]
+[probe.darwin]
+# Seatbelt cannot say "a directory on the way to a grant": the root, which no grant covers,
+# does not list at all
+exit = 0
+stdout-has = ["ls catalog: item-a.txt item-b.txt", "ls drop/sub: three.txt", "cat drop/sub/three.txt: exit 1"]
+stdout-lacks = ["private"]
+
+[[probe]]
+name    = "view-grep"
+program = "probes/view_grep.py"
+covers  = "a recursive search finds only what the tool may read"
+check   = "accepted"
+[probe.run]
+exit = 0
+stdout-has   = ["src/util.py", "notes/deep/ok.txt"]
+stdout-lacks = ["journal", "NO.txt", "item-a"]
+[probe.darwin]
+# ... and so a pattern grant's directories do not list: ok.txt opens by name, grep cannot find it
+exit = 0
+stdout-has   = ["src/util.py"]
+stdout-lacks = ["journal", "NO.txt", "item-a"]
+
+[[probe]]
+name    = "view-write"
+program = "probes/view_write.py"
+covers  = "writers: write grant, concrete and patterned protections, read grant, no grant"
+check   = "accepted"
+[probe.run]
+exit = 0
+stdout-has = [
+    "touch out/view-new.txt: exit 0",
+    "touch out/keep/final.txt: exit 1",
+    "touch repos/alpha/.git/config: exit 1",
+    "touch src/new.py: exit 1",
+    "touch private/new.txt: exit 1",
+    "cp src/main.py out/main-copy.py: exit 0",
+    "cp src/main.py repos/alpha/.git/hooks: exit 1",
+]
+
+[[probe]]
+name      = "view-links"
+program   = "probes/view_links.py"
+covers    = "a file with two names is never written; links only to writable files; directories never rename"
+platforms = ["linux"]
+check     = "accepted"
+[probe.run]
+exit = 0
+stdout-has = [
+    "touch out/hard-a.txt (built with two names): 1",
+    "touch out/links-a.txt (one name): 0",
+    "ln out/links-a.txt out/links-b.txt (a writable target): 0",
+    "touch out/links-a.txt (now two names): 1",
+    "ln repos/alpha/.git/config out/config-link (a protected target): 1",
+    "mv out/mv-a.txt out/mv-b.txt (between permitted names): 0",
+    "mv out/mv-b.txt out/keep/mv-c.txt (into a protection): 1",
+    "mv out/dir-a out/dir-b (a directory): 1",
+]
+
+[[probe]]
+name    = "view-casefold"
+program = "probes/view_casefold.py"
+covers  = "folding: a folded spelling does not exist, a new name cannot land on a stored one"
+needs   = ["casefold"]
+check   = "accepted"
+[probe.run]
+exit = 0
+stdout-has = [
+    "head (host view) cf/STORED.TXT: exit 0",
+    "cat cf/Stored.txt: exit 0",
+    "cat cf/STORED.TXT: exit 1",
+    "cp src/main.py cf/STORED.TXT: exit 1",
+    "cf/Stored.txt holds: stored as Stored.txt",
+    "mkdir cf/DOCS: exit 1",
+    "touch cf/.GIT/config: exit 1",
+    "touch cf/.git/config: exit 1",
+    "touch cf/new.txt: exit 0",
+]
+[probe.darwin]
+# Seatbelt judges the name the directory stores (the working assumption this probe tests): a
+# folded spelling reaches the file under the stored name's grant, and the stored name's
+# protection. If touch cf/.GIT/config exits 0, Seatbelt compares the spelled name instead.
+exit = 0
+stdout-has = [
+    "head (host view) cf/STORED.TXT: exit 0",
+    "cat cf/Stored.txt: exit 0",
+    "cat cf/STORED.TXT: exit 0",
+    "cp src/main.py cf/STORED.TXT: exit 0",            # judged as Stored.txt, which cf/** makes writable
+    'cf/Stored.txt holds: print("hello from src")',
+    "mkdir cf/DOCS: exit 1",
+    "touch cf/.GIT/config: exit 1",
+    "touch cf/.git/config: exit 1",
+    "touch cf/new.txt: exit 0",
+]
+
+[[probe]]
+name    = "host-view"
+program = "probes/host_view.py"
+covers  = "the contrast: the host view trusts the tool with the whole filesystem"
+check   = "accepted"
+[probe.run]
+exit       = 0
+stdout-has = ["head private/journal.txt: exit 0"]
+
+# ---------------------------------------------------------------------------------------------
+# the program's own requests (serve.py)
+
+[[probe]]
+name    = "net-get"
+program = "probes/net_get.py"
+covers  = "a request the rule admits"
+needs   = ["network"]
+check   = "accepted"
+[probe.run]
+exit       = 0
+stdout-has = ["hello from the api"]
+
+[[probe]]
+name    = "net-path-denied"
+program = "probes/net_path_denied.py"
+covers  = "a granted host, an ungranted path"
+check   = "denied"
+because = "the URL's path /private/note is outside the permitted"
+
+[[probe]]
+name    = "net-percent"
+program = "probes/net_percent.py"
+covers  = "a path whose escapes spell \"..\" has no location"
+check   = "denied"
+because = "the URL's path is not proven"
+
+[[probe]]
+name    = "net-hop-denied"
+program = "probes/net_hop_denied.py"
+covers  = "the broker judges every redirect hop: to an ungranted path, and to one with no location"
+needs   = ["network"]
+check   = "accepted"
+[probe.run]
+exit         = 0
+stdout-has   = ["hop to /private/note: policy_denied", "hop to /pub/%2e%2e/private/note: policy_denied"]
+stdout-lacks = ["followed"]
+
+[[probe]]
+name    = "net-source"
+program = "probes/net_source.py"
+covers  = "what the governing rule's source returned carries its atom"
+needs   = ["network"]
+check   = "accepted"
+[probe.run]
+exit       = 0
+stdout-has = ["feature-x"]
+
+[[probe]]
+name    = "net-source-literal"
+program = "probes/net_source_literal.py"
+covers  = "the same text, named by the program, does not"
+check   = "denied"
+because = "WORD is not validated by: testbed-api"
+
+[[probe]]
+name    = "net-redirect"
+program = "probes/net_redirect.py"
+covers  = "credentials follow a redirect within the origin, and are dropped across origins"
+needs   = ["network"]
+check   = "accepted"
+[probe.run]
+exit       = 0
+stdout-has = ["same origin keeps it: True", "another port drops it: True"]
+
+# ---------------------------------------------------------------------------------------------
+# checks through the broker
+
+[[probe]]
+name    = "check-single"
+program = "probes/check_single.py"
+args    = ["alpha"]
+covers  = "check_single through the broker"
+check   = "accepted"
+[probe.run]
+exit       = 0
+stdout-has = ["slug ok: alpha"]
+
+[[probe]]
+name    = "check-single-fails"
+program = "probes/check_single.py"
+args    = [""]
+covers  = "... and a value the checker refuses"
+check   = "accepted"
+[probe.run]
+exit         = 1
+stdout-lacks = ["slug ok"]
+
+[[probe]]
+name    = "check-by-name"
+program = "probes/check_by_name.py"
+args    = ["alpha"]
+covers  = "check by keyword through the broker"
+check   = "accepted"
+[probe.run]
+exit       = 0
+stdout-has = ["slug ok: alpha"]
+
+# ---------------------------------------------------------------------------------------------
+# policy-level behaviour
+
+[[probe]]
+name    = "strict"
+program = "probes/hello.py"
+policy  = "strict.toml"
+covers  = "strict: a location the jail cannot express refuses the run before it starts"
+check   = "accepted"
+[probe.run]
+exit         = 1
+stdout-lacks = ["ran"]
+stderr-has   = ["strict"]
+
+[[refused]]
+policy = "refused/overlapping-network.toml"
+error  = "overlap"
+
+[[refused]]
+policy = "refused/absolute-pattern.toml"
+error  = "must begin with a literal name"
+
+[[refused]]
+policy = "refused/list-key.toml"
+error  = "'list' is no longer a key"
+
+[[lint]]
+policy = "policy.toml"
+kinds  = ["literal-directory"]
+
+[[lint]]
+policy = "lints.toml"
+kinds  = ["literal-directory", "shadowed-protection"]
+[lint.darwin]
+kinds  = ["literal-directory", "shadowed-protection", "spelling"]

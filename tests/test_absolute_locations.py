@@ -8,7 +8,10 @@ import unittest
 
 from certorail import markers
 from certorail.analysis import (
+    ANY_COMPONENT,
     ANY_NAME,
+    PATH_ATOMS,
+    Alternation,
     DirSplat,
     Exact,
     Located,
@@ -23,6 +26,7 @@ from certorail.analysis import (
 )
 from certorail.host import Accepted, Rejected
 from certorail.host import check as host_check
+from certorail.ids import NO_PARENT_TRAVERSAL, NO_SLASH
 from certorail.policy import Policy, location_of, program
 from certorail.policyfile import parse_location
 
@@ -104,11 +108,26 @@ class TestTransfer(unittest.TestCase):
         self.assertEqual(locate(got), Located(absolute("etc", "passwd"), "str"))
 
     def test_leading_slash_spelling_is_absolute(self) -> None:
-        name = StrFact(atoms=frozenset({"no-slash", "no-parent-traversal"}))
+        name = StrFact(regex=ANY_COMPONENT, atoms=PATH_ATOMS)  # one listed name: never "" or "."
         self.assertEqual(
             evaluate('f"/var/data/{name}"', {"name": name}),
             Located(StaticPath((Named("var"), Named("data"), ANY_NAME), absolute=True), "str"),
         )
+
+    def test_empty_text_before_a_leading_slash_stays_absolute(self) -> None:
+        # "" names nothing, so "" + "/srv/x" is the absolute /srv/x -- not srv/x under the root
+        empty = {"e": StrFact(regex=Exact(""))}
+        self.assertEqual(evaluate('e + "/srv/x"', empty), Located(absolute("srv", "x"), "str"))
+        self.assertEqual(evaluate('f"{e}/srv/x"', empty), Located(absolute("srv", "x"), "str"))
+        # a value that may be "" has no single reading: no location, and not "not-absolute"
+        maybe = {"e": StrFact(regex=Alternation([Exact(""), Exact("docs")]))}
+        got = evaluate('e + "/srv/x"', maybe)
+        self.assertIsNone(locate(got))
+        assert isinstance(got, StrFact)
+        self.assertNotIn("not-absolute", got)
+        # a name that may be "" joined onto a leading "/" is no component either
+        loose = {"n": StrFact(atoms=frozenset({NO_SLASH, NO_PARENT_TRAVERSAL}))}
+        self.assertIsNone(locate(evaluate('n + "/srv/x"', loose)))
 
     def test_absolute_path_replayed_in_an_f_string(self) -> None:
         st = {"base": Located(absolute("opt", "data"), "path")}

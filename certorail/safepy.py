@@ -204,8 +204,10 @@ class ContainerClosureAnalysis(_LexicalAnalysis):
     there, and a write to it would break the invariant every other use relies on. Pass it as a
     parameter instead: the contract carries the obligation.
 
-    Purely syntactic. A scope is the module, a function, a lambda or a class body; a
-    comprehension is transparent (the walker walks it inline) except that its targets shadow.
+    Purely syntactic. A scope is the module, a function, a lambda or a class body; a list, set
+    or dict comprehension is transparent (the walker walks it inline) except that its targets
+    shadow. A generator expression is transparent only in its first iterable: the rest runs when
+    the generator is consumed, and is a closure like a lambda body.
     A name bound in a scope -- a parameter, an assignment, a def -- is that scope's own, so
     ``xs = []`` inside the body makes ``xs`` local as Python does."""
 
@@ -221,9 +223,12 @@ class ContainerClosureAnalysis(_LexicalAnalysis):
         declared = frozenset(self._declared_containers(body))
         self._walk(body, visible, visible | declared)
 
-    def _walk(self, nodes: Iterable[ast.AST], visible: frozenset[str], inner: frozenset[str]) -> None:
+    def _walk(
+        self, nodes: Iterable[ast.AST], visible: frozenset[str], inner: frozenset[str],
+        fix: str = "pass it as a parameter",
+    ) -> None:
         """*visible*: names that, read here, close over a container. *inner*: what a scope
-        nested here may close over."""
+        nested here may close over. *fix*: what the violation tells the program to do instead."""
         stack: list[ast.AST] = list(nodes)
         while stack:
             n = stack.pop()
@@ -232,7 +237,7 @@ class ContainerClosureAnalysis(_LexicalAnalysis):
                     self._violation(
                         n,
                         f"{name!r} is a typed container of an enclosing scope: a container may not "
-                        "be closed over; pass it as a parameter",
+                        f"be closed over; {fix}",
                     )
                 case ast.FunctionDef() | ast.AsyncFunctionDef():
                     # decorators, defaults and annotations are evaluated here; the body is a scope
@@ -253,9 +258,20 @@ class ContainerClosureAnalysis(_LexicalAnalysis):
                     stack.extend(n.bases)
                     stack.extend(k.value for k in n.keywords)
                     self._walk(n.body, inner - _scope_binds(n.body), inner)
-                case ast.ListComp(generators=gens) | ast.SetComp(generators=gens) | ast.GeneratorExp(generators=gens) | ast.DictComp(generators=gens):
+                case ast.ListComp(generators=gens) | ast.SetComp(generators=gens) | ast.DictComp(generators=gens):
                     targets = {t.id for g in gens for t in ast.walk(g.target) if isinstance(t, ast.Name)}
-                    self._walk(ast.iter_child_nodes(n), visible - targets, inner - targets)
+                    self._walk(ast.iter_child_nodes(n), visible - targets, inner - targets, fix)
+                case ast.GeneratorExp(elt=elt, generators=[first, *rest]):
+                    # the first iterable is evaluated where the expression is written; the rest
+                    # runs when the generator is consumed, and reaches a container as a lambda does
+                    stack.append(first.iter)
+                    targets = {t.id for g in n.generators for t in ast.walk(g.target) if isinstance(t, ast.Name)}
+                    lazy = [first.target, *first.ifs, *(p for g in rest for p in (g.target, g.iter, *g.ifs)), elt]
+                    self._walk(
+                        lazy, inner - targets, inner - targets,
+                        "a generator expression runs past its first `for` only when consumed: "
+                        "use a list comprehension, which runs where it is written",
+                    )
                 case _:
                     stack.extend(ast.iter_child_nodes(n))
 

@@ -15,6 +15,7 @@ from collections.abc import Sequence
 
 from certorail.broker import Broker, BrokerError, _recv_exact, _send_frame, build_broker
 from certorail.policy import Policy
+from certorail.sandbox import Spawner
 
 
 class _Handler(socketserver.BaseRequestHandler):
@@ -38,12 +39,12 @@ def build_server(
     policy: Policy,
     root: str | os.PathLike[str] | None = None,
     stream_to: tuple[int, int] | None = None,
-    view: pathlib.Path | None = None,
+    spawner: Spawner | None = None,
 ) -> PathServer:
     path = os.fspath(socket_path)
     if os.path.exists(path):
         os.unlink(path)
-    return PathServer(path, build_broker(policy, root, stream_to, view))
+    return PathServer(path, build_broker(policy, root, stream_to, spawner))
 
 
 def channel(broker: Broker) -> socket.socket:

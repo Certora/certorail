@@ -334,7 +334,6 @@ root = "/srv/work/audit"
 [filesystem]
 read  = ["repos/**", "reports/**"]           # inspect clones, re-read earlier reports
 write = ["repos/**", 'reports/**/<\w+\.md>'] # clones + markdown reports only
-list  = ["repos/**", "reports/**"]
 
 [regions]                                    # step 3b: the state the checks depend on
 "git.config" = { footprint = ".git/config", about = "remotes, hooks: everything git reads from config" }

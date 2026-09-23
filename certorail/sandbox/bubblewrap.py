@@ -1,12 +1,13 @@
 """The Linux spawner: bubblewrap, with the FUSE view of the root as its one run-scoped resource.
 
-Lowering (``lower``): a location that is one path is a ``Bind``; a pattern without a view, or
-outside the root, is ``Omitted`` with the reason. When the run has the view, the root-relative
-section is not lowered at all: the view is one bind of the root and the daemon enforces the
-section behind it. The rule's additions are always binds when they are one path -- over the
-view, if there is one, since an addition is the rule's own trust statement -- and omitted when
-they are patterns. ``list`` grants are the view's or nothing: a bind exposes contents, so there
-is no bind that lists.
+Lowering (``lower``): a location that is exactly a union of concrete paths -- literal names and
+``{a,b}`` sets, a literal path or a literal subtree -- is one ``Bind`` per path; a pattern without
+a view, or outside the root, is ``Omitted`` with the reason, since a grant may never widen. When
+the run has the view, the root-relative section is not lowered at all: the view is one bind of
+the root and the daemon enforces the section behind it. The rule's additions are binds likewise
+-- over the view, if there is one, since an addition is the rule's own trust statement -- and
+omitted when they are patterns. A literal directory grant is the view's or nothing: it names the
+directory's listing, and a bind exposes its contents.
 
 Spawning (``spawn``): the host filesystem is today's world -- the whole filesystem, read-only
 under ``write_fs = False`` with the scratch directory writable over it. The policy filesystem is
@@ -21,6 +22,7 @@ import os
 import pathlib
 import platform
 import shutil
+import sys
 import tempfile
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
@@ -28,9 +30,10 @@ from typing import IO
 
 from typing import TYPE_CHECKING
 
+from certorail.analysis import LocationFact, StaticPath
 from certorail.childjail import JailUnavailable, Spawn
 from certorail.confinement import Confinement, HostFilesystem, PolicyFilesystem
-from certorail.locations import single_path
+from certorail.locations import bindable_paths
 from certorail.selfjail import ARCHES, fork_denial_filter
 from certorail.viewdaemon import Attachment, ViewSpec, ViewUnavailable, attach
 from certorail.sandbox import NoView, ServedRoot
@@ -48,6 +51,20 @@ TOOLCHAIN = (
     "/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d", "/etc/alternatives",
     "/etc/passwd", "/etc/group", "/etc/nsswitch.conf", "/etc/localtime",
 )
+
+
+def _literal_directory(loc: LocationFact, path: pathlib.Path) -> bool:
+    """Is *loc* a literal location naming an existing directory -- the directory alone, which no
+    bind can say?"""
+    return isinstance(loc, StaticPath) and path.is_dir()
+
+
+def _literal_directories(locs: tuple[LocationFact, ...], root: pathlib.Path) -> bool:
+    """Does some root-relative grant name a directory literally (the view's to serve)?"""
+    return any(
+        not loc.absolute and any(_literal_directory(loc, p) for p in (bindable_paths(loc, root) or ()))
+        for loc in locs
+    )
 
 
 def _seccomp_program() -> IO[bytes]:
@@ -68,6 +85,8 @@ def _seccomp_program() -> IO[bytes]:
 class BubblewrapSpawner:
     root_view: ServedRoot | NoView
     _lease: Attachment | None = field(default=None, repr=False)
+    # the policy's strict mode: a protection not there to bind refuses the spawn
+    strict: bool = False
 
     # -- the run --------------------------------------------------------------------------
 
@@ -77,14 +96,14 @@ class BubblewrapSpawner:
         exists and the section has a root-relative pattern, its absence explained otherwise."""
         section = policy.section()
         if not policy.confines:
-            return cls(NoView("no rule runs under the policy filesystem"))
-        if not section.relative_patterns:
-            return cls(NoView("every root-relative location of the section is one path"))
+            return cls(NoView("no rule runs under the policy filesystem"), strict=policy.strict)
+        if not section.relative_patterns and not _literal_directories(section.read + section.write, root):
+            return cls(NoView("every root-relative location of the section is one bindable path"), strict=policy.strict)
         try:
             lease = attach(ViewSpec(os.path.realpath(root), section.read, section.write, section.no_write))
         except ViewUnavailable as e:
-            return cls(NoView(str(e)))
-        return cls(ServedRoot(lease.mountpoint, pathlib.Path(root)), lease)
+            return cls(NoView(str(e)), strict=policy.strict)
+        return cls(ServedRoot(lease.mountpoint, pathlib.Path(root)), lease, strict=policy.strict)
 
     def __enter__(self) -> "BubblewrapSpawner":
         return self
@@ -99,19 +118,23 @@ class BubblewrapSpawner:
     def lower(self, fs: PolicyFilesystem, write_fs: bool) -> tuple[Lowered, ...]:
         view = self.root_view
         served = isinstance(view, ServedRoot)
-        if isinstance(view, ServedRoot) and view.root != fs.root:
+        if served and view.root != fs.root:
             # a spawner is provisioned for one run, one root; a confinement of another root is
             # a programming error, not a world with nothing in it
             raise ValueError(f"this spawner serves {view.root}, not {fs.root}")
         out: list[Lowered] = []
 
-        def section(role: Role, locs: tuple) -> None:
+        def section(role: Role, locs: tuple[LocationFact, ...]) -> None:
             for loc in locs:
                 if served and not loc.absolute:
                     continue  # the view's: one bind of the root, the daemon behind it
-                path = single_path(loc, fs.root)
-                if path is not None:
-                    out.append(Bind(path, role))
+                paths = bindable_paths(loc, fs.root)
+                if paths is not None and role != "no-write" and any(_literal_directory(loc, p) for p in paths):
+                    # a literal grant names the directory alone (it lists); a bind would expose
+                    # everything inside it, so only the view can say it
+                    out.append(Omitted(loc, role, "a literal directory grant needs the view: a bind would expose its contents"))
+                elif paths is not None:
+                    out.extend(Bind(p, role) for p in paths)
                 elif loc.absolute:
                     out.append(Omitted(loc, role, "a pattern outside the root has no bind mount and no view"))
                 else:
@@ -120,11 +143,11 @@ class BubblewrapSpawner:
 
         def additions(role: Role, locs: tuple) -> None:
             for loc in locs:
-                path = single_path(loc, fs.root)
-                if path is not None:
-                    out.append(Bind(path, role))
+                paths = bindable_paths(loc, fs.root)
+                if paths is not None:
+                    out.extend(Bind(p, role) for p in paths)
                 else:
-                    out.append(Omitted(loc, role, "a rule's addition must be one path: a pattern has no bind mount"))
+                    out.append(Omitted(loc, role, "a rule's addition must be concrete paths: a pattern has no bind mount"))
 
         section("read", fs.section.read)
         section("write", fs.section.write)
@@ -134,6 +157,20 @@ class BubblewrapSpawner:
         return tuple(out)
 
     # -- spawning ---------------------------------------------------------------------------
+
+    def _unguarded(self, c: Confinement, fs: PolicyFilesystem) -> list[pathlib.Path]:
+        """Protections a bind cannot hold yet: a ``no-write`` path that does not exist while a
+        writable bind covers where it would be created -- nothing to remount, so the tool could
+        create it. Said out loud, not silently accepted."""
+        if not c.write_fs:
+            return []
+        lowered = [x for x in self.lower(fs, c.write_fs) if isinstance(x, Bind)]
+        writable_paths = [x.path for x in lowered if writable(x.role)]
+        return [
+            x.path for x in lowered
+            if x.role == "no-write" and not x.path.exists()
+            and any(w == x.path or w in x.path.parents for w in writable_paths)
+        ]
 
     def _world(self, c: Confinement, fs: PolicyFilesystem, scratch: str, cwd: str, exe: str | None) -> list[str]:
         ops: list[str] = ["--dev", "/dev", "--proc", "/proc", "--dir", cwd, "--chdir", cwd]
@@ -178,6 +215,11 @@ class BubblewrapSpawner:
             command = [bwrap, "--die-with-parent"]
             if isinstance(fs, PolicyFilesystem):
                 assert scratch is not None
+                for guarded in self._unguarded(confinement, fs):
+                    what = f"no-write {guarded}: does not exist and a write grant covers it, so a confined tool could create it"
+                    if self.strict:
+                        raise JailUnavailable(f"{what} (strict)")
+                    print(f"certorail: {what}", file=sys.stderr)
                 command += self._world(confinement, fs, scratch, os.path.abspath(cwd), executable(argv, env))
             elif scratch is None:
                 # the filesystem as the host has it, devices included (a plain --bind is nodev)

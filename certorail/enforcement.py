@@ -322,6 +322,15 @@ class Discharge(Protocol):
     def __call__(self, atom: Atom, text: str) -> bool: ...
 
 
+def _no_network_sources(method: str, url: ValidationFact | None) -> frozenset[SourceId]:
+    return frozenset()
+
+
+# a network request's source atoms: the ``source`` of the one rule governing each request the
+# proven URL may denote (``Policy.network_sources``), nothing when the URL is not proven
+type NetworkSources = Callable[[str, ValidationFact | None], frozenset[SourceId]]
+
+
 @dataclass(frozen=True)
 class Vocabulary:
     """The policy's atoms as the analysis sees them (ATOMS.md): the check signatures, and the
@@ -349,6 +358,8 @@ class Vocabulary:
     reads: Mapping[Atom, Effects] = field(default_factory=dict)
     writes: WriteTable = field(default_factory=WriteTable)
     medium_of: Mapping[RegionId, Medium] = field(default_factory=dict)
+    # behaviour derived from the policy's network rules, not data: left out of equality
+    network_sources: NetworkSources = field(default=_no_network_sources, compare=False)
 
     def decidable_from_text(self) -> frozenset[Atom]:
         """The atoms a string alone can be shown to carry, by kind: the built-ins (structure),
@@ -888,21 +899,6 @@ class Enforcement:
                 return frozenset({atom})
         return frozenset()
 
-    def _network_sources(self, url: ValidationFact | None) -> frozenset[SourceId]:
-        """The source atoms of the rule(s) a proven URL's host falls under: every host the netloc
-        may denote must match, or the response vouches for nothing."""
-        lifted = url_of(url)
-        hosts = _hosts_of(url)
-        if lifted is None or hosts is None:
-            return frozenset()
-        path = lifted.path
-        return frozenset(
-            atom
-            for pattern, paths, atom in self.vocabulary.sources.network
-            if all(host_matches(pattern, h) for h in hosts)
-            and (not paths or (path is not None and any(location_le(path, p) for p in paths)))
-        )
-
     def _read_sources(self, path: ValidationFact | None) -> frozenset[SourceId] | None:
         """The source atoms of the ``[[source]]`` locations a proven path lies within; None when
         the path is not proven at all (then there is no handle, and the read is unconfined
@@ -923,8 +919,9 @@ class Enforcement:
         if callee.matches(*EXEC_CALLEE) and site.args:
             program = _exact_text(site.args[0])
             return Data() if program is None else Data(self._exec_sources(program, site.args[1:]))
-        if site.args and any(callee.matches(*NETWORK_NAMESPACE, m) for m in NETWORK_METHODS):
-            return Data(self._network_sources(_as_fact(site.args[0])))
+        if site.args and (method := next((m for m in NETWORK_METHODS if callee.matches(*NETWORK_NAMESPACE, m)), None)):
+            # the one rule governing the request decides what its response is tagged with
+            return Data(self.vocabulary.network_sources(method.upper(), _as_fact(site.args[0])))
         if site.method in ("read_text", "read_bytes") and not site.args:
             sources = self._read_sources(scalar(site.receiver))
             return None if sources is None else Data(sources)

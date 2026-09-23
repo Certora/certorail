@@ -12,11 +12,17 @@ import unittest
 
 import certorail
 from certorail import markers
-from certorail.host import _bwrap_command, _jail_write_paths, _seatbelt_profile
-from certorail.policy import Policy
+from certorail.analysis import pretty_location as pretty
+from certorail.policy import Policy, network
+from certorail.sandbox.lowering import Bind, RegexRule
+from certorail.sandbox.program import bwrap_argv, lower_program, seatbelt_profile
 
 ROOT = pathlib.Path("/work")
 COMMAND = ["python3", "-I", "-P", "-c", "bootstrap", "prog.py"]
+
+
+def writable(policy: Policy) -> list[str]:
+    return [str(p) for p in lower_program(policy, ROOT, patterns=False).writable]
 
 
 class TestWriteSurface(unittest.TestCase):
@@ -28,13 +34,66 @@ class TestWriteSurface(unittest.TestCase):
                 markers.within("/opt", leaf=markers.matches(r"\w+\.log")),  # concrete prefix
             ],
         )
-        self.assertEqual(_jail_write_paths(policy, ROOT), ["/work", "/srv/checkouts", "/opt"])
+        self.assertEqual(writable(policy), ["/work", "/srv/checkouts", "/opt"])
+
+    def test_protections_lower_by_platform(self) -> None:
+        policy = Policy.allow(write=["**"], no_write=["secrets", "repos/*/.git"])
+        linux = lower_program(policy, ROOT, patterns=False)
+        self.assertEqual(linux.protected, (Bind(ROOT / "secrets", "no-write"),))
+        self.assertEqual([pretty(o.location) for o in linux.omitted], ["repos/*/.git"])
+        mac = lower_program(policy, ROOT, patterns=True)
+        self.assertEqual(len(mac.protected), 2)
+        self.assertIsInstance(mac.protected[1], RegexRule)
+        self.assertEqual(mac.omitted, ())
+
+
+class TestStrict(unittest.TestCase):
+    """``strict = true``: a confined grant whose jail cannot express the policy refuses the run,
+    before anything runs, instead of warning."""
+
+    def test_an_omission_refuses_a_strict_run(self) -> None:
+        if sys.platform != "linux":
+            self.skipTest("the omission here is bubblewrap's (Seatbelt spells the pattern)")
+        from certorail.childjail import View
+        from certorail.host import JailRefused, run
+        from certorail.policy import program
+
+        def policy(strict: bool) -> Policy:
+            # an absolute pattern: no bind says it and no view serves it
+            return Policy.allow(read=["**", "/srv/<x.*>"], programs=[program("cat", cwd=".", view=View.POLICY)], strict=strict)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            refused = run("print('never')\n", "p.py", policy(True), pathlib.Path(tmp))
+            assert isinstance(refused, JailRefused)
+            self.assertEqual([o.role for o in refused.omitted], ["read"])
+            self.assertIn("strict", refused.describe()[0])
+
+
+class TestEnumerablePrefixes(unittest.TestCase):
+    """An absolute grant must begin with literal names or {a,b} sets, which the jail explodes;
+    one it could only widen to "/" is refused at load."""
+
+    def test_sets_are_exploded(self) -> None:
+        policy = Policy.allow(write=["/{srv,opt}/data/**", "/srv/data/<x.*>"])
+        self.assertEqual(writable(policy), ["/work", "/opt/data", "/srv/data"])
+
+    def test_a_pattern_first_component_is_refused(self) -> None:
+        for spelling in ("/**", "/*/data", "/<t.*>/data", "/"):
+            with self.subTest(spelling=spelling):
+                with self.assertRaisesRegex(ValueError, "must begin with a literal name"):
+                    Policy.allow(write=[spelling])
+                with self.assertRaisesRegex(ValueError, "must begin with a literal name"):
+                    Policy.allow(no_write=[spelling])
+
+    def test_relative_locations_and_url_paths_are_not_affected(self) -> None:
+        Policy.allow(read=["*/data"], write=["<t.*>/**"])
+        Policy.allow(network=[network("api.example.com", path="/**")])
 
 
 class TestBubblewrap(unittest.TestCase):
     def test_the_world(self) -> None:
         policy = Policy.allow(write=[markers.within("repos")], no_write=[markers.within("secrets")])
-        argv = _bwrap_command("/usr/bin/bwrap", policy, ROOT, policy.mounts(ROOT), COMMAND)
+        argv = bwrap_argv(lower_program(policy, ROOT, patterns=False), "/usr/bin/bwrap", COMMAND)
         text = " ".join(argv)
         self.assertTrue(text.startswith("/usr/bin/bwrap --ro-bind / / --dev /dev --proc /proc "))
         self.assertIn("--bind-try /work /work", text)
@@ -49,7 +108,7 @@ class TestBubblewrap(unittest.TestCase):
 class TestSeatbelt(unittest.TestCase):
     def test_the_profile(self) -> None:
         policy = Policy.allow(write=[markers.within("repos")], no_write=[markers.within("secrets")])
-        lines = _seatbelt_profile(policy, ROOT, policy.mounts(ROOT)).splitlines()
+        lines = seatbelt_profile(lower_program(policy, ROOT, patterns=True)).splitlines()
         real = os.path.realpath
         self.assertEqual(lines[:3], ["(version 1)", "(allow default)", "(deny file-write*)"])
         allowed = f'(allow file-write* (subpath "{real("/work")}"))'

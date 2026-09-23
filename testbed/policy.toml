@@ -1,0 +1,193 @@
+# The certorail testbed: one sandbox root that exercises every mechanism at once. The tree it
+# governs is built by build.py (README.md walks it); scenario.toml says what every probe under
+# probes/ must do against it, and run.py checks that.
+#
+# Two layers enforce this document, and the probes exercise both:
+#   - the analysis, on the confined program's own operations (open, os.listdir, certora.exec,
+#     certora.network): `certorail check` decides these without running anything;
+#   - the OS jail, around the tools the program runs: every [[program]] below but `head` sees
+#     the filesystem through `exec.view = "policy"` -- on Linux the FUSE view (the section has
+#     patterns and a literal directory), on macOS a Seatbelt profile. A tool is handed any path
+#     under the root (its holes say `**`), so what it may actually open is the view's to decide.
+policy-version = 1
+base = false        # self-contained: no machine ruleset composed in
+
+[filesystem]
+read = [
+    "src/**",                                   # a tree: a bind on Linux, a subpath on macOS
+    'notes/**/<[a-z]+\.txt>',                   # a pattern: the FUSE view on Linux, a regex on macOS
+    "catalog",                                  # a literal directory: its listing, none of its files (lint)
+    "drop",                                     # listing drop is reading drop itself ...
+    "drop/*",                                   # ... and one level below it: each listed name is one component
+    "out/**",
+    "repos/**",
+    "cf/**",                                    # the case-folding directory (chattr +F, see README)
+    "/tmp/certorail-testbed-outside/{abs,alt}/**",  # absolute: a literal head, {a,b} exploded into two binds
+]
+write = [
+    "out/**",
+    "repos/**",
+    "cf/**",
+    "data/*/x.txt",                             # exactly one component between: never "" and never "."
+    "/tmp/certorail-testbed-outside/{abs,alt}/**",
+]
+no-write = [
+    "out/keep",                                 # one concrete path: a read-only bind over the writable tree
+    "**/.git",                                  # a pattern: the view / a Seatbelt regex; the analysis folds case
+]
+
+[atoms]
+testbed-api = { pure = true }                   # source: what the local API returned, unmodified
+slug-ok     = { pure = true }                   # what the slug check vouches for
+
+# ---------------------------------------------------------------------------------------------
+# a check, run through the broker at run time (check_single and check both reach it)
+
+[[validation]]
+name        = "slug"
+params      = ["value"]
+argv        = ["test", "-n", "${value}"]        # non-empty: exit 0
+writes      = []
+network     = false
+write-fs    = false
+establishes = { value = ["slug-ok"] }
+
+# ---------------------------------------------------------------------------------------------
+# readers under the policy view: the program may name any path; the view decides what exists.
+# Every tool rule spells "--" after its flags, which the host inserts: a template's literal
+# prefix is what the program spells, so the "--" follows a hole.
+
+[[program]]
+name = "cat"
+argv = ["cat", "${FLAGS...}", "--", "${FILES...}"]
+cwd  = "."
+holes.FLAGS = { kind = "flags", bare = ["-n"] }
+holes.FILES = { kind = "each", location = "**", min = 1 }
+network    = false
+write-fs   = false
+exec.spawn = false
+exec.view  = "policy"
+
+[[program]]
+name = "ls"
+argv = ["ls", "${FLAGS...}", "--", "${FILES...}"]
+cwd  = "."
+holes.FLAGS = { kind = "flags", bare = ["-1", "-a", "-A"] }
+holes.FILES = { kind = "each", location = "**" }
+network    = false
+write-fs   = false
+exec.spawn = false
+exec.view  = "policy"
+
+[[program]]
+name = "grep"
+argv = ["grep", "${FLAGS...}", "--", "${PATTERN}", "${FILES...}"]
+cwd  = "."
+holes.FLAGS   = { kind = "flags", bare = ["-r", "-l", "-n", "-i"] }
+holes.PATTERN = { any = true }
+holes.FILES   = { kind = "each", location = "**", min = 1 }
+network    = false
+write-fs   = false
+exec.spawn = false
+exec.view  = "policy"
+
+# the contrast: the host view trusts the tool with the whole filesystem, grants or no grants
+[[program]]
+name = "head"
+argv = ["head", "${FLAGS...}", "--", "${FILES...}"]
+cwd  = "."
+holes.FLAGS = { kind = "flags", "-n" = { matches = '\d+' } }
+holes.FILES = { kind = "each", location = "**", min = 1 }
+network    = false
+write-fs   = false
+exec.spawn = false
+
+# ---------------------------------------------------------------------------------------------
+# writers under the policy view: write grants writable, protections and read grants not
+
+[[program]]
+name = "touch"
+argv = ["touch", "${FLAGS...}", "--", "${FILES...}"]
+cwd  = "."
+holes.FLAGS = { kind = "flags", bare = ["-c"] }
+holes.FILES = { kind = "each", location = "**", min = 1 }
+network    = false
+exec.spawn = false
+exec.view  = "policy"
+
+[[program]]
+name = "mkdir"
+argv = ["mkdir", "${FLAGS...}", "--", "${DIRS...}"]
+cwd  = "."
+holes.FLAGS = { kind = "flags", bare = ["-p"] }
+holes.DIRS  = { kind = "each", location = "**", min = 1 }
+network    = false
+exec.spawn = false
+exec.view  = "policy"
+
+[[program]]
+name = "cp"
+argv = ["cp", "${FLAGS...}", "--", "${SRC}", "${DST}"]
+cwd  = "."
+holes.FLAGS = { kind = "flags", bare = ["-p"] }
+holes.SRC   = { location = "**" }
+holes.DST   = { location = "**" }
+network    = false
+exec.spawn = false
+exec.view  = "policy"
+
+[[program]]
+name = "ln"
+argv = ["ln", "${FLAGS...}", "--", "${TARGET}", "${LINK}"]
+cwd  = "."
+holes.FLAGS  = { kind = "flags", bare = ["-v"] }
+holes.TARGET = { location = "**" }
+holes.LINK   = { location = "**" }
+network    = false
+exec.spawn = false
+exec.view  = "policy"
+
+[[program]]
+name = "mv"
+argv = ["mv", "${FLAGS...}", "--", "${SRC}", "${DST}"]
+cwd  = "."
+holes.FLAGS = { kind = "flags", bare = ["-v"] }
+holes.SRC   = { location = "**" }
+holes.DST   = { location = "**" }
+network    = false
+exec.spawn = false
+exec.view  = "policy"
+
+# ---------------------------------------------------------------------------------------------
+# provenance: echo takes only what the local API returned (and, having no "--", no option)
+
+[[program]]
+name = "echo"
+argv = ["echo", "${WORD}"]
+cwd  = "."
+holes.WORD = { atoms = ["testbed-api"] }
+network    = false
+write-fs   = false
+exec.spawn = false
+exec.view  = "policy"
+
+# ---------------------------------------------------------------------------------------------
+# the program's own requests: serve.py listens on both ports. The two rules differ by port, so
+# they do not overlap, and a request is governed by exactly one of them.
+
+[[network]]
+host            = "127.0.0.1"
+schemes         = ["http"]
+ports           = [8765]
+methods         = ["GET"]
+allow-nonpublic = true
+path            = ["/pub/**", "/hop-same", "/hop-port", "/hop-private", "/hop-percent", "/headers"]
+source          = "testbed-api"
+
+[[network]]
+host            = "127.0.0.1"
+schemes         = ["http"]
+ports           = [8766]
+methods         = ["GET"]
+allow-nonpublic = true
+path            = "/headers"

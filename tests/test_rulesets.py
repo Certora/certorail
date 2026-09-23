@@ -9,8 +9,13 @@ import unittest
 from unittest import mock
 
 from certorail import markers
+from certorail.analysis import pretty_location
 from certorail.childjail import View
+from certorail.confinement import PolicyFilesystem
 from certorail.host import Accepted, Rejected
+from certorail.sandbox import NoView
+from certorail.sandbox.bubblewrap import BubblewrapSpawner
+from certorail.sandbox.lowering import Bind, Omitted
 from certorail.host import check as host_check
 from certorail.ids import HoleName
 from certorail.control.install import install, install_pack
@@ -216,9 +221,12 @@ exec.mount-read = ["${credentials}/**", "hooks/*"]
         policy = from_data(self.root({"ruleset": "push.toml", "credentials": "/srv/keys"}))
         (push,) = policy.programs
         self.assertEqual([str(loc.absolute) for loc in push.mount_read], ["True", "False"])
-        m = policy.mounts(pathlib.Path("/root"), push)
-        self.assertIn(pathlib.Path("/srv/keys"), m.reads)
-        self.assertEqual([o for o in m.omitted if o.startswith("mount-read")], ["mount-read hooks/*"])
+        fs = policy.confinement(push, pathlib.Path("/root")).filesystem
+        assert isinstance(fs, PolicyFilesystem)
+        lowered = BubblewrapSpawner(NoView("a test serves no view")).lower(fs, write_fs=False)
+        self.assertIn(Bind(pathlib.Path("/srv/keys"), "mount-read"), lowered)
+        omitted = [x for x in lowered if isinstance(x, Omitted) and x.role == "mount-read"]
+        self.assertEqual([pretty_location(o.location) for o in omitted], ["hooks/*"])
 
     def test_a_ruleset_names_no_absolute_mount(self) -> None:
         self.ruleset("abs.toml", self.RULESET.replace('"${credentials}/**"', '"/srv/keys/**"'))
