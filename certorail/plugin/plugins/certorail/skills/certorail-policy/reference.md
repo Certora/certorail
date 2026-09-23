@@ -71,7 +71,8 @@ anchor in the middle, non-ASCII, a `"`) has no Seatbelt spelling: the location i
 the jail and the host says so at startup (or refuses to run, under `strict`). Write `[0-9]` where
 you would write `\d`. The translation is generated from Python's own parse of the pattern, so what
 does translate means the same thing on both sides: `.` and a negated `[^...]` never match a `/`,
-because a component never contains one. One known exception: `.` in ERE also matches a newline.
+because a component never contains one. Two known exceptions: `.` in ERE also matches a newline,
+and Seatbelt matches without regard to case (see "Names, not objects" under `[filesystem]`).
 
 | Spelling | Meaning |
 |---|---|
@@ -184,9 +185,19 @@ behind it:
 - A symlink inside a granted tree is followed: a read grant on `vendor/**` permits reading
   through `vendor/link`, wherever it points. The OS jail around the program confines its writes
   to the root and the absolute write grants; it does not confine reads.
-- On macOS the jail matches a name as the directory stores it. A policy spelling `.git` where
-  the directory stores `.Git` names a path the jail does not match, though the filesystem would
-  open it: `describe` flags it (lint `spelling`). Spell names as they are stored.
+- **On macOS, Seatbelt matches paths without regard to case.** A tool under `exec.view =
+  "policy"` may open `notes/deep/NO.txt` through the grant `notes/**/<[a-z]+\.txt>`, which the
+  analysis refuses the program itself. That is no wider than the grant on a case-insensitive
+  volume, the macOS default: if a path matches the grant ignoring case, some re-casing of it
+  matches exactly (`notes/deep/no.txt`), the volume resolves that re-cased path to the same
+  file, and the program may open it under that spelling. A grant that tells names apart by case
+  therefore tells apart spellings, not files. **On a case-sensitive volume it is wider:**
+  `NO.txt` and `no.txt` are two files there, and a tool reaches the one the grant excludes, so
+  do not rely on case in a grant for tools on such a volume. Protections gain from it: `.GIT`
+  is guarded by `**/.git`.
+- Spell names as the directory stores them: a program iterating a listing sees the stored
+  spelling, which a policy literal spelled otherwise does not match, and `describe` flags that
+  (lint `spelling`).
 
 ## `[regions]`
 

@@ -29,6 +29,23 @@ protection that beats any write grant: a write that could land under `.git` is d
 though `**` would have allowed it. Start with reads open and writes narrow; a program that
 needs to write somewhere new is asking you for a grant, and that is the review moment.
 
+Grants read narrow and protections read wide. A grant covers exactly the paths it spells:
+`write = "foo"` permits writing `foo` itself and refuses `foo/bar`, and `read = "src"` for a
+directory permits listing it but opening none of its files (`src/**` is the tree;
+`certorail describe` points out the literal spelling). A protection covers what it spells and
+everything below: `no-write = "foo"` refuses `foo` and `foo/bar` alike, so `foo` and `foo/**`
+are the same protection. Neither depends on what is on disk today. The asymmetry is deliberate:
+a spelling read either way errs toward refusal, and it is what lets `**/.git` keep writes out
+of `.git/config`.
+
+Grants are about names, not the files behind them (the README lists what that means). One
+consequence to know on macOS: the OS jail around a tool matches paths without regard to case,
+so a grant that tells names apart by case, like `<[a-z]+\.txt>`, lets a tool open `NO.txt`. On
+the default case-insensitive volume that is no wider than the grant, because `no.txt` names the
+same file and the grant admits it. On a case-sensitive volume they are two files, and there you
+should not rely on case to keep a tool out of one. Protections gain from the same rule: `.GIT`
+is protected by `**/.git`.
+
 ## Programs
 
 Programs are the reason certorail exists: an agent that can run `git`, `grep` or `pytest` can

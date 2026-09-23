@@ -12,8 +12,11 @@ Seatbelt reads POSIX ERE. The ERE is generated from Python's own parse of the pa
 node, so whatever renders means the same thing on both sides by construction; a node with no ERE
 counterpart (``\\d \\w \\s``, whose Python meaning is a Unicode class; lazy, possessive and
 atomic forms; lookarounds; backreferences; inline flags; non-ASCII) refuses the whole pattern
-rather than approximating it. The one difference let through: ``.`` in ERE matches a newline,
-Python's does not.
+rather than approximating it. Two differences let through: ``.`` in ERE matches a newline,
+Python's does not; and Seatbelt matches every filter without regard to case (measured on a Mac
+2026-09-23: ``no\\.txt`` admitted ``NO.txt``). On a case-insensitive volume that widens no grant
+-- a path matching ignoring case has a re-casing that matches exactly and names the same file --
+and on a case-sensitive one it does; the reference says so.
 
 The profile: everything but file data allowed, then the entries of ``/`` (every process reads
 them at startup: measured 2026-09-22, without this ``ls`` and ``cat`` abort before ``main``),

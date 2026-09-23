@@ -212,6 +212,18 @@ stdout-has = [
     "cat catalog/item-a.txt: exit 1",
     "cat src/link-out: exit 1",
 ]
+[probe.darwin]
+# Seatbelt matches without regard to case: NO.txt matches <[a-z]+\.txt> as no.txt, the spelling
+# under which the program itself may open the same file on a case-insensitive volume
+exit = 0
+stdout-has = [
+    "cat src/main.py: exit 0",
+    "cat private/journal.txt: exit 1",
+    "cat notes/deep/ok.txt: exit 0",
+    "cat notes/deep/NO.txt: exit 0",
+    "cat catalog/item-a.txt: exit 1",
+    "cat src/link-out: exit 1",
+]
 
 [[probe]]
 name    = "view-list"
@@ -305,9 +317,8 @@ stdout-has = [
     "touch cf/new.txt: exit 0",
 ]
 [probe.darwin]
-# Seatbelt judges the name the directory stores (the working assumption this probe tests): a
-# folded spelling reaches the file under the stored name's grant, and the stored name's
-# protection. If touch cf/.GIT/config exits 0, Seatbelt compares the spelled name instead.
+# Seatbelt matches without regard to case: a folded spelling reaches the file, judged by a grant
+# that matches it ignoring case, and is refused by a protection that does (.GIT under **/.git)
 exit = 0
 stdout-has = [
     "head (host view) cf/STORED.TXT: exit 0",

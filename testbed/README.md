@@ -81,15 +81,14 @@ private/                  under no grant: absent for a tool under the view
 
 ## What differs on macOS
 
-Seatbelt is the jail on macOS, and three things it cannot say show up as `[probe.darwin]`
+Seatbelt is the jail on macOS, and what it cannot say shows up as `[probe.darwin]`
 expectations in `scenario.toml`:
 - **No directory "on the way to a grant".** The root does not list for a tool under the view,
   and a pattern grant's directories do not list either. Its files open by name, but `grep -r`
   cannot find them.
-- **Folded spellings reach the stored name's grant.** `cat cf/STORED.TXT` succeeds there, judged
-  as `Stored.txt`. Linux's view refuses the spelling instead.
+- **Matching ignores case** (measured 2026-09-23). `cat notes/deep/NO.txt` succeeds through
+  `notes/**/<[a-z]+\.txt>`, and `cat cf/STORED.TXT` and a `cp` onto it reach `Stored.txt`, where
+  Linux's view refuses the spelling. On the default case-insensitive volume that reaches no
+  file the program could not open under another spelling (reference.md, "Names, not objects").
+  Protections gain: `touch cf/.GIT/config` is refused by `**/.git`.
 - **No hard-link or rename rules.** `view-links` is Linux only.
-
-`view-casefold` on macOS is also the test of the working assumption that Seatbelt compares the
-*stored* name. If `touch cf/.GIT/config` exits 0 there, it compares the spelled one, and the
-`spelling` lint and the macOS docs are wrong.

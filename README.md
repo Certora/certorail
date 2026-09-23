@@ -33,7 +33,7 @@ judge whether the grants were wise. Read the policy as carefully as you would a 
 information on how to lockdown programs launched via certorail, see the [grants guide](GRANTS.md).
 
 A policy talks about names, not objects. A grant or a protection constrains the path a program
-spells, never the file that path ends up at. The rule of thumb has three consequences worth
+spells, never the file that path ends up at. The rule of thumb has four consequences worth
 knowing:
 
 - A symbolic link inside a granted tree is followed. A read through it reaches wherever the link
@@ -44,6 +44,12 @@ knowing:
 - A location hole in a program rule constrains how the argument is spelled, not how the tool
   resolves it. A network rule's `source` tags whatever comes back through that URL, redirects
   included.
+- On macOS the OS jail around a tool matches paths without regard to case, so a grant written
+  `notes/**/<[a-z]+\.txt>` lets a tool open `notes/NO.txt`. On the default case-insensitive
+  volume that reaches no file the program could not open anyway: the same file is also
+  `notes/no.txt`, which the grant admits. A grant that tells names apart by case tells spellings
+  apart, not files. On a case-sensitive volume `NO.txt` and `no.txt` are two files, and there a
+  grant must not rely on case to keep a tool away from one of them.
 
 A program is rejected before it runs if any operation cannot be proven to stay within the policy.
 The OS jail backs the analysis at run time; on Linux, without `bubblewrap` installed the program

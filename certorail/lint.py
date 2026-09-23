@@ -10,7 +10,8 @@ constrains the name a program spells, never the file behind it.
 - ``literal-directory``: a read or write grant naming a directory literally (``src``) grants the
   directory itself -- listing it -- and none of its files; ``src/**`` is the usual intent.
 - ``spelling`` (macOS): a literal name in the policy that the directory stores under another
-  spelling folding to the same name (``.Git`` for ``.git``): the jail matches the stored name.
+  spelling folding to the same name (``.Git`` for ``.git``): the names a program reads from a
+  listing carry the stored spelling, which the policy's does not match.
 """
 import os
 import pathlib
@@ -87,7 +88,7 @@ def lint(policy: "Policy", root: pathlib.Path, *, platform: str = sys.platform) 
                         out.append(Lint(
                             "spelling", loc,
                             f"{pretty_location(loc)} spells {c.name!r}, but {here} stores it as {stored[0]!r}: "
-                            "the jail matches the stored name",
+                            "a name a program reads from a listing is spelled the stored way",
                         ))
                     break
                 here = here / c.name
