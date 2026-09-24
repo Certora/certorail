@@ -94,4 +94,4 @@ patterned policy, and `certorail view stop` unmounts them. These are both Linux 
 
 ## License
 
-GPL-3.0-only. © Certora Ltd.
+MIT. See [`LICENSE`](LICENSE). © Certora Ltd.

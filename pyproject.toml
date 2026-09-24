@@ -7,7 +7,7 @@ name = "certorail"
 version = "0.1.0"
 description = "CertorAIl"
 requires-python = ">=3.12"
-license = "GPL-3.0-only"
+license = "MIT"
 authors = [
     {name = "Certora Ltd."}
 ]
