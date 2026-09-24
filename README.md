@@ -1,6 +1,6 @@
 # certorail
 
-Static confinement for LLM-authored Python.
+Confinement for LLM-authored tool calls using static analysis of Python.
 
 A program written in a restricted subset of Python is analysed, checked against a security
 policy, and — only if every filesystem and subprocess operation is *proven* to stay where the
@@ -8,8 +8,16 @@ policy allows — run in an isolated interpreter. Anything unprovable is rejecte
 
 ## Getting Started
 
-See the instructions in the [setup guide](SETUP.md). You will need `uv` and, on Linux, `bubblewrap`.
-There is no support (yet) for Windows platforms, MacOS and Linux only for now.
+### Quickstart
+
+Get [uv](https://docs.astral.sh/uv/getting-started/installation/) and run:
+```
+uv tool install certorail
+certorail init
+```
+
+See the full instructions in the [setup guide](SETUP.md). You will need `uv` and, on Linux, `bubblewrap`.
+MacOS and Linux only for now, there is no support (yet) for Windows platforms. 
 
 ## Usage
 
@@ -18,22 +26,24 @@ and is the expect method for you to manage your certorail installation and polic
 how the LLM is expected to execute programs via certorail. As part of the first time
 `certorail init` process, you will have the option to configure Claude Code to whitelist `certorail-run`.
 
-## What certorail does, and does not
+More agent integrations are coming soon!
+
+## What certorail does
 
 certorail confines the programs that are run through it. It does not stop an agent from doing
 anything else. If the agent can run a shell, edit files or call tools outside certorail, none of that
 is checked, so certorail is only as good as the harness that makes `certorail-run` the agent's one
-unprompted way to execute code. Claude Code's permission rules can do that; nothing in certorail
+way to execute code. Claude Code's permission rules can do that; nothing in certorail
 enforces it.
 
 Programs run with your authority. A policy grant is trust you extend: a program that is allowed to
 write under a directory, run a command or reach a host does so as you, and the tools it runs do
-whatever those tools do. The analysis proves that the Certorail program stays within the grants; it does not
+whatever those tools do. The analysis proves that the certorail program stays within the grants; it does not
 judge whether the grants were wise. Read the policy as carefully as you would a sudoers file. For
 information on how to lockdown programs launched via certorail, see the [grants guide](GRANTS.md).
 
 A policy talks about names, not objects. A grant or a protection constrains the path a program
-spells, never the file that path ends up at. The rule of thumb has four consequences worth
+spells, not the file that path ends up at. The rule of thumb has four consequences worth
 knowing:
 
 - A symbolic link inside a granted tree is followed. A read through it reaches wherever the link
@@ -91,6 +101,10 @@ then runs it. Both take `--policy FILE` to try a draft policy before you install
 
 `certorail view status` lists the filesystem views certorail keeps mounted for jailed tools under a
 patterned policy, and `certorail view stop` unmounts them. These are both Linux only, and you will rarely need either.
+
+## Contributing
+
+Community contributions are welcome both for infrastructure and for policy packs.
 
 ## License
 
