@@ -108,4 +108,4 @@ Community contributions are welcome both for infrastructure and for policy packs
 
 ## License
 
-MIT. © Certora Ltd.
+MIT. See [`LICENSE`](LICENSE). © Certora Ltd.
