@@ -3,7 +3,7 @@
 Two commands, the second an interview:
 
 ```
-uv tool install certorail          # or, from a checkout of this repository: uv tool install .
+uv tool install .                  # from a checkout of this repository
 certorail init                     # from the directory you want governed
 ```
 
