@@ -10,8 +10,8 @@ policy allows — run in an isolated interpreter. Anything unprovable is rejecte
 
 ### Quickstart
 
-Get [uv](https://docs.astral.sh/uv/getting-started/installation/). certorail is not on PyPI, so
-install it from a checkout of this repository:
+Get [uv](https://docs.astral.sh/uv/getting-started/installation/) and install from a checkout of
+this repository:
 ```
 git clone https://github.com/Certora/certorail.git
 cd certorail
