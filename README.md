@@ -10,9 +10,15 @@ policy allows — run in an isolated interpreter. Anything unprovable is rejecte
 
 ### Quickstart
 
-Get [uv](https://docs.astral.sh/uv/getting-started/installation/) and run:
+Get [uv](https://docs.astral.sh/uv/getting-started/installation/) and install from a checkout of
+this repository:
 ```
-uv tool install certorail
+git clone https://github.com/Certora/certorail.git
+cd certorail
+uv tool install .
+```
+Then, from the directory you want governed, run:
+```
 certorail init
 ```
 
