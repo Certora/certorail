@@ -1,24 +1,30 @@
-"""The FUSE view (MOUNTS.md): the sandbox root, served through a passthrough filesystem that
-shows a confined tool exactly what the policy's filesystem section grants and lets it write
-exactly what the section permits -- patterns included, which is what a bind mount cannot do.
+"""The FUSE view (MOUNTS.md, LOWERING2.md "Views"): a directory, served through a passthrough
+filesystem that shows a jail exactly what the layers it holds grant and lets it write exactly
+what they permit -- patterns, exact paths and hidden names included, which is what a bind mount
+cannot do.
 
-The mount is one per (root, filesystem section) and long-lived (``viewdaemon``); bubblewrap binds
-it at the root's real path for each confined child. The filesystem is a passthrough keyed by
+The mount is one per (directory, layers) and long-lived (``viewdaemon``); bubblewrap binds it at
+the directory's own path for each jail that needs it. The filesystem is a passthrough keyed by
 backing-file reference, from ``scripts/probe_fuse_view.py`` where it was measured: a directory
-inode holds an ``O_PATH`` descriptor (the anchor for every ``*at`` call), a file inode holds the
-directory it was found in and its name there and is re-resolved on demand with an identity check,
-an open handle is a real descriptor. What this module adds is the **filter**: every name the
-kernel is shown or asked to create is decided against the policy by the analysis' own ordering
-(``location_le``) on the concrete path -- exact, since one side is always a real path:
+inode holds an ``O_PATH`` descriptor (the anchor for every ``*at`` call), checked against its
+recorded path before each use; a file inode holds the directory it was found in and its name there
+and is re-resolved on demand with an identity check; an open handle is a real descriptor. Either
+check failing is ESTALE, on which the kernel looks the path up again, so a directory or file
+replaced or moved behind the view is served as what is at its path now
+(``scripts/probe_view_replacement.py``). What this module adds is the **filter**: every name the
+kernel is shown or asked to create is decided by the layers, in order, on its concrete path --
+the jail compiler's own meaning (``grants.state_at``), a pattern matched by the analysis'
+ordering (``location_le``), exact since one side is always a real path:
 
-- a path is *readable* iff it lies within some ``read`` or ``write`` grant: a file's contents
-  open, a directory lists every entry by name (listing a directory is reading it);
-- an entry is *visible* -- it looks up, it is listed -- iff it is readable, its directory is, or
-  (for a directory) some grant names a path below it; a name visible only because its directory
-  is readable shows its metadata, never its contents;
-- a name may be created, changed or removed iff its path lies within some ``write`` grant and at
-  or below no ``no-write`` protection. Whether the child may write at all is bubblewrap's
-  read-only bind, per rule (``write-fs``); the filesystem itself is always mounted writable.
+- a path is *readable* iff its state is read-only or writable: a file's contents open, a
+  directory lists every entry by name (listing a directory is reading it);
+- an entry is *visible* -- it looks up, it is listed -- iff it is readable; or its directory is
+  and no ``hidden`` layer has the last word on it (a name visible only so shows its metadata,
+  never its contents); or it is a directory on the way to something a grant names below it,
+  which no ``hidden`` layer after that grant covers;
+- a name may be created, changed or removed iff its state is writable. Whether the jail may
+  write through the view at all is bubblewrap's read-only bind of it; the filesystem itself is
+  always mounted writable.
 
 Names are the directory's own: a lookup must name an entry exactly as the directory stores it, and
 no operation may introduce a name the backing filesystem resolves to a differently spelled entry
@@ -44,81 +50,99 @@ Requires ``pyfuse3`` (the ``fuse`` extra); importing this module without it rais
 and ``viewdaemon`` reports the view unavailable.
 """
 import errno
+import functools
+import inspect
 import os
 import pathlib
 import stat as statmod
-from collections.abc import Sequence
+from collections.abc import Callable, Coroutine, Sequence
 from functools import lru_cache
-from typing import override
+from typing import Any, override
 
 import pyfuse3
 from pyfuse3 import EntryAttributes, FileHandleT, FileInfo, FileNameT, FlagT, InodeT, ModeT, RequestContext
 
-from certorail.analysis import DirSplat, LocationFact, Named, StaticPath, location_le, subsumes
+from certorail.analysis import DirSplat, LocationFact, Named, StaticPath, subsumes
 from certorail.folding import exact_lookups
+from certorail.sandbox.grants import Access, Exactly, Narrowing, Pattern, Region, State, Subtree, after, covers, within
+from certorail.viewdaemon import ViewLayer
 
 type NativeFd = int                 # a descriptor of this process (O_PATH or I/O)
 type NativeKey = tuple[int, int]    # (st_dev, st_ino): a backing file's identity
-type RelPath = tuple[str, ...]      # a path relative to the root, as component names
+type RelPath = tuple[str, ...]      # a path relative to the served directory, as component names
 
 
-def _at(path: RelPath) -> StaticPath:
-    return StaticPath(tuple(Named(n) for n in path))
-
-
-def _names_below(path: RelPath, loc: LocationFact) -> bool:
-    """Does *loc* denote some path strictly below *path*?"""
+def _names_below(names: tuple[str, ...], loc: LocationFact) -> bool:
+    """Does *loc* denote some path strictly below *names* (relative to its anchor)?"""
     match loc:
         case StaticPath(path_components=cs):
-            return len(cs) > len(path) and all(subsumes(c, Named(n)) for c, n in zip(cs, path))
+            return len(cs) > len(names) and all(subsumes(c, Named(n)) for c, n in zip(cs, names))
         case DirSplat(static_prefix=ps):
-            return all(subsumes(c, Named(n)) for c, n in zip(ps, path))
+            return all(subsumes(c, Named(n)) for c, n in zip(ps, names))
+
+
+def reaches_below(region: Region, path: pathlib.Path) -> bool:
+    """Might *region* name something strictly below *path*?"""
+    match region:
+        case Subtree(path=top) | Exactly(path=top):
+            return top != path and within(top, path)
+        case Pattern(location=loc, anchor=anchor):
+            if within(anchor, path):
+                return True  # at or above where the pattern is anchored
+            return within(path, anchor) and _names_below(path.relative_to(anchor).parts, loc)
 
 
 class Filter:
-    """The policy's filesystem section, asked about concrete paths relative to the root, by the
-    analysis' own ordering. Absolute locations are not the view's business: they are binds
-    beside it."""
+    """The layers a view holds, asked about concrete paths below the directory it serves."""
 
-    def __init__(
-        self,
-        read: tuple[LocationFact, ...],
-        write: tuple[LocationFact, ...],
-        no_write: tuple[LocationFact, ...],
-    ) -> None:
-        def relative(locs: tuple[LocationFact, ...]) -> tuple[LocationFact, ...]:
-            return tuple(loc for loc in locs if not loc.absolute)
-
-        self.grants: tuple[LocationFact, ...] = relative(read) + relative(write)
-        self.writes: tuple[LocationFact, ...] = relative(write)
-        self.protections: tuple[LocationFact, ...] = relative(no_write)
+    def __init__(self, directory: pathlib.Path, layers: Sequence[ViewLayer]) -> None:
+        self.directory = directory
+        self.layers = tuple(layers)
 
     @lru_cache(maxsize=200_000)
+    def decided(self, path: RelPath) -> tuple[State, bool]:
+        """*path*'s state, by the layers in order (``grants.state_at``), and whether a ``hidden``
+        layer has the last word on it -- covers it, with no grant covering it after."""
+        at = self.directory.joinpath(*path)
+        state, hidden = State.ABSENT, False
+        for layer in self.layers:
+            restriction = isinstance(layer.says, Narrowing)
+            if covers(layer.region, at, below=restriction):
+                state = after(state, layer.says)
+                hidden = layer.says is Narrowing.HIDDEN or (hidden and restriction)
+        return state, hidden
+
     def readable(self, path: RelPath) -> bool:
-        """Within some grant: a file's contents open, a directory lists every name."""
-        return any(location_le(_at(path), g) for g in self.grants)
+        """A file's contents open, a directory lists every name."""
+        return self.decided(path)[0] in (State.READ_ONLY, State.WRITABLE)
 
     @lru_cache(maxsize=200_000)
     def dir_visible(self, path: RelPath) -> bool:
-        """A directory exists for the child iff it is readable or some grant names a path below
-        it (the root always does)."""
-        return not path or self.readable(path) or any(_names_below(path, g) for g in self.grants)
+        """A directory exists for the jail iff it is the served directory, readable, or on the
+        way to something a grant names below it that no ``hidden`` layer after the grant covers
+        wholly -- one at or above the directory. (One below it hides no more than itself.)"""
+        if not path or self.readable(path):
+            return True
+        at = self.directory.joinpath(*path)
+        return any(
+            isinstance(layer.says, Access) and reaches_below(layer.region, at)
+            and not any(later.says is Narrowing.HIDDEN and covers(later.region, at, below=True) for later in self.layers[i + 1:])
+            for i, layer in enumerate(self.layers)
+        )
 
     def visible(self, path: RelPath, is_dir: bool) -> bool:
-        """Does the entry look up and list? Readable, under a readable directory (its name
-        only), or a directory on the way to a grant."""
-        if path and self.readable(path[:-1]):
+        """Does the entry look up and list? Readable; under a readable directory, by name, unless
+        hidden; or a directory on the way to a grant."""
+        if self.readable(path):
             return True
-        return self.dir_visible(path) if is_dir else self.readable(path)
+        if path and self.readable(path[:-1]) and not self.decided(path)[1]:
+            return True
+        return is_dir and self.dir_visible(path)
 
-    @lru_cache(maxsize=200_000)
     def may_write(self, path: RelPath) -> bool:
-        """Within some write grant, and at or below no protection."""
-        if not path or not any(location_le(_at(path), w) for w in self.writes):
-            return False
-        return not any(
-            location_le(_at(path[:k]), p) for p in self.protections for k in range(1, len(path) + 1)
-        )
+        """Writable: the name may be created, changed or removed. Never the served directory
+        itself, which is a mountpoint."""
+        return bool(path) and self.decided(path)[0] is State.WRITABLE
 
 
 class Inode:
@@ -161,13 +185,40 @@ def _identity(st: os.stat_result) -> NativeKey:
     return (st.st_dev, st.st_ino)
 
 
-class View(pyfuse3.Operations):
+def _answering[**P, R](handler: Callable[P, Coroutine[Any, Any, R]]) -> Callable[P, Coroutine[Any, Any, R]]:
+    """*handler*, with an error from the backing filesystem answered to the kernel as its errno."""
+
+    @functools.wraps(handler)
+    async def answered(*args: P.args, **kwargs: P.kwargs) -> R:
+        try:
+            return await handler(*args, **kwargs)
+        except OSError as e:
+            raise pyfuse3.FUSEError(e.errno or errno.EIO) from None
+
+    return answered
+
+
+class _Answering(pyfuse3.Operations):
+    """Every request handler a subclass defines answers an error from the backing filesystem -- a
+    directory deleted under an inode the kernel still holds, a full disk, a permission -- as that
+    errno. pyfuse3 ends its main loop on any exception but a ``FUSEError``, which takes the view
+    down for every jail using it. Anything else still does: a bug fails closed."""
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        for name, value in list(vars(cls).items()):
+            if inspect.iscoroutinefunction(value) and callable(getattr(pyfuse3.Operations, name, None)):
+                setattr(cls, name, _answering(value))
+
+
+class View(_Answering):
     supports_dot_lookup = True
     enable_writeback_cache = False
 
     def __init__(self, source: pathlib.Path, rules: Filter) -> None:
         super().__init__()
         self.rules = rules
+        self.source = source
         root_fd: NativeFd = os.open(source, os.O_PATH | os.O_DIRECTORY)
         root = Inode(_identity(os.stat(root_fd)), fd=root_fd, path=())
         self.inodes: dict[InodeT, Inode] = {pyfuse3.ROOT_INODE: root}
@@ -220,18 +271,55 @@ class View(pyfuse3.Operations):
         if not self.spelled_as_stored(parent, name):
             raise pyfuse3.FUSEError(errno.EEXIST)
 
-    def parent_fd(self, parent: InodeT) -> NativeFd:
-        fd = self.inodes[parent].fd
-        assert fd is not None  # the kernel names children only of directories, which hold one
+    def anchor(self) -> NativeFd:
+        """The root's descriptor, re-opened when the directory at the source path is no longer
+        the one it holds: a root replaced during a run, or between runs sharing this daemon, is
+        served as the new directory, and the inodes the kernel holds below the old one go stale
+        (``held``). With nothing at the source path, the old one is kept."""
+        root = self.inodes[pyfuse3.ROOT_INODE]
+        assert root.fd is not None
+        try:
+            if _identity(os.stat(self.source)) == root.key:
+                return root.fd
+            fd: NativeFd = os.open(self.source, os.O_PATH | os.O_DIRECTORY)
+        except OSError:
+            return root.fd
+        if self.by_key.get(root.key) == pyfuse3.ROOT_INODE:
+            del self.by_key[root.key]
+        os.close(root.fd)
+        root.fd, root.key = fd, _identity(os.stat(fd))
+        self.by_key[root.key] = pyfuse3.ROOT_INODE
         return fd
 
+    def held(self, inode: InodeT) -> NativeFd:
+        """The descriptor the directory *inode* holds, while it is still the directory at its
+        recorded path. A descriptor pins the object, not the name: a directory replaced or moved
+        away would take what is done under its path to the old object, wherever that now is
+        (measured: writes landed in the moved directory for as long as the kernel cached the
+        entry). ESTALE instead, and the kernel looks the path up again."""
+        if inode == pyfuse3.ROOT_INODE:
+            return self.anchor()
+        node = self.inodes[inode]
+        assert node.fd is not None and node.path is not None
+        try:
+            st = os.stat(os.path.join(*node.path), dir_fd=self.anchor(), follow_symlinks=False)
+        except OSError:
+            raise pyfuse3.FUSEError(errno.ESTALE) from None
+        if _identity(st) != node.key:
+            raise pyfuse3.FUSEError(errno.ESTALE)
+        return node.fd
+
+    def parent_fd(self, parent: InodeT) -> NativeFd:
+        return self.held(parent)  # the kernel names children only of directories, which hold one
+
     def fd_of(self, inode: InodeT) -> NativeFd:
-        """A live O_PATH descriptor for *inode*: held, for a directory; opened on demand for a
-        file, by the name it was found under in its held parent, and refused (ESTALE) if what is
-        there now is a different file. The caller closes a file's descriptor (``release_fd``)."""
+        """A live O_PATH descriptor for *inode*: held, for a directory, while it is still at its
+        path; opened on demand for a file, by the name it was found under in its held parent, and
+        refused (ESTALE) if what is there now is a different file. The caller closes a file's
+        descriptor (``release_fd``)."""
         node = self.inodes[inode]
         if node.fd is not None:
-            return node.fd
+            return self.held(inode)
         assert node.parent is not None and node.name is not None
         try:
             fd: NativeFd = os.open(node.name, os.O_PATH | os.O_NOFOLLOW, dir_fd=self.parent_fd(node.parent))
@@ -249,7 +337,7 @@ class View(pyfuse3.Operations):
     def stat_of(self, inode: InodeT) -> os.stat_result:
         node = self.inodes[inode]
         if node.fd is not None:
-            return os.stat(node.fd)
+            return os.stat(self.held(inode))
         assert node.parent is not None and node.name is not None
         try:
             st = os.stat(node.name, dir_fd=self.parent_fd(node.parent), follow_symlinks=False)
@@ -499,7 +587,7 @@ class View(pyfuse3.Operations):
         # target simply fails to look up. An absolute target escapes the view: bwrap's job.
         node = self.inodes[inode]
         if node.fd is not None:
-            return os.fsencode(os.readlink(_proc(node.fd)))
+            return os.fsencode(os.readlink(_proc(self.held(inode))))
         assert node.parent is not None and node.name is not None
         self.stat_of(inode)  # identity check
         return os.fsencode(os.readlink(node.name, dir_fd=self.parent_fd(node.parent)))
@@ -515,7 +603,7 @@ class View(pyfuse3.Operations):
         node = self.inodes[inode]
         fd: NativeFd
         if node.fd is not None:
-            fd = os.open(_proc(node.fd), flags & ~os.O_NOFOLLOW)
+            fd = os.open(_proc(self.held(inode)), flags & ~os.O_NOFOLLOW)
         else:
             assert node.parent is not None and node.name is not None
             try:
