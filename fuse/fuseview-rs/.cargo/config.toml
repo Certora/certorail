@@ -1,0 +1,9 @@
+# A static executable: its jail (scripts/native_view.py) needs no libraries. Cargo reads this from
+# the directory it runs in, so build from here: cargo build --release. The target is named so that
+# crt-static reaches the executable alone, not the proc-macros the build loads (which cannot be
+# static); it puts the executable at target/x86_64-unknown-linux-gnu/release/fuseview-rs.
+[build]
+target = "x86_64-unknown-linux-gnu"
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+crt-static"]

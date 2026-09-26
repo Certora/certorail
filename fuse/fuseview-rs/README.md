@@ -1,6 +1,6 @@
 # fuseview-rs
 
-certorail's FUSE view (`certorail/fuseview.py`) ported to Rust, to answer one question: how much of the view's cost comes from the interpreter? This is a scratch experiment, and nothing in certorail runs it.
+certorail's FUSE view (`certorail/fuseview.py`) ported to Rust, to answer one question: how much of the view's cost comes from the interpreter? Nothing in certorail runs it yet.
 
 The algorithm is the same as the Python view's, check for check and system call for system call, except for one redundant check it drops (below): the d_path checks through `/proc/self/fd`, identity by (device, inode, type), directories by key and files by place, the folding test, the deferred `O_TRUNC`, the same filter over the same layers.
 
@@ -8,16 +8,16 @@ The algorithm is the same as the Python view's, check for check and system call 
 
 fuser 0.18 needs Rust 1.85 or later. Build from this directory, where `.cargo/config.toml` makes the executable static; its jail holds no libraries:
 
-    cd scratch/fuseview-rs && cargo build --release
+    cd fuse/fuseview-rs && cargo build --release
 
 The executable lands at `target/x86_64-unknown-linux-gnu/release/fuseview-rs`. No libfuse is needed. Linking statically wants glibc's static archives (`libc6-dev` on Debian and Ubuntu). `cargo test` runs the filter's cases from `tests/test_fuseview.py` and a decoded specification.
 
 ## Run
 
-    .venv/bin/python scripts/probe_view_find.py --rust scratch/fuseview-rs/target/x86_64-unknown-linux-gnu/release/fuseview-rs
-    .venv/bin/python scripts/view_shell.py ~/certora --rust scratch/fuseview-rs/target/x86_64-unknown-linux-gnu/release/fuseview-rs
+    .venv/bin/python scripts/probe_view_find.py --rust fuse/fuseview-rs/target/x86_64-unknown-linux-gnu/release/fuseview-rs
+    .venv/bin/python scripts/view_shell.py ~/certora --rust fuse/fuseview-rs/target/x86_64-unknown-linux-gnu/release/fuseview-rs
 
-Both scripts run the daemon jailed (`scripts/native_view.py`, shared with the Lean port in `scratch/fuseview-lean`). bubblewrap gives it the served directory read-only at its own path, the executable, the specification, a `/proc` of its own and bubblewrap's minimal `/dev`, and nothing else: no other file of the host, no network, no environment. A jailed process cannot mount, so the script makes the mount outside the jail the way libfuse does. fusermount3 opens `/dev/fuse`, mounts it, and hands back the descriptor, which the daemon serves (`--fd N`). Unmounting the view ends the daemon.
+Both scripts run the daemon jailed (`scripts/native_view.py`, shared with the Lean port in `fuse/fuseview-lean`). bubblewrap gives it the served directory read-only at its own path, the executable, the specification, a `/proc` of its own and bubblewrap's minimal `/dev`, and nothing else: no other file of the host, no network, no environment. A jailed process cannot mount, so the script makes the mount outside the jail the way libfuse does. fusermount3 opens `/dev/fuse`, mounts it, and hands back the descriptor, which the daemon serves (`--fd N`). Unmounting the view ends the daemon.
 
 The daemon's protocol:
 

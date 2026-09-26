@@ -2,7 +2,7 @@ import Fuseview
 
 /-!
 certorail's FUSE view (`certorail/fuseview.py`), in Lean: the Rust port's question
-(`scratch/fuseview-rs`) asked again -- what does native execution buy -- with the protocol spoken
+(`fuse/fuseview-rs`) asked again -- what does native execution buy -- with the protocol spoken
 directly, request by request, over a /dev/fuse descriptor someone else mounted
 (`scripts/native_view.py` mounts it, and jails this).
 

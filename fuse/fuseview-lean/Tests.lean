@@ -13,7 +13,7 @@ def at_ (parts : List String) : Path := parts.toArray.map Name.ofString
 def named (s : String) : Component := .named (Name.ofString s)
 
 def matching (p : String) : Component :=
-  match Regex.Regex.compile p with
+  match NamePattern.compile p with
   | .ok r => .matching r
   | .error e => panic! s!"{p}: {e}"
 
@@ -178,17 +178,17 @@ def specCases : T Unit := do
     (Spec.parse "{\"directory\":\"/r\",\"format\":2,\"layers\":[{\"grant\":\"read-only\",\"region\":{\"anchor\":\"/r\",\"pattern\":{\"absolute\":false,\"path\":[{\"regex\":\"(?!x).*\"}]}}}]}" matches .error _)
 
 def fullmatch (pattern name : String) : Option Bool :=
-  match Regex.Regex.compile pattern with
+  match NamePattern.compile pattern with
   | .ok r => r.fullmatch (Name.ofString name)
   | .error _ => none
 
-def compiles (pattern : String) : Bool := Regex.Regex.compile pattern matches .ok _
+def compiles (pattern : String) : Bool := NamePattern.compile pattern matches .ok _
 
 def regexCases : T Unit := do
   check "literal" (fullmatch "abc" "abc" == some true)
   check "fullmatch, not search" (fullmatch "abc" "abcd" == some false)
   check "dot" (fullmatch "a.c" "abc" == some true)
-  check "dot is not newline" (fullmatch "a.c" "a\nc" == some false)
+  check "a name holding a newline has no answer" (fullmatch "a.c" "a\nc" == none)
   check "star" (fullmatch "ab*c" "ac" == some true && fullmatch "ab*c" "abbbc" == some true)
   check "plus" (fullmatch "ab+c" "ac" == some false && fullmatch "ab+c" "abc" == some true)
   check "optional" (fullmatch "colou?r" "color" == some true && fullmatch "colou?r" "colour" == some true)
@@ -207,7 +207,12 @@ def regexCases : T Unit := do
   check "words" (fullmatch "\\w+\\.py" "my_mod.py" == some true)
   check "a class on a non-ASCII name has no answer" (fullmatch "\\w+" "café" == none)
   check "a literal on a non-ASCII name has one" (fullmatch "caf." "café" == some true)
-  check "$ before a final newline, yet fullmatch spans it" (fullmatch "a$" "a\n" == some false)
+  check "nor under $, which Python lets match before a final newline" (fullmatch "a$" "a\n" == none)
+  check "dot is anything but a newline, as Python's" (fullmatch "a.c" "a-c" == some true)
+  check "an empty alternative" (fullmatch "a|" "" == some true && fullmatch "a|" "a" == some true)
+  check "a non-ASCII literal, spelled for lean-regex" (fullmatch "é+" "éé" == some true)
+  check "a vertical tab under \\s has no answer" (fullmatch "a\\sb" (String.ofList ['a', Char.ofNat 11, 'b']) == none)
+  check "special characters stay literal" (fullmatch "a\\.b\\+c" "a.b+c" == some true && fullmatch "a\\.b\\+c" "aXbbc" == some false)
   check "^ and \\Z" (fullmatch "^ab\\Z" "ab" == some true)
   check "lazy is the same language" (fullmatch "a+?b" "aaab" == some true)
   check "an empty loop terminates" (fullmatch "(a*)*b" "aaab" == some true && fullmatch "(a*)*b" "aaa" == some false)

@@ -1,5 +1,5 @@
 import Fuseview.Bytes
-import Fuseview.Regex
+import Fuseview.NamePattern
 
 /-!
 The filter (`fuseview.Filter`, over `grants.covers` and `grants.after`): the layers a view holds,
@@ -7,7 +7,7 @@ asked about concrete paths below the directory it serves. A pattern is matched c
 component, as the analysis' ordering matches one whose other side is a real path
 (`analysis.location_le`). Paths are absolute, as their components.
 
-`none` is a question with no answer -- a regex that cannot say (see `Regex`) -- and every answer
+`none` is a question with no answer -- a regex that cannot say (see `NamePattern`) -- and every answer
 built on one is the closed one: the name is neither visible, readable nor writable.
 -/
 namespace Fuseview
@@ -17,7 +17,7 @@ inductive Component where
   | any
   | oneOf (ns : Array Name)
   /-- the whole name must match -/
-  | matching (re : Regex.Regex)
+  | matching (re : NamePattern)
   deriving Inhabited
 
 inductive Location where

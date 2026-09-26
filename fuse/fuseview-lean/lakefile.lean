@@ -3,6 +3,10 @@ open Lake DSL System
 
 package «fuseview-lean»
 
+/-- The regex engine a `<...>` component is matched with: formally verified (both its matchers are
+proven sound and complete against its semantics), and nothing of its own to fetch. -/
+require Regex from git "https://github.com/pandaman64/lean-regex" @ "v4.32.0" / "regex"
+
 lean_lib Fuseview
 
 /-- The system calls Lean's IO library does not make (`c/shim.c`). -/
