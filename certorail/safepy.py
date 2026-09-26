@@ -567,36 +567,70 @@ class ValidationAnalysis(_LexicalAnalysis):
             self.visit(tp)
         # a class statement binds its name like a def does: ``class tuple:`` with an __init__
         # that keeps its argument would launder a typed container through a roster read
-        self._visit_binding(node.name, node)
+        self._visit_bound_name(node.name, node)
         for s in node.body:
             self.visit(s)
 
     # PEP 695 type parameters bind names in an annotation scope the body can see; a TypeVar is
     # not callable, but a bound builtin name is a bound builtin name
     def visit_TypeVar(self, node: ast.TypeVar) -> Any:
-        self._visit_binding(node.name, node)
+        self._visit_bound_name(node.name, node)
         return self.generic_visit(node)
 
     def visit_ParamSpec(self, node: ast.ParamSpec) -> Any:
-        self._visit_binding(node.name, node)
+        self._visit_bound_name(node.name, node)
         return self.generic_visit(node)
 
     def visit_TypeVarTuple(self, node: ast.TypeVarTuple) -> Any:
-        self._visit_binding(node.name, node)
+        self._visit_bound_name(node.name, node)
         return self.generic_visit(node)
 
+    # -- match patterns --------------------------------------------------------------------------
+    #
+    # A pattern reads its subject and binds names, and none of it is an ``Attribute`` or a ``Name``
+    # node: a class pattern's keywords are attribute reads (``case object(__globals__=g)`` is ``g =
+    # subject.__globals__``), a mapping pattern's keys are values, a capture is a binding. Each gets
+    # what the attribute read, the value or the binding would, and every pattern is walked into,
+    # wherever it sits.
+
+    def _visit_bound_name(self, name: str | None, node: ast.AST) -> None:
+        """A name bound by a string field (a capture, ``except ... as``): a binding, and no dunder,
+        which would rebind the module's own (``__builtins__``)."""
+        if name is None:
+            return
+        if is_dunder(name):
+            self._violation(node, "bind dunder")
+        self._visit_binding(name, node)
+
     def visit_MatchAs(self, node: ast.MatchAs) -> Any:
-        if node.name is not None:
-            self._visit_binding(node.name, node)
+        self._visit_bound_name(node.name, node)
+        if node.pattern is not None:
+            self.visit(node.pattern)
 
     def visit_MatchStar(self, node: ast.MatchStar) -> Any:
-        if node.name is not None:
-            self._visit_binding(node.name, node)
+        self._visit_bound_name(node.name, node)
 
     def visit_MatchMapping(self, node: ast.MatchMapping) -> Any:
-        if node.rest is not None:
-            self._visit_binding(node.rest, node)
-    
+        for key in node.keys:
+            self.visit(key)
+        for pattern in node.patterns:
+            self.visit(pattern)
+        self._visit_bound_name(node.rest, node)
+
+    def visit_MatchClass(self, node: ast.MatchClass) -> Any:
+        self.visit(node.cls)
+        for name in node.kwd_attrs:
+            # an attribute read of the subject, a receiver nothing is known about: the rules
+            # ``_visit_ap`` holds every such read to
+            if is_dunder(name):
+                self._violation(node, "dunder attribute")
+            elif name in FORBIDDEN_ATTRIBUTES:
+                self._violation(node, f"forbidden attribute {name}")
+            elif name in PATH_SINK_METHODS:
+                self._violation(node, f"{name} may only be called, not taken as a value")
+        for pattern in (*node.patterns, *node.kwd_patterns):
+            self.visit(pattern)
+
     def visit_AnnAssign(self, node: ast.AnnAssign) -> Any:
         self._visit_mention(node.annotation, AttributeContext.type)
         self.visit(node.target)
@@ -606,8 +640,7 @@ class ValidationAnalysis(_LexicalAnalysis):
     def visit_ExceptHandler(self, node: ast.ExceptHandler) -> Any:
         if node.type is not None:
             self._visit_mention(node.type, AttributeContext.type)
-        if node.name is not None:
-            self._visit_binding(node.name, node)  # ``except E as name`` binds name
+        self._visit_bound_name(node.name, node)  # ``except E as name`` binds name
         for s in node.body:
             self.visit(s)
 

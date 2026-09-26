@@ -217,11 +217,16 @@ kind. Listing a directory, or asking whether a path exists, is a read of it.
 
 - `open(p, mode)`: a mode containing `w`, `a`, `x` or `+` needs *write*, any other mode *read*. The mode is a literal; a
   computed mode counts as a write.
-- `os.listdir(p)`, `os.walk(p)`, `os.path.exists(p)`, `os.path.isfile(p)`, `os.path.isdir(p)`: *read*.
+- `os.listdir(p)`, `os.path.exists(p)`, `os.path.isfile(p)`, `os.path.isdir(p)`: *read*.
 - `pathlib.Path` methods on `p`: `.open()` (the mode as for `open`), `.read_text()`, `.read_bytes()`, `.iterdir()`,
   `.glob()`, `.rglob()`, `.exists()`, `.is_file()`, `.is_dir()` need *read*; `.write_text()`, `.write_bytes()`, `.mkdir()`,
   `.touch()`, `.chmod()`, `.replace(target)` (both `p` and `target`) need *write*. Each is called fully applied where it is
   named; `f = p.read_text` is a violation.
+- A traversal that descends lists every directory below where it starts, so it needs *read* of that whole subtree
+  (`p/**`): `os.walk(p)`, `p.rglob(pat)`, and `p.glob(pat)` when `pat` has a `/` or `**`. `p.iterdir()` and a one-level
+  `p.glob(pat)` read `p` alone.
+- `p.mkdir(parents=True)` also makes the missing directories on the way to `p`; the write grant covering `p` permits
+  them.
 
 ### Subprocess Exec
 

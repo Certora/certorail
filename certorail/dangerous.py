@@ -350,7 +350,11 @@ type AccessKind = Literal["read", "write", "list"]
 
 # builtins and module-level functions: dotted callee -> (index of the path argument, kind).
 # A missing argument (``os.listdir()``) means the current directory, i.e. the sandbox root.
-# For ``open`` the mode decides between read and write; "read" is the default mode.
+# For ``open`` the mode decides between read and write; "read" is the default mode. A traversal
+# that descends -- ``os.walk``, ``rglob``, a ``glob`` whose pattern reaches past the first level --
+# lists every directory at or below where it starts, and is that listing (``enforcement._below``).
+# ``mkdir(parents=True)`` also makes the missing directories on the way to its path: each lies on
+# the way to a location the write grant covers, which is what a write grant lets a program make.
 PATH_SINK_FUNCTIONS: dict[tuple[str, ...], tuple[int, AccessKind]] = {
     ("open",): (0, "read"),
     ("os", "listdir"): (0, "list"), ("os", "walk"): (0, "list"),

@@ -35,5 +35,49 @@ class TestSources(unittest.TestCase):
         self.assertNotIn("trusted", reveal("http://api.example.com:8080/data/x"))
 
 
+class TestASourceAtomFillsAHole(unittest.TestCase):
+    """A value extracted from a sourced response carries the source's atom, which a program
+    rule's hole may require -- but an argv hole also wants ``not-option``, which a source cannot
+    vouch for: the extracted text could be ``-e`` (a report from the field, 2026-09-25)."""
+
+    POLICY = """
+policy-version = 1
+base = false
+[atoms]
+vetted = { pure = true }
+[[network]]
+host    = "api.example.com"
+schemes = ["https"]
+source  = "vetted"
+[[program]]
+name = "echo"
+argv = ["echo", "${WORD}"]
+cwd  = "."
+holes.WORD = { atoms = ["vetted"] }
+"""
+
+    def check(self, guard: str) -> Accepted | Rejected:
+        import tomllib
+
+        source = (
+            'r = certora.network.get("https://api.example.com/x")\n'
+            'word = certora.extract(r, ".field")\n'
+            f"{guard}"
+            'certora.exec("echo", word, cwd=".")\n'
+        )
+        return host_check(source, "<t>", from_data(tomllib.loads(self.POLICY)))
+
+    def test_unguarded_the_word_may_be_an_option(self) -> None:
+        got = self.check("")
+        assert isinstance(got, Rejected), got
+        self.assertIn("WORD may begin with '-' and be read as an option", "\n".join(got.describe("<t>")))
+
+    def test_guarded_it_is_echoed(self) -> None:
+        for guard in ('assert not word.startswith("-")\n', 'if word.startswith("-"):\n    raise SystemExit(1)\n'):
+            with self.subTest(guard=guard):
+                got = self.check(guard)
+                self.assertIsInstance(got, Accepted, "\n".join(got.describe("<t>")))
+
+
 if __name__ == "__main__":
     unittest.main()

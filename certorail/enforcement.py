@@ -61,6 +61,7 @@ from certorail.analysis import (
     pretty_location,
     pretty_regex,
     scalar,
+    splat_under,
     url_of,
     _regex_subsumes,
 )
@@ -531,6 +532,24 @@ def _at_sink(value: Value) -> ValidationFact | None:
     fact = _as_fact(value)
     located = locate(fact)
     return fact if located is None else located
+
+
+def _below(fact: ValidationFact | None) -> ValidationFact | None:
+    """What a traversal that descends lists: every directory at or below where it starts."""
+    return replace(fact, location=splat_under(fact.location)) if isinstance(fact, Located) else fact
+
+
+def _descends(method: str, site: Callsite) -> bool:
+    """Does the ``pathlib`` traversal list directories below its receiver? ``rglob`` always; a
+    ``glob`` whose pattern may reach past the first level -- a separator or ``**`` in it, or a
+    pattern not known statically -- conservatively, since which directories a ``glob`` lists on the
+    way varies with the Python version."""
+    if method == "rglob":
+        return True
+    if method != "glob":
+        return False
+    pattern = site.keyword("pattern") if "pattern" in site.keywords else (site.args[0] if site.args else None)
+    return not isinstance(pattern, str) or "/" in pattern or "**" in pattern
 
 
 def _open_kind(mode: str | None) -> AccessKind:
@@ -1236,7 +1255,8 @@ class Enforcement:
         if full is not None and full in PATH_SINK_FUNCTIONS:
             index, kind = PATH_SINK_FUNCTIONS[full]
             fact = site.args[index] if index < len(site.args) else Located(StaticPath(()), "str")
-            return Audit((SinkSite(node, ".".join(full), _at_sink(fact), kind),))
+            at = _at_sink(fact)
+            return Audit((SinkSite(node, ".".join(full), _below(at) if full == ("os", "walk") else at, kind),))
         if full is not None and len(full) > 1 and callee.base_name in self.modules:
             return Audit()  # a module function that is no sink (json.loads, re.match, certora.field)
         name = site.method
@@ -1270,7 +1290,8 @@ class Enforcement:
                 violations.append((node, f"{name}(): the {keyword} argument is required"))
             if not violations:
                 sites.append(SinkSite(node, f"<path>.{name}({keyword})", _at_sink(target), target_kind))
-        sites.append(SinkSite(node, f"<path>.{name}", _at_sink(receiver), kind))
+        at = _at_sink(receiver)
+        sites.append(SinkSite(node, f"<path>.{name}", _below(at) if _descends(name, site) else at, kind))
         return Audit(tuple(sites), tuple(violations))
 
     def _audit_open(self, site: Callsite) -> Audit:
