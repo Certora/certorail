@@ -1,0 +1,13 @@
+[package]
+name = "fuseview-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"  # fuser 0.18 is edition 2024
+publish = false
+description = "certorail's FUSE view (certorail/fuseview.py), ported to measure what native execution buys"
+
+[dependencies]
+fuser = "0.18"  # no default features: mounts through fusermount3, no libfuse needed
+libc = "0.2"
+serde_json = "1"
+fancy-regex = "0.14"  # Python's re has lookarounds and backreferences; the regex crate has neither
