@@ -1,4 +1,4 @@
-"""Effect regions (EFFECTS.md, step 1): the ``[regions]`` vocabulary, the media a grant claims,
+"""Effect regions: the ``[regions]`` vocabulary, the media a grant claims,
 ``writes`` on rules and ``reads`` on atoms, the write and read sets they induce, and the
 computed "dies on" in ``--describe``. Nothing here touches the kill yet."""
 import copy

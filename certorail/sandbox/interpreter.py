@@ -1,5 +1,5 @@
-"""The certorail process's interpreter's world (FLOORS.md): what it reads, for the policy view's
-read-only mounts. Derived from the interpreter the jail will run, asked once unjailed at its real
+"""The certorail process's interpreter's world: what it reads, for the policy view's read-only
+mounts. Derived from the interpreter the jail will run, asked once unjailed at its real
 path with ``-I -S``: its executable, its prefixes and stdlib directories, and the directory of every
 shared object the loader maps while it imports every stdlib module the subset admits
 (``/proc/self/maps`` on Linux; dyld's image list on macOS, whose system libraries live in the

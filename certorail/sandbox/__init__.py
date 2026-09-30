@@ -1,6 +1,6 @@
-"""The jail compiler (LOWERING2.md): a run's jails stated (``front``), placed (``place``),
-certified (``certify``), attached to their views and emitted (``emit``), each pass its own module.
-This package exports what the rest of certorail spawns with: ``prepare`` and the ``Spawner`` it
+"""The jail compiler: a run's jails stated (``front``), placed (``place``), certified
+(``certify``), attached to their views and emitted (``emit``), each pass its own module. This
+package exports what the rest of certorail spawns with: ``prepare`` and the ``Spawner`` it
 returns (``run``)."""
 from certorail.childjail import JailUnavailable, Spawn
 from certorail.sandbox.place import CompileError

@@ -1,5 +1,5 @@
-"""The jail compiler's pure passes (LOWERING2.md): the front end, Place and Flatten, against a
-simulated filesystem -- no bubblewrap, no Seatbelt, no FUSE."""
+"""The jail compiler's pure passes: the front end, Place and Flatten, against a simulated
+filesystem -- no bubblewrap, no Seatbelt, no FUSE."""
 import pathlib
 import random
 import unittest
@@ -239,7 +239,7 @@ class TestPolicyWorld(unittest.TestCase):
         self.assertEqual(items[1:], (Bind(P("/r"), Access.READ_ONLY), Bind(P("/r"), Access.WRITABLE)))
         self.assertEqual(flatten(EmptyBase(), items)[-1], Mount(P("/r"), State.WRITABLE, Own()))
 
-    # the findings of PLACE_PROOF.md
+    # what the placement checker demands (proofs/place): nothing sits under a link, a listing is a need
 
     def test_a_grant_under_a_link_is_held_in_a_view(self) -> None:
         # lstat follows /r/vendor, so /r/vendor/lib reads as a directory; a bind would show where it leads
@@ -560,7 +560,7 @@ class TestStability(unittest.TestCase):
 
 
 class TestHostWorldRedlines(unittest.TestCase):
-    """A host-view tool under the machine's redlines (REDLINES.md): views at the innermost stable
+    """A host-view tool under the machine's redlines: views at the innermost stable
     directory above each, the rest of its children bound back, whether the base is writable or
     read-only -- a mount on a redline's own name would detach when something outside renamed a
     file over it."""

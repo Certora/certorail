@@ -78,9 +78,8 @@ and there is no "accepted race".
   which is what keeps a view at one where it is (`view_live`: the model has a view live only
   while the host names its directory as it did, like any mount on a host name); nothing outside
   the jail touches a stable one (`kept`, `subtrees`), which is what keeps a whole run's bind
-  naming what it did (`root_leads_stays`). It is `world.toml`'s `stable` (REDLINES.md,
-  "Stability"): the user's judgment about the machine, spelled out per world by
-  `certify.stability`.
+  naming what it did (`root_leads_stays`). It is `world.toml`'s `stable`: the user's judgment
+  about the machine, spelled out per world by `certify.stability`.
 - **The facts** (`FactsHold`): what the placer read was true when the jail was made. Each spawn
   asks again (`Recorded.changed`).
 - **The views' daemon**: it decides each name by `stateFrom` over its layers, shows the host's

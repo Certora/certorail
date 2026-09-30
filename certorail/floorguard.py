@@ -1,5 +1,5 @@
-"""This machine's redlines for the certorail process in host mode, held in the process itself
-(FLOORS.md): an audit hook (PEP 578) that the bootstrap installs last before the program runs.
+"""This machine's redlines for the certorail process in host mode, held in the process itself:
+an audit hook (PEP 578) that the bootstrap installs last before the program runs.
 
 Host mode's promise: the program runs with the user's authority and reaches files through the
 names its policy grants -- the analysis proves the names -- wherever those names lead, links
@@ -132,8 +132,8 @@ def _lifted(path: pathlib.Path, lifts: tuple[LocationFact, ...]) -> bool:
 @dataclass(frozen=True)
 class Guard:
     """What the hook holds: this machine's ``never-*`` paths, resolved when ``world.toml`` loaded,
-    and the lifts of them the root policy wrote for the program (``[system.exec]``, REDLINES.md),
-    absolute: readable and read-only (*lift_read*), or writable (*lift_write*)."""
+    and the lifts of them the root policy wrote for the program (``[system.exec]``), absolute:
+    readable and read-only (*lift_read*), or writable (*lift_write*)."""
 
     never_write: tuple[pathlib.Path, ...]
     never_visible: tuple[pathlib.Path, ...]

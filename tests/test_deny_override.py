@@ -214,7 +214,7 @@ class TestNoWrite(RulesetCase):
 
     def test_host_mode_holds_protections_by_name_alone(self) -> None:
         # host mode is the user's authority: a protection holds where the analysis checks names,
-        # and a link out of the grants is followed (FLOORS.md); the policy view holds it in its jail
+        # and a link out of the grants is followed; the policy view holds it in its jail
         policy = Policy.allow(
             write=[markers.within(".")],
             no_write=[markers.within("secrets"), markers.within("/etc/certorail"), markers.within("repos", leaf=markers.matches(r"\.git"))],

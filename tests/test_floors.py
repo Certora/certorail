@@ -1,4 +1,4 @@
-"""The certorail process at run time (FLOORS.md): ``[system]`` in the root policy, this machine's
+"""The certorail process at run time: ``[system]`` in the root policy, this machine's
 ``world.toml``, the load-time checks between them, and the jail they lower to -- end to end where
 bubblewrap is at hand."""
 import os

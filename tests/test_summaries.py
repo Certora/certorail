@@ -1,4 +1,4 @@
-"""The callee analysis, phase two (EFFECTS.md, summaries.py): a call to a module-level function
+"""The callee analysis, phase two (summaries.py): a call to a module-level function
 applies that function's summary -- the kill its body applies, computed as a fixpoint over the
 module with every parameter unknown -- and binds its result when that is a standard value.
 Every other program call (a class instantiated, a lambda or a nested function held in a

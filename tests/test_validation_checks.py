@@ -247,7 +247,7 @@ class TestPolicy(unittest.TestCase):
                     )
                 },
                 pure_atoms=frozenset(BUILTIN_ATOMS.values()),  # the built-ins are always in scope
-                # the one exec rule declares no media, so it writes everything (EFFECTS.md)
+                # the one exec rule declares no media, so it writes everything
                 writes=WriteTable(exec=((ProgramName("git"), ("log",), EVERYTHING),)),
             ),
         )
@@ -496,7 +496,7 @@ class TestCheckSingle(unittest.TestCase):
 
     def test_an_effectful_check_establishes_nothing_in_a_comprehension(self) -> None:
         # iteration i+1's effectful evaluator kills what iteration i established: only
-        # pure atoms accumulate across a comprehension (CONTAINERS.md)
+        # pure atoms accumulate across a comprehension
         vocabulary = Policy.allow(
             validations=[
                 validation(

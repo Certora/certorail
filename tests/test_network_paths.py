@@ -115,7 +115,7 @@ class TestPolicySide(unittest.TestCase):
         self.assertIn("- GET https://api.github.com; path within /repos/**", describe(POLICY, "p"))
 
     def test_a_path_scoped_source(self) -> None:
-        # PROVENANCE.md's deferred item: a network source scoped by path
+        # a network source scoped by path
         policy = Policy.allow(
             network=[network("api.github.com", path=markers.within("/repos"), source="gh-repos")],
         )

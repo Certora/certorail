@@ -1,5 +1,5 @@
-"""What a ``[[program]]`` or ``[[validation]]`` grant says about its child (JAILS.md, option B: per
-grant, by what the grant declares) -- the grant-level vocabulary, before any lowering.
+"""What a ``[[program]]`` or ``[[validation]]`` grant says about its child (per grant, by what the
+grant declares) -- the grant-level vocabulary, before any lowering.
 
 The confined program runs in the host's jail (``sandbox.program``); the tools and checkers its
 grants name run host-side, in the broker, and by default with the host's environment and reach --
@@ -10,9 +10,9 @@ narrowing is **enforced**, a property of the process rather than a claim::
     write-fs = false                   # no filesystem writes, save a private TMPDIR discarded after
     exec.env   = ["PATH", "HOME", { GIT_PAGER = "cat" }]   # passed through, or set; the rest is scrubbed
     exec.spawn = false                 # no process creation
-    exec.view  = "policy"              # sees only what the policy grants (MOUNTS.md)
+    exec.view  = "policy"              # sees only what the policy grants
 
-``network`` and ``write-fs`` are the grant's *media* (EFFECTS.md): what the tool cannot reach it
+``network`` and ``write-fs`` are the grant's *media*: what the tool cannot reach it
 cannot write, so the effects analysis and the jail read the same two keys. Region-level claims
 that no jail could check stay declarations (``writes = [...]``). Every key defaults to the
 unjailed baseline.

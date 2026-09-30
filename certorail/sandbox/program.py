@@ -1,9 +1,9 @@
-"""The certorail process's own jail (FLOORS.md; LOWERING2.md, "Two worlds"): what the front end
-grants it -- the host's ``/`` in host mode, the policy's world under ``[system.exec] view =
-"policy"`` -- and the interpreter the policy's world is built around. ``sandbox.prepare`` builds
-it from a ``ProgramRequest`` and compiles it with the run's other jails, and the run's
-``Spawner`` writes it (``Spawner.launch``): bubblewrap's arguments around the interpreter on
-Linux, the Seatbelt profile the bootstrap installs on itself on macOS.
+"""The certorail process's own jail: what the front end grants it -- the host's ``/`` in host
+mode, the policy's world under ``[system.exec] view = "policy"`` -- and the interpreter the
+policy's world is built around. ``sandbox.prepare`` builds it from a ``ProgramRequest`` and
+compiles it with the run's other jails, and the run's ``Spawner`` writes it (``Spawner.launch``):
+bubblewrap's arguments around the interpreter on Linux, the Seatbelt profile the bootstrap
+installs on itself on macOS.
 
 Host mode checks the one thing no layer says there: a ``never-visible`` path hiding what this
 interpreter needs to start, which the floor guard would refuse it mid-import. Under the policy

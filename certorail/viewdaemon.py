@@ -1,4 +1,4 @@
-"""The long-lived FUSE view (MOUNTS.md, LOWERING2.md "Views"): one daemon per (directory, layers)
+"""The long-lived FUSE view: one daemon per (directory, layers)
 keeps the view mounted at a deterministic path, retires when no run has used it for a while, and
 is recovered by the next run when it has died -- so a sequence of ``certorail`` invocations pays
 one mount, not one per call.

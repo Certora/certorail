@@ -11,7 +11,7 @@ from certorail.selfjail import ARCHES, fork_denial_filter
 # what a Linux policy world holds besides the policy's own grants: where programs, their
 # libraries, the loader's cache and the name databases ``ls -l`` reads live. Read-only, each only
 # if present, stable across a run. Machine-specific toolchains (a homebrew, a nix store) are
-# MOUNTS.md's ``world.toml``.
+# ``world.toml``'s, the machine's configuration.
 TOOLCHAIN = (
     "/usr", "/lib", "/lib32", "/lib64", "/libx32", "/bin", "/sbin",
     "/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d", "/etc/alternatives",

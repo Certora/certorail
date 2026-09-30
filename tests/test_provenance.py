@@ -1,4 +1,4 @@
-"""Source provenance (PROVENANCE.md): source atoms yielded by rules, bound to handles, established
+"""Source provenance: source atoms yielded by rules, bound to handles, established
 only by the extractors, dying at the first derivation, consumed as any atom."""
 import io
 import unittest

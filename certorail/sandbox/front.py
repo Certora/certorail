@@ -1,6 +1,6 @@
-"""The jail compiler's front end (LOWERING2.md, "Two worlds"; REDLINES.md): the policy, the
-machine's floor and the root, stated as each jail's grants. What each jail gets is decided here
-and nowhere else; how a backend holds it is the passes' (``place``).
+"""The jail compiler's front end: the policy, the machine's floor and the root, stated as each
+jail's grants. What each jail gets is decided here and nowhere else; how a backend holds it is
+the passes' (``place``).
 
 - ``program_host``: the certorail process in host mode -- the host's ``/``, the user's authority.
   The machine's redlines are the floor guard's (``floorguard``), in the process.
@@ -108,8 +108,8 @@ def _floor(floor: Floor) -> list[Layer[Region]]:
 
 def _lifts(whose: str, reads: Sequence[LocationFact], writes: Sequence[LocationFact], root: pathlib.Path) -> list[Layer[Region]]:
     """A process's lifts of the redlines, as grants after them over their own paths: readable and
-    read-only, or writable (REDLINES.md). Whether each lies in a redline it may lift was judged at
-    load (``world.floor_findings``)."""
+    read-only, or writable. Whether each lies in a redline it may lift was judged at load
+    (``world.floor_findings``)."""
     return [
         *_layers(f"{whose} lift-read", reads, root, Grant(Access.READ_ONLY)),
         *_layers(f"{whose} lift-write", writes, root, Grant(Access.WRITABLE)),

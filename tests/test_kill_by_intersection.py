@@ -1,4 +1,4 @@
-"""The kill by intersection (EFFECTS.md): an effect kills an environmental atom exactly when
+"""The kill by intersection: an effect kills an environmental atom exactly when
 what the effect writes meets what the atom depends on. Exec and network sites take their write
 set from the policy, a check from its signature, and the program's own file writes write the
 whole filesystem medium: every atom reading a filesystem region dies at one, wherever the file

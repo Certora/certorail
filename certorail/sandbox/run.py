@@ -1,6 +1,6 @@
-"""One run's jails (LOWERING2.md, "The passes"): each stated by the front end (``front``), checked
-and placed for this machine's backend when the run starts (``place``), the views they need
-attached, and each spawn linked and emitted (``emit``) -- bubblewrap on Linux, Seatbelt on macOS.
+"""One run's jails: each stated by the front end (``front``), checked and placed for this
+machine's backend when the run starts (``place``), the views they need attached, and each spawn
+linked and emitted (``emit``) -- bubblewrap on Linux, Seatbelt on macOS.
 
 ``prepare(policy, root, program)`` builds the certorail process's jail from *program*, when the
 run has one, and compiles it with every tool's and checker's, by its rule's media and ``exec``

@@ -1,6 +1,6 @@
 """Names, typed by the domain they belong to.
 
-Atoms come in three kinds and the kind is part of the id (ATOMS.md), so the three are real
+Atoms come in three kinds and the kind is part of the id, so the three are real
 ``str`` subclasses: a fact's atom set is a ``frozenset[Atom]`` whose members say what they are,
 a function can ask for a ``SourceId`` where only provenance makes sense, and the type checker
 keeps the kinds apart. They are still strings -- equal to and hashed as their text -- so every
@@ -14,7 +14,7 @@ the Python API) the vocabulary's kind table is authoritative.
   Declared by no file; nameable in any (a hole's ``atoms``, a checker's ``establishes``).
 - ``CheckId``: an atom a policy declares in ``[atoms]`` and establishes by a validation, a
   regex definition, or a guard. Environmental or pure; the vocabulary knows which.
-- ``SourceId``: an atom a policy declares and only extraction establishes (PROVENANCE.md).
+- ``SourceId``: an atom a policy declares and only extraction establishes.
 
 The other names -- regions, validations, programs, flagsets, flags, holes, check parameters --
 are phantom types: distinct ``str`` subclasses under the type checker, ``str`` itself at
@@ -62,7 +62,7 @@ NO_PARENT_TRAVERSAL: Final = AtomId("no-parent-traversal")
 NOT_ABSOLUTE: Final = AtomId("not-absolute")
 NOT_DOT_DOT: Final = AtomId("not-dot-dot")
 # the value does not begin with "-", so a tool cannot read it as an option: what every token or
-# each hole not preceded by a literal "--" requires (TEMPLATES.md, the leading-dash guard)
+# each hole not preceded by a literal "--" requires (the leading-dash guard)
 NOT_OPTION: Final = AtomId("not-option")
 
 BUILTIN_ATOMS: Final[Mapping[str, AtomId]] = {
@@ -84,7 +84,7 @@ def spelled(name: str) -> Atom:
 if TYPE_CHECKING:
 
     class RegionId(str):
-        """A piece of state (EFFECTS.md). Declared as a key of ``[regions]``; spelled in the
+        """A piece of state. Declared as a key of ``[regions]``; spelled in the
         ``writes`` of a ``[[program]]``, ``[[validation]]`` or ``[[network]]`` rule and in an
         atom's ``reads`` -- where the two medium words ``fs`` and ``network`` are not regions but
         stand for every region of that medium (``effects.as_medium``)."""

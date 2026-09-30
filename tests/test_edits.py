@@ -1,4 +1,4 @@
-"""Lifts and edits in the root policy (REDLINES.md): a root policy lets one grant's process past the
+"""Lifts and edits in the root policy: a root policy lets one grant's process past the
 machine's redlines (``exec.lift-read`` / ``lift-write``), on a rule it declares or through an
 ``[[edit]]`` of a rule an applied ruleset grants -- which amends that rule's ``exec`` table and
 nothing else. A ruleset lifts nothing."""

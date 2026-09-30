@@ -80,7 +80,7 @@ def signature(t: Template) -> str:
     return " ".join(words)
 
 
-# -- effects (EFFECTS.md) -------------------------------------------------------------------
+# -- effects --------------------------------------------------------------------------------
 
 
 def writes_phrase(e: Effects) -> str:
@@ -343,7 +343,7 @@ def _network(r: NetworkRule, policy: Policy) -> str:
 
 
 def _runtime(policy: Policy) -> list[str]:
-    """What the certorail process meets at run time beyond the checked names (FLOORS.md): the
+    """What the certorail process meets at run time beyond the checked names: the
     places an accepted program can still fail mid-run."""
     s = policy.system
     if s.view is View.POLICY:

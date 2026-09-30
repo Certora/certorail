@@ -14,7 +14,7 @@ passes over the typed documents this module produces, and they stay plain code. 
 that touches the outside world: the models never read the filesystem.
 
 Two top-level documents share every sub-model: a ``PolicyDoc`` (a root policy: grants,
-network, ``root``) and a ``RulesetDoc`` (exec-side vocabulary with ``[params]``, TEMPLATES.md).
+network, ``root``) and a ``RulesetDoc`` (exec-side vocabulary with ``[params]``).
 Inside a ruleset a location may be headed by a parameter (``${where}/**``), an atom list may
 splice one (``${gate}``), a hole may *be* one (``holes.BRANCH = "${branch}"``), and ``when``
 may read a bool parameter; the models accept those spellings everywhere (``reference`` reads
@@ -214,7 +214,7 @@ class _Table(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# constraints, flags, holes (TEMPLATES.md)
+# constraints, flags, holes
 # ---------------------------------------------------------------------------
 
 
@@ -412,7 +412,7 @@ def _bad_hole_ref(s: str) -> str:
 
 
 class FootprintRegion(_Table):
-    """A region on the filesystem (EFFECTS.md): its footprint, at or below each location."""
+    """A region on the filesystem: its footprint, at or below each location."""
 
     footprint: LocationSlot
     about: str = ""
@@ -495,13 +495,13 @@ class AtomDecl(_Table):
 
 
 class ExecViewDecl(_Table):
-    """What a process sees of the filesystem (MOUNTS.md, FLOORS.md) -- the half of ``exec`` a
-    grant's tool and the certorail process itself share: ``view`` (``"host"``, the host's whole
-    filesystem, or ``"policy"``, only what the policy's filesystem section grants); under the
-    policy view, what the process sees beyond the section, mounted read-only or writable; and in
-    either view, the machine's redlines it is let past (``lift-read``, readable and read-only;
-    ``lift-write``, writable: REDLINES.md), in a root policy only. The analysis never reads
-    these: they shape a process's world, not the program's names."""
+    """What a process sees of the filesystem -- the half of ``exec`` a grant's tool and the
+    certorail process itself share: ``view`` (``"host"``, the host's whole filesystem, or
+    ``"policy"``, only what the policy's filesystem section grants); under the policy view, what
+    the process sees beyond the section, mounted read-only or writable; and in either view, the
+    machine's redlines it is let past (``lift-read``, readable and read-only; ``lift-write``,
+    writable), in a root policy only. The analysis never reads these: they shape a process's
+    world, not the program's names."""
 
     view: Literal["host", "policy"] = "host"
     mount_read: Locations | None = None
@@ -517,7 +517,7 @@ class ExecViewDecl(_Table):
 
 
 class ExecDecl(ExecViewDecl):
-    """``exec`` on a grant: the rest of how its child is run (JAILS.md, ``childjail``), beyond
+    """``exec`` on a grant: the rest of how its child is run (``childjail``), beyond
     the media keys -- the environment (``env``: a list whose strings name variables passed
     through from the host and whose tables set variables to literal values; absent: the host's
     whole environment), whether it may create processes (``spawn``), and the view. Enforced by
@@ -540,8 +540,7 @@ class SystemExecDecl(ExecViewDecl):
 
 
 class SystemDecl(_Table):
-    """``[system]`` (FLOORS.md): the certorail process at run time -- ``exec``, its view. Root
-    policies only."""
+    """``[system]``: the certorail process at run time -- ``exec``, its view. Root policies only."""
 
     exec_: SystemExecDecl | None = None
 
@@ -554,7 +553,7 @@ _RETIRED_MEDIA_KEYS = {
 
 class _Media(_Table):
     """The media a grant reaches -- enforced by its jail (``network``, ``write-fs``) -- what it
-    writes within them (``writes``, EFFECTS.md), and the rest of the jail (``exec``)."""
+    writes within them (``writes``), and the rest of the jail (``exec``)."""
 
     network: bool = True
     write_fs: bool = True
@@ -589,7 +588,7 @@ class ValidationDecl(_Media):
     argv: Annotated[list[Annotated[str, AfterValidator(_validation_argv_piece)]], Field(min_length=1)]
     cwd: LocationSlot | None = None
     establishes: dict[str, AtomList] = Field(default_factory=dict)
-    # the sha256 of the evaluator this assertion was reviewed with (INSTALL.md): the establishing
+    # the sha256 of the evaluator this assertion was reviewed with: the establishing
     # behavior pinned to an implementation, checked before every run; absent, runs what is installed
     pin: str | None = None
 
@@ -710,7 +709,7 @@ class ProgramDecl(_Media):
 
 
 class SourceDecl(_Table):
-    """``[[source]]``: read locations whose contents yield a source atom (PROVENANCE.md)."""
+    """``[[source]]``: read locations whose contents yield a source atom."""
 
     name: str
     location: LocationSlot
@@ -748,11 +747,11 @@ class NetworkDecl(_Table):
 
 
 # ---------------------------------------------------------------------------
-# rulesets: parameters and applications (TEMPLATES.md)
+# rulesets: parameters and applications
 # ---------------------------------------------------------------------------
 
 
-# a ruleset parameter's kind (TEMPLATES.md): what it binds and where it may be substituted
+# a ruleset parameter's kind: what it binds and where it may be substituted
 type ParamKind = Literal["directory", "atom", "bool", "constraint"]
 
 
@@ -828,11 +827,11 @@ class EditExecDecl(_Table):
 
 
 class EditDecl(_Table):
-    """``[[edit]]`` (REDLINES.md): an amendment of one rule an applied ruleset grants, without
-    restating it -- its ``exec`` table, and nothing else: how the tool is run, never what the
-    program may ask of it (``override``'s) or what the analysis assumes of it (the media). The
-    target is a program rule by its leading words, or a validation by its name, narrowed by
-    ``from``, the ruleset as ``[[apply]]`` names it. Root policies only."""
+    """``[[edit]]``: an amendment of one rule an applied ruleset grants, without restating it --
+    its ``exec`` table, and nothing else: how the tool is run, never what the program may ask of
+    it (``override``'s) or what the analysis assumes of it (the media). The target is a program
+    rule by its leading words, or a validation by its name, narrowed by ``from``, the ruleset as
+    ``[[apply]]`` names it. Root policies only."""
 
     program: str | None = None
     validation: str | None = None
@@ -923,9 +922,9 @@ class PolicyDoc(_Vocabulary):
     filesystem: Filesystem = Field(default_factory=Filesystem)
     network: list[NetworkDecl] = Field(default_factory=list)
     deny: list[DenyDecl] = Field(default_factory=list)
-    # amendments of the applied rulesets' rules: their exec tables (REDLINES.md). Root only
+    # amendments of the applied rulesets' rules: their exec tables. Root only
     edit: list[EditDecl] = Field(default_factory=list)
-    # the certorail process at run time: its view (FLOORS.md). Root only
+    # the certorail process at run time: its view. Root only
     system: SystemDecl = Field(default_factory=SystemDecl)
 
     @field_validator("root")
@@ -937,8 +936,8 @@ class PolicyDoc(_Vocabulary):
 
 
 class RulesetDoc(_Vocabulary):
-    """A ruleset (TEMPLATES.md): exec-side vocabulary only, parameterised. No filesystem
-    grants, no network, no root; it may *protect* locations (``[filesystem] no-write``)."""
+    """A ruleset: exec-side vocabulary only, parameterised. No filesystem grants, no network, no
+    root; it may *protect* locations (``[filesystem] no-write``)."""
 
     ruleset_version: Literal[1]
     params: dict[str, ParamDecl] = Field(default_factory=dict)
@@ -958,7 +957,7 @@ class RulesetDoc(_Vocabulary):
 
 
 # ---------------------------------------------------------------------------
-# world.toml: machine configuration (FLOORS.md), namespaced by the process it configures
+# world.toml: machine configuration, namespaced by the process it configures
 # ---------------------------------------------------------------------------
 
 
@@ -974,7 +973,7 @@ type MachinePaths = Annotated[list[MachinePath], BeforeValidator(_listed)]
 
 class RedlineDecl(_Table):
     """A redline's table form: the path, and whether a root policy may lift it for one of its
-    grants (REDLINES.md). The string form is ``can-override = true``."""
+    grants. The string form is ``can-override = true``."""
 
     path: MachinePath
     can_override: bool = True
@@ -1018,14 +1017,14 @@ type StableEntries = Annotated[list[Annotated[str, AfterValidator(_stable_entry)
 
 class WorldDoc(_Table):
     """``world.toml``. ``[system.*]`` is the certorail process; ``[tools]`` is reserved for what a
-    tool's policy view holds besides the policy (MOUNTS.md), not yet read. ``view-daemon`` is how
+    tool's policy view holds besides the policy, not yet read. ``view-daemon`` is how
     the view daemon caches names: ``"cached"`` (a directory's entries for a second: the speed of
     every path walk through a view) or ``"strict"`` (no cache: a directory replaced from outside
     the jail is seen at once, and a bind mount over it comes loose at once). ``stable`` is the
-    machine's stability model (REDLINES.md, "Stability"): which directories nothing replaces while
-    a jail lives, so that a mount may rest on them -- selectors (``"tops"``: the top-level
-    directories; ``"home"``; ``"home-dots"``: the dot directories in it; ``"root"``: the sandbox
-    root; ``"xdg"``: the XDG base directories under home), absolute paths, or ``"nothing"`` alone."""
+    machine's stability model: which directories nothing replaces while a jail lives, so that a
+    mount may rest on them -- selectors (``"tops"``: the top-level directories; ``"home"``;
+    ``"home-dots"``: the dot directories in it; ``"root"``: the sandbox root; ``"xdg"``: the XDG
+    base directories under home), absolute paths, or ``"nothing"`` alone."""
 
     system: SystemWorldDecl = Field(default_factory=SystemWorldDecl)
     view_daemon: Literal["cached", "strict"] = "cached"

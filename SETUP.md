@@ -39,8 +39,8 @@ one runs its tool inside the jail, and if the jail is missing the tool does not 
 program gets a broker error naming it) rather than running unconfined. Every rule in the coreutils
 pack carries all three, so without bubblewrap the first `ls` or `grep` under it fails closed. Any
 packaged bubblewrap works (Ubuntu 24.04 ships 0.9); the optional writable overlay for build tools
-(`MOUNTS.md`) wants 0.10, a source build today. Inside a container, bubblewrap needs
-unprivileged user namespaces, which some container runtimes disable.
+wants 0.10, a source build today. Inside a container, bubblewrap needs unprivileged user
+namespaces, which some container runtimes disable.
 
 ## Ruleset packs
 

@@ -400,7 +400,7 @@ PATH_SINK_METHOD_TARGETS: dict[str, tuple[str, AccessKind]] = {
 # subprocess: no shell, output always captured, cwd mandatory. Statically (walker):
 #   * no *args / **kwargs -- a command that cannot be read cannot be reported;
 #   * the required keywords are present; any other keyword binds a hole of the
-#     policy's command template for the program (TEMPLATES.md) -- which holes
+#     policy's command template for the program -- which holes
 #     exist is the policy's business, so the walker records and the policy denies;
 #   * the program is a string literal (or a name bound to exactly one): it is
 #     the thing a reviewer needs to see;
@@ -440,7 +440,7 @@ NETWORK_NAMESPACE: tuple[str, ...] = (NAMESPACE, "network")
 NETWORK_METHODS: frozenset[str] = frozenset({"get", "head", "delete", "post", "put", "patch"})
 NETWORK_BODY_METHODS: frozenset[str] = frozenset({"post", "put", "patch"})
 
-# The validation-kill (walker, enforcement.kill_of; EFFECTS.md, "The callee analysis"): a call
+# The validation-kill (walker, enforcement.kill_of; the callee analysis): a call
 # kills every live environmental atom its write set reaches, and ANY call may run program code
 # -- a module function, a lambda held in a variable, a class instantiation -- which may do
 # anything, so a call the analysis cannot place writes everything. The calls it can place are
@@ -494,7 +494,7 @@ INERT_CALLEES: dict[tuple[str, ...], ArgumentCondition] = {
     # dataclass field: they store what they are given and run nothing
     ("dataclasses", "dataclass"): "keywords-and-splats", ("dataclasses", "field"): "keywords-and-splats",
     ("functools", "cache"): "keywords-and-splats", ("functools", "lru_cache"): "keywords-and-splats",
-    # the extractors (PROVENANCE.md) and the location guard: the host's own code, over a handle
+    # the extractors and the location guard: the host's own code, over a handle
     # or text the program already holds -- reached by name (``read``, ``split``), hence inert
     (NAMESPACE, "extract"): "all", (NAMESPACE, "extract_all"): "all",
     (NAMESPACE, "lines"): "all", (NAMESPACE, "field"): "all", (NAMESPACE, "pathmatch"): "all",

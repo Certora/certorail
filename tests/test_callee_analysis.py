@@ -1,4 +1,4 @@
-"""The callee analysis, phase one (EFFECTS.md): a call is the interpreter's own code -- no kill
+"""The callee analysis, phase one: a call is the interpreter's own code -- no kill
 -- when it is a roster builtin or module function under its argument condition, or a method on
 an inert receiver with inert arguments; the walker tracks a coarse ``Std`` value for standard
 values and a closedness bit on them and on handles. Anything that may run program code writes

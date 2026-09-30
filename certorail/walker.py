@@ -18,7 +18,7 @@ what is demanded -- is ``enforcement.Enforcement``'s. The walker digests each ca
 ``Callsite`` (values, not syntax) and applies what comes back: sites and violations into the
 report, the kill onto the state, a check's atoms onto the variables it named. What a call to one
 of the program's own module-level functions does is a ``summaries.Summary``, computed by the
-walker as a fixpoint before the walk (EFFECTS.md, the callee analysis).
+walker as a fixpoint before the walk (the callee analysis).
 
 Kept apart from ``analysis`` (the domain and the expression semantics) so that this module can
 import ``guards``, ``annotations`` and ``safepy`` -- which themselves import ``analysis`` -- without
@@ -138,7 +138,7 @@ def _roster_blessings(
     root: ast.AST, contracts: dict[str, tuple[ast.FunctionDef, Contract]]
 ) -> set[int]:
     """The ``ast.Name`` occurrences (by ``id``) in container-roster positions: the blessed
-    shapes of CONTAINERS.md, computed syntactically in one pass over the whole tree.
+    shapes, computed syntactically in one pass over the whole tree.
     ``visit_Name`` treats any other Load of a tracked container as its escape -- a
     violation, always, so no escaped-set ever needs propagating to block boundaries: for
     any program that survives, that set is empty.
@@ -160,8 +160,8 @@ def _roster_blessings(
                 if method == "extend" and args:
                     bless(args[0])
                 if method == EXEC_CALLEE[1] and isinstance(recv, ast.Name) and recv.id == EXEC_CALLEE[0]:
-                    # a container bound to a hole of certora.exec is a roster read (the splat of
-                    # TEMPLATES.md); the exec audit records its element fact for the policy
+                    # a container bound to a hole of certora.exec is a roster read (the template
+                    # splat); the exec audit records its element fact for the policy
                     for k in kws:
                         if k.arg is not None and k.arg not in EXEC_RESERVED_KEYWORDS:
                             bless(k.value)
@@ -795,7 +795,7 @@ class ValidationWalker(ast.NodeVisitor):
             self._escape(node, node.id, tracked)
 
     def _escape(self, node: ast.AST, name: str, container: Container) -> None:
-        """Any use outside the roster: an error, always (CONTAINERS.md). A typed container
+        """Any use outside the roster: an error, always. A typed container
         is an opt-in assertion by code written de novo to be analyzable; silently dropping
         the state and complaining later -- if the thrown-away fact even turns out to matter
         -- serves nobody here. Provenance still decides *returns* (a local moves out, a
@@ -828,7 +828,7 @@ class ValidationWalker(ast.NodeVisitor):
     def _assign(self, target: ast.expr, value: ast.expr) -> None:
         self.visit(value)  # for sinks inside the value, e.g. ``x = open(...)``
         if isinstance(target, ast.Name):
-            # a source handle or an extraction first (PROVENANCE.md): those right-hand sides
+            # a source handle or an extraction first: those right-hand sides
             # have no scalar reading worth keeping, and must not be shadowed by one
             site = self._maybe_call(value, lambda c: self._digest(c, self.state))
             fact: ValidationFact | Container | Data | Std | None = None
@@ -913,7 +913,7 @@ class ValidationWalker(ast.NodeVisitor):
         return fact if isinstance(fact, Container) else None
 
     def _construct_container(self, node: ast.AnnAssign, declared: Container) -> None:
-        """The opt-in construction site (CONTAINERS.md): an annotated assignment whose value
+        """The opt-in construction site: an annotated assignment whose value
         is a known constructor, every element establishing the declared element fact."""
         if not isinstance(node.target, ast.Name):
             self._violation(node, "container: the target must be a bare name")
@@ -963,7 +963,7 @@ class ValidationWalker(ast.NodeVisitor):
                 declared.kind == "set" and not gen.is_async
             ):
                 return self._comprehension_conforms(value, elt, gen, declared)
-            # the extractors (PROVENANCE.md): every element is something the source produced
+            # the extractors: every element is something the source produced
             case ast.Call(func=func, args=[source_expr, _], keywords=[]) if (
                 declared.kind == "list"
                 and (callee := resolve_callee(func)) is not None
@@ -1009,8 +1009,7 @@ class ValidationWalker(ast.NodeVisitor):
         declared element fact. When any iteration may run an effectful call, environmental
         checks cannot accumulate across iterations -- iteration i+1's effects kill what
         iteration i established -- so only what survives those effects enters the container
-        fact (CONTAINERS.md: an effectful check_single usefully establishes only its pure atoms
-        here)."""
+        fact (an effectful check_single usefully establishes only its pure atoms here)."""
         targets = {
             n.id for n in ast.walk(gen.target) if isinstance(n, ast.Name)
         }
@@ -1082,7 +1081,7 @@ class ValidationWalker(ast.NodeVisitor):
             # or a handle -- the receiver, or anything aliasing it -- so the state is opened
             self._kill_state(OPENING)
         elif isinstance(node.ctx, ast.Load) and node.attr in self.property_names:
-            # a read by a name some class defines as a property may run that getter (EFFECTS.md):
+            # a read by a name some class defines as a property may run that getter:
             # program code, unless the receiver is known to be no program object
             receiver = node.value
             if isinstance(receiver, ast.Name) and receiver.id in self.modules:
@@ -1364,7 +1363,7 @@ class ValidationWalker(ast.NodeVisitor):
         # kill and holds at every iteration start.
         # a container escaping anywhere in the body is a violation reported by the walked
         # pass itself: no escaped-set propagates to the boundary, because for any program
-        # that survives, that set is empty (CONTAINERS.md)
+        # that survives, that set is empty
         killed = _kill(self.state, _assigned_names([node]))
 
         def iteration(*, header: bool) -> None:
@@ -1410,7 +1409,7 @@ class ValidationWalker(ast.NodeVisitor):
     def _consume(self, iterable: ast.expr) -> None:
         """Iterating *iterable* where it stands: a non-inert one -- a generator, a program
         object, a carrier over one -- runs program code on every step, so it is an unknown call
-        (EFFECTS.md, laziness). A ``for`` needs this once, before the loop: every iteration
+        (laziness). A ``for`` needs this once, before the loop: every iteration
         boundary starts from the pre-loop state, so the kill reaches every later step too."""
         if not self._interpreter().is_inert(iterable):
             self._kill_state(OPAQUE)
@@ -1573,7 +1572,7 @@ class ValidationWalker(ast.NodeVisitor):
         """The module-level constants every function body may rely on: a name bound by exactly
         one unconditional top-level assignment -- and nowhere else in the program -- to a value
         nothing can change. Scalars only: a container is mutable, and a body may not close over
-        one at all (``safepy``, CONTAINERS.md)."""
+        one at all (``safepy``)."""
         counts = _program_binds(module)
         state: dict[str, ValidationFact | Std] = {}
         for s in module.body:
@@ -1726,7 +1725,7 @@ def analyze(
         return Report(violations=list(functions.violations))
     if vocabulary is not None:
         # a contract's atoms are spelled by kind (certora.validated / certora.source); the
-        # policy's kind table holds the author to it (ATOMS.md)
+        # policy's kind table holds the author to it
         problems: list[tuple[ast.AST, str]] = []
         for fdef, contract in functions.contracts.values():
             for declared in (*contract.params.values(), contract.returns):

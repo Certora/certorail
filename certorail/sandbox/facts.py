@@ -1,8 +1,7 @@
-"""What the jail compiler reads from the filesystem, and nothing else (LOWERING2.md, "What the
-compiler reads from the filesystem"): the kind of a path, where a path resolves to, and the
-names in a directory. Every pass asks through a ``Facts``, so the passes are pure given the
-answers, a test can hand them a filesystem that does not exist, and a recipe can carry the
-answers it was compiled against (``Recorded``) for linking to ask again."""
+"""What the jail compiler reads from the filesystem, and nothing else: the kind of a path, where a
+path resolves to, and the names in a directory. Every pass asks through a ``Facts``, so the
+passes are pure given the answers, a test can hand them a filesystem that does not exist, and a
+recipe can carry the answers it was compiled against (``Recorded``) for linking to ask again."""
 import enum
 import os
 import pathlib

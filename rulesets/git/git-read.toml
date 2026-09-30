@@ -1,7 +1,7 @@
 # git, read rung: commands that report and change nothing a program could observe later. Every
 # rule is `network = false`; every rule but status and diff is `write-fs = false` (those two refresh
 # the index's stat cache, so they declare `writes = ["git.index"]` honestly). Both media keys are
-# enforced: the tool runs jailed out of the medium (JAILS.md).
+# enforced: the tool runs jailed out of the medium.
 #
 # Absent, therefore denied, everywhere in this file:
 #   global options (they precede the subcommand): -c key=value, -C, --git-dir, --work-tree,

@@ -1,4 +1,4 @@
-"""Effect regions (EFFECTS.md): the state an effect writes and an atom depends on, as sets.
+"""Effect regions: the state an effect writes and an atom depends on, as sets.
 
 A *region* is a name for a piece of state a checker can observe and a command can change, and it
 has exactly one *medium*: ``fs`` (it lives on the local filesystem) or ``network`` (it is remote).

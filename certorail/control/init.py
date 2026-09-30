@@ -17,7 +17,7 @@ policy file, through the installer.
 5. Ask whether to allow all programs the policy does not name (``default-allow``: any
    arguments, unjailed, the user's authority). Default no.
 6. Ask whether the certorail process runs under the policy view (``[system.exec] view =
-   "policy"``, FLOORS.md; default no). Written only when the answer is yes.
+   "policy"``; default no). Written only when the answer is yes.
 
 Before the interview, the machine-level half of a first run (``setup``), idempotent and asked
 step by step: the prerequisites the jails need are reported with the command that installs

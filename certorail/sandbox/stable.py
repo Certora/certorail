@@ -1,8 +1,8 @@
-"""The stability model against the filesystem (REDLINES.md, "Stability"): ``world.toml``'s
-``stable`` -- selectors and paths (``world.Stable``) -- expanded to the names it says nothing
-replaces while a jail lives, as the placement checker takes them (``Place.Stability``). A host
-world's view of a redline sits at the innermost of them above the redline; a whole run binds a
-grant plainly at one of them, where otherwise it would serve it through a view.
+"""The stability model against the filesystem: ``world.toml``'s ``stable`` -- selectors and paths
+(``world.Stable``) -- expanded to the names it says nothing replaces while a jail lives, as the
+placement checker takes them (``Place.Stability``). A host world's view of a redline sits at the
+innermost of them above the redline; a whole run binds a grant plainly at one of them, where
+otherwise it would serve it through a view.
 
 Trusted, never checked: the user's judgment about this machine. In a host world a wrong judgment
 exposes a redline for the exec in which something outside replaced the directory; in a policy

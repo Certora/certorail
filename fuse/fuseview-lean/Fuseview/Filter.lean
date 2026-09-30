@@ -132,9 +132,9 @@ def hiddenLastWord (f : Filter) (at_ : Place.Path) : List Place.Layer â†’ Bool â
 
 /-- Hidden: the name shows where its directory is readable, and its contents -- a file's data, a
 directory's listing and every name below it -- are refused with `EACCES`, not `ENOENT`, so a tool
-sees a refusal and not an absence (REDLINES.md, "What a refusal looks like"). Files and
-directories alike; and whether or not anything granted the path before the hide (a hide over
-what no grant shows still refuses, rather than answering "not there"). -/
+sees a refusal and not an absence. Files and directories alike; and whether or not anything
+granted the path before the hide (a hide over what no grant shows still refuses, rather than
+answering "not there"). -/
 def hidden (f : Filter) (path : Path) : Bool :=
   let names := (f.directory ++ path).toList
   f.unsure names || f.hiddenLastWord (names.map Name.encode) f.layers false

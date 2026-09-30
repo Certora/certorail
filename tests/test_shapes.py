@@ -1,4 +1,4 @@
-"""Two rule shapes and nothing between (TEMPLATES.md): a flat rule is exactly its words, a
+"""Two rule shapes and nothing between: a flat rule is exactly its words, a
 template says what each argument is. The retired flat-rule argument keys are load errors that
 name the replacement; the open flag vocabulary (``any = true``) is the explicit spelling of
 "this tool is trusted with its options"; and ``not-option`` is the built-in atom behind the

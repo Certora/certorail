@@ -11,7 +11,7 @@
 # to answer one question: which flags take a PATH the tool would open. Those are constrained to
 # `${where}/**`; everything else a flag takes is data for the tool. Every rule is also
 # `exec.view = "policy"`: the tool sees the filesystem section of the applying policy as mounts
-# and nothing else (MOUNTS.md), so `cat` of a path the program could not read is ENOENT.
+# and nothing else, so `cat` of a path the program could not read is ENOENT.
 #
 # Absent, therefore denied, everywhere in this file: anything that follows or waits (`tail -f`,
 # `--follow`), writes (`sort -o`, `tee`, `--output`), runs a program (`find -exec/-execdir/-ok`,

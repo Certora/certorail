@@ -1,4 +1,4 @@
-"""One atom domain (ATOMS.md): a fact carries a ``frozenset[AtomId | CheckId | SourceId]``, and
+"""One atom domain: a fact carries a ``frozenset[AtomId | CheckId | SourceId]``, and
 ``Vocabulary.missing`` is the one answer to "does this value carry X" -- structure for the
 built-ins, the regex for a defined atom, a literal checker for a checkable one, nothing for a
 source. The dash guard is ``not-option`` asked that way; the annotation kinds are checked."""

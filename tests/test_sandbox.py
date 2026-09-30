@@ -190,7 +190,7 @@ class TestTheProgramsLaunch(Built):
 
 
 class TestRedlinesBindTools(Built):
-    """This machine's redlines bind every tool (REDLINES.md): a host-view one through a view at the
+    """This machine's redlines bind every tool: a host-view one through a view at the
     stable directory above the redline (``/srv``, a top-level directory), the rest of it bound back."""
 
     WORLD = World(Floor.of(never_visible=(P("/srv/keys"),)))

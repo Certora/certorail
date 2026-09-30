@@ -8,7 +8,7 @@ run of components, so the test is a small alignment. It serves the ``no-write`` 
 (``Policy.protected``). A region's declared
 ``footprint`` keeps its shape for the reader and for a per-program write jail if one comes; the
 kill of environmental atoms does not consult it -- a program's file write is a write of the whole
-filesystem medium (EFFECTS.md).
+filesystem medium.
 
 Component equality folds case and normalises Unicode -- NFC, then casefold -- unconditionally:
 whether two spellings name one file is a property of the mount (APFS is case- and

@@ -1,4 +1,4 @@
-"""Function summaries: the second half of the callee analysis (EFFECTS.md).
+"""Function summaries: the second half of the callee analysis.
 
 A call the enforcement cannot place may run *program* code. For a call to a module-level
 function by name -- the one shape of program call the subset makes resolvable: such a name is
@@ -74,8 +74,8 @@ HAVOC = Summary(OPAQUE, None)
 
 def is_generator(node: ast.FunctionDef) -> bool:
     """Does the body yield? Then a call creates a generator and runs nothing; the body runs when
-    the generator is consumed (EFFECTS.md: creation applies the body's kill eagerly, and the
-    result is not inert)."""
+    the generator is consumed (creation applies the body's kill eagerly, and the result is not
+    inert)."""
     pending: list[ast.AST] = list(node.body)
     while pending:
         n = pending.pop()

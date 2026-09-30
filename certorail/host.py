@@ -254,8 +254,8 @@ def run(
 def _announce_layers(policy: Policy, world: World, jailed: bool) -> None:
     """The runtime layers beyond the default, said once at startup: each is a way for the
     program or a tool it runs to fail mid-run, and the failure should have an explanation, from
-    what the run said at its start (FLOORS.md, REDLINES.md). *jailed*: the program itself runs
-    under them (not ``--no-jail``); its tools and checkers always do."""
+    what the run said at its start. *jailed*: the program itself runs under them (not
+    ``--no-jail``); its tools and checkers always do."""
     f = world.floor
     if not f.empty:
         parts = [
@@ -371,7 +371,7 @@ class Loaded:
 
     policy: Policy
     provenance: tuple[str, ...]
-    # this machine's world.toml, checked against the policy (FLOORS.md)
+    # this machine's world.toml, checked against the policy
     world: World = World()
 
 
@@ -419,7 +419,7 @@ def _policy_and_origin(path: pathlib.Path | None, root: pathlib.Path | None) -> 
 
 def _machine_world(policy: Policy, root: pathlib.Path) -> World:
     """This machine's world.toml, and the policy against it: a grant it can never exercise here
-    refuses the policy on this machine (FLOORS.md)."""
+    refuses the policy on this machine."""
     try:
         world = load_world()
     except WorldFileError as e:

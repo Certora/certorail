@@ -197,7 +197,7 @@ class InheritanceAnalysis(_LexicalAnalysis):
         self.generic_visit(node)
 
 class ContainerClosureAnalysis(_LexicalAnalysis):
-    """A tracked container may not be closed over (CONTAINERS.md): a ``def`` or ``lambda`` that
+    """A tracked container may not be closed over: a ``def`` or ``lambda`` that
     names a typed container declared in an enclosing scope -- without binding that name itself
     -- is a violation, whatever it does with it. The walker analyses a body from its parameters
     and the module constants; a container reached through a closure would be an untracked name

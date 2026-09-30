@@ -1,4 +1,4 @@
-"""The per-grant jail for exec'd tools and checkers (JAILS.md option B): the media keys and the
+"""The per-grant jail for exec'd tools and checkers: the media keys and the
 ``exec`` table as a grant's ``Jail``, what ``--describe`` says, and -- where bubblewrap is present
 -- that the jail's restrictions are properties of the process, not claims."""
 import base64

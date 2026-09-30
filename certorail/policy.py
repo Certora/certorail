@@ -40,14 +40,14 @@ it, two checkers cannot stack environment atoms on one value). Both are trusted 
 everything in this file. ``program(..., requires=[...])`` consumes atoms: the exec's cwd must
 carry them, live, at the site.
 
-*Regions* (EFFECTS.md) make "any potentially-effectful call" precise. ``region()`` names a piece
+*Regions* make "any potentially-effectful call" precise. ``region()`` names a piece
 of state with one medium -- ``fs``, with a footprint saying where it lives, or ``network`` -- and
 rules say what they
 **write** (``writes=[...]``, within the media they reach: ``network=False``, ``write_fs=False``)
 while environmental atoms say what they depend on (``reads={atom: [...]}``). An effect kills an
 atom exactly when the two sets meet; undeclared means everything, so a policy that says nothing
 keeps today's kill. The media are *enforced*: a grant with ``network=False`` or
-``write_fs=False`` runs its child in a jail that denies the medium (``childjail``, JAILS.md);
+``write_fs=False`` runs its child in a jail that denies the medium (``childjail``);
 ``writes`` stays a claim, since no jail can check regions.
 
 Evaluation presupposes ``Report.ok``: every site already has a proven location. The policy
@@ -279,8 +279,7 @@ def _permitted(network: bool, write_fs: bool) -> frozenset[Medium]:
 
 
 def _write_set(network: bool, write_fs: bool, writes: Effects | None) -> Effects:
-    """What a grant writes (EFFECTS.md): its declaration, else every region of the media it
-    reaches."""
+    """What a grant writes: its declaration, else every region of the media it reaches."""
     return whole(_permitted(network, write_fs)) if writes is None else writes
 
 
@@ -323,7 +322,7 @@ class Validation:
     cwd: tuple[LocationFact, ...] | None
     establishes: dict[ParamName, frozenset[Atom]]  # param name or CWD -> atoms
     pure_atoms: frozenset[Atom] = frozenset()  # the established atoms wrapped in pure()
-    # the evaluator's media (EFFECTS.md): may it reach the network, may it write the filesystem.
+    # the evaluator's media: may it reach the network, may it write the filesystem.
     # Enforced: the broker jails the evaluator out of a medium it does not reach (childjail)
     network: bool = True
     write_fs: bool = True
@@ -335,18 +334,18 @@ class Validation:
     spawn: bool = True
     view: View = View.HOST
     # under the policy view: what the evaluator sees beyond the policy's filesystem section
-    # (``exec.mount-read`` / ``exec.mount-write``, MOUNTS.md); the analysis never consults them
+    # (``exec.mount-read`` / ``exec.mount-write``); the analysis never consults them
     mount_read: tuple[LocationFact, ...] = ()
     mount_write: tuple[LocationFact, ...] = ()
-    # the sha256 the declaring document pinned its evaluator to (INSTALL.md); verified against
+    # the sha256 the declaring document pinned its evaluator to; verified against
     # the bytes captured at load. None: unpinned
     pin: str | None = None
     # the evaluator's bytes, captured when ${checkers}/x was resolved: what runs is a snapshot
     # of these, so the installed file drifting mid-run changes nothing. None: a plain evaluator
     # (a system binary), executed by path as spelled
     evaluator: bytes | None = None
-    # the machine's redlines this evaluator is let past (``exec.lift-read`` / ``lift-write``,
-    # REDLINES.md): a root policy's statement, never a ruleset's; the analysis never consults them
+    # the machine's redlines this evaluator is let past (``exec.lift-read`` / ``lift-write``):
+    # a root policy's statement, never a ruleset's; the analysis never consults them
     lift_read: tuple[LocationFact, ...] = ()
     lift_write: tuple[LocationFact, ...] = ()
 
@@ -455,7 +454,7 @@ def reexec[R: Program | Validation](
     rule: R, *, env: Iterable[str | Mapping[str, str]] | None, spawn: bool, view: View,
     mount_read: Iterable[Where], mount_write: Iterable[Where], lift_read: Iterable[Where], lift_write: Iterable[Where],
 ) -> R:
-    """*rule* with its ``exec`` table replaced whole (an ``[[edit]]``, REDLINES.md): checked as
+    """*rule* with its ``exec`` table replaced whole (an ``[[edit]]``): checked as
     the constructors check a table written in place, and nothing else about the rule changed."""
     reads, writes = _mounts(rule.name, view, rule.write_fs, mount_read, mount_write)
     lifted_reads, lifted_writes = _lifts(rule.name, rule.write_fs, lift_read, lift_write)
@@ -497,17 +496,17 @@ class Program:
     # subcommand -- unlisted, or computed -- is denied. Prefix-freedom (checked in allow())
     # makes the applicable rule unique.
     subcommand: tuple[str, ...] = ()
-    # the command-line shape (TEMPLATES.md). None for the flat rule: exactly the words
+    # the command-line shape. None for the flat rule: exactly the words
     # [name, *subcommand] and nothing after them -- a template with no holes. Any argument
     # beyond the words needs a template that says what it is.
     template: Template | None = None
     # provenance for reports: the ruleset (and bindings) this rule came from, None for a rule
     # the root policy wrote itself
     origin: str | None = None
-    # the source atom this rule's results yield (PROVENANCE.md): a value extracted from the
+    # the source atom this rule's results yield: a value extracted from the
     # exec's output is something this program produced, unmodified
     source: SourceId | None = None
-    # the tool's media (EFFECTS.md): they bound its write set without naming a region, and the
+    # the tool's media: they bound its write set without naming a region, and the
     # broker enforces them -- the tool runs jailed out of a medium it does not reach (childjail)
     network: bool = True
     write_fs: bool = True
@@ -519,11 +518,11 @@ class Program:
     spawn: bool = True
     view: View = View.HOST
     # under the policy view: what the tool sees beyond the policy's filesystem section
-    # (``exec.mount-read`` / ``exec.mount-write``, MOUNTS.md); the analysis never consults them
+    # (``exec.mount-read`` / ``exec.mount-write``); the analysis never consults them
     mount_read: tuple[LocationFact, ...] = ()
     mount_write: tuple[LocationFact, ...] = ()
-    # the machine's redlines this tool is let past (``exec.lift-read`` / ``lift-write``,
-    # REDLINES.md): a root policy's statement, never a ruleset's; the analysis never consults them
+    # the machine's redlines this tool is let past (``exec.lift-read`` / ``lift-write``):
+    # a root policy's statement, never a ruleset's; the analysis never consults them
     lift_read: tuple[LocationFact, ...] = ()
     lift_write: tuple[LocationFact, ...] = ()
 
@@ -781,13 +780,13 @@ class NetworkRule:
     read_timeout: float | None = None
     total_timeout: float | None = None
     max_response_bytes: int | None = None
-    # the source atom responses from this rule yield (PROVENANCE.md)
+    # the source atom responses from this rule yield
     source: SourceId | None = None
     # the URL paths this rule admits, server-absolute (a leading "/"), any-of; empty: any path.
     # Checked statically on the proven URL path, and by the broker on every hop, both reading the
     # path as sent (``url_path_location``)
     paths: tuple[LocationFact, ...] = ()
-    # the network regions requests under this rule write (EFFECTS.md); None: undeclared -- the
+    # the network regions requests under this rule write; None: undeclared -- the
     # whole network medium, or nothing when the rule admits only GET and HEAD
     writes: Effects | None = None
 
@@ -884,7 +883,7 @@ def path_permitted(rule: NetworkRule, url_path: LocationFact | None) -> bool:
 
 @dataclass(frozen=True)
 class Source:
-    """A read location whose contents are a source (PROVENANCE.md): ``read_text()``, ``open()``
+    """A read location whose contents are a source: ``read_text()``, ``open()``
     and friends on a proven path within one of *locations* yield a handle carrying *name*.
     Grants nothing -- the read must still be permitted by the filesystem grants."""
 
@@ -899,7 +898,7 @@ def source(name: str, location: Where | Iterable[Where]) -> Source:
 
 
 # ---------------------------------------------------------------------------
-# effect regions (EFFECTS.md)
+# effect regions
 # ---------------------------------------------------------------------------
 
 
@@ -1073,7 +1072,7 @@ class Policy:
     # (`git -C x push` is a `git push`, and no shape matching would say so)
     default_allow: bool = False
     # ``[system]``: the certorail process at run time -- its view, and its mounts under the policy
-    # view (FLOORS.md)
+    # view
     system: SystemJail = SystemJail()
     # the programs `[[deny]]` named, by leading name: named, so governed; with no rule of their
     # own, refused outright -- the first-verb blacklist under default-allow
@@ -1083,7 +1082,7 @@ class Policy:
     atoms: tuple[AtomDef, ...] = ()
     network: tuple[NetworkRule, ...] = ()
     sources: tuple[Source, ...] = ()
-    # EFFECTS.md: the state vocabulary, and what each environmental atom depends on (an atom
+    # effects: the state vocabulary, and what each environmental atom depends on (an atom
     # absent here depends on everything)
     regions: tuple[Region, ...] = ()
     reads: Mapping[Atom, Effects] = field(default_factory=dict)
@@ -1118,7 +1117,7 @@ class Policy:
         progs = tuple(programs)
         srcs = tuple(sources)
         net_in = tuple(network)
-        # source atoms (PROVENANCE.md) are established by extraction alone: not by a checker,
+        # source atoms are established by extraction alone: not by a checker,
         # and never with a regex definition (a literal must not satisfy them)
         source_atoms = frozenset(
             [p.source for p in progs if p.source is not None]
@@ -1179,7 +1178,7 @@ class Policy:
         }
         if conflicted:
             raise ValueError(f"atoms declared both pure and environmental: {sorted(conflicted)}")
-        # regions (EFFECTS.md): unique names; every write claim names declared regions within the
+        # regions: unique names; every write claim names declared regions within the
         # media the rule claims to reach; every read claim belongs to an environmental atom some
         # validation establishes and names declared regions
         regs = tuple(regions)
@@ -1306,7 +1305,7 @@ class Policy:
 
     @property
     def source_atoms(self) -> frozenset[SourceId]:
-        """The atoms extraction establishes (PROVENANCE.md): pure, never re-checkable from text."""
+        """The atoms extraction establishes: pure, never re-checkable from text."""
         return frozenset(
             [p.source for p in self.programs if p.source is not None]
             + [r.source for r in self.network if r.source is not None]
@@ -1318,7 +1317,7 @@ class Policy:
         return {r.name: r.medium for r in self.regions}
 
     def write_set(self, rule: Program | Validation | NetworkRule) -> Effects:
-        """What *rule* writes (EFFECTS.md): its declaration, else every region of the media it
+        """What *rule* writes: its declaration, else every region of the media it
         reaches. A network rule reaches the network only, and one admitting only GET and HEAD
         writes nothing: a GET that mutates the server is the server's bug."""
         if isinstance(rule, NetworkRule):
@@ -1656,7 +1655,7 @@ class Policy:
         required: frozenset[Atom],
         discharge: Discharge | None,
     ) -> frozenset[Atom]:
-        """The required atoms *value* does not carry: ``Vocabulary.missing`` (ATOMS.md)."""
+        """The required atoms *value* does not carry: ``Vocabulary.missing``."""
         return self.vocabulary().missing(value, required, discharge)
 
     def _cwd_mismatch(

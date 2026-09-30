@@ -7,9 +7,9 @@ says *site*, *dies*, *yields* or *does not establish*:
 - the shape audits, which turn a call into a ``Site`` for the policy to evaluate, or into
   violations (``audit``);
 - the kill: what a call does to the state (``kill_of``: the regions it writes, whether it may
-  run program code) and which atoms a write set kills (``survivors``, ``forget``), EFFECTS.md;
+  run program code) and which atoms a write set kills (``survivors``, ``forget``);
 - provenance: the source handle a call yields, the fact an extractor produces (``handle``,
-  ``with_handle``, ``extract_fact``, ``check_single_fact``), PROVENANCE.md;
+  ``with_handle``, ``extract_fact``, ``check_single_fact``);
 - entailment: does a value establish what a rely, a guarantee, a container element or a check
   demands (``establishes``, ``rely_failures``).
 
@@ -95,7 +95,7 @@ from certorail.locations import parse_location
 from certorail.templates import Binding, Elements, Many, Value, matches_leading
 
 # ---------------------------------------------------------------------------
-# the container roster (CONTAINERS.md): the method surface that keeps a tracked list/set tracked
+# the container roster: the method surface that keeps a tracked list/set tracked
 # ---------------------------------------------------------------------------
 
 # Writes carry an entailment obligation; "sequence" -- the borrowed view a Sequence[...]
@@ -116,7 +116,7 @@ CONTAINER_READ_CALLS: frozenset[str] = frozenset(
 
 # Methods of the standard containers that reach their arguments only through ``__hash__`` and
 # ``__eq__`` -- fixed, since no program class defines a dunder -- so they run no program code
-# whatever they are given (EFFECTS.md). Storing a non-inert argument still opens the state.
+# whatever they are given. Storing a non-inert argument still opens the state.
 HASH_IDENTITY_METHODS: frozenset[str] = frozenset(
     {"append", "insert", "index", "count", "remove", "get", "setdefault", "pop", "add", "discard"}
 )
@@ -129,7 +129,7 @@ HASH_IDENTITY_METHODS: frozenset[str] = frozenset(
 
 @dataclass(frozen=True)
 class Kill:
-    """What one call does to the state (EFFECTS.md): the regions it may write -- every
+    """What one call does to the state: the regions it may write -- every
     environmental atom reading one dies -- and whether it *opens* the standard values and
     handles: program code may have run inside it, so any list, dict, set or unknown-kind value
     may now hold a program object through an alias, or a non-inert value was stored into one.
@@ -194,7 +194,7 @@ class ExecSite:
     program: str
     arguments: tuple[Value, ...]
     cwd: ValidationFact | None
-    # hole bindings by keyword (TEMPLATES.md): a value, a display (Many), or a typed container
+    # hole bindings by keyword: a value, a display (Many), or a typed container
     # (Elements); which holes exist is the policy's business
     keywords: Mapping[str, Binding] = field(default_factory=dict)
 
@@ -266,7 +266,7 @@ class CheckSignature:
     name: ValidationName
     params: tuple[ParamName, ...]
     establishes: dict[ParamName, frozenset[Atom]]  # parameter name, or "cwd" -> validation atoms
-    # what the evaluator's own run writes (EFFECTS.md): NOTHING for an effect-free check, the
+    # what the evaluator's own run writes: NOTHING for an effect-free check, the
     # whole media it reaches when the policy declared no regions
     writes: Effects = EVERYTHING
     needs_cwd: bool = True  # False: the check does not care where it runs; cwd= may be omitted
@@ -287,7 +287,7 @@ def host_matches(pattern: str, host: str) -> bool:
 
 @dataclass(frozen=True)
 class WriteTable:
-    """What the policy's exec and network rules write (EFFECTS.md), keyed as the walker resolves
+    """What the policy's exec and network rules write, keyed as the walker resolves
     sites: an exec by program and the leading words after it, a network request by host and
     methods. A check's write set rides its ``CheckSignature``."""
 
@@ -297,7 +297,7 @@ class WriteTable:
 
 @dataclass(frozen=True)
 class SourceTable:
-    """Which rules yield which *source atom* (PROVENANCE.md), as the walker needs them to bind a
+    """Which rules yield which *source atom*, as the walker needs them to bind a
     handle: an exec by program and leading words, a network request by host pattern, a file
     read by location."""
 
@@ -334,7 +334,7 @@ type NetworkSources = Callable[[str, ValidationFact | None], frozenset[SourceId]
 
 @dataclass(frozen=True)
 class Vocabulary:
-    """The policy's atoms as the analysis sees them (ATOMS.md): the check signatures, and the
+    """The policy's atoms as the analysis sees them: the check signatures, and the
     kind table -- which atoms are *pure* (true of the value's text alone, so no effect can
     invalidate them: they die only with the value; an environmental atom is about the world at
     a location and dies at every call that may change what it depends on), which of the pure
@@ -353,7 +353,7 @@ class Vocabulary:
     checkable: frozenset[CheckId] = frozenset()
     # source atoms and the rules that yield them (also a subset of ``pure_atoms``)
     sources: SourceTable = field(default_factory=SourceTable)
-    # EFFECTS.md, for the kill by intersection: per environmental atom the state it depends on
+    # for the kill by intersection: per environmental atom the state it depends on
     # (an atom absent here depends on everything), per rule what it writes, and each declared
     # region's medium
     reads: Mapping[Atom, Effects] = field(default_factory=dict)
@@ -435,7 +435,7 @@ class Callsite:
     look.
 
     The three ``inert_*`` flags are decided by the walker over the argument expressions, for
-    the argument conditions of the callee analysis (EFFECTS.md; ``dangerous.INERT_CALLEES``):
+    the argument conditions of the callee analysis (``dangerous.INERT_CALLEES``):
     ``inert_keywords`` -- every ``name=value`` is inert; ``inert_splats`` -- every ``*xs`` and
     every ``**m`` splats an inert value; ``inert_arguments`` -- both, and every plain positional
     argument is inert too."""
@@ -762,10 +762,10 @@ class Enforcement:
             )
         return None
 
-    # -- the kill (EFFECTS.md) ----------------------------------------------------------------
+    # -- the kill ---------------------------------------------------------------------------
 
     def kill_of(self, site: Callsite) -> Kill | ProgramCall:
-        """What this call does to the state (EFFECTS.md, the callee analysis).
+        """What this call does to the state (the callee analysis).
 
         The ``certora`` calls and the file sinks are effects with a known medium that run no
         program code: a check writes what its signature declares, an exec or a request what the
@@ -910,7 +910,7 @@ class Enforcement:
         name = _exact_text(site.args[0])
         return None if name is None else self.vocabulary.signatures.get(ValidationName(name))
 
-    # -- provenance (PROVENANCE.md) -----------------------------------------------------------
+    # -- provenance -------------------------------------------------------------------------
 
     def _exec_sources(self, program: str, arguments: Sequence[Value]) -> frozenset[SourceId]:
         for name, words, atom in self.vocabulary.sources.exec:

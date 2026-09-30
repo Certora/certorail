@@ -657,7 +657,7 @@ def subsumes(general: Component, specific: Component) -> bool:
             return False
 
 
-# The built-in atoms (ids.BUILTIN_ATOMS, ATOMS.md): structural properties of a value, derived
+# The built-in atoms (ids.BUILTIN_ATOMS): structural properties of a value, derived
 # from its text or location by ``holds`` below. "not-dot-dot": the string is not exactly "..".
 # Together with "no-slash" it implies "no-parent-traversal" (a single component traverses upward
 # only if it is exactly ".."). "not-option": the string does not begin with "-".
@@ -947,7 +947,7 @@ def may_start_with_dash(value: "str | ValidationFact | None") -> bool:
 # Going into text is giving up on the path (or URL) reading; the transfer functions stay in
 # path-land for as long as the operation is a path operation.
 #
-# Every fact additionally carries ``atoms``: the atoms this exact value carries (ATOMS.md), of
+# Every fact additionally carries ``atoms``: the atoms this exact value carries, of
 # every kind -- built-ins stated by a guard or an annotation, check atoms established by
 # ``certora.check`` or a guard's regex, source atoms constructed by extraction. Atoms belong to
 # the value as it was when it gained them: they ride along assignment and the same-value
@@ -1021,8 +1021,8 @@ type ValidationFact = StrFact | PathFact | Located | UrlString
 
 @dataclass(frozen=True)
 class Container:
-    """A tracked ``list``/``set``: the reduced-product partner of the scalar facts
-    (CONTAINERS.md). Deliberately NOT a ValidationFact: the scalar transfer functions never
+    """A tracked ``list``/``set``: the reduced-product partner of the scalar facts.
+    Deliberately NOT a ValidationFact: the scalar transfer functions never
     see one -- the scalar projection (``scalar``, ``Interpreter.expr``) is None for a
     container-valued name -- and the two
     domains meet only at the roster operations the walker recognizes.
@@ -1038,7 +1038,7 @@ class Container:
 
 @dataclass(frozen=True)
 class Data:
-    """A *source handle* (PROVENANCE.md): the result of a ``certora.exec``, a ``certora.network``
+    """A *source handle*: the result of a ``certora.exec``, a ``certora.network``
     request, or a file read, bound to a name. Like ``Container``, deliberately NOT a
     ValidationFact: the scalar projection is None for a handle-valued name, and the two domains
     meet only at the extractors (``certora.extract`` & co.) and at iteration (``for line in f``).
@@ -1047,14 +1047,14 @@ class Data:
     the rule that produced it. Empty for a handle from a rule that names no source: still
     extractable, vouching for nothing.
 
-    ``closed`` is the inertness bit shared with ``Std`` (EFFECTS.md, the callee analysis): a
+    ``closed`` is the inertness bit shared with ``Std`` (the callee analysis): a
     handle is a Python object an attribute store can patch (``h.read = f``), so it is inert --
     handing it to an extractor or calling its methods runs no program code -- only while no
     program code can have touched it. Any call that may run program code, and any attribute
     store, opens every handle in the state, since an alias may have been the receiver.
 
-    ``writes`` makes the handle a *file opened for writing* at a proven location (EFFECTS.md,
-    "File writes"): None for a read handle (and a source); a tuple of the locations the file
+    ``writes`` makes the handle a *file opened for writing* at a proven location: None for a
+    read handle (and a source); a tuple of the locations the file
     may be at otherwise -- one for ``f = open(p, "w")``, several after a join. A write through
     it (``f.write``, ``print(file=f)``) is a file write like ``p.write_text()``: a write of the
     whole filesystem medium. **The locations themselves are not load-bearing**: no kill and no
@@ -1077,7 +1077,7 @@ type StdKind = Literal[
 @dataclass(frozen=True)
 class Std:
     """A value of standard type about which nothing more is tracked: the coarse partner of the
-    facts, for the callee analysis (EFFECTS.md) -- a number, ``None``, a ``re.Match``, a list
+    facts, for the callee analysis -- a number, ``None``, a ``re.Match``, a list
     or a dict of such things. Like ``Container`` and ``Data``, deliberately NOT a
     ValidationFact: the scalar projection is None for a Std-valued name, nothing is ever
     established on one, and it exists only to answer "can a call on, or with, this value run
@@ -1116,7 +1116,7 @@ type Entry = ValidationFact | Container | Data | Std
 type StateMap = Mapping[str, Entry]
 
 def inert(entry: Entry | None) -> bool:
-    """Is a state entry an inert value (EFFECTS.md)? A str or path fact and a tracked container
+    """Is a state entry an inert value? A str or path fact and a tracked container
     (of facts) always; a standard value and a source handle while closed; an unknown value
     never."""
     match entry:
@@ -1796,7 +1796,7 @@ _STR_RETURNING_METHODS = frozenset({
 # no program class defines a dunder); ``str`` is handled apart, since it may keep a fact
 _STR_RETURNING_BUILTINS = frozenset({"repr", "format", "chr", "hex", "oct", "bin", "ascii"})
 
-# --- standard values (EFFECTS.md, the callee analysis) --------------------------------------------
+# --- standard values (the callee analysis) -------------------------------------------------------
 #
 # Beside text and paths, the walker needs one bit about every other value -- can a call on, or
 # with, it run program code? -- and a ``Std`` tracks a kind and closedness for that. The
@@ -2188,7 +2188,7 @@ class Interpreter:
                 handle = self.st[name]
                 assert isinstance(handle, Data)
                 # ``for line in f`` over a source handle: each line is something the source
-                # produced, unmodified (PROVENANCE.md) -- ``certora.lines`` spelled the stdlib way
+                # produced, unmodified -- ``certora.lines`` spelled the stdlib way
                 return StrFact(atoms=frozenset(handle.sources))
             case (ast.List(elts=elts) | ast.Tuple(elts=elts) | ast.Set(elts=elts)) if elts and not any(
                 isinstance(e, ast.Starred) for e in elts

@@ -272,9 +272,8 @@ behind it:
 A region names a piece of state that a checker can observe and a command can change. Regions
 are the vocabulary in which a rule says what it **writes** and an environmental atom says what
 it **reads**; an environmental fact dies at a call exactly when the call's write set meets the
-atom's read set (EFFECTS.md). Declare every region before use, once; two files (a policy and a
-ruleset, two rulesets) declaring the same name identically mean the same region, differently is
-an error.
+atom's read set. Declare every region before use, once; two files (a policy and a ruleset, two
+rulesets) declaring the same name identically mean the same region, differently is an error.
 
 | Key | Type | Meaning |
 |---|---|---|
@@ -558,8 +557,7 @@ in `[atoms]` with `pure = true`, and only extraction establishes it: `certora.ex
 `extract_all`, `lines`, `field`, or `for line in f` over a handle. Consume it like any atom:
 `holes.BRANCH = { atoms = ["gh-api"] }` means "a value the GitHub API returned, unmodified" --
 never a literal, never something read elsewhere and massaged. This is the dual of `literal`:
-`literal` for what the agent chose, a source atom for what a trusted query produced. See
-`PROVENANCE.md`.
+`literal` for what the agent chose, a source atom for what a trusted query produced.
 
 ## `[[apply]]` and rulesets
 
@@ -735,9 +733,9 @@ What a validation's program experiences when a confined program calls `certora.c
 
 ## What kills an environmental fact
 
-A program author needs to know when a checked fact is still live. The rule (EFFECTS.md): a
-fact established by `certora.check` dies when its variable is reassigned, and additionally at
-every call whose write set meets the atom's `reads`. What a call writes:
+A program author needs to know when a checked fact is still live. The rule: a fact established
+by `certora.check` dies when its variable is reassigned, and additionally at every call whose
+write set meets the atom's `reads`. What a call writes:
 
 - `certora.exec`, `certora.network.*`, `certora.check`: the rule's declared write set, as
   above; an undeclared rule writes everything.

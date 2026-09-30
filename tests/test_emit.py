@@ -1,6 +1,6 @@
-"""The emitters (LOWERING2.md, "The passes"): a placed jail, linked with one spawn's working
-directory, executable and scratch directory, as bubblewrap's command line and as a Seatbelt
-profile. Pure: nothing here runs bubblewrap or Seatbelt."""
+"""The emitters: a placed jail, linked with one spawn's working directory, executable and scratch
+directory, as bubblewrap's command line and as a Seatbelt profile. Pure: nothing here runs
+bubblewrap or Seatbelt."""
 import pathlib
 import unittest
 

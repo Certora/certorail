@@ -1,6 +1,6 @@
-"""The emitters (LOWERING2.md, "The passes"): a placed jail, linked with what changes per spawn,
-as the command bubblewrap runs or the profile Seatbelt installs. Pure: every path they print was
-decided before them -- by the plan, the link, the views' mountpoints.
+"""The emitters: a placed jail, linked with what changes per spawn, as the command bubblewrap
+runs or the profile Seatbelt installs. Pure: every path they print was decided before them -- by
+the plan, the link, the views' mountpoints.
 
 Linking is the last step before a process starts. In the policy world the spawn's executable is
 laid under the plan's layers, which decide it like anything else they cover: a grant around it

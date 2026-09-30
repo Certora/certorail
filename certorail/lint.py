@@ -13,7 +13,7 @@ constrains the name a program spells, never the file behind it.
   spelling folding to the same name (``.Git`` for ``.git``): the names a program reads from a
   listing carry the stored spelling, which the policy's does not match.
 - ``floor-overlap``: a grant reaching into a path this machine's ``world.toml`` marks
-  ``never-write`` or ``never-visible`` (FLOORS.md): the floor carves it out at run time, so an
+  ``never-write`` or ``never-visible``: the floor carves it out at run time, so an
   operation there fails mid-run. (A grant lying wholly inside one does not load at all.)
 """
 import os

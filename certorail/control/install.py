@@ -3,7 +3,7 @@
 The config directory (``policydir.config_dir()``) is the one auditable place for everything the
 analysis trusts, and until now things got there by hand: an agent or a user writing files into
 ``policy/``, ``checkers/`` and ``rulesets/`` directly, with nothing validated until some later
-run failed to load. This module is the mechanical path (INSTALL.md): validate the exact bytes
+run failed to load. This module is the mechanical path: validate the exact bytes
 that will land, refuse conflicts instead of overwriting them, and rotate into place in the
 order that keeps the tree loadable at every instant -- checkers and notes first, TOML last,
 each file written beside its target and ``os.replace``d, because the loader fails closed on a
@@ -24,8 +24,7 @@ this package under ``certorail/rulesets/``, is a pack):
   placement in ``policy/<munged root>/``, and a second file claiming the same root is refused
   outright -- ambient discovery would refuse to choose between them anyway.
 
-No ledger, no signatures, no hashes yet (INSTALL.md defers them): this is the rotation layer
-those would sit on.
+No ledger, no signatures, no hashes yet: this is the rotation layer those would sit on.
 """
 import argparse
 import importlib.resources
@@ -197,7 +196,7 @@ def load_pack(pack: pathlib.Path) -> _Pack:
         for p in sorted(checkers_dir.rglob("*")):
             if p.is_file():
                 plan.checkers[p.relative_to(checkers_dir).as_posix()] = p.read_bytes()
-    # the closure, both ways (INSTALL.md): referenced but missing fails here rather than at
+    # the closure, both ways: referenced but missing fails here rather than at
     # some later load; supplied but unreferenced is refused as smuggling
     referenced: set[str] = set()
     for name, doc in sorted(docs.items()):

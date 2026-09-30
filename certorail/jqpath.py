@@ -1,4 +1,4 @@
-"""The jq-subset paths of ``certora.extract`` / ``certora.extract_all`` (PROVENANCE.md).
+"""The jq-subset paths of ``certora.extract`` / ``certora.extract_all``.
 
     .              the document itself
     .name          a key (an identifier)

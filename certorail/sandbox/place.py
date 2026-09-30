@@ -1,6 +1,5 @@
-"""The Place pass (LOWERING2.md, "When a bind may stand in for a view"): each layer of a jail
-held by a bind, placed in a view, or refused -- per backend, from the grants and what ``Facts``
-says of the filesystem, and nothing else.
+"""The Place pass: each layer of a jail held by a bind, placed in a view, or refused -- per
+backend, from the grants and what ``Facts`` says of the filesystem, and nothing else.
 
 Bubblewrap. A host jail is the host's ``/``, and nothing to place. In a policy jail a view is
 correct by definition, and a bind stands in for it only where the two cannot disagree for as long
@@ -436,12 +435,12 @@ def _anchored(path: pathlib.Path, names: StableNames, facts: Facts) -> pathlib.P
 
 
 def _place_host(grants: HostGrants, facts: Facts, view_unavailable: str | None) -> BwrapPlan | CompileError:
-    """A host jail with redlines over it (REDLINES.md): every redline and lift is held in a view
-    at the innermost stable directory above it, writable or read-only base alike (``never-write``
-    under a read-only base says nothing the base does not, and needs no view). In each view's
-    directory the children no deciding layer reaches are bound back over it: speed, and a Unix
-    socket, which does not connect through a view; a bind back the host replaces from outside
-    detaches, and the view decides the name."""
+    """A host jail with redlines over it: every redline and lift is held in a view at the
+    innermost stable directory above it, writable or read-only base alike (``never-write`` under
+    a read-only base says nothing the base does not, and needs no view). In each view's directory
+    the children no deciding layer reaches are bound back over it: speed, and a Unix socket, which
+    does not connect through a view; a bind back the host replaces from outside detaches, and the
+    view decides the name."""
     access = Access.WRITABLE if grants.writable else Access.READ_ONLY
     names = expand(grants.stable, grants.root, facts)
     refusals: list[Refusal] = []

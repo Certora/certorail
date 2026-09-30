@@ -1,4 +1,4 @@
-"""Rulesets and ``[[apply]]`` (TEMPLATES.md): parameterised bundles of exec-side vocabulary in
+"""Rulesets and ``[[apply]]``: parameterised bundles of exec-side vocabulary in
 the config directory, applied once with set-valued directory parameters, identified by
 (file, hash, bindings), restricted in what executables they may name."""
 import os

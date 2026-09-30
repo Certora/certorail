@@ -99,7 +99,7 @@ def exec(
     output are one or the other, per call.
 
     Keywords other than ``cwd`` and ``stream`` bind the *holes* of the policy's command template
-    for the program (TEMPLATES.md): a string or a path for a token hole, a list of them for a
+    for the program: a string or a path for a token hole, a list of them for a
     splice. The broker binds the call like a signature and composes the argv itself.
 
     This is the runtime half. The static half (``walker``) additionally requires the program to
@@ -361,7 +361,7 @@ network = _Network()
 
 
 # ---------------------------------------------------------------------------
-# extractors: how data gets out of a source with its provenance intact (PROVENANCE.md)
+# extractors: how data gets out of a source with its provenance intact
 #
 # The static half binds a *source atom* to what these return: a value extracted from the result
 # of a source-bearing rule is something that source produced, unmodified. Any string operation

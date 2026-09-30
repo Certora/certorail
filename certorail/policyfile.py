@@ -1164,11 +1164,11 @@ def _edit(
     where: str, edits: Sequence[EditDecl], rules: list[_Placed[Program]], validations: list[_Placed[Validation]],
     errors: _Errors,
 ) -> tuple[list[_Placed[Program]], list[_Placed[Validation]]]:
-    """``[[edit]]`` (REDLINES.md): each amends the ``exec`` table of exactly one rule an applied
-    ruleset grants -- a program rule by its leading words, a validation by its name, narrowed by
-    ``from`` -- after the rulesets, ``[[deny]]`` and ``override``, so against the final rule set.
-    An edit matching none (its rule replaced, taken back, or removed by a pack update), matching
-    several, or matching a rule the root declares itself, is a load error, never a no-op."""
+    """``[[edit]]``: each amends the ``exec`` table of exactly one rule an applied ruleset grants
+    -- a program rule by its leading words, a validation by its name, narrowed by ``from`` --
+    after the rulesets, ``[[deny]]`` and ``override``, so against the final rule set. An edit
+    matching none (its rule replaced, taken back, or removed by a pack update), matching several,
+    or matching a rule the root declares itself, is a load error, never a no-op."""
     programs, checks = list(rules), list(validations)
     for i, e in enumerate(edits):
         path = Path().edit(i)

@@ -1,4 +1,4 @@
-"""Command templates (TEMPLATES.md): a template binds like a signature -- the fast path stays
+"""Command templates: a template binds like a signature -- the fast path stays
 positional -- holes are relies, flags are a vocabulary, and the broker composes the argv."""
 import os
 import pathlib
@@ -552,7 +552,7 @@ PUSH_FLAGS = flagset(
 )
 
 class TestFlagRequires(unittest.TestCase):
-    """A flag's demands (TEMPLATES.md): atoms required of another hole or of the cwd while the
+    """A flag's demands: atoms required of another hole or of the cwd while the
     flag is present, on top of what the hole and the rule ask."""
 
     @classmethod

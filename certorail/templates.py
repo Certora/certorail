@@ -1,4 +1,4 @@
-"""Command templates: the shape of a permitted command line (TEMPLATES.md).
+"""Command templates: the shape of a permitted command line.
 
 A template is a sequence of *pieces* -- literal words and *holes*, ``${X}`` for one token and
 ``${X...}`` for a splice -- and it binds like a Python call: the leading literal words select
@@ -337,7 +337,7 @@ class Many:
 @dataclass(frozen=True)
 class Elements:
     """A variadic hole's value as a typed container: every element has this fact, the count is
-    unknown (CONTAINERS.md: the splat, landing where it was always going to)."""
+    unknown (the splat, landing where it was always going to)."""
 
     elem: ValidationFact
 
@@ -525,7 +525,7 @@ def constraint_failure(c: Constraint, value: Value, atoms_missing: AtomsMissing)
     return None
 
 
-# The leading-dash guard (TEMPLATES.md): a token or each hole not preceded by a literal "--"
+# The leading-dash guard: a token or each hole not preceded by a literal "--"
 # requires the built-in ``not-option``, asked of the value like any other atom -- structure
 # (``analysis.holds``), or a checker's ``establishes`` -- and denied with this reason
 DASH_REASON = (

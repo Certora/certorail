@@ -155,8 +155,7 @@ record of a wrong turn):
    The guard is then one line: a token or each hole not preceded by `--` requires
    `not-option`; a flag's value does not. Denials name the atom, `--describe` renders it, and
    the deferred program-side guard (`not s.startswith("-")` establishing it) is a later transfer
-   function, not a new mechanism. This is TEMPLATES.md's deferred "`not-option` atom" item,
-   arrived at from the other side.
+   function, not a new mechanism.
 
 **Binder ergonomics** (the pack loads without these; the fast path needs them):
 
@@ -213,6 +212,6 @@ nothing). `git-policy.toml` loads, pack and all.
 - Global options (`-c key=value`, `-C`, `--git-dir`) precede the subcommand and are unspellable
   in a template whose leading words select it. Good: `-c core.hooksPath=` is the sharpest tool
   in the box. But it also means the pack cannot *emit* `-c core.hooksPath=/dev/null` as a
-  defence; that would be a child-environment matter (JAILS.md).
+  defence; that would be a child-environment matter.
 - `git.rev` admits text that is also a path. In every command that takes `REVS` this is either
   harmless (the read rung) or already in the rewrite rung; `switch` rejects a path itself.

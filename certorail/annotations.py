@@ -400,7 +400,7 @@ def _container(
     t: Term, kind: Literal["list", "set", "sequence"], inner: Term
 ) -> Container | None:
     """``list[...]`` / ``set[...]`` / ``typing.Sequence[...]``: tracked iff the element type
-    carries markers (CONTAINERS.md). A plain element type says nothing the analysis owns --
+    carries markers. A plain element type says nothing the analysis owns --
     it stays the runtime type guard's business -- so it yields no fact at all."""
     elem = _parse(inner)
     if isinstance(elem, Container):
@@ -416,7 +416,7 @@ def _mentions_annotated(e: ast.AST) -> bool:
 
 def parse_annotation(e: ast.expr) -> ValidationFact | Container | None:
     """The fact an annotation expresses -- a scalar fact, a tracked container
-    (``list[Annotated[...]]`` &c., CONTAINERS.md) -- or ``None`` if it says nothing the
+    (``list[Annotated[...]]`` &c.) -- or ``None`` if it says nothing the
     analysis tracks. ``Annotated`` inside an untracked container is refused rather than
     silently dropped."""
     return _parse(lower(e))

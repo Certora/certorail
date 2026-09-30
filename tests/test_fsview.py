@@ -1,4 +1,4 @@
-"""The policy's filesystem section as the jails hold it (MOUNTS.md): the one path a bind can say,
+"""The policy's filesystem section as the jails hold it: the one path a bind can say,
 the ERE a Seatbelt filter takes, and each location as the front end states it and a backend
 places it. Pure, no jail."""
 import os

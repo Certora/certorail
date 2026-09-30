@@ -138,10 +138,10 @@ Honesty rules:
 ## Step 3b: regions, media and `writes`
 
 By default every command kills every environmental fact, so a program must check immediately
-before each use and can never batch: check, act, check, act. Regions make the kill precise
-(EFFECTS.md): a rule declares what it **writes**, an atom what it **reads**, and the fact dies
-only where the two meet. Skip this step when the tasks are check-then-act pairs; do it when a
-checked fact must outlive an intervening command, or when the same fact gates several commands.
+before each use and can never batch: check, act, check, act. Regions make the kill precise: a
+rule declares what it **writes**, an atom what it **reads**, and the fact dies only where the two
+meet. Skip this step when the tasks are check-then-act pairs; do it when a checked fact must
+outlive an intervening command, or when the same fact gates several commands.
 
 1. **Name the state.** One `[regions]` entry per piece of state a checker can observe and a
    command can change, each with one medium: a `footprint` (where it lives, for the reader:

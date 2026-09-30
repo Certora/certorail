@@ -1,5 +1,5 @@
-"""What a jail is granted, as the front end states it and before any backend has a say
-(LOWERING2.md, "The representation"). Nothing here knows bubblewrap, Seatbelt or FUSE.
+"""What a jail is granted, as the front end states it and before any backend has a say. Nothing
+here knows bubblewrap, Seatbelt or FUSE.
 
 A jail is a world: the host's ``/`` (``HostGrants``), or nothing but what its layers grant
 (``PolicyGrants``), which apply in order -- a later layer wins where it overlaps an earlier one.
@@ -123,10 +123,10 @@ class Process:
 class HostGrants:
     """The host's ``/``, writable where unix allows or read-only: host mode is the user's
     authority. Over it, for a tool's or a checker's jail, *layers*: the machine's redlines, then
-    the rule's lifts of them (REDLINES.md), each held in a view at the innermost directory the
-    machine's stability model (*stable*, ``world.toml``) says nothing replaces; *root*, the sandbox
-    root, is what its ``root`` selector names (None: the certorail process's own host mode, which
-    has no layers: the floor guard holds its redlines, in the process, ``floorguard``)."""
+    the rule's lifts of them, each held in a view at the innermost directory the machine's
+    stability model (*stable*, ``world.toml``) says nothing replaces; *root*, the sandbox root,
+    is what its ``root`` selector names (None: the certorail process's own host mode, which has
+    no layers: the floor guard holds its redlines, in the process, ``floorguard``)."""
 
     writable: bool
     lifetime: Lifetime

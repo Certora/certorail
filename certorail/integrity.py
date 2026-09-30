@@ -14,8 +14,7 @@ assertion, not the file. ``checkers/`` is a flat shared namespace, and a later p
 legitimately installing a different ``org-checkout`` must not silently change what *this*
 document's validations mean -- with the pin here, they fail loudly instead of following the
 new bytes. The document is also self-contained: reviewing the TOML reviews a commitment to an
-exact implementation, and it is the natural place a proof attestation would sit later
-(INSTALL.md's verified tier).
+exact implementation, and it is the natural place a proof attestation would sit later.
 
 Semantics:
 

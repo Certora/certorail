@@ -1,7 +1,7 @@
 """What a policy says a jail holds beyond its ``[filesystem]`` section, before any backend has a
 say: a rule's own mounts (``exec.mount-read`` / ``exec.mount-write``), and ``[system]`` -- the
 certorail process's view, under the policy view its own mounts, and in either view the machine's
-redlines it is let past (``lift-read`` / ``lift-write``, REDLINES.md). The jail compiler's front
+redlines it is let past (``lift-read`` / ``lift-write``). The jail compiler's front
 end (``sandbox.front``) states each jail from these and the policy.
 """
 from dataclasses import dataclass

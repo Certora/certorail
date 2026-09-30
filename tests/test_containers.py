@@ -1,4 +1,4 @@
-"""Typed containers (CONTAINERS.md): opt-in list/set tracking, the roster, escapes with
+"""Typed containers: opt-in list/set tracking, the roster, escapes with
 provenance, invariance at call sites, Sequence borrows, and move-out returns."""
 import unittest
 

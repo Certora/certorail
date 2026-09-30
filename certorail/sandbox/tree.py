@@ -1,6 +1,6 @@
-"""Flatten (LOWERING2.md, "The passes"): bubblewrap's placed items, in application order, turned
-into the fewest mounts that leave every path as the items would, ancestors first -- the order
-bubblewrap needs, since a later mount of an ancestor hides earlier mounts below it.
+"""Flatten: bubblewrap's placed items, in application order, turned into the fewest mounts that
+leave every path as the items would, ancestors first -- the order bubblewrap needs, since a later
+mount of an ancestor hides earlier mounts below it.
 
 A mount has a state (read-only or writable) and a source: the host's own path (``Own``), or a
 view (``Through``). A mount is kept only where its state or its source differs from what it

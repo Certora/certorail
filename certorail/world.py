@@ -1,5 +1,5 @@
-"""The machine's configuration (FLOORS.md, REDLINES.md): ``world.toml`` in the config directory,
-namespaced by the process it configures.
+"""The machine's configuration: ``world.toml`` in the config directory, namespaced by the process
+it configures.
 
 - ``[system.floor]``: what no process may ever write (``never-write``) and none may ever see
   (``never-visible``) -- the certorail process, its tools, its checkers -- whatever the policy
@@ -8,7 +8,7 @@ namespaced by the process it configures.
 - ``[system.interpreter] read``: what the certorail process's interpreter reads that discovery
   does not find, for the policy view.
 - ``stable``: the stability model (``Stable``) -- which directories nothing replaces while a jail
-  lives, where a mount may rest (REDLINES.md, "Stability").
+  lives, where a mount may rest.
 - ``view-daemon``: whether the view daemon caches names.
 
 Machine knowledge: the analysis never reads it. It decides which policies load here
@@ -78,7 +78,7 @@ def home() -> pathlib.Path:
 
 
 class Selector(enum.Enum):
-    """A family of directories ``stable`` names at once (REDLINES.md, "Stability")."""
+    """A family of directories ``stable`` names at once."""
 
     TOPS = "tops"            # the top-level directories: every child of /
     HOME = "home"            # the home directory
@@ -232,8 +232,8 @@ class FloorOverlap:
 
 @dataclass(frozen=True)
 class LiftConflict:
-    """A lift that cannot be what it says (REDLINES.md): it lies in no redline of a kind it lifts,
-    or it reaches one this machine marks ``can-override = false``. The policy does not load."""
+    """A lift that cannot be what it says: it lies in no redline of a kind it lifts, or it reaches
+    one this machine marks ``can-override = false``. The policy does not load."""
 
     who: str
     kind: LiftKind

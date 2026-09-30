@@ -1,4 +1,4 @@
-"""The FUSE view (viewdaemon; LOWERING2.md "Views"): the specification is pure and always tested;
+"""The FUSE view (viewdaemon): the specification is pure and always tested;
 the mount, the daemon protocol and the confined child need the Lean daemon (``fuse/fuseview-lean``,
 built), bubblewrap, /dev/fuse and fusermount3, and skip without them. What the daemon decides at
 each name is its own test suite's (``lake -d fuse/fuseview-lean exe fuseview-tests``), over the
