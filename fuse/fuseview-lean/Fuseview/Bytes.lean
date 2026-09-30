@@ -9,18 +9,21 @@ structure Name where
   bytes : ByteArray
   deriving Inhabited
 
-partial def bytesEqFrom (a b : ByteArray) (i : Nat) : Bool :=
-  if i ≥ a.size then true
-  else if a[i]! != b[i]! then false
-  else bytesEqFrom a b (i + 1)
-
-def bytesEq (a b : ByteArray) : Bool :=
-  a.size == b.size && bytesEqFrom a b 0
+/-- Byte for byte -- as the arrays behind them, whose equality test is lawful, so a proof may
+conclude two names are the same (`Name.eq_of_beq`). -/
+def bytesEq (a b : ByteArray) : Bool := a.data == b.data
 
 partial def fnvFrom (b : ByteArray) (i : Nat) (h : UInt64) : UInt64 :=
   if i ≥ b.size then h else fnvFrom b (i + 1) ((h ^^^ b[i]!.toUInt64) * 0x100000001b3)
 
 instance : BEq Name := ⟨fun a b => bytesEq a.bytes b.bytes⟩
+
+theorem Name.eq_of_beq {a b : Name} (h : (a == b) = true) : a = b := by
+  obtain ⟨⟨da⟩⟩ := a
+  obtain ⟨⟨db⟩⟩ := b
+  have : da = db := beq_iff_eq.1 h
+  subst this
+  rfl
 instance : Hashable Name := ⟨fun n => fnvFrom n.bytes 0 0xcbf29ce484222325⟩
 
 def Name.ofString (s : String) : Name := ⟨s.toUTF8⟩

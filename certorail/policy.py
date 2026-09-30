@@ -53,7 +53,6 @@ keeps today's kill. The media are *enforced*: a grant with ``network=False`` or
 Evaluation presupposes ``Report.ok``: every site already has a proven location. The policy
 decides whether that location is one the host permits.
 """
-import os
 import pathlib
 import subprocess
 import urllib.parse
@@ -90,7 +89,7 @@ from certorail.analysis import (
     ValidationFact
 )
 from certorail.childjail import Environment, Jail, JailUnavailable, View, environment_spec
-from certorail.confinement import Additions, Confinement, FilesystemSection, HostFilesystem, PolicyFilesystem
+from certorail.confinement import SystemJail
 from certorail.effects import EVERYTHING, NOTHING, Effects, Medium, effects_of, whole
 from certorail.ids import (
     BUILTIN_ATOMS,
@@ -142,7 +141,6 @@ from certorail import footprints
 
 if TYPE_CHECKING:
     from certorail.sandbox import Spawner
-    from certorail.viewdaemon import ViewSpec
 from certorail.walker import Report
 
 # ---------------------------------------------------------------------------
@@ -347,6 +345,10 @@ class Validation:
     # of these, so the installed file drifting mid-run changes nothing. None: a plain evaluator
     # (a system binary), executed by path as spelled
     evaluator: bytes | None = None
+    # the machine's redlines this evaluator is let past (``exec.lift-read`` / ``lift-write``,
+    # REDLINES.md): a root policy's statement, never a ruleset's; the analysis never consults them
+    lift_read: tuple[LocationFact, ...] = ()
+    lift_write: tuple[LocationFact, ...] = ()
 
     @property
     def write_set(self) -> Effects:
@@ -380,6 +382,8 @@ def validation(
     mount_write: Iterable[Where] = (),
     pin: str | None = None,
     evaluator: bytes | None = None,
+    lift_read: Iterable[Where] = (),
+    lift_write: Iterable[Where] = (),
 ) -> Validation:
     params_t = tuple(ParamName(p) for p in params)
     if len(set(params_t)) != len(params_t) or CWD in params_t:
@@ -427,10 +431,37 @@ def validation(
             "atoms on cwd"
         )
     mounts = _mounts(name, view, write_fs, mount_read, mount_write)
+    lifts = _lifts(name, write_fs, lift_read, lift_write)
     return Validation(
         ValidationName(name), params_t, argv_t, None if cwd is None else _one_or_many(cwd), est,
         frozenset(pure_set), network, write_fs, None if writes is None else effects_of(writes),
-        _env(env), spawn, view, *mounts, pin, evaluator=evaluator,
+        _env(env), spawn, view, *mounts, pin, evaluator, *lifts,
+    )
+
+
+def _lifts(
+    name: str, write_fs: bool, lift_read: Iterable[Where], lift_write: Iterable[Where],
+) -> tuple[tuple[LocationFact, ...], tuple[LocationFact, ...]]:
+    """A grant's lifts of the machine's redlines, checked: a writable lift needs the filesystem
+    medium. Whether each lies within a redline this machine lets be lifted is the machine's
+    question (``world.floor_findings``)."""
+    reads, writes = _locations(lift_read), _locations(lift_write)
+    if writes and not write_fs:
+        raise ValueError(f"{name!r}: lift-write with write-fs = false: nothing it lifts could be written")
+    return reads, writes
+
+
+def reexec[R: Program | Validation](
+    rule: R, *, env: Iterable[str | Mapping[str, str]] | None, spawn: bool, view: View,
+    mount_read: Iterable[Where], mount_write: Iterable[Where], lift_read: Iterable[Where], lift_write: Iterable[Where],
+) -> R:
+    """*rule* with its ``exec`` table replaced whole (an ``[[edit]]``, REDLINES.md): checked as
+    the constructors check a table written in place, and nothing else about the rule changed."""
+    reads, writes = _mounts(rule.name, view, rule.write_fs, mount_read, mount_write)
+    lifted_reads, lifted_writes = _lifts(rule.name, rule.write_fs, lift_read, lift_write)
+    return replace(
+        rule, env=_env(env), spawn=spawn, view=view, mount_read=reads, mount_write=writes,
+        lift_read=lifted_reads, lift_write=lifted_writes,
     )
 
 
@@ -491,6 +522,10 @@ class Program:
     # (``exec.mount-read`` / ``exec.mount-write``, MOUNTS.md); the analysis never consults them
     mount_read: tuple[LocationFact, ...] = ()
     mount_write: tuple[LocationFact, ...] = ()
+    # the machine's redlines this tool is let past (``exec.lift-read`` / ``lift-write``,
+    # REDLINES.md): a root policy's statement, never a ruleset's; the analysis never consults them
+    lift_read: tuple[LocationFact, ...] = ()
+    lift_write: tuple[LocationFact, ...] = ()
 
     @property
     def write_set(self) -> Effects:
@@ -541,6 +576,8 @@ def program(
     view: View = View.HOST,
     mount_read: Iterable[Where] = (),
     mount_write: Iterable[Where] = (),
+    lift_read: Iterable[Where] = (),
+    lift_write: Iterable[Where] = (),
 ) -> Program:
     """*requires* is the atoms the cwd must carry, or a table ``{cwd: [...], HOLE: [...]}``
     that also demands atoms of a hole's value, folded into that hole's constraint."""
@@ -614,6 +651,7 @@ def program(
         spawn,
         view,
         *_mounts(name, view, write_fs, mount_read, mount_write),
+        *_lifts(name, write_fs, lift_read, lift_write),
     )
 
 
@@ -980,13 +1018,10 @@ def literal_slot(v: Validation, atom_name: Atom) -> str | None:
     return None
 
 
-def _run_literal_checker(
-    v: Validation, slot: str, text: str, root: pathlib.Path, confinement: Confinement, spawner: "Spawner",
-) -> bool:
+def _run_literal_checker(v: Validation, slot: str, text: str, root: pathlib.Path, spawner: "Spawner") -> bool:
     """One evaluator run with *text* bound to *slot*: argv substitution for a parameter slot,
     ``cwd=root/text`` for the cwd slot (a pure text predicate should not care where it runs, so a
-    parameter-slot checker runs at the root), under the validation's *confinement* as *spawner*
-    realises it."""
+    parameter-slot checker runs at the root), in the validation's jail as *spawner* holds it."""
     argv = [piece if isinstance(piece, str) else text for piece in v.argv]
     if v.evaluator is not None:
         # exec the load-time snapshot: what was (pin-)verified at load is what runs
@@ -995,7 +1030,7 @@ def _run_literal_checker(
     if not cwd.is_dir():
         return False
     try:
-        with spawner.spawn(confinement, argv, cwd) as spawn:
+        with spawner.spawn(v, argv, cwd) as spawn:
             result = subprocess.run(
                 spawn.argv, cwd=cwd, env=spawn.env, pass_fds=spawn.pass_fds, shell=False,
                 capture_output=True, check=False,
@@ -1037,10 +1072,9 @@ class Policy:
     # program name and nothing finer -- the one classification of an exec that is decidable
     # (`git -C x push` is a `git push`, and no shape matching would say so)
     default_allow: bool = False
-    # strict: a confined grant whose jail cannot express the policy exactly refuses the run
-    # (``host.run``) and a spawn with a protection not there to bind (``sandbox``), instead of
-    # warning and running
-    strict: bool = False
+    # ``[system]``: the certorail process at run time -- its view, and its mounts under the policy
+    # view (FLOORS.md)
+    system: SystemJail = SystemJail()
     # the programs `[[deny]]` named, by leading name: named, so governed; with no rule of their
     # own, refused outright -- the first-verb blacklist under default-allow
     denied: frozenset[ProgramName] = frozenset()
@@ -1071,7 +1105,7 @@ class Policy:
         applied: Iterable[str] = (),
         default_allow: bool = False,
         denied: Iterable[str] = (),
-        strict: bool = False,
+        system: SystemJail = SystemJail(),
     ) -> "Policy":
         vals = tuple(validations)
         names = [v.name for v in vals]
@@ -1229,7 +1263,13 @@ class Policy:
         jailed = [("read", read_l), ("write", write_l), ("no-write", no_write_l)] + [
             (f"{' '.join(r.leading_words) if isinstance(r, Program) else r.name} {kind}", locs)
             for r in (*progs, *vals)
-            for kind, locs in (("mount-read", r.mount_read), ("mount-write", r.mount_write))
+            for kind, locs in (
+                ("mount-read", r.mount_read), ("mount-write", r.mount_write),
+                ("lift-read", r.lift_read), ("lift-write", r.lift_write),
+            )
+        ] + [
+            ("[system.exec] mount-read", system.additions.read), ("[system.exec] mount-write", system.additions.write),
+            ("[system.exec] lift-read", system.lifts.read), ("[system.exec] lift-write", system.lifts.write),
         ]
         for what, locs in jailed:
             for loc in locs:
@@ -1239,7 +1279,8 @@ class Policy:
             read=read_l, write=write_l,
             no_write=no_write_l, programs=progs, validations=vals, atoms=atoms_t,
             network=tuple(net_rules), sources=srcs, regions=regs, reads=reads_m, applied=tuple(applied),
-            default_allow=default_allow, denied=frozenset(ProgramName(d) for d in denied), strict=strict,
+            default_allow=default_allow, denied=frozenset(ProgramName(d) for d in denied),
+            system=system,
         )
 
     def governed(self, name: str) -> bool:
@@ -1441,36 +1482,16 @@ class Policy:
 
     @property
     def confines(self) -> bool:
-        """Does some grant run its child under the policy view (``exec.view = "policy"``)?"""
-        return any(r.view is View.POLICY for r in (*self.programs, *self.validations))
-
-    def view_spec(self, root: pathlib.Path) -> "ViewSpec":
-        """What a FUSE view of this policy under *root* serves (``viewdaemon``)."""
-        from certorail.viewdaemon import ViewSpec
-
-        return ViewSpec(os.path.realpath(root), self.read, self.write, self.no_write)
-
-    def section(self) -> FilesystemSection:
-        """The ``[filesystem]`` section as one value (``certorail.confinement``)."""
-        return FilesystemSection(self.read, self.write, self.no_write)
-
-    def confinement(self, rule: "Program | Validation", root: pathlib.Path) -> Confinement:
-        """What *rule*'s child may do (``certorail.confinement``): its media and ``exec`` table,
-        and the filesystem it sees -- the host's, or this policy's section under *root* plus the
-        rule's own additions. The one constructor of a ``Confinement``."""
-        filesystem: HostFilesystem | PolicyFilesystem = (
-            PolicyFilesystem(root, self.section(), Additions(rule.mount_read, rule.mount_write))
-            if rule.view is View.POLICY
-            else HostFilesystem()
-        )
-        return Confinement(rule.env, rule.network, rule.write_fs, rule.spawn, filesystem)
+        """Does some process run under the policy view -- a grant's child (``exec.view =
+        "policy"``) or the certorail process itself (``[system.exec] view = "policy"``)?"""
+        return self.system.view is View.POLICY or any(r.view is View.POLICY for r in (*self.programs, *self.validations))
 
     def discharger(self, root: PathLike[str] | str, spawner: "Spawner") -> Discharge:
         """A runner for literal checkers: ``discharge(atom, text)`` is True when some effect-free
         validation establishing the pure *atom* through a single slot accepts the exact *text*,
-        run right now under *root*, confined as its rule says by *spawner* (the run's, with its
-        FUSE view). Cached per (atom, text); handed to ``evaluate`` and to ``analyze`` so
-        constants need neither a ``certora.check`` nor a regex definition."""
+        run right now under *root*, in its rule's jail as *spawner* holds it (the run's, with its
+        views). Cached per (atom, text); handed to ``evaluate`` and to ``analyze`` so constants
+        need neither a ``certora.check`` nor a regex definition."""
         rootpath = pathlib.Path(root)
         cache: dict[tuple[Atom, str], bool] = {}
 
@@ -1478,7 +1499,7 @@ class Policy:
             key = (atom, text)
             if key not in cache:
                 cache[key] = any(
-                    _run_literal_checker(v, slot, text, rootpath, self.confinement(v, rootpath), spawner)
+                    _run_literal_checker(v, slot, text, rootpath, spawner)
                     for v in self.validations
                     if (slot := literal_slot(v, atom)) is not None
                 )

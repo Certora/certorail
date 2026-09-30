@@ -1,11 +1,6 @@
-"""The macOS spawner: Seatbelt through ``sandbox-exec``. No run-scoped state: patterns are
-regex filters, so no view is ever needed, and every plan is a pure function of the confinement.
-
-Lowering (``lower``): a location that is one path is a ``Bind`` -- a ``subpath`` filter for a
-tree or a protection, a ``literal`` filter for a literal grant, which names that path alone; a
-pattern is a ``RegexRule``, anchored over canonical paths, a protection's covering its subtree;
-a ``<regex>`` outside the subset Python and ERE share, or one a profile string cannot hold, is
-``Omitted``.
+"""What the Seatbelt backend knows of its own: the toolchain a macOS policy world holds, and the
+regex dialect a pattern is spelled in (``place.place_seatbelt`` places a jail's layers as rules,
+``emit.seatbelt_profile`` writes the profile).
 
 The regex dialect (``ere_of``): a policy ``<regex>`` is validated at load as a Python regex, and
 Seatbelt reads POSIX ERE. The ERE is generated from Python's own parse of the pattern, node by
@@ -17,27 +12,11 @@ Python's does not; and Seatbelt matches every filter without regard to case (mea
 2026-09-23: ``no\\.txt`` admitted ``NO.txt``). On a case-insensitive volume that widens no grant
 -- a path matching ignoring case has a re-casing that matches exactly and names the same file --
 and on a case-sensitive one it does; the reference says so.
-
-The profile: everything but file data allowed, then the entries of ``/`` (every process reads
-them at startup: measured 2026-09-22, without this ``ls`` and ``cat`` abort before ``main``),
-the toolchain, the tool, the scratch directory and the readable locations allowed for reading
-(listing a directory is reading it: a read grant covers the directories within it), the
-writable locations (under ``write_fs``) and the scratch directory for writing, the protections
-denied for writing last. Metadata reads stay allowed so path resolution works: names are
-visible, contents are not. Seatbelt's matching, measured on a Mac 2026-09-22: within one
-operation later rules win, and a rule on a specific operation shadows every rule on its wildcard
--- with ``file-read-data`` denied an allow on ``file-read*`` never applies -- so the read
-allowances are spelled on ``file-read-data`` itself.
-
-Written against Apple's documented profile language and unrun here; ``scripts/probe_seatbelt.py``
-is the probe a Mac runs.
 """
-import contextlib
 import os
 import pathlib
 import re
-import shutil
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable
 from re import _parser as _sre  # pyright: ignore[reportAttributeAccessIssue]  -- Python's own regex parser
 
 from certorail.analysis import (
@@ -59,13 +38,9 @@ from certorail.analysis import (
     RegexLit,
     StaticPath,
 )
-from certorail import sbpl
-from certorail.childjail import JailUnavailable, Spawn
-from certorail.confinement import Confinement, HostFilesystem, PolicyFilesystem
-from certorail.locations import single_path
-from certorail.sandbox.common import environment, executable, scratch_for
-from certorail.sandbox.lowering import Bind, Lowered, Omitted, RegexRule, Role, readable, writable
 
+# what a macOS policy world holds besides the policy's own grants: where programs, their
+# libraries and the system's own configuration live. Read-only, stable across a run
 TOOLCHAIN = (
     "/usr", "/bin", "/sbin", "/System", "/Library", "/private/var/db", "/private/etc", "/dev",
     "/opt/homebrew",
@@ -281,10 +256,13 @@ def _component(c: Component) -> str | None:
             return _regex(r)
 
 
-def pattern_regex(loc: LocationFact, root: pathlib.Path, *, below: bool) -> str | None:
+def pattern_regex(
+    loc: LocationFact, root: pathlib.Path, *, below: bool,
+    resolve: Callable[[pathlib.Path], str] = os.path.realpath,
+) -> str | None:
     """*loc* as an anchored ERE over canonical absolute paths -- the paths it denotes, and with
     *below* everything under them too (a protection guards a subtree). None when some component
-    has no single-regex spelling."""
+    has no single-regex spelling. *resolve* canonicalises the literal head."""
     parts = loc.path_components if isinstance(loc, StaticPath) else loc.static_prefix
     # the literal names at the front resolve like a bind does (``/tmp`` is ``/private/tmp``, a
     # symlinked directory is its target); what follows the first pattern cannot be resolved
@@ -293,7 +271,7 @@ def pattern_regex(loc: LocationFact, root: pathlib.Path, *, below: bool) -> str 
         literal += 1
     anchor = pathlib.Path("/") if loc.absolute else root
     names = [c.name for c in parts[:literal] if isinstance(c, Named)]
-    resolved = os.path.realpath(anchor.joinpath(*names))
+    resolved = str(resolve(anchor.joinpath(*names)))
     rendered = [_component(c) for c in parts[literal:]]
     if any(r is None for r in rendered):
         return None
@@ -309,108 +287,3 @@ def pattern_regex(loc: LocationFact, root: pathlib.Path, *, below: bool) -> str 
         return f"^{head}/{body}/(.*/)?{leaf}{tail}$" if body else f"^{head}/(.*/)?{leaf}{tail}$"
     tail = "(/.*)?" if below else ""
     return f"^{head}/{body}{tail}$" if body else f"^{head}{tail}$"
-
-
-# ---------------------------------------------------------------------------------------------
-# the spawner
-# ---------------------------------------------------------------------------------------------
-
-
-def _canonical(path: str | os.PathLike[str]) -> str:
-    # Seatbelt matches canonical paths: the per-user temp dir is under /private/var
-    return os.path.realpath(path)
-
-
-def _filter(item: str | Bind | RegexRule) -> str:
-    if isinstance(item, RegexRule):
-        rendered = sbpl.regex(item.pattern)
-        assert rendered is not None, "lower() omits patterns that cannot sit in a literal"
-        return rendered
-    if isinstance(item, Bind):
-        path = _canonical(item.path)
-        return sbpl.subpath(path) if item.subtree else sbpl.literal(path)
-    return sbpl.subpath(_canonical(item))
-
-
-class SeatbeltSpawner:
-    def __enter__(self) -> "SeatbeltSpawner":
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        pass
-
-    # -- lowering (pure) --------------------------------------------------------------------
-
-    def lower(self, fs: PolicyFilesystem, write_fs: bool) -> tuple[Lowered, ...]:
-        out: list[Lowered] = []
-
-        def each(role: Role, locs: tuple[LocationFact, ...]) -> None:
-            for loc in locs:
-                path = single_path(loc, fs.root)
-                if path is not None:
-                    # a literal grant is that path alone; a protection guards its whole subtree
-                    subtree = isinstance(loc, DirSplat) or role == "no-write"
-                    out.append(Bind(path, role, subtree))
-                    continue
-                regex = pattern_regex(loc, fs.root, below=(role == "no-write"))
-                if regex is None or sbpl.regex(regex) is None:
-                    out.append(Omitted(loc, role, NOT_ERE))
-                else:
-                    out.append(RegexRule(regex, role))
-
-        each("read", fs.section.read)
-        each("write", fs.section.write)
-        each("mount-read", fs.additions.read)
-        each("mount-write", fs.additions.write)
-        each("no-write", fs.section.no_write)
-        return tuple(out)
-
-    # -- the profile ------------------------------------------------------------------------
-
-    def profile(self, c: Confinement, scratch: str | None, exe: str | None) -> str:
-        rules = ["(version 1)", "(allow default)"]
-        fs = c.filesystem
-        if isinstance(fs, PolicyFilesystem):
-            lowered = [x for x in self.lower(fs, c.write_fs) if isinstance(x, (Bind, RegexRule))]
-            rules.append("(deny file-read-data file-write*)")
-            reads: list[str | Bind | RegexRule] = [*TOOLCHAIN, *([exe] if exe is not None else [])]
-            reads += [x for x in lowered if readable(x.role)]
-            if scratch is not None:
-                reads.append(scratch)
-            rules.append('(allow file-read-data (literal "/") ' + " ".join(_filter(x) for x in reads) + ")")
-            writes: list[str | Bind | RegexRule] = [x for x in lowered if writable(x.role)] if c.write_fs else []
-            if scratch is not None:
-                writes.append(scratch)
-            rules.append("(allow file-write* " + " ".join(_filter(x) for x in writes) + ' (literal "/dev/null"))')
-            guards = [x for x in lowered if x.role == "no-write"]
-            if guards:
-                rules.append("(deny file-write* " + " ".join(_filter(x) for x in guards) + ")")
-        elif scratch is not None:
-            rules += ["(deny file-write*)", f'(allow file-write* {_filter(scratch)} (literal "/dev/null"))']
-        if not c.network:
-            rules.append("(deny network*)")
-        if not c.spawn:
-            rules.append("(deny process-fork)")
-        return " ".join(rules)
-
-    # -- spawning ---------------------------------------------------------------------------
-
-    @contextlib.contextmanager
-    def spawn(
-        self, confinement: Confinement, argv: Sequence[str], cwd: pathlib.Path, base_env: dict[str, str] | None = None,
-    ) -> Iterator[Spawn]:
-        base = dict(os.environ) if base_env is None else base_env
-        if not confinement.restricts:
-            yield Spawn(list(argv), dict(base))
-            return
-        with scratch_for(confinement) as scratch:
-            env = environment(confinement.env, base, scratch)
-            fs = confinement.filesystem
-            if confinement.network and confinement.write_fs and confinement.spawn and isinstance(fs, HostFilesystem):
-                yield Spawn(list(argv), env)
-                return
-            sandbox_exec = shutil.which("sandbox-exec")
-            if sandbox_exec is None:
-                raise JailUnavailable("sandbox-exec is not available; a jailed grant cannot run without it")
-            exe = executable(argv, env) if isinstance(fs, PolicyFilesystem) else None
-            yield Spawn([sandbox_exec, "-p", self.profile(confinement, scratch, exe), *argv], env)

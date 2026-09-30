@@ -30,8 +30,7 @@ def WRITE : Says := .grant .writable
 def NO_WRITE : Says := .restrict .noWrite
 def HIDDEN : Says := .restrict .hidden
 
-def filter (dir : String) (layers : List (Says × Region)) : Filter :=
-  { directory := splitPath dir, layers := layers.toArray.map fun (says, region) => { region, says } }
+def filter (dir : String) (layers : List (Says × Region)) : Filter := Filter.make (splitPath dir) layers
 
 abbrev T := StateT (Array String) IO
 
@@ -104,16 +103,20 @@ def layerCases : T Unit := do
   check "hidden: notes.txt shows" (home.visible (at_ ["notes.txt"]) false)
   check "hidden: notes.txt does not open" (!home.readable (at_ ["notes.txt"]))
   check "hidden: proj shows" (home.visible (at_ ["proj"]) true)
-  check "hidden: .ssh does not" (!home.visible (at_ [".ssh"]) true)
-  check "hidden: .ssh/id does not" (!home.visible (at_ [".ssh", "id_ed25519"]) false)
+  check "hidden: .ssh shows its name" (home.visible (at_ [".ssh"]) true)
+  check "hidden: .ssh does not list" (!home.readable (at_ [".ssh"]))
+  check "hidden: .ssh is hidden, though nothing granted it" (home.hidden (at_ [".ssh"]))
+  check "hidden: proj is not" (!home.hidden (at_ ["proj"]))
+  check "hidden: .ssh/id does not show (inside a hidden directory)" (!home.visible (at_ [".ssh", "id_ed25519"]) false)
   check "hidden: .ssh/id unwritable" (!home.mayWrite (at_ [".ssh", "id_ed25519"]))
   let known := filter "/h" [(READ, subtree "/h"), (HIDDEN, subtree "/h/.ssh"), (READ, exactly "/h/.ssh/known_hosts")]
   check "on the way to known_hosts" (known.visible (at_ [".ssh"]) true)
   check "the hidden listing shows that alone" (!known.readable (at_ [".ssh"]))
+  check ".ssh, granted then hidden, is hidden" (known.hidden (at_ [".ssh"]))
   check "known_hosts reads" (known.readable (at_ [".ssh", "known_hosts"]))
   check "id_ed25519 stays hidden" (!known.visible (at_ [".ssh", "id_ed25519"]) false)
   let before := filter "/h" [(READ, exactly "/h/.ssh/known_hosts"), (READ, subtree "/h"), (HIDDEN, subtree "/h/.ssh")]
-  check "a grant before the hide: .ssh" (!before.visible (at_ [".ssh"]) true)
+  check "a grant before the hide: .ssh shows, hidden" (before.visible (at_ [".ssh"]) true && before.hidden (at_ [".ssh"]))
   check "a grant before the hide: known_hosts" (!before.readable (at_ [".ssh", "known_hosts"]))
   -- a name no regex can read fails closed: a hide by pattern hides it, a grant by pattern does not grant it
   let odd : Name := ⟨"key".toUTF8 ++ ⟨#[0xff]⟩ ++ ".pem".toUTF8⟩
@@ -164,7 +167,7 @@ def specCases : T Unit := do
     check "spec: other/x" (!f.readable (at_ ["other", "x"]))
     check "spec: out/new" (f.mayWrite (at_ ["out", "new"]))
     check "spec: out/x/.git/config" (!f.mayWrite (at_ ["out", "x", ".git", "config"]))
-    check "spec: docs/private" (!f.visible (at_ ["docs", "private"]) true)
+    check "spec: docs/private shows, hidden" (f.visible (at_ ["docs", "private"]) true && f.hidden (at_ ["docs", "private"]))
     check "spec: docs/private/key" (!f.visible (at_ ["docs", "private", "key"]) false)
     check "spec: README" (f.readable (at_ ["README"]))
     check "spec: README.old" (!f.readable (at_ ["README.old"]))
@@ -230,11 +233,11 @@ def regexCases : T Unit := do
 def AT_FDCWD : Fd := UInt32.ofNat (4294967296 - 100)
 
 /-- A request as the kernel sends one: the 40-byte header, then *body*. -/
-def request (opcode : UInt32) (nodeid : UInt64) (body : ByteArray) : ByteArray :=
+def request (opcode : UInt32) (nodeid : UInt64) (body : ByteArray) (unique : UInt64 := 7) : ByteArray :=
   let h := Proto.buffer (40 + body.size)
   let h := wr32 h (40 + body.size).toUInt32
   let h := wr32 h opcode
-  let h := wr64 h 7  -- unique
+  let h := wr64 h unique
   let h := wr64 h nodeid
   let h := wr32 h 1000
   let h := wr32 h 1000
@@ -247,10 +250,15 @@ def cname (s : String) : ByteArray := s.toUTF8.push 0
 
 /-- The reply to *req*: its errno (0: none) and its body. -/
 def ask (core : Core) (req : ByteArray) : IO (UInt32 × ByteArray × Core) := do
-  let (reply, core) ← answer {} core req
-  match reply with
+  let (replies, core) ← answer {} core req
+  match replies.find? (fun (head, _) => rd64 head 8 == rd64 req 8) with
   | some (head, body) => return (0 - rd32 head 4, body, core)
   | none => return (0, .empty, core)
+
+/-- Every reply *req* brings, its own and others': (request id, errno, body). -/
+def askAll (core : Core) (req : ByteArray) : IO (Array (UInt64 × UInt32 × ByteArray) × Core) := do
+  let (replies, core) ← answer {} core req
+  return (replies.map fun (head, body) => (rd64 head 8, 0 - rd32 head 4, body), core)
 
 def readIn (fh offset : UInt64) (size : UInt32) : ByteArray :=
   zeros (wr32 (wr64 (wr64 .empty fh) offset) size) 20
@@ -275,8 +283,8 @@ def protocolCases : T Unit := do
   let made ← Sys.symlinkat "a.txt".toUTF8 AT_FDCWD (dir ++ "/link").toUTF8
   check "a link is made" (made matches .ok _)
   let spec : Spec := { directory := dir, layers := #[
-    { region := .pattern (.splat #[] none) (splitPath dir), says := .grant .readOnly },
-    { region := .subtree (splitPath (dir ++ "/hidden")), says := .restrict .hidden }] }
+    (.grant .readOnly, .pattern (.splat #[] none) (splitPath dir)),
+    (.restrict .hidden, .subtree (splitPath (dir ++ "/hidden")))] }
   let core ← match ← Core.new spec with
     | .ok core => pure core
     | .error e => do check s!"the tree is served: {e}" false; return
@@ -288,8 +296,13 @@ def protocolCases : T Unit := do
   check "a.txt is a regular file" (rd32 body 100 &&& S_IFMT == 0o100000)
   check "its name keeps a second" (rd64 body 16 == 1)
   check "its attributes keep none" (rd64 body 24 == 0)
-  let (err, _, core) ← ask core (request 1 ROOT (cname "hidden"))
-  check "hidden does not look up" (err == ENOENT)
+  let (err, body, core) ← ask core (request 1 ROOT (cname "hidden"))
+  check "hidden looks up: its name shows" (err == 0 && rd32 body 100 &&& S_IFMT == S_IFDIR)
+  let hiddenIno := rd64 body 0
+  let (err, _, core) ← ask core (request 27 hiddenIno (zeros .empty 8))
+  check "hidden does not open for listing: EACCES" (err == EACCES)
+  let (err, _, core) ← ask core (request 1 hiddenIno (cname "secret"))
+  check "inside hidden, a lookup is EACCES" (err == EACCES)
   let (err, _, core) ← ask core (request 1 ROOT (cname "nothing"))
   check "a name not there does not look up" (err == ENOENT)
   -- GETATTR
@@ -310,8 +323,8 @@ def protocolCases : T Unit := do
   let (err, body, core) ← ask core (request 44 ROOT (readIn dh 0 4096))
   check "a listing answers" (err == 0)
   let names := (listed body 0 #[]).qsort (· < ·)
-  check s!"the listing shows a.txt, link and sub, not hidden: {names}" (names == #["a.txt", "link", "sub"])
-  let (err, body, core) ← ask core (request 44 ROOT (readIn dh 3 4096))
+  check s!"the listing shows a.txt, hidden (by name), link and sub: {names}" (names == #["a.txt", "hidden", "link", "sub"])
+  let (err, body, core) ← ask core (request 44 ROOT (readIn dh 4 4096))
   check "the listing's end is empty" (err == 0 && body.size == 0)
   let (err, _, core) ← ask core (request 29 ROOT (zeros (wr64 .empty dh) 16))
   check "releasedir" (err == 0)
@@ -401,7 +414,7 @@ def renameCases : T Unit := do
   IO.FS.writeFile (base / "dir1" / "f.txt") "eff"
   let dir := (← IO.FS.realPath base).toString
   let everything := [(READ, splat dir [] none), (WRITE, splat dir [] none)]
-  let spec : Spec := { directory := dir, layers := (filter dir everything).layers }
+  let spec : Spec := { directory := dir, layers := everything.toArray }
   let core ← match ← Core.new spec with
     | .ok core => pure core
     | .error e => do check s!"the writable tree is served: {e}" false; return
@@ -420,16 +433,94 @@ def renameCases : T Unit := do
   let (err, _, _) ← ask core (request 12 ROOT (renameIn ROOT "targetXYZ" "target"))
   check s!"and rename it into place (errno {err})" (err == 0)
   -- a later protection reaching below refuses
-  let guarded : Spec := { directory := dir, layers := (filter dir (everything ++ [(NO_WRITE, splat dir [] (some (named ".git")))])).layers }
+  let guarded : Spec := { directory := dir, layers := (everything ++ [(NO_WRITE, splat dir [] (some (named ".git")))]).toArray }
   let core ← match ← Core.new guarded with
     | .ok core => pure core
     | .error e => do check s!"the guarded tree is served: {e}" false; return
   let (err, _, _) ← ask core (request 12 ROOT (renameIn ROOT "dir2" "dir3"))
   check "under a later protection a directory does not rename" (err == EPERM)
 
+/-- `struct fuse_lk_in`: 48 bytes. -/
+def lkIn (fh owner : UInt64) (type : UInt32) (flock : Bool) (start : UInt64 := 0) (end_ : UInt64 := Proto.OFFSET_MAX) : ByteArray :=
+  let b := wr64 (wr64 (wr64 (wr64 .empty fh) owner) start) end_
+  wr32 (wr32 (wr32 (wr32 b type) 0) (if flock then Proto.LK_FLOCK else 0)) 0
+
+/-- `struct fuse_flush_in` and `struct fuse_release_in` share their shape: 24 bytes. -/
+def closeIn (fh : UInt64) (flags : UInt32) (owner : UInt64) : ByteArray :=
+  wr64 (wr32 (wr32 (wr64 .empty fh) 0) flags) owner
+
+def has (replies : Array (UInt64 × UInt32 × ByteArray)) (unique : UInt64) (errno : UInt32) : Bool :=
+  replies.any fun (u, e, _) => u == unique && e == errno
+
+def lockCases : T Unit := do
+  let some bin := (← IO.appPath).parent | check "the test binary has a directory" false
+  let base := (bin.parent.getD bin) / "test-tree-l"
+  if ← base.pathExists then IO.FS.removeDirAll base
+  IO.FS.createDirAll base
+  IO.FS.writeFile (base / "f.txt") "locked\n"
+  let dir := (← IO.FS.realPath base).toString
+  let spec : Spec := { directory := dir, layers := #[(READ, splat dir [] none), (WRITE, splat dir [] none)] }
+  let core ← match ← Core.new spec with
+    | .ok core => pure core
+    | .error e => do check s!"the lock tree is served: {e}" false; return
+  let (_, body, core) ← ask core (request 1 ROOT (cname "f.txt"))
+  let ino := rd64 body 0
+  let (err, body, core) ← ask core (request 14 ino (wr32 (wr32 .empty O.RDWR) 0))
+  let fh1 := rd64 body 0
+  let (err2, body, core) ← ask core (request 14 ino (wr32 (wr32 .empty O.RDWR) 0))
+  let fh2 := rd64 body 0
+  check "two opens of f.txt" (err == 0 && err2 == 0)
+  let .ok outside ← Sys.openPath (dir ++ "/f.txt").toUTF8 O.RDONLY | check "the test opens f.txt itself" false
+  -- flock(2): the open file's own, held on the backing file
+  let (err, _, core) ← ask core (request 32 ino (lkIn fh1 1 F.WRLCK true))
+  check "flock through one open" (err == 0)
+  let (err, _, core) ← ask core (request 32 ino (lkIn fh2 2 F.WRLCK true))
+  check "flock through another conflicts" (err == EAGAIN)
+  check "and a process outside the view meets it" (errnoOf (← Sys.flock outside (LOCK.SH ||| LOCK.NB)) == some EAGAIN)
+  let (rs, core) ← askAll core (request 33 ino (lkIn fh2 2 F.WRLCK true) 101)
+  check "a waiting flock is set aside, unanswered" (rs.isEmpty && core.parked.size == 1)
+  let (rs, core) ← askAll core (request 32 ino (lkIn fh1 1 F.UNLCK true) 102)
+  check "letting go answers the waiter" (has rs 102 0 && has rs 101 0 && core.parked.isEmpty)
+  let (err, _, core) ← ask core (request 32 ino (lkIn fh2 2 F.UNLCK true))
+  check "the waiter lets go" (err == 0)
+  -- POSIX locks: owners conflict with each other, never with themselves, and with processes outside
+  let (err, _, core) ← ask core (request 32 ino (lkIn fh1 10 F.WRLCK false 0 99))
+  check "a POSIX write lock" (err == 0)
+  let (err, _, core) ← ask core (request 32 ino (lkIn fh2 10 F.RDLCK false 50 149))
+  check "its owner, through another open, converts part of it" (err == 0)
+  let (err, _, core) ← ask core (request 32 ino (lkIn fh2 20 F.WRLCK false 0 9))
+  check "another owner conflicts" (err == EAGAIN)
+  let (err, body, core) ← ask core (request 31 ino (lkIn fh2 20 F.WRLCK false 0 9))
+  check s!"getlk names the conflict (errno {err})" (err == 0 && body.size == 24 && rd32 body 16 == F.WRLCK && rd64 body 0 == 0 && rd64 body 8 == 49)
+  let (err, body, core) ← ask core (request 31 ino (lkIn fh2 20 F.RDLCK false 200 299))
+  check "and none where there is none" (err == 0 && rd32 body 16 == F.UNLCK)
+  check "a process outside meets it" (errnoOf (← Sys.ofdLock outside F.RDLCK 0 10) == some EAGAIN)
+  let (err, _, core) ← ask core (request 25 ino (closeIn fh1 0 10))
+  check "a close lets go of the owner's locks" (err == 0 && !core.owners.contains (ino, 10))
+  let (err, _, core) ← ask core (request 32 ino (lkIn fh2 20 F.WRLCK false 0 9))
+  check "so another owner has it" (err == 0)
+  -- an interrupt answers a waiter EINTR, and one that came first answers its request at once
+  let (rs, core) ← askAll core (request 33 ino (lkIn fh1 30 F.WRLCK false 0 9) 201)
+  check "a waiting POSIX lock is set aside" (rs.isEmpty && core.parked.size == 1)
+  let (rs, core) ← askAll core (request 36 ROOT (wr64 .empty 201) 202)
+  check "an interrupt answers it EINTR, and itself nothing" (rs.size == 1 && has rs 201 EINTR && core.parked.isEmpty)
+  let (rs, core) ← askAll core (request 36 ROOT (wr64 .empty 301) 302)
+  check "an interrupt of a request not here yet is remembered" (rs.isEmpty && core.interrupted.contains 301)
+  let (rs, core) ← askAll core (request 33 ino (lkIn fh1 30 F.WRLCK false 0 9) 301)
+  check "and its request is answered EINTR on arrival" (has rs 301 EINTR && core.parked.isEmpty)
+  -- releases: a flush's owner lets go; a waiter through the handle is answered
+  let (rs, core) ← askAll core (request 33 ino (lkIn fh1 30 F.WRLCK false 0 9) 401)
+  check "one more waiter" (rs.isEmpty)
+  let (rs, core) ← askAll core (request 18 ino (closeIn fh1 0 0) 402)
+  check "a release answers the waiters through it" (has rs 402 0 && has rs 401 EBADF && core.parked.isEmpty)
+  let (err, _, core) ← ask core (request 18 ino (closeIn fh2 Proto.RELEASE_FLUSH 20))
+  check "a release that flushes lets go of its owner's locks" (err == 0 && !core.owners.contains (ino, 20))
+  check "and the file is free outside" (errnoOf (← Sys.ofdLock outside F.RDLCK 0 10) == none)
+  Sys.close outside
+
 def main : IO UInt32 := do
   let ((), failures) ← (do
-      filterCases; layerCases; moveCases; specCases; regexCases; shimCases; protocolCases; renameCases : T Unit).run #[]
+      filterCases; layerCases; moveCases; specCases; regexCases; shimCases; protocolCases; renameCases; lockCases : T Unit).run #[]
   if failures.isEmpty then
     IO.println "all cases pass"
     return 0

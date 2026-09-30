@@ -17,6 +17,15 @@ def nameAt (req : ByteArray) (i : Nat) : Op (Name × Nat) :=
   | some r => pure r
   | none => throw EINVAL
 
+/-- The lock a GETLK, SETLK or SETLKW asks about: `struct fuse_lk_in`, its pid left out. -/
+def lockIn (req : ByteArray) : Lock where
+  fh := rd64 req 40
+  owner := rd64 req 48
+  start := rd64 req 56
+  end_ := rd64 req 64
+  type := rd32 req 72
+  flock := rd32 req 80 &&& Proto.LK_FLOCK != 0
+
 /-- The reply body to *req*, none for a request that takes no reply; a thrown errno is the error
 reply. -/
 def handle (cfg : Config) (req : ByteArray) : Op (Option ByteArray) := do
@@ -94,7 +103,8 @@ def handle (cfg : Config) (req : ByteArray) : Op (Option ByteArray) := do
     return some (Proto.writeOut n)
   | 17 => -- STATFS
     return some (Proto.statfsOut (← statfs))
-  | 18 => -- RELEASE
+  | 18 => -- RELEASE: flags at 48, release_flags at 52, lock_owner at 56
+    if rd32 req 52 &&& Proto.RELEASE_FLUSH != 0 then dropOwner nodeid (rd64 req 56)
     release (rd64 req 40)
     return some .empty
   | 20 => -- FSYNC
@@ -102,7 +112,17 @@ def handle (cfg : Config) (req : ByteArray) : Op (Option ByteArray) := do
     sys (Sys.fsync (rd64 req 40).toUInt32 datasync)
     return some .empty
   | 21 | 24 => throw ENOTSUP  -- SETXATTR, REMOVEXATTR
-  | 25 => return some .empty  -- FLUSH
+  | 25 => -- FLUSH, at each close: the closing process lets go of its POSIX locks on the file
+    dropOwner nodeid (rd64 req 56)
+    return some .empty
+  | 31 => -- GETLK
+    let (type, start, end_, pid) ← testLock nodeid (lockIn req)
+    return some (Proto.lkOut type start end_ pid)
+  | 32 => -- SETLK
+    tryLock nodeid (lockIn req)
+    return some .empty
+  | 33 => -- SETLKW: had now, or answered when it is free (the loop), or interrupted
+    waitLock (rd64 req 8) nodeid (lockIn req)
   | 27 => -- OPENDIR
     let fd ← opendir nodeid
     return some (Proto.openOut (Proto.buffer 16) fd.toUInt64 0)
@@ -113,26 +133,61 @@ def handle (cfg : Config) (req : ByteArray) : Op (Option ByteArray) := do
     let (name, _) ← nameAt req 56
     let (e, fd) ← create nodeid name (rd32 req 44) (rd32 req 40)
     return some (Proto.createOut e.ino e.st cfg.ttls fd.toUInt64 fileFlags)
-  | 36 => return none  -- INTERRUPT: every request here is answered at once
+  | 36 => -- INTERRUPT: a waiting lock is answered EINTR; the interrupt itself takes no reply
+    interrupt (rd64 req 40)
+    return none
   | 38 => return some .empty  -- DESTROY
   | 44 => -- READDIRPLUS
     Sys.count 2
     return some (← readdirplus (rd64 req 40) (rd64 req 48) (rd32 req 56).toNat cfg.ttls)
   | _ => throw ENOSYS
 
-/-- *req* answered against *core*: the reply to write (none for none), and the tables after. -/
-def answer (cfg : Config) (core : Core) (req : ByteArray) : IO (Option (ByteArray × ByteArray) × Core) := do
+abbrev Replies := Array (ByteArray × ByteArray)
+
+/-- The replies *core* holds for requests other than the current one, and the tables without them. -/
+def drained (core : Core) : Replies × Core := (core.outbox, { core with outbox := #[] })
+
+/-- *req* answered against *core*: the replies to write -- its own (none for none), then those to
+waiting locks it let finish -- and the tables after. -/
+def answer (cfg : Config) (core : Core) (req : ByteArray) : IO (Replies × Core) := do
   let unique := rd64 req 8
   let (result, core) ← ((handle cfg req).run).run core
-  let reply := match result with
-    | .ok none => none
-    | .ok (some body) => some (Proto.header unique body.size, body)
-    | .error e => some (Proto.errorHeader unique e, .empty)
-  return (reply, core)
+  -- a request may have let a lock go: every waiter tried again
+  let (_, core) ← (retryParked.run).run core
+  let own : Replies := match result with
+    | .ok none => #[]
+    | .ok (some body) => #[(Proto.header unique body.size, body)]
+    | .error e => #[(Proto.errorHeader unique e, .empty)]
+  let (others, core) := drained core
+  return (own ++ others, core)
+
+/-- The waiters tried again with no request to answer: the loop's tick. -/
+def retry (core : Core) : IO (Replies × Core) := do
+  let (_, core) ← (retryParked.run).run core
+  return drained core
+
+def send (fd : Fd) (replies : Replies) : IO Unit := do
+  for (head, body) in replies do
+    discard <| Sys.writev fd head body  -- ENOENT: the request was interrupted meanwhile
+
+/-- How long the loop waits for a request while a lock waits, in milliseconds, before trying the
+waiters again: a lock let go of outside the view is noticed within it. -/
+def TICK : UInt32 := 10
 
 /-- Answer requests until the view is unmounted. *buf* is the last request's buffer, handed back to
-be read into again: nothing holds it once its request is answered. -/
+be read into again: nothing holds it once its request is answered. While a lock waits, the loop
+never blocks longer than a tick: the waiter is tried again at each. -/
 partial def serve (cfg : Config) (fd : Fd) (core : Core) (buf : ByteArray) : IO Unit := do
+  if !core.parked.isEmpty then
+    match ← Sys.waitReadable fd TICK with
+    | .ok true => pure ()
+    | .ok false =>
+      let (replies, core) ← retry core
+      send fd replies
+      return ← serve cfg fd core buf
+    | .error e =>
+      if e == EINTR then return ← serve cfg fd core buf
+      throw (IO.userError s!"waiting on the FUSE device: errno {e}")
   match ← Sys.fuseRead fd buf Proto.REQUEST_BUFFER with
   | .error e =>
     if e == ENODEV then return  -- unmounted
@@ -140,9 +195,8 @@ partial def serve (cfg : Config) (fd : Fd) (core : Core) (buf : ByteArray) : IO 
     throw (IO.userError s!"reading the FUSE device: errno {e}")
   | .ok req =>
     if req.size < 40 then return ← serve cfg fd core req
-    let (reply, core) ← answer cfg core req
-    if let some (head, body) := reply then
-      discard <| Sys.writev fd head body  -- ENOENT: the request was interrupted meanwhile
+    let (replies, core) ← answer cfg core req
+    send fd replies
     serve cfg fd core req
 
 /-- The kernel's first request is INIT: answered here, before anything else is served. -/

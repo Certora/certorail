@@ -1,13 +1,18 @@
 """Taking shapes back from an applied ruleset (``[[deny]]``), replacing one (``override = true``),
 and a ruleset's obligation on the root's writes (``[filesystem] no-write``)."""
+import os
 import pathlib
+import sys
+import tempfile
 import unittest
 
 from certorail import markers
 from certorail.analysis import DirSplat, Named, StaticPath
 from certorail.host import Accepted, Rejected
-from certorail.sandbox.lowering import Bind
-from certorail.sandbox.program import lower_program
+from certorail.sandbox.facts import Disk
+from certorail.sandbox.place import BwrapPlan, HostBase, place_bubblewrap
+from certorail.sandbox.program import ProgramJail, program_jail
+from certorail.world import World
 from certorail.host import check as host_check
 from certorail.policy import Policy
 from certorail.policyfile import PolicyFileError, from_data
@@ -207,18 +212,19 @@ class TestNoWrite(RulesetCase):
         self.assertIn("- protected (no write may touch these", describe(policy, "p.toml", None))
         self.assertIn("): secrets/**", describe(policy, "p.toml", None))
 
-    def test_concrete_protections_reach_the_jail(self) -> None:
+    def test_host_mode_holds_protections_by_name_alone(self) -> None:
+        # host mode is the user's authority: a protection holds where the analysis checks names,
+        # and a link out of the grants is followed (FLOORS.md); the policy view holds it in its jail
         policy = Policy.allow(
             write=[markers.within(".")],
             no_write=[markers.within("secrets"), markers.within("/etc/certorail"), markers.within("repos", leaf=markers.matches(r"\.git"))],
         )
-        # the wildcard one is the analysis' alone
-        jail = lower_program(policy, pathlib.Path("/work"), patterns=False)
-        self.assertEqual(
-            [g.path for g in jail.protected if isinstance(g, Bind)],
-            [pathlib.Path("/work/secrets"), pathlib.Path("/etc/certorail")],
-        )
-        self.assertEqual(len(jail.omitted), 1)  # the wildcard one is the analysis' alone
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(os.path.realpath(tmp))
+            (root / "secrets").mkdir()
+            jail = program_jail(policy, World(), root, sys.executable, ())
+            assert isinstance(jail, ProgramJail)
+            self.assertEqual(place_bubblewrap(jail.grants, Disk()), BwrapPlan(HostBase(True), ()))  # the host's /, nothing more
 
     def test_a_ruleset_spells_no_absolute_protection(self) -> None:
         self.ruleset("abs.toml", 'ruleset-version = 1\n[filesystem]\nno-write = ["/etc/**"]\n')

@@ -142,6 +142,8 @@ class TestShapeErrors(unittest.TestCase):
 
     def test_closed_keys(self) -> None:
         self.assertEqual(problems('policy-version = 1\nroot = "/x"\ncolour = "blue"\n'), ["unknown key 'colour'"])
+        # nothing is left out of a jail any more, so strict has nothing to decide
+        self.assertEqual(problems('policy-version = 1\nstrict = true\n'), ["unknown key 'strict'"])
         self.assertTrue(any("holes.A" in p for p in problems(
             'policy-version = 1\n[[program]]\nname = "x"\ncwd = "."\nargv = ["x", "${A}"]\nholes.A = { any = true, min = 1 }\n'
         )))

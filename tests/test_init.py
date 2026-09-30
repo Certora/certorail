@@ -133,13 +133,15 @@ class TestInit(unittest.TestCase):
         s = self.run_init(Script())
         self.assertEqual(
             [q[:25] for q, _ in s.asked],
-            ["Apply the base ruleset to", "Give programs full read a", "Allow all programs the po"],
+            ["Apply the base ruleset to", "Give programs full read a", "Allow all programs the po",
+             "Run the program itself un"],
         )
-        self.assertEqual([d for _, d in s.asked], [True, True, False])  # allow-all defaults to no
+        self.assertEqual([d for _, d in s.asked], [True, True, False, False])  # allow-all and the view default to no
         self.assertEqual(s.prompted, [])
         file, policy = self.installed()
         self.assertNotIn("base = false", file.read_text())
         self.assertNotIn("default-allow", file.read_text())
+        self.assertNotIn("[system", file.read_text())  # every answer the default: nothing to write
         self.assertFalse(policy.default_allow)
         for kind in ("read", "write"):
             self.assertEqual([str(loc) for loc in getattr(policy, kind)], [str(loc) for loc in load_policy_file(file).read])
@@ -181,6 +183,14 @@ class TestInit(unittest.TestCase):
         self.assertIn("default-allow = true", file.read_text())
         self.assertTrue(policy.default_allow)
         self.assertFalse(policy.governed(ProgramName("git")))  # no rule names it: it runs ungoverned
+
+    def test_the_view(self) -> None:
+        from certorail.childjail import View
+
+        self.run_init(Script({"under the policy view": True}))
+        file, policy = self.installed()
+        self.assertIn('[system.exec]\nview = "policy"', file.read_text())
+        self.assertIs(policy.system.view, View.POLICY)
 
     def test_empty_answers_grant_nothing(self) -> None:
         self.run_init(Script({"full read": False}, typed=["", ""]))

@@ -43,6 +43,28 @@ structure Listing where
   entries : Option (Array (Name × Stat))
   deriving Inhabited
 
+/-- A lock the kernel asks for (`struct fuse_lk_in`): through the open file *fh*, for *owner*, over
+[*start*, *end_*] (`Proto.OFFSET_MAX`: to the end of the file), of *type* (`F.RDLCK`, `F.WRLCK`,
+`F.UNLCK`); flock(2)'s when *flock*, else fcntl(2)'s. -/
+structure Lock where
+  fh : UInt64
+  owner : UInt64
+  start : UInt64
+  end_ : UInt64
+  type : UInt32
+  flock : Bool
+  deriving Inhabited
+
+/-- `struct flock`'s length for the lock's span: 0 is to the end. -/
+def Lock.len (l : Lock) : UInt64 := if l.end_ == Proto.OFFSET_MAX then 0 else l.end_ - l.start + 1
+
+/-- A `SETLKW` the lock was not free for: its request, the file, the lock. -/
+structure Waiter where
+  unique : UInt64
+  ino : UInt64
+  lock : Lock
+  deriving Inhabited
+
 structure Core where
   rules : Filter
   /-- the served directory's path, and where the kernel reports it to be -/
@@ -59,6 +81,17 @@ structure Core where
   -- when no name leads to it any more
   openHandles : Std.HashMap UInt64 (Array UInt64)
   handleInodes : Std.HashMap UInt64 UInt64
+  -- locks. A POSIX lock owner (a process, to the kernel) holds its locks on a file through one
+  -- descriptor of its own, reopened from a handle on the file, as open-file-description locks: so
+  -- two owners conflict, as two processes do, and an owner never conflicts with itself
+  owners : Std.HashMap (UInt64 × UInt64) Fd
+  /-- the `SETLKW`s set aside until their lock is free: the loop never waits in a call -/
+  parked : Array Waiter
+  /-- interrupts that came before their request (the kernel delivers them first): a `SETLKW` among
+  them is answered EINTR on arrival. The newest few: request ids only grow -/
+  interrupted : Array UInt64
+  /-- replies to requests other than the one being answered: a waiter's lock had, or interrupted -/
+  outbox : Array (ByteArray × ByteArray)
 
 abbrev Op := ExceptT Errno (StateT Core IO)
 
@@ -281,6 +314,13 @@ def admit (parent : UInt64) (name : Name) (st? : Option Stat) : Op Entry := do
       { c with inodes := inodes, byPlace := c.byPlace.insert place ino }
     return ⟨ino, st⟩
 
+/-- Every lock owner's descriptor on *ino*, closed: the kernel has forgotten the file. -/
+def dropOwners (ino : UInt64) : Op Unit := do
+  for ((i, o), fd) in (← get).owners.toList do
+    if i == ino then
+      Sys.close fd
+      modify fun c => { c with owners := c.owners.erase (i, o) }
+
 /-- *count* of the kernel's references to *ino* let go. -/
 partial def unref (ino : UInt64) (count : UInt64) : Op Unit := do
   if ino == ROOT then return
@@ -290,6 +330,7 @@ partial def unref (ino : UInt64) (count : UInt64) : Op Unit := do
     modify fun c => { c with inodes := c.inodes.insert ino { n with refs := refs } }
     return
   modify fun c => { c with inodes := c.inodes.erase ino }
+  dropOwners ino
   match n.place with
   | .dir fd _ _ =>
     -- not if a newer inode took the key
@@ -335,6 +376,8 @@ def scan (fh parent : UInt64) : Op (Array (Name × Stat)) := do
 -- names: the filter lives here -------------------------------------------------------------------
 
 def lookup (parent : UInt64) (name : Name) : Op Entry := do
+  -- inside a hidden directory: may not look, and the refusal says so
+  if (← get).rules.hidden (← pathOf parent) then throw EACCES
   let st ← sys (Sys.fstatat (← parentFd parent) name)
   if !(← spelledAsStored parent name) then throw ENOENT  -- another spelling of an entry: not this name
   if !((← get).rules.visible (← childPath parent name) st.isDir) then
@@ -342,6 +385,9 @@ def lookup (parent : UInt64) (name : Name) : Op Entry := do
   admit parent name (some st)
 
 def opendir (ino : UInt64) : Op Fd := do
+  -- a hidden directory shows its name and lists nothing, loudly; a directory merely on the way
+  -- to a grant lists what is visible in it
+  if (← get).rules.hidden (← pathOf ino) then throw EACCES
   let h ← fdOf ino
   let fd ← tryFinally (sys (Sys.reopen h.fd (O.RDONLY ||| O.DIRECTORY))) h.release
   modify fun c => { c with listings := c.listings.insert fd.toUInt64 ⟨ino, none⟩ }
@@ -534,7 +580,104 @@ def openFile (ino : UInt64) (flags : UInt32) : Op Fd := do
   opened ino fd.toUInt64
   return fd
 
+-- locks: held on the backing files -----------------------------------------------------------
+
+/-- The object *fh* is on, reopened as widely as it allows: read-write, else write-only, else
+read-only. A write lock is only ever asked through a handle open for writing, which one of these
+then matches. -/
+def reopenWidest (fh : Fd) : IO (Except Errno Fd) := do
+  if let .ok fd ← Sys.reopen fh O.RDWR then return .ok fd
+  if let .ok fd ← Sys.reopen fh O.WRONLY then return .ok fd
+  Sys.reopen fh O.RDONLY
+
+/-- The descriptor that holds *l*'s owner's POSIX locks on *ino*: made once, from the handle the
+request came through. -/
+def ownerFd (ino : UInt64) (l : Lock) : Op Fd := do
+  if let some fd := (← get).owners[(ino, l.owner)]? then return fd
+  let fd ← sys (reopenWidest l.fh.toUInt32)
+  modify fun c => { c with owners := c.owners.insert (ino, l.owner) fd }
+  return fd
+
+/-- *l* tried now, never waiting: EAGAIN when another holds a lock that conflicts. A flock(2) lock
+is the open file's own, so it is taken on the handle itself (one backing descriptor per open); a
+POSIX one on its owner's descriptor. -/
+def tryLock (ino : UInt64) (l : Lock) : Op Unit := do
+  if l.flock then
+    let op := if l.type == F.RDLCK then LOCK.SH else if l.type == F.WRLCK then LOCK.EX else LOCK.UN
+    sys (Sys.flock l.fh.toUInt32 (op ||| LOCK.NB))
+  else if l.type == F.UNLCK && !(← get).owners.contains (ino, l.owner) then
+    return  -- an owner with no descriptor here holds nothing to let go of
+  else
+    let fd ← ownerFd ino l
+    tryCatch (sys (Sys.ofdLock fd l.type l.start l.len)) fun e =>
+      throw (if e == EACCES then EAGAIN else e)  -- POSIX lets a conflict be either
+
+/-- The lock that would conflict with *l* (`GETLK`): its type (`F.UNLCK`: none), span, holder. -/
+def testLock (ino : UInt64) (l : Lock) : Op (UInt32 × UInt64 × UInt64 × UInt32) := do
+  let r ← sys (Sys.ofdTest (← ownerFd ino l) l.type l.start l.len)
+  let start := rd64 r 8
+  let len := rd64 r 16
+  return ((rd64 r 0).toUInt32, start, if len == 0 then Proto.OFFSET_MAX else start + len - 1, (rd64 r 24).toUInt32)
+
+/-- *owner* lets go of every POSIX lock it holds on *ino*: its descriptor closed, which releases
+them, as a close of any descriptor a process has on a file does (FLUSH). -/
+def dropOwner (ino owner : UInt64) : Op Unit := do
+  let some fd := (← get).owners[(ino, owner)]? | return
+  Sys.close fd
+  modify fun c => { c with owners := c.owners.erase (ino, owner) }
+
+/-- A reply to a request other than the one being answered. -/
+def reply (unique : UInt64) (result : Except Errno ByteArray) : Op Unit :=
+  let message := match result with
+    | .ok body => (Proto.header unique body.size, body)
+    | .error e => (Proto.errorHeader unique e, ByteArray.empty)
+  modify fun c => { c with outbox := c.outbox.push message }
+
+/-- A `SETLKW` for *l*: had now, or set aside for the loop to try again -- none, no reply yet --
+unless its interrupt came first. -/
+def waitLock (unique ino : UInt64) (l : Lock) : Op (Option ByteArray) := do
+  if (← get).interrupted.contains unique then
+    modify fun c => { c with interrupted := c.interrupted.filter (· != unique) }
+    throw EINTR
+  try
+    tryLock ino l
+    return some .empty
+  catch e =>
+    if e != EAGAIN then throw e
+    modify fun c => { c with parked := c.parked.push ⟨unique, ino, l⟩ }
+    return none
+
+/-- The kernel's INTERRUPT of *unique*: a waiter answered EINTR; or, for a request not read yet
+(interrupts are delivered first), remembered. One already answered is forgotten with the rest. -/
+def interrupt (unique : UInt64) : Op Unit := do
+  let c ← get
+  match c.parked.find? (·.unique == unique) with
+  | some w =>
+    set { c with parked := c.parked.filter (·.unique != unique) }
+    reply w.unique (.error EINTR)
+  | none =>
+    let kept := if c.interrupted.size ≥ 64 then c.interrupted.extract 1 c.interrupted.size else c.interrupted
+    set { c with interrupted := kept.push unique }
+
+/-- Every waiter tried again: those whose lock is free now answered, the rest kept, in order. -/
+def retryParked : Op Unit := do
+  let waiting := (← get).parked
+  if waiting.isEmpty then return
+  modify fun c => { c with parked := #[] }
+  for w in waiting do
+    try
+      tryLock w.ino w.lock
+      reply w.unique (.ok .empty)
+    catch e =>
+      if e == EAGAIN then modify fun c => { c with parked := c.parked.push w }
+      else reply w.unique (.error e)
+
 def release (fh : UInt64) : Op Unit := do
+  -- a waiter through the handle let go of has nothing left to lock through; the handle's own
+  -- flock(2) lock goes with its descriptor
+  for w in (← get).parked do
+    if w.lock.fh == fh then reply w.unique (.error EBADF)
+  modify fun c => { c with parked := c.parked.filter (·.lock.fh != fh) }
   closed fh
   Sys.close fh.toUInt32
 
@@ -562,7 +705,11 @@ def Core.new (spec : Spec) : IO (Except String Core) := do
         nextInode := ROOT + 1
         listings := {}
         openHandles := {}
-        handleInodes := {} }
+        handleInodes := {}
+        owners := {}
+        parked := #[]
+        interrupted := #[]
+        outbox := #[] }
     | _, _ => return .error s!"{spec.directory}: cannot tell where it is"
 
 end Fuseview

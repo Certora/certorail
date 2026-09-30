@@ -2,7 +2,7 @@
 """Run the testbed scenario (scenario.toml) against a built root: every probe, every policy that
 must not load, every lint. Standard library only.
 
-    python3 run.py [--root ROOT] [--certorail CMD] [--no-build] [-v] [NAME ...]
+    python3 run.py [--root ROOT] [--certorail CMD] [--no-build] [--require-casefold] [-v] [NAME ...]
 
 Rebuilds the tree first (build.py: probes change it) unless --no-build, starts serve.py while
 the probes that need the network run, and prints one line per item -- PASS, FAIL with what
@@ -14,6 +14,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 
@@ -24,15 +25,28 @@ PLATFORM = "darwin" if sys.platform == "darwin" else "linux"
 
 
 class Runner:
-    def __init__(self, root: pathlib.Path, certorail: list[str], verbose: bool) -> None:
+    def __init__(self, root: pathlib.Path, certorail: list[str], verbose: bool, scratch: pathlib.Path) -> None:
         self.root = root
         self.certorail = certorail
         self.verbose = verbose
+        self.scratch = scratch
         self.failed = 0
 
     def certorail_run(self, *words: str | pathlib.Path) -> subprocess.CompletedProcess[str]:
         argv = [*self.certorail, *(str(w) for w in words)]
         return subprocess.run(argv, capture_output=True, text=True, timeout=300)
+
+    def policy(self, name: str) -> pathlib.Path:
+        """The policy file *name*, with the default root it spells (lints.toml's absolute write
+        grant) respelled as this run's root."""
+        path = TESTBED / name
+        text = path.read_text(encoding="utf-8")
+        if self.root == build.DEFAULT_ROOT or str(build.DEFAULT_ROOT) not in text:
+            return path
+        respelled = self.scratch / name
+        respelled.parent.mkdir(parents=True, exist_ok=True)
+        respelled.write_text(text.replace(str(build.DEFAULT_ROOT), str(self.root)), encoding="utf-8")
+        return respelled
 
     def report(self, verdict: str, name: str, detail: str = "", result: subprocess.CompletedProcess[str] | None = None) -> None:
         if verdict == "FAIL":
@@ -53,7 +67,7 @@ class Runner:
             return self.report("SKIP", name, "cf/ does not fold (README: chattr +F, then build.py again)")
         program = TESTBED / probe["program"]
         result = self.certorail_run(
-            "run", "--root", self.root, "--policy", TESTBED / probe.get("policy", "policy.toml"),
+            "run", "--root", self.root, "--policy", self.policy(probe.get("policy", "policy.toml")),
             program, "--", *probe.get("args", []),
         )
         rejected = f"{program}: rejected" in result.stderr
@@ -81,7 +95,7 @@ class Runner:
 
     def refused(self, item: dict) -> None:
         name = f"refused {item['policy']}"
-        result = self.certorail_run("describe", "--root", self.root, "--policy", TESTBED / item["policy"])
+        result = self.certorail_run("describe", "--root", self.root, "--policy", self.policy(item["policy"]))
         if result.returncode == 0:
             return self.report("FAIL", name, "it loaded", result)
         if item["error"] not in result.stderr + result.stdout:
@@ -91,13 +105,10 @@ class Runner:
     def lint(self, item: dict) -> None:
         name = f"lint {item['policy']}"
         kinds = item["darwin"]["kinds"] if PLATFORM == "darwin" and "darwin" in item else item["kinds"]
-        result = self.certorail_run("describe", "--root", self.root, "--policy", TESTBED / item["policy"])
+        result = self.certorail_run("describe", "--root", self.root, "--policy", self.policy(item["policy"]))
         missing = [k for k in kinds if f"lint ({k})" not in result.stderr]
         if result.returncode != 0 or missing:
-            hint = ""
-            if "shadowed-protection" in missing and self.root != build.DEFAULT_ROOT:
-                hint = f" (lints.toml spells the default root {build.DEFAULT_ROOT}; edit it to match {self.root})"
-            return self.report("FAIL", name, f"missing {', '.join(missing) or 'nothing'}{hint}", result)
+            return self.report("FAIL", name, f"missing {', '.join(missing) or 'nothing'}", result)
         self.report("PASS", name, ", ".join(kinds), result)
 
 
@@ -118,6 +129,7 @@ def main() -> int:
     parser.add_argument("--root", type=pathlib.Path, default=build.DEFAULT_ROOT)
     parser.add_argument("--certorail", default="certorail", help="the command, split like a shell would (e.g. 'uv run certorail')")
     parser.add_argument("--no-build", action="store_true", help="run against the tree as it is")
+    parser.add_argument("--require-casefold", action="store_true", help="fail, rather than skip the folding probes, when cf/ does not fold")
     parser.add_argument("-v", "--verbose", action="store_true", help="print every run's output, not only a failure's")
     ns = parser.parse_args()
     scenario = tomllib.loads((TESTBED / "scenario.toml").read_text(encoding="utf-8"))
@@ -131,8 +143,15 @@ def main() -> int:
             return 1
     casefold = PLATFORM == "darwin" or bool(build.casefolded(ns.root / "cf"))  # APFS folds by default
     print(f"platform {PLATFORM}; cf/ folds: {casefold}\n")
+    if ns.require_casefold and not casefold:
+        print("cf/ does not fold, and --require-casefold says it must (README: chattr +F, then build.py again)")
+        return 1
+    with tempfile.TemporaryDirectory(prefix="certorail-testbed-policies-") as scratch:
+        runner = Runner(ns.root, shlex.split(ns.certorail), ns.verbose, pathlib.Path(scratch))
+        return run_scenario(runner, scenario, probes, casefold, ns.names)
 
-    runner = Runner(ns.root, shlex.split(ns.certorail), ns.verbose)
+
+def run_scenario(runner: Runner, scenario: dict, probes: list[dict], casefold: bool, names: list[str]) -> int:
     server = None
     if any("network" in p.get("needs", []) for p in probes):
         server = subprocess.Popen([sys.executable, str(TESTBED / "serve.py")], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -146,7 +165,7 @@ def main() -> int:
     finally:
         if server is not None:
             server.terminate()
-    if not ns.names:
+    if not names:
         for item in scenario.get("refused", []):
             runner.refused(item)
         for item in scenario.get("lint", []):

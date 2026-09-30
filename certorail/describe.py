@@ -15,9 +15,11 @@ matching a regex, ``<(a|b)>`` one of, ``<path within L, M>`` a proven path, ``<l
 """
 from collections.abc import Iterable
 
-from certorail.analysis import pretty_location, pretty_regex
+from certorail.analysis import Named, StaticPath, location_le, pretty_location, pretty_regex
+from certorail.childjail import View
 from certorail.effects import EVERYTHING, Effects
 from certorail.ids import BUILTIN_ATOMS, NOT_OPTION, Atom, FlagName, SourceId
+from certorail.locations import enumerable_prefixes
 from certorail.policy import NetworkRule, Policy, Program, Validation, literal_slot, pretty_locations
 from certorail.templates import CWD, Constraint, Each, Flags, Flagset, HoleRef, Template, Token
 
@@ -121,7 +123,9 @@ def jail_line(rule: Program | Validation) -> str | None:
     """The grant's jail (childjail), when it restricts anything: what the OS denies the child.
     The media are enforced this way; ``writes`` stays the rule's claim."""
     j = rule.jail
-    if not j.restricts:
+    lifts = [f"{pretty_location(loc)} (readable, read-only)" for loc in rule.lift_read]
+    lifts += [f"{pretty_location(loc)} (writable)" for loc in rule.lift_write]
+    if not j.restricts and not lifts:
         return None
     parts: list[str] = []
     if not j.network:
@@ -143,6 +147,8 @@ def jail_line(rule: Program | Validation) -> str | None:
             passed = ", ".join(j.env.passed) if j.env.passed else "nothing passed through"
             sets = "".join(f"; sets {k}={v}" for k, v in j.env.sets)
             parts.append(f"environment: {passed}{sets}")
+    if lifts:
+        parts.append("let past this machine's redlines at: " + ", ".join(lifts))
     return "jailed (enforced by the OS): " + "; ".join(parts)
 
 
@@ -336,6 +342,46 @@ def _network(r: NetworkRule, policy: Policy) -> str:
     return line
 
 
+def _runtime(policy: Policy) -> list[str]:
+    """What the certorail process meets at run time beyond the checked names (FLOORS.md): the
+    places an accepted program can still fail mid-run."""
+    s = policy.system
+    if s.view is View.POLICY:
+        lines = ["- policy view: the program sees only the filesystem above (and the interpreter's own "
+                 "files); a read or write through a name that resolves outside the grants fails at run time"]
+        also = [pretty_location(loc) for loc in (*s.additions.read, *s.additions.write)]
+        if also:
+            lines.append(f"- the program also sees: {', '.join(also)}")
+        return lines
+    return ["- host view: the program reaches files through the names above, wherever those names lead; at run "
+            "time only this machine's floor (world.toml) and unix permissions refuse an access"]
+
+
+def fixed_line(policy: Policy) -> str | None:
+    """The directories the policy's protections fix in place, in the OS jail: names, not objects,
+    so renaming a directory removes every name below it, and a protected name below a writable
+    directory fixes each directory on the way to it. What is in them stays writable."""
+    fixed: dict[str, None] = {}
+    patterned: list[str] = []
+    for protected in policy.no_write:
+        for prefix in enumerable_prefixes(protected):
+            literal = StaticPath(tuple(Named(n) for n in prefix), protected.absolute)
+            # strictly above the protected names -- the literal prefix too, where a pattern below
+            # it says which names they are
+            covered = location_le(literal, protected)
+            if not covered:
+                patterned.append(pretty_location(protected))
+            for k in range(1, len(prefix) + (0 if covered else 1)):
+                d = StaticPath(tuple(Named(n) for n in prefix[:k]), protected.absolute)
+                if any(location_le(d, w) for w in policy.write) and not any(location_le(d, n) for n in policy.no_write):
+                    fixed[pretty_location(d)] = None
+    listed = [*fixed, *(f"every directory on the way to a name {p} matches" for p in dict.fromkeys(patterned))]
+    if not listed:
+        return None
+    return ("- fixed in place (a protected name lies below each: in the OS jail it cannot be renamed, removed or "
+            "replaced, though what is in it stays writable): " + "; ".join(listed))
+
+
 def _section(title: str, lines: Iterable[str]) -> list[str]:
     body = list(lines)
     return [f"## {title}", *(body or ["- none"]), ""]
@@ -370,6 +416,8 @@ def describe(policy: Policy, origin: str, governs: str | None = None) -> str:
             "- protected (no write may touch these, whatever write grants; a written path must "
             "provably lie outside them): " + ", ".join(pretty_location(loc) for loc in policy.no_write)
         )
+        if (fixed := fixed_line(policy)) is not None:
+            fs.append(fixed)
     defined = frozenset(a.name for a in policy.atoms)
     programs = [line for p in policy.programs for line in _program(p, policy)]
     if policy.default_allow:
@@ -385,6 +433,7 @@ def describe(policy: Policy, origin: str, governs: str | None = None) -> str:
     return "\n".join(
         head
         + _section("Filesystem", fs)
+        + _section("At run time", _runtime(policy))
         + _section("Programs: certora.exec(<words>, <holes>, cwd=<proven path>)", programs)
         + _section("Validations", validations)
         + (

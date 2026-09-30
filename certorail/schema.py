@@ -494,23 +494,37 @@ class AtomDecl(_Table):
 # ---------------------------------------------------------------------------
 
 
-class ExecDecl(_Table):
-    """``exec``: the rest of how the grant's child is run (JAILS.md, ``childjail``), beyond the
-    media keys -- the environment (``env``: a list whose strings name variables passed through
-    from the host and whose tables set variables to literal values; absent: the host's whole
-    environment), whether it may create processes (``spawn``), and what it sees of the
-    filesystem (``view``: ``"host"``, the host's whole filesystem, or ``"policy"``, only what the
-    policy's filesystem section grants, MOUNTS.md). Enforced by the OS jail; all default to the
-    unjailed baseline."""
+class ExecViewDecl(_Table):
+    """What a process sees of the filesystem (MOUNTS.md, FLOORS.md) -- the half of ``exec`` a
+    grant's tool and the certorail process itself share: ``view`` (``"host"``, the host's whole
+    filesystem, or ``"policy"``, only what the policy's filesystem section grants); under the
+    policy view, what the process sees beyond the section, mounted read-only or writable; and in
+    either view, the machine's redlines it is let past (``lift-read``, readable and read-only;
+    ``lift-write``, writable: REDLINES.md), in a root policy only. The analysis never reads
+    these: they shape a process's world, not the program's names."""
+
+    view: Literal["host", "policy"] = "host"
+    mount_read: Locations | None = None
+    mount_write: Locations | None = None
+    lift_read: Locations | None = None
+    lift_write: Locations | None = None
+
+    @model_validator(mode="after")
+    def _mounts_need_the_view(self) -> "ExecViewDecl":
+        if self.view != "policy" and (self.mount_read is not None or self.mount_write is not None):
+            raise ValueError('mount-read / mount-write widen the policy view: they need view = "policy"')
+        return self
+
+
+class ExecDecl(ExecViewDecl):
+    """``exec`` on a grant: the rest of how its child is run (JAILS.md, ``childjail``), beyond
+    the media keys -- the environment (``env``: a list whose strings name variables passed
+    through from the host and whose tables set variables to literal values; absent: the host's
+    whole environment), whether it may create processes (``spawn``), and the view. Enforced by
+    the OS jail; all default to the unjailed baseline."""
 
     env: Annotated[list[str | dict[str, str]], BeforeValidator(_listed)] | None = None
     spawn: bool = True
-    view: Literal["host", "policy"] = "host"
-    # under view = "policy": locations this grant's child sees beyond the policy's filesystem
-    # section (MOUNTS.md) -- mounted read-only, or writable (which needs write-fs = true). The
-    # analysis never sees them: they widen the tool's world, not the program's
-    mount_read: Locations | None = None
-    mount_write: Locations | None = None
 
     @field_validator("env")
     @classmethod
@@ -519,11 +533,17 @@ class ExecDecl(_Table):
             environment_spec(items)  # names are names, each mentioned once, none the host's own
         return items
 
-    @model_validator(mode="after")
-    def _mounts_need_the_view(self) -> "ExecDecl":
-        if self.view != "policy" and (self.mount_read is not None or self.mount_write is not None):
-            raise ValueError('mount-read / mount-write widen the policy view: they need view = "policy"')
-        return self
+
+class SystemExecDecl(ExecViewDecl):
+    """``[system.exec]``: the view of the certorail process itself. Its network (the broker
+    only) and process creation (none) are fixed, so the table has no ``env`` or ``spawn``."""
+
+
+class SystemDecl(_Table):
+    """``[system]`` (FLOORS.md): the certorail process at run time -- ``exec``, its view. Root
+    policies only."""
+
+    exec_: SystemExecDecl | None = None
 
 
 _RETIRED_MEDIA_KEYS = {
@@ -554,6 +574,8 @@ class _Media(_Table):
     def _writable_mounts_need_the_medium(self) -> "_Media":
         if self.exec_ is not None and self.exec_.mount_write is not None and not self.write_fs:
             raise ValueError("exec.mount-write on a grant with write-fs = false: nothing it mounts could be written")
+        if self.exec_ is not None and self.exec_.lift_write is not None and not self.write_fs:
+            raise ValueError("exec.lift-write on a grant with write-fs = false: nothing it lifts could be written")
         return self
 
 
@@ -792,6 +814,40 @@ class DenyDecl(_Table):
     argv: Annotated[list[Annotated[str, AfterValidator(_literal_word)]], Field(min_length=1)]
 
 
+class EditExecDecl(_Table):
+    """An ``[[edit]]``'s ``exec``: the keys of a grant's ``exec`` table, each optional. A value
+    replaces the target's; a list is added to the target's."""
+
+    view: Literal["host", "policy"] | None = None
+    spawn: bool | None = None
+    env: Annotated[list[str | dict[str, str]], BeforeValidator(_listed)] | None = None
+    mount_read: Locations | None = None
+    mount_write: Locations | None = None
+    lift_read: Locations | None = None
+    lift_write: Locations | None = None
+
+
+class EditDecl(_Table):
+    """``[[edit]]`` (REDLINES.md): an amendment of one rule an applied ruleset grants, without
+    restating it -- its ``exec`` table, and nothing else: how the tool is run, never what the
+    program may ask of it (``override``'s) or what the analysis assumes of it (the media). The
+    target is a program rule by its leading words, or a validation by its name, narrowed by
+    ``from``, the ruleset as ``[[apply]]`` names it. Root policies only."""
+
+    program: str | None = None
+    validation: str | None = None
+    from_: str | None = None
+    exec_: EditExecDecl
+
+    @model_validator(mode="after")
+    def _one_target(self) -> "EditDecl":
+        if (self.program is None) == (self.validation is None):
+            raise ValueError("an edit targets one rule: program = \"<leading words>\" or validation = \"<name>\"")
+        if self.program is not None and not self.program.split():
+            raise ValueError("program names a rule by its leading words: one or more words")
+        return self
+
+
 class Protected(_Table):
     """``[filesystem] no-write``: locations no program write may touch, whatever ``write``
     grants -- a write that may lie at or below one is denied. A ruleset's obligation on every
@@ -864,12 +920,13 @@ class PolicyDoc(_Vocabulary):
     # a named program keeps its shapes (fail closed). A `[filesystem]` kind left unwritten is
     # then `**`. Root policies only: a ruleset has no such key
     default_allow: bool = False
-    # refuse a run whose confined grants the jail cannot express exactly (a location it would
-    # omit, a protection not there to bind yet) instead of warning and running. Root only
-    strict: bool = False
     filesystem: Filesystem = Field(default_factory=Filesystem)
     network: list[NetworkDecl] = Field(default_factory=list)
     deny: list[DenyDecl] = Field(default_factory=list)
+    # amendments of the applied rulesets' rules: their exec tables (REDLINES.md). Root only
+    edit: list[EditDecl] = Field(default_factory=list)
+    # the certorail process at run time: its view (FLOORS.md). Root only
+    system: SystemDecl = Field(default_factory=SystemDecl)
 
     @field_validator("root")
     @classmethod
@@ -898,6 +955,88 @@ class RulesetDoc(_Vocabulary):
             if _REF.fullmatch("${" + name + "}") is None:
                 raise ValueError(f"parameter names are letters, digits, '_' and '-': {name!r}")
         return params
+
+
+# ---------------------------------------------------------------------------
+# world.toml: machine configuration (FLOORS.md), namespaced by the process it configures
+# ---------------------------------------------------------------------------
+
+
+def _machine_path(text: str) -> str:
+    if not (text.startswith("/") or text == "~" or text.startswith("~/")):
+        raise ValueError(f"expected an absolute path, or one under ~: {text!r}")
+    return text
+
+
+type MachinePath = Annotated[str, AfterValidator(_machine_path)]
+type MachinePaths = Annotated[list[MachinePath], BeforeValidator(_listed)]
+
+
+class RedlineDecl(_Table):
+    """A redline's table form: the path, and whether a root policy may lift it for one of its
+    grants (REDLINES.md). The string form is ``can-override = true``."""
+
+    path: MachinePath
+    can_override: bool = True
+
+
+type Redlines = Annotated[list[MachinePath | RedlineDecl], BeforeValidator(_listed)]
+
+
+class FloorDecl(_Table):
+    """``[system.floor]``: what no process may ever write, and what none may ever see."""
+
+    never_write: Redlines = Field(default_factory=list)
+    never_visible: Redlines = Field(default_factory=list)
+
+
+class InterpreterDecl(_Table):
+    """``[system.interpreter]``: what the certorail process's interpreter reads that discovery
+    does not find (under the policy view)."""
+
+    read: MachinePaths = Field(default_factory=list)
+
+
+class SystemWorldDecl(_Table):
+    floor: FloorDecl = Field(default_factory=FloorDecl)
+    interpreter: InterpreterDecl = Field(default_factory=InterpreterDecl)
+
+
+STABLE_SELECTORS = ("nothing", "tops", "home", "home-dots", "root", "xdg")
+
+
+def _stable_entry(text: str) -> str:
+    if text in STABLE_SELECTORS:
+        return text
+    if text.startswith("/") or text == "~" or text.startswith("~/"):
+        return text
+    raise ValueError(f"expected one of {', '.join(STABLE_SELECTORS)}, an absolute path, or one under ~: {text!r}")
+
+
+type StableEntries = Annotated[list[Annotated[str, AfterValidator(_stable_entry)]], BeforeValidator(_listed)]
+
+
+class WorldDoc(_Table):
+    """``world.toml``. ``[system.*]`` is the certorail process; ``[tools]`` is reserved for what a
+    tool's policy view holds besides the policy (MOUNTS.md), not yet read. ``view-daemon`` is how
+    the view daemon caches names: ``"cached"`` (a directory's entries for a second: the speed of
+    every path walk through a view) or ``"strict"`` (no cache: a directory replaced from outside
+    the jail is seen at once, and a bind mount over it comes loose at once). ``stable`` is the
+    machine's stability model (REDLINES.md, "Stability"): which directories nothing replaces while
+    a jail lives, so that a mount may rest on them -- selectors (``"tops"``: the top-level
+    directories; ``"home"``; ``"home-dots"``: the dot directories in it; ``"root"``: the sandbox
+    root; ``"xdg"``: the XDG base directories under home), absolute paths, or ``"nothing"`` alone."""
+
+    system: SystemWorldDecl = Field(default_factory=SystemWorldDecl)
+    view_daemon: Literal["cached", "strict"] = "cached"
+    stable: StableEntries = Field(default_factory=lambda: ["home", "tops"])
+
+    @field_validator("stable")
+    @classmethod
+    def _nothing_alone(cls, entries: list[str]) -> list[str]:
+        if "nothing" in entries and len(entries) > 1:
+            raise ValueError('"nothing" stands alone: it says no directory is stable')
+        return entries
 
 
 # ---------------------------------------------------------------------------
@@ -963,6 +1102,14 @@ def parse_ruleset(data: object, where: str) -> RulesetDoc:
     """The typed ruleset document, or ``SchemaError`` with every shape problem."""
     try:
         return RulesetDoc.model_validate(data, context={"where": where})
+    except ValidationError as e:
+        raise SchemaError(where, _format(e)) from None
+
+
+def parse_world(data: object, where: str) -> WorldDoc:
+    """The typed ``world.toml``, or ``SchemaError`` with every shape problem."""
+    try:
+        return WorldDoc.model_validate(data, context={"where": where})
     except ValidationError as e:
         raise SchemaError(where, _format(e)) from None
 

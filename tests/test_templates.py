@@ -5,6 +5,7 @@ import pathlib
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 from certorail import markers
 from certorail.analysis import ANY_NAME, DirSplat, Exact, Located, Named, StaticPath, StrFact
@@ -753,8 +754,7 @@ class TestBrokerRoundTrip(unittest.TestCase):
     def test_markers_exec_sends_the_bindings(self) -> None:
         program_end = channel(self.server.broker)
         self.addCleanup(program_end.close)
-        os.environ["CERTORAIL_BROKER_FD"] = str(program_end.fileno())
-        self.addCleanup(os.environ.pop, "CERTORAIL_BROKER_FD", None)
+        self.enterContext(mock.patch.object(markers, "BROKER_FD", program_end.fileno()))
         result = markers.exec("printf", "%s+%s\\n", ARGS=["x", "y"], cwd=".")
         self.assertEqual(result.stdout_lines(), ["x+y"])
         with self.assertRaises(TypeError):
@@ -825,8 +825,7 @@ class TestStreaming(unittest.TestCase):
     def test_markers_exec_streams(self) -> None:
         program_end = channel(self.server.broker)
         self.addCleanup(program_end.close)
-        os.environ["CERTORAIL_BROKER_FD"] = str(program_end.fileno())
-        self.addCleanup(os.environ.pop, "CERTORAIL_BROKER_FD", None)
+        self.enterContext(mock.patch.object(markers, "BROKER_FD", program_end.fileno()))
         result = markers.exec("sh", "-c", "echo live", cwd=".", stream=True)
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b"", b""))
         self.assertIn("live\n", self.terminal_text())

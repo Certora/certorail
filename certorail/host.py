@@ -16,19 +16,24 @@ the plugin's hook, kept out of ``--help``.)
 2. ``Policy.evaluate``: every proven sink and every ``certora.exec`` against the policy. Any
    denial rejects the program.
 3. ``rewrite``: ``assert`` hardened, ``@certora.checked`` on contracted functions.
-4. Run: the rewritten source in a fresh interpreter (``-I -P``: no environment, no cwd on
-   ``sys.path``) with the sandbox root as cwd, ``certora`` bound to ``certorail.markers`` and
-   ``sys.argv`` set to the program's arguments -- inside an OS jail: no network, writes
-   confined to the policy's write surface, no fork or exec, and the broker reached over one
-   inherited socket, the single door out. Nothing of the run is a file anyone could name: the
-   bootstrap is the command line (``-c``), and the program source and, on macOS, the Seatbelt
-   profile reach the child as inherited descriptors to unlinked files, so what runs is what
-   was analysed. On Linux the jail is bubblewrap around the interpreter plus the bootstrap's
-   seccomp filter; on macOS the bootstrap itself installs the whole jail with one
-   ``sandbox_init`` (``selfjail``), since a process already inside a Seatbelt sandbox cannot
-   sandbox itself again, so nothing may wrap it first. The static analysis is the primary
-   confinement; the jail is where anything it missed goes to die. Without bubblewrap a Linux
-   run proceeds with a loud warning (or quietly with ``--no-jail``).
+4. Run: the rewritten source in a fresh interpreter (``-I -P``: no ``PYTHON*`` settings, no cwd
+   on ``sys.path``; the bootstrap clears the environment before the program runs) with the
+   sandbox root as cwd, ``certora`` bound to ``certorail.markers`` and
+   ``sys.argv`` set to the program's arguments -- inside an OS jail: no network, no fork or
+   exec, and the broker reached over one inherited socket, the single door out; the filesystem
+   as the view says (the host's, or the policy's). Nothing of the run is a file anyone could
+   name: the bootstrap is the command line (``-c``), and the program source, in host mode the
+   floor guard's document and, on macOS, the Seatbelt profile reach the child as inherited
+   descriptors to unlinked files, so what runs is what was analysed. On Linux the jail is
+   bubblewrap around the interpreter plus the bootstrap's seccomp filter; on macOS the
+   bootstrap itself installs the whole jail with one ``sandbox_init`` (``selfjail``), since a
+   process already inside a Seatbelt sandbox cannot sandbox itself again, so nothing may wrap
+   it first. In host mode the bootstrap also installs the floor guard (``floorguard``), which
+   holds this machine's redlines (``never-write``, ``never-visible``) where each path leads.
+   The static analysis is the primary confinement; the jail is where anything it missed goes
+   to die. A jail that cannot be had refuses the run: without bubblewrap before anything runs,
+   a self-jail that does not install before the program does. ``--no-jail`` runs the program
+   with no jail of its own; its tools and checkers keep theirs.
 
 The policy is a TOML (or JSON) document (``policyfile``), given with ``--policy`` or discovered
 ambiently for the root (``policydir``); without one, ``policyfile.default_policy`` applies: read,
@@ -42,7 +47,6 @@ import contextlib
 import os
 import pathlib
 import shlex
-import shutil
 import socket
 import subprocess
 import sys
@@ -52,10 +56,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import IO
 
-from certorail.analysis import pretty_location
 from certorail.broker import build_broker, terminal_descriptors
-from certorail.sandbox import Omitted, Spawner, omissions, provision, unprovisioned
-from certorail.sandbox.program import bwrap_argv, lower_program, seatbelt_profile
+from certorail.childjail import View
+from certorail.floorguard import Guard
+from certorail.sandbox import CompileError, ProgramRequest, SelfInstalled, Spawner, Wrapped, prepare
+from certorail.world import World, WorldFileError, floor_findings, load_world
 from certorail.describe import describe
 from certorail.lint import lint
 from certorail.policy import Denial, Policy, Program
@@ -104,11 +109,12 @@ def check(
 ) -> Accepted | Rejected:
     """Analyse and evaluate; on success, the program as it will run. Raises ``SyntaxError``.
 
-    With *root*, the policy's literal checkers may run (under it, a confined one by the run's
-    *spawner* when given) to discharge pure atoms on statically-known text; without it, only
-    regex-defined atoms are discharged statically."""
+    With *root*, the policy's literal checkers may run (under it, each in its jail as the run's
+    *spawner* holds it, or with no run around them, ``Spawner.unattached``) to discharge pure
+    atoms on statically-known text; without it, only regex-defined atoms are discharged
+    statically."""
     tree = ast.parse(source, filename)
-    discharge = None if root is None else policy.discharger(root, spawner if spawner is not None else unprovisioned())
+    discharge = None if root is None else policy.discharger(root, spawner if spawner is not None else Spawner.unattached(policy, root))
     report = analyze(source, filename, policy.vocabulary(), discharge)
     if report.violations:
         return Rejected(report, violations=report.violations)
@@ -137,17 +143,45 @@ if os.environ.get("CERTORAIL_SELF_JAIL"):
     # read from the descriptor the host handed over
     import certorail.selfjail
     profile_fd = os.environ.get("CERTORAIL_SEATBELT_FD")
-    warning = certorail.selfjail.install(None if profile_fd is None else int(profile_fd))
-    if warning is not None:
-        print("certorail: self-jail not installed: " + warning, file=sys.stderr)
+    failure = certorail.selfjail.install(None if profile_fd is None else int(profile_fd))
+    if failure is not None:
+        print("certorail: the run is refused: the self-jail cannot be installed: " + failure, file=sys.stderr)
+        sys.exit(1)
 import certorail.markers
 # the program as the host analysed it, over an inherited descriptor: no file in between
 with os.fdopen(int(os.environ["CERTORAIL_PROGRAM_FD"]), encoding="utf-8") as f:
     source = f.read()
-sys.argv = [filename, *args]
 namespace = {"__name__": "__main__", "__file__": filename, "certora": certorail.markers}
+floor_fd = os.environ.get("CERTORAIL_FLOOR_FD")
+if floor_fd is not None:
+    # last before the program: the machine's redlines, where each path leads at each operation
+    import certorail.floorguard
+    with os.fdopen(int(floor_fd), encoding="utf-8") as f:
+        guard = certorail.floorguard.Guard.parse(f.read())
+    sys.dont_write_bytecode = True  # an import writes nothing
+    certorail.floorguard.install(guard)
+# nothing of the environment reaches the program: the markers read the broker's descriptor when
+# imported, above, and os.environb and posix.environ are the same mapping as os.environ
+os.environ.clear()
+sys.argv = [filename, *args]
 exec(compile(source, filename, "exec"), namespace)
 '''
+
+
+def bootstrap(certorail_parent: str) -> str:
+    """The child interpreter's ``-c`` source, finding certorail under *certorail_parent*."""
+    return _BOOTSTRAP.replace("__CERTORAIL_PARENT__", repr(certorail_parent))
+
+
+# What the child inherits of this process's environment: what its interpreter needs to start (the
+# library search paths some builds rely on) and to read text and time as the user does (the locale,
+# the time zone) -- nothing a program could carry off. Not LD_PRELOAD: native code injected into the
+# interpreter would bypass the floor guard. The bootstrap clears even these before the program runs.
+_CHILD_ENVIRONMENT = frozenset({"LANG", "LANGUAGE", "TZ", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH"})
+
+
+def _child_environment() -> dict[str, str]:
+    return {k: v for k, v in os.environ.items() if k in _CHILD_ENVIRONMENT or k.startswith("LC_")}
 
 
 def _handover(prefix: str, text: str) -> IO[bytes]:
@@ -163,32 +197,40 @@ def _handover(prefix: str, text: str) -> IO[bytes]:
 
 @dataclass(frozen=True)
 class JailRefused:
-    """A strict policy's run refused before anything ran: what the confined grants' jail could
-    not express."""
+    """The run refused before anything ran: a jail it needs cannot be held as configured
+    (``sandbox.prepare``) -- every reason, from every jail."""
 
-    omitted: tuple[Omitted, ...]
+    reasons: tuple[str, ...]
 
     def describe(self) -> list[str]:
-        return [
-            "certorail: strict: a grant runs under the policy filesystem view, and the jail here "
-            "cannot express these locations, so the run is refused:"
-        ] + [f"certorail:   {o.role} {pretty_location(o.location)}: {o.reason}" for o in self.omitted]
+        return ["certorail: the run is refused: a jail it needs cannot be held as configured:"] + [
+            f"certorail:   {r}" for r in self.reasons
+        ]
 
 
-def _announce_omissions(omitted: tuple[Omitted, ...]) -> None:
-    """A confined grant's world is what this run's mechanism can express of the policy's
-    filesystem section and the rule's own mounts; whatever it cannot is absent from the world,
-    and that is never silent (MOUNTS.md)."""
-    if not omitted:
-        return
-    print(
-        "certorail: a grant runs under the policy filesystem view (exec.view = \"policy\"), and "
-        "these locations cannot be expressed by the jail here, so its world OMITS them "
-        "(strict = true in the policy refuses such a run instead):",
-        file=sys.stderr,
-    )
-    for o in omitted:
-        print(f"certorail:   {o.role} {pretty_location(o.location)}: {o.reason}", file=sys.stderr)
+def prepare_run(
+    policy: Policy, root: pathlib.Path, python: str = sys.executable, jail: bool = True, world: World = World(),
+) -> Spawner | JailRefused:
+    """Every jail a run of *policy* at *root* needs -- the certorail process's, running *python*
+    on this machine (*world*), unless *jail* is off -- compiled, with the views they need
+    attached; or every reason it cannot have them, before anything runs."""
+    spawner = prepare(policy, root, ProgramRequest(python) if jail else None, world=world)
+    if isinstance(spawner, CompileError):
+        return JailRefused(tuple(r.describe() for r in spawner.refusals))
+    return spawner
+
+
+def checked(
+    source: str, filename: str, policy: Policy, root: pathlib.Path, python: str = sys.executable,
+    jail: bool = True, world: World = World(),
+) -> Accepted | Rejected | JailRefused:
+    """What ``run`` decides, running nothing of the program: every jail it needs compiled, and the
+    program checked with its literal checkers in theirs."""
+    spawner = prepare_run(policy, root, python, jail, world)
+    if isinstance(spawner, JailRefused):
+        return spawner
+    with spawner:
+        return check(source, filename, policy, root, spawner)
 
 
 def run(
@@ -199,15 +241,33 @@ def run(
     args: Sequence[str] = (),
     python: str = sys.executable,
     jail: bool = True,
+    world: World = World(),
 ) -> subprocess.CompletedProcess[bytes] | Rejected | JailRefused:
-    # the run's mechanism for confined children, with its run-scoped resources (the FUSE view
-    # of the root, when the policy needs one): leased for the run, released after
-    with provision(policy, root) as spawner:
-        omitted = omissions(spawner, policy, root) if policy.confines else ()
-        if omitted and policy.strict:
-            return JailRefused(omitted)
-        _announce_omissions(omitted)
-        return _run(source, filename, policy, root, args, python, jail, spawner)
+    spawner = prepare_run(policy, root, python, jail, world)
+    if isinstance(spawner, JailRefused):
+        return spawner
+    # the run's jails and the views they need: leased for the run, released after
+    with spawner:
+        return _run(source, filename, policy, root, args, python, spawner, world)
+
+
+def _announce_layers(policy: Policy, world: World, jailed: bool) -> None:
+    """The runtime layers beyond the default, said once at startup: each is a way for the
+    program or a tool it runs to fail mid-run, and the failure should have an explanation, from
+    what the run said at its start (FLOORS.md, REDLINES.md). *jailed*: the program itself runs
+    under them (not ``--no-jail``); its tools and checkers always do."""
+    f = world.floor
+    if not f.empty:
+        parts = [
+            f"{kind} {', '.join(str(p) for p in paths)}"
+            for kind, paths in (("never-write", f.write_paths), ("never-visible", f.visible_paths)) if paths
+        ]
+        who = "the program and its tools" if jailed else "the program's tools"
+        print(f"certorail: this machine's redlines bind {who} ({world.source}): {'; '.join(parts)}; "
+              f"a tool's are held at its stable directories (stable = {world.stable.describe()})", file=sys.stderr)
+    if jailed and policy.system.view is View.POLICY:
+        print("certorail: the program runs under the policy view (reads and writes through names that resolve "
+              "outside the grants fail)", file=sys.stderr)
 
 
 def _run(
@@ -217,19 +277,18 @@ def _run(
     root: pathlib.Path,
     args: Sequence[str],
     python: str,
-    jail: bool,
     spawner: Spawner,
+    world: World,
 ) -> subprocess.CompletedProcess[bytes] | Rejected:
     outcome = check(source, filename, policy, root, spawner)
     if isinstance(outcome, Rejected):
         return outcome
     for line in reveal_lines(outcome.report, filename):
         print(line, file=sys.stderr)  # asked for in the source: shown even when the run proceeds
-    certorail_parent = str(pathlib.Path(__file__).resolve().parent.parent)
     # the runtime halves of check/exec/network all live in the broker: the confined program
     # never sees the policy, only the socket
-    bootstrap = _BOOTSTRAP.replace("__CERTORAIL_PARENT__", repr(certorail_parent))
-    env = dict(os.environ)
+    child_source = bootstrap(str(pathlib.Path(__file__).resolve().parent.parent))
+    env = _child_environment()
     # what the child inherits -- unlinked files and a socket end, nothing anyone else can name:
     # the program as analysed, the broker's door and, on macOS, the jail itself. So what runs
     # is what was analysed, whatever happens on the machine between here and the bootstrap.
@@ -250,28 +309,35 @@ def _run(
         serving = threading.Thread(target=broker.serve, args=(host_end,), name="certorail-broker", daemon=True)
         serving.start()
         env["CERTORAIL_BROKER_FD"] = str(child_end.fileno())
-    # the bootstrap is the command line itself; the program's name is for tracebacks and argv
-    command = [python, "-I", "-P", "-c", bootstrap, filename, *args]
-    if jail:
+    # the bootstrap is the command line itself; the program's name is for tracebacks and argv.
+    # Under the policy view -S too: no site, so no site-packages and no .pth file in its world
+    launch = spawner.launch()
+    flags = ["-I", "-S", "-P"] if launch is not None and policy.system.view is View.POLICY else ["-I", "-P"]
+    command = [python, *flags, "-c", child_source, filename, *args]
+    _announce_layers(policy, world, jailed=launch is not None)
+    if launch is not None:
         # the self-jail the bootstrap installs on itself before the program runs: on Linux the
         # seccomp exec denial inside bubblewrap's namespaces, on macOS the whole Seatbelt
         # profile, since nothing may sandbox the interpreter before it does
         env["CERTORAIL_SELF_JAIL"] = "1"
-        program_jail = lower_program(policy, root, patterns=sys.platform == "darwin")
-        if sys.platform == "linux":
-            bwrap = shutil.which("bwrap")
-            if bwrap is None:
-                print(
-                    "certorail: bwrap not found: running WITHOUT the OS jail "
-                    "(install bubblewrap; or pass --no-jail to accept this)",
-                    file=sys.stderr,
-                )
-            else:
-                command = bwrap_argv(program_jail, bwrap, command)
-        elif sys.platform == "darwin":
-            profile = _handover("certorail-seatbelt-", seatbelt_profile(program_jail))
-            handover.append(profile)
-            env["CERTORAIL_SEATBELT_FD"] = str(profile.fileno())
+        floor_guard = Guard.of(world.floor, policy.system.lifts, root)
+        if policy.system.view is not View.POLICY and not floor_guard.empty:
+            # host mode: the machine's redlines, held in the process itself (floorguard); the
+            # policy view holds them in its jail
+            guard = _handover("certorail-floor-", floor_guard.document())
+            handover.append(guard)
+            env["CERTORAIL_FLOOR_FD"] = str(guard.fileno())
+        if launch.executable is not None:
+            # the interpreter at its real path: a venv's bin/python, and the pyvenv.cfg beside
+            # it, lie outside the world
+            command[0] = str(launch.executable)
+        match launch.jail:
+            case Wrapped(prefix=prefix):
+                command = [*prefix, *command]
+            case SelfInstalled(profile=text):
+                profile = _handover("certorail-seatbelt-", text)
+                handover.append(profile)
+                env["CERTORAIL_SEATBELT_FD"] = str(profile.fileno())
     try:
         try:
             proc = subprocess.Popen(command, cwd=root, env=env, pass_fds=[h.fileno() for h in handover])
@@ -284,11 +350,15 @@ def _run(
         done: subprocess.CompletedProcess[bytes] = subprocess.CompletedProcess(command, proc.returncode)
         return done
     finally:
-        if host_end is not None:
-            with contextlib.suppress(OSError):
-                host_end.close()  # EOF for the serve loop, should the program have left it hanging
-        if serving is not None:
-            serving.join(timeout=5)
+        _close_broker(host_end, serving)
+
+
+def _close_broker(host_end: socket.socket | None, serving: threading.Thread | None) -> None:
+    if host_end is not None:
+        with contextlib.suppress(OSError):
+            host_end.close()  # EOF for the serve loop, should the program have left it hanging
+    if serving is not None:
+        serving.join(timeout=5)
 
 
 @dataclass(frozen=True)
@@ -301,6 +371,8 @@ class Loaded:
 
     policy: Policy
     provenance: tuple[str, ...]
+    # this machine's world.toml, checked against the policy (FLOORS.md)
+    world: World = World()
 
 
 def _provenance(policy: Policy, origin: str | None) -> tuple[str, ...]:
@@ -320,7 +392,7 @@ def _provenance(policy: Policy, origin: str | None) -> tuple[str, ...]:
     return tuple(lines)
 
 
-def load_policy(path: pathlib.Path | None, root: pathlib.Path | None = None) -> Loaded:
+def _policy_and_origin(path: pathlib.Path | None, root: pathlib.Path | None) -> tuple[Policy, str | None]:
     if path is None:
         if root is not None:
             try:
@@ -330,22 +402,41 @@ def load_policy(path: pathlib.Path | None, root: pathlib.Path | None = None) -> 
             if found is not None:
                 policy_file, prefix = found
                 try:
-                    policy = load_policy_file(policy_file)
+                    return load_policy_file(policy_file), f"{policy_file} (root {prefix})"
                 except PolicyFileError as e:
                     raise SystemExit(str(e))
-                return Loaded(policy, _provenance(policy, f"{policy_file} (root {prefix})"))
         try:
-            policy = default_policy()  # the built-in posture, plus the base ruleset if installed
+            return default_policy(), None  # the built-in posture, plus the base ruleset if installed
         except PolicyFileError as e:
             raise SystemExit(str(e))
-        return Loaded(policy, _provenance(policy, None))
     if path.suffix not in (".toml", ".json"):
         raise SystemExit(f"{path}: a policy is a .toml or .json document")
     try:
-        policy = load_policy_file(path)
+        return load_policy_file(path), None
     except PolicyFileError as e:
         raise SystemExit(str(e))
-    return Loaded(policy, _provenance(policy, None))
+
+
+def _machine_world(policy: Policy, root: pathlib.Path) -> World:
+    """This machine's world.toml, and the policy against it: a grant it can never exercise here
+    refuses the policy on this machine (FLOORS.md)."""
+    try:
+        world = load_world()
+    except WorldFileError as e:
+        raise SystemExit(str(e))
+    conflicts, _ = floor_findings(policy, world, root)
+    if conflicts:
+        raise SystemExit("\n".join(
+            [f"certorail: the policy does not load on this machine ({world.source}):"]
+            + [f"certorail:   {c.line()}" for c in conflicts]
+        ))
+    return world
+
+
+def load_policy(path: pathlib.Path | None, root: pathlib.Path | None = None) -> Loaded:
+    policy, origin = _policy_and_origin(path, root)
+    world = _machine_world(policy, root) if root is not None else World()
+    return Loaded(policy, _provenance(policy, origin), world)
 
 
 def policy_origin(path: pathlib.Path | None, root: pathlib.Path) -> tuple[str, str | None]:
@@ -399,7 +490,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         loaded = load_policy(ns.policy, root)
         for line in loaded.provenance:
             print(line, file=sys.stderr)
-        for finding in lint(loaded.policy, root):  # for the policy's author, not the program's
+        for finding in lint(loaded.policy, root, world=loaded.world):  # for the policy's author, not the program's
             print(f"certorail: {finding.line()}", file=sys.stderr)
         print(describe(loaded.policy, *policy_origin(ns.policy, root)))
         return 0
@@ -570,11 +661,11 @@ def _execute(
             print(line, file=sys.stderr)
     try:
         if check_only:
-            outcome: Accepted | Rejected | JailRefused | subprocess.CompletedProcess[bytes] = check(
-                source, filename, policy, root
+            outcome: Accepted | Rejected | JailRefused | subprocess.CompletedProcess[bytes] = checked(
+                source, filename, policy, root, jail=jail, world=loaded.world
             )
         else:
-            outcome = run(source, filename, policy, root, args, jail=jail)
+            outcome = run(source, filename, policy, root, args, jail=jail, world=loaded.world)
     except SyntaxError as e:
         print(f"{filename}:{e.lineno}: syntax error: {e.msg}", file=sys.stderr)
         return 2

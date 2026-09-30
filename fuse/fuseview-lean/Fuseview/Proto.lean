@@ -26,10 +26,21 @@ def BIG_WRITES : UInt32 := bit 5
 def AUTO_INVAL_DATA : UInt32 := bit 12
 def DO_READDIRPLUS : UInt32 := bit 13
 def PARALLEL_DIROPS : UInt32 := bit 18
+-- and what pyfuse3 cannot offer: the locks sent to the daemon, which holds them on the backing
+-- files, where a process outside the view meets them -- else the kernel keeps them on the view's
+-- own inodes, and a jailed tool and an outside one locking one file never exclude each other
+def POSIX_LOCKS : UInt32 := bit 1
+def FLOCK_LOCKS : UInt32 := bit 10
 
 def FATTR_FH : UInt32 := bit 6
 def FOPEN_KEEP_CACHE : UInt32 := bit 1
 def FSYNC_FDATASYNC : UInt32 := 1
+/-- `fuse_lk_in.lk_flags`: the lock is flock(2)'s, not fcntl(2)'s. -/
+def LK_FLOCK : UInt32 := 1
+/-- `fuse_release_in.release_flags`: the release is also a flush, whose owner's locks go. -/
+def RELEASE_FLUSH : UInt32 := 1
+/-- The last byte a lock can reach: `struct fuse_file_lock` ends a lock "to the end" here. -/
+def OFFSET_MAX : UInt64 := 0x7fffffffffffffff
 
 abbrev buffer (capacity : Nat) : ByteArray := ByteArray.emptyWithCapacity capacity
 
@@ -101,6 +112,10 @@ def createOut (ino : UInt64) (st : Stat) (ttls : Ttls) (fh : UInt64) (flags : UI
 
 def writeOut (n : UInt32) : ByteArray := wr32 (wr32 (buffer 8) n) 0
 
+/-- `struct fuse_lk_out`, one `struct fuse_file_lock`: 24 bytes. -/
+def lkOut (type : UInt32) (start end_ : UInt64) (pid : UInt32) : ByteArray :=
+  wr32 (wr32 (wr64 (wr64 (buffer 24) start) end_) type) pid
+
 /-- `struct fuse_statfs_out` from the shim's eight u64s (blocks bfree bavail files ffree bsize
 namemax frsize): 80 bytes. -/
 def statfsOut (v : ByteArray) : ByteArray :=
@@ -118,7 +133,8 @@ def statfsOut (v : ByteArray) : ByteArray :=
 /-- `struct fuse_init_out`: 64 bytes. *kernelMinor*, *readahead*, *offered*: what the kernel's
 INIT said. -/
 def initOut (kernelMinor readahead offered : UInt32) : ByteArray :=
-  let wanted := ASYNC_READ ||| ATOMIC_O_TRUNC ||| BIG_WRITES ||| AUTO_INVAL_DATA ||| DO_READDIRPLUS ||| PARALLEL_DIROPS
+  let wanted := ASYNC_READ ||| ATOMIC_O_TRUNC ||| BIG_WRITES ||| AUTO_INVAL_DATA ||| DO_READDIRPLUS ||| PARALLEL_DIROPS |||
+    POSIX_LOCKS ||| FLOCK_LOCKS
   let b := buffer 64
   let b := wr32 b 7
   let b := wr32 b (min kernelMinor MINOR)

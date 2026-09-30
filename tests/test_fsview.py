@@ -1,24 +1,36 @@
-"""The policy filesystem section lowered for the jails (MOUNTS.md): the one path a bind can say,
-the ERE a Seatbelt filter takes, and each spawner's typed lowering. Pure, no jail."""
+"""The policy's filesystem section as the jails hold it (MOUNTS.md): the one path a bind can say,
+the ERE a Seatbelt filter takes, and each location as the front end states it and a backend
+places it. Pure, no jail."""
 import os
 import pathlib
 import re
-import tempfile
 import unittest
+from collections.abc import Sequence
 
-from certorail.analysis import pretty_location
 from certorail.childjail import View
-from certorail.confinement import Additions, FilesystemSection, PolicyFilesystem
 from certorail.locations import parse_location as loc
 from certorail.locations import single_path as bind_path
-from certorail.policy import Policy, program
-from certorail.sandbox import NoView
-from certorail.sandbox.bubblewrap import BubblewrapSpawner
-from certorail.sandbox.lowering import Bind, Omitted, RegexRule
-from certorail.sandbox.seatbelt import NOT_ERE, SeatbeltSpawner, ere_of, pattern_regex
+from certorail.policy import Policy, Program, program
+from certorail.sandbox.front import tool
+from certorail.sandbox.grants import Access, Exactly, Grant, Narrowing, Pattern, PolicyGrants, Restriction, Subtree
+from certorail.sandbox.place import (
+    CompileError, LiteralRule, RegexRule, Rule, SeatbeltPlan, SubpathRule, place_bubblewrap, place_seatbelt,
+)
+from certorail.sandbox.seatbelt import NOT_ERE, ere_of, pattern_regex
+from tests.test_jail_compiler import FakeFS
 
 ROOT = pathlib.Path("/sandbox")
 REAL = re.escape(os.path.realpath(ROOT))  # what a regex over canonical paths starts with
+FS = FakeFS(dirs=("/sandbox/src", "/sandbox/docs", "/sandbox/repos", "/sandbox/out", "/srv/alpha", "/srv/beta"),
+            files=("/sandbox/README.md",))
+CAT = program("cat", cwd=".", view=View.POLICY)
+
+
+def jail(rule: Program = CAT, *, read: Sequence[str] = (), write: Sequence[str] = (), no_write: Sequence[str] = ()) -> PolicyGrants:
+    """*rule*'s jail at ROOT under a policy of this section, as the front end states it."""
+    grants = tool(Policy.allow(read=read, write=write, no_write=no_write, programs=[rule]), rule, ROOT, ())
+    assert isinstance(grants, PolicyGrants)
+    return grants
 
 
 class TestBindPath(unittest.TestCase):
@@ -82,15 +94,14 @@ class TestEreOf(unittest.TestCase):
             with self.subTest(pattern=pattern):
                 self.assertIsNone(ere_of(pattern))
 
-    def test_a_refused_regex_is_omitted_with_the_reason_under_patterns(self) -> None:
-        section = FilesystemSection(read=(loc("logs/**/<\\d+\\.log>"),), no_write=(loc("<(?i)secret>"),))
-        lowered = SeatbeltSpawner().lower(PolicyFilesystem(ROOT, section), write_fs=False)
-        self.assertEqual([(o.role, o.reason) for o in lowered if isinstance(o, Omitted)],
-                         [("read", NOT_ERE), ("no-write", NOT_ERE)])
-        self.assertEqual(len(lowered), 2)
-        # the same shape spelled in the shared subset lowers
-        ok = SeatbeltSpawner().lower(PolicyFilesystem(ROOT, FilesystemSection(read=(loc("logs/**/<[0-9]+\\.log>"),))), write_fs=False)
-        self.assertEqual(ok, (RegexRule(f"^{os.path.realpath(ROOT)}/logs/(.*/)?([0-9]+\\.log)$", "read"),))
+    def test_a_regex_seatbelt_cannot_spell_refuses_the_jail(self) -> None:
+        refused = place_seatbelt(jail(read=["logs/**/<\\d+\\.log>"], no_write=["<(?i)secret>"]), FS)
+        assert isinstance(refused, CompileError)
+        self.assertEqual([r.reason for r in refused.refusals], [NOT_ERE, NOT_ERE])
+        # the same shape spelled in the shared subset is a rule
+        placed = place_seatbelt(jail(read=["logs/**/<[0-9]+\\.log>"]), FS)
+        assert isinstance(placed, SeatbeltPlan)
+        self.assertEqual(placed.rules, (Rule(RegexRule(f"^{ROOT}/logs/(.*/)?([0-9]+\\.log)$"), Grant(Access.READ_ONLY)),))
 
 
 class TestPatternRegex(unittest.TestCase):
@@ -132,71 +143,54 @@ class TestPatternRegex(unittest.TestCase):
         self.assertFalse(guard.search(f"{real}/repos/x/.gitignore"))
 
 
-def fs(read: tuple = (), write: tuple = (), no_write: tuple = (), additions: Additions = Additions()) -> PolicyFilesystem:
-    return PolicyFilesystem(ROOT, FilesystemSection(read, write, no_write), additions)
+class TestTheSectionAsLayers(unittest.TestCase):
+    """Each location as the front end states it -- the paths it is exactly the union of, or one
+    pattern -- and what each backend does with it. Nothing is rounded: a location no backend here
+    can hold refuses the jail."""
 
+    def test_without_a_view_what_no_bind_says_refuses_the_jail(self) -> None:
+        grants = jail(read=["src/**/<.*\\.py>", "docs/**"], write=["repos/*/**"], no_write=["repos/**/.git"])
+        refused = place_bubblewrap(grants, FS, view_unavailable="a test attaches no view")
+        assert isinstance(refused, CompileError)
+        # docs/** is a bind; the patterns and the protection are a view's
+        self.assertEqual([r.origin.describe().split()[0] for r in refused.refusals], ["read", "write", "no-write"])
 
-class TestLowering(unittest.TestCase):
-    """What each mechanism does with each location: a typed ``Lowered`` value per location, with
-    its role, never a string."""
+    def test_seatbelt_spells_everything_as_rules(self) -> None:
+        placed = place_seatbelt(jail(read=["src/**/<.*\\.py>", "docs/**", "README.md"], write=["repos/*/**"],
+                                     no_write=["repos/**/.git", "out/final"]), FS)
+        assert isinstance(placed, SeatbeltPlan)
+        rules = [(rule.filter, rule.effect) for rule in placed.rules]
+        self.assertIn((RegexRule(f"^{ROOT}/src/(.*/)?([^/]*\\.py)$"), Grant(Access.READ_ONLY)), rules)
+        self.assertIn((SubpathRule(ROOT / "docs"), Grant(Access.READ_ONLY)), rules)
+        self.assertIn((LiteralRule(ROOT / "README.md"), Grant(Access.READ_ONLY)), rules)   # a literal is that path alone
+        # a protection guards what lies below what it names, and the jail alone stops a tool
+        self.assertIn((SubpathRule(ROOT / "out" / "final"), Restriction(Narrowing.NO_WRITE, sole=True)), rules)
 
-    def test_without_patterns_what_no_bind_expresses_is_omitted_not_rounded(self) -> None:
-        lowered = BubblewrapSpawner(NoView("a test serves no view")).lower(fs(
-            read=(loc("src/**/<.*\\.py>"), loc("docs/**")), write=(loc("repos/*/**"),), no_write=(loc("repos/**/.git"),),
-        ), write_fs=True)
-        self.assertEqual([x for x in lowered if isinstance(x, Bind)], [Bind(ROOT / "docs", "read")])
-        self.assertEqual([(o.role, pretty_location(o.location)) for o in lowered if isinstance(o, Omitted)],
-                         [("read", "src/**/</.*\\.py/>"), ("write", "repos/*/**"), ("no-write", "repos/**/.git")])
-
-    def test_seatbelt_lowers_everything_it_can_spell(self) -> None:
-        lowered = SeatbeltSpawner().lower(fs(
-            read=(loc("src/**/<.*\\.py>"), loc("docs/**"), loc("README.md")), write=(loc("repos/*/**"),),
-            no_write=(loc("repos/**/.git"), loc("out/final")),
-        ), write_fs=True)
-        self.assertIn(RegexRule(f"^{os.path.realpath(ROOT)}/src/(.*/)?([^/]*\\.py)$", "read"), lowered)
-        self.assertIn(Bind(ROOT / "docs", "read", subtree=True), lowered)
-        self.assertIn(Bind(ROOT / "README.md", "read", subtree=False), lowered)  # a literal is that path alone
-        self.assertIn(Bind(ROOT / "out" / "final", "no-write", subtree=True), lowered)  # a protection guards below
-        self.assertFalse([x for x in lowered if isinstance(x, Omitted)])
-
-    def test_a_set_of_names_is_one_bind_per_name(self) -> None:
+    def test_a_set_of_names_is_one_region_per_name(self) -> None:
         # {a,b} is exactly two paths; a pattern after it is not, and a grant is never widened
-        lowered = BubblewrapSpawner(NoView("a test serves no view")).lower(fs(
-            read=(loc("/srv/{alpha,beta}/**"), loc("/srv/{alpha,beta}/<x.*>")), no_write=(loc("{out,dist}/final"),),
-        ), write_fs=True)
-        self.assertEqual([x for x in lowered if isinstance(x, Bind)], [
-            Bind(pathlib.Path("/srv/alpha"), "read"), Bind(pathlib.Path("/srv/beta"), "read"),
-            Bind(ROOT / "dist" / "final", "no-write"), Bind(ROOT / "out" / "final", "no-write"),
+        grants = jail(read=["/srv/{alpha,beta}/**", "/srv/{alpha,beta}/<x.*>"], no_write=["{out,dist}/final"])
+        self.assertEqual([layer.region for layer in grants.layers], [
+            Subtree(pathlib.Path("/srv/alpha")), Subtree(pathlib.Path("/srv/beta")),
+            Pattern(loc("/srv/{alpha,beta}/<x.*>"), pathlib.Path("/")),
+            Subtree(ROOT / "dist" / "final"), Subtree(ROOT / "out" / "final"),
         ])
-        self.assertEqual([pretty_location(o.location) for o in lowered if isinstance(o, Omitted)], ["/srv/{alpha,beta}/</x.*/>"])
 
-    def test_a_rules_additions_lower_under_their_own_names(self) -> None:
-        lowered = BubblewrapSpawner(NoView("a test serves no view")).lower(fs(
-            read=(loc("src/**"),), additions=Additions(read=(loc("/srv/keys/**"), loc("cfg/*")), write=(loc(".git/**"),)),
-        ), write_fs=True)
-        self.assertIn(Bind(pathlib.Path("/srv/keys"), "mount-read"), lowered)
-        self.assertIn(Bind(ROOT / ".git", "mount-write"), lowered)
-        self.assertEqual([(o.role, pretty_location(o.location)) for o in lowered if isinstance(o, Omitted)],
-                         [("mount-read", "cfg/*")])
+    def test_a_rules_additions_are_layers_under_their_own_names(self) -> None:
+        git = program("git", cwd=".", view=View.POLICY, mount_read=["/srv/keys/**", "cfg/*"], mount_write=[".git/**"])
+        grants = jail(git, read=["src/**"])
+        self.assertEqual([(layer.origin.describe(), layer.effect) for layer in grants.layers[1:]], [
+            ("git's mount-read /srv/keys/**", Grant(Access.READ_ONLY)),
+            ("git's mount-read cfg/*", Grant(Access.READ_ONLY)),
+            ("git's mount-write .git/**", Grant(Access.WRITABLE)),
+        ])
 
-    def test_a_literal_directory_is_the_views_or_nothing_under_bubblewrap(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = pathlib.Path(tmp)
-            (root / "src").mkdir()
-            (root / "README.md").write_text("x\n")
-            section = FilesystemSection(read=(loc("src"), loc("README.md")))
-            lowered = BubblewrapSpawner(NoView("a test serves no view")).lower(PolicyFilesystem(root, section), write_fs=False)
-            # a file binds exactly; a directory named alone cannot be bound without its contents
-            self.assertIn(Bind(root / "README.md", "read"), lowered)
-            self.assertEqual([pretty_location(o.location) for o in lowered if isinstance(o, Omitted)], ["src"])
-
-    def test_the_policy_builds_the_confinement_the_lowering_reads(self) -> None:
-        rule = program("git", cwd=".", view=View.POLICY, mount_read=["/srv/keys/**"], mount_write=[".git/**"])
-        policy = Policy.allow(read=["src/**"], write=["out/**"], no_write=["out/final"], programs=[rule])
-        c = policy.confinement(rule, ROOT)
-        assert isinstance(c.filesystem, PolicyFilesystem)
-        self.assertEqual(c.filesystem.section, FilesystemSection(policy.read, policy.write, policy.no_write))
-        self.assertEqual(c.filesystem.additions, Additions(rule.mount_read, rule.mount_write))
+    def test_a_path_named_exactly_is_a_views_under_bubblewrap(self) -> None:
+        # what is there may change kind, or not be there yet: a bind of it would say too much
+        grants = jail(read=["src", "README.md"])
+        self.assertEqual([layer.region for layer in grants.layers], [Exactly(ROOT / "src"), Exactly(ROOT / "README.md")])
+        refused = place_bubblewrap(grants, FS, view_unavailable="a test attaches no view")
+        assert isinstance(refused, CompileError)
+        self.assertEqual([r.origin.describe() for r in refused.refusals], ["read grant src", "read grant README.md"])
 
 
 if __name__ == "__main__":

@@ -97,6 +97,15 @@ class TestDescribe(unittest.TestCase):
         # discharged on a literal
         self.assertEqual(self.text.count("on a literal:"), 1)
 
+    def test_the_directories_a_protection_fixes(self) -> None:
+        # a protected name below a writable directory fixes each directory on the way to it
+        text = describe(Policy.allow(write=["**"], no_write=["a/b/keep", "**/.git", "out/<k.*>"]), "policy.toml")
+        self.assertIn("- fixed in place (a protected name lies below each: in the OS jail it cannot be renamed, "
+                      "removed or replaced, though what is in it stays writable): a; a/b; out; "
+                      "every directory on the way to a name **/.git matches; "
+                      "every directory on the way to a name out/</k.*/> matches", text)
+        self.assertNotIn("fixed in place", describe(Policy.allow(write=["**"], no_write=[".git"]), "policy.toml"))
+
     def test_the_cli_flag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             policy = pathlib.Path(tmp) / "p.toml"

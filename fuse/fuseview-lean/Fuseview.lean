@@ -1,6 +1,7 @@
 import Fuseview.Bytes
 import Fuseview.Sys
 import Fuseview.NamePattern
+import Fuseview.Match
 import Fuseview.Filter
 import Fuseview.Spec
 import Fuseview.Proto

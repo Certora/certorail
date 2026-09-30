@@ -1,13 +1,20 @@
-"""The long-lived FUSE view (MOUNTS.md): one daemon per (root, filesystem section) keeps the
-view mounted at a deterministic path, retires when no run has used it for a while, and is
-recovered by the next run when it has died -- so a sequence of ``certorail`` invocations pays
+"""The long-lived FUSE view (MOUNTS.md, LOWERING2.md "Views"): one daemon per (directory, layers)
+keeps the view mounted at a deterministic path, retires when no run has used it for a while, and
+is recovered by the next run when it has died -- so a sequence of ``certorail`` invocations pays
 one mount, not one per call.
+
+The daemon is the Lean view (``fuse/fuseview-lean``; ``native.locate_view_daemon`` finds its
+binary), which decides every name by the placement checker's own ``stateFrom`` (``proofs/place``)
+and is jailed by bubblewrap with nothing but the directory it serves. This module is its
+supervisor: it makes the mount out here (``fusermount3``), hands the daemon the descriptor, and
+runs the lease protocol below, asking the daemon for its request counts each tick to know when it
+is idle.
 
 Layout, under ``$CERTORAIL_VIEWS_DIR``, else ``$XDG_RUNTIME_DIR/certorail/perm-mounts`` (a local
 tmpfs, per login: flock is only emulated on NFS), else the config directory's ``perm-mounts``::
 
-    <key>/mnt        the mountpoint (bound by bubblewrap at the root's real path)
-    <key>/view.json  what the daemon serves: the root and the lowered filesystem section
+    <key>/mnt        the mountpoint (bound by bubblewrap at the directory it serves)
+    <key>/view.json  what the daemon serves: the directory and the layers it holds there
     <key>/lock       decisions are taken holding this (flock, exclusive)
     <key>/lease      every run using the view holds this shared; the daemon retires only when
                      it can take it exclusively
@@ -41,12 +48,14 @@ import sys
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, override
+from typing import Any
 
-from certorail.analysis import AnyName, Component, DirSplat, LocationFact, Matching, Named, OneOf, RegexLit, StaticPath
+from certorail import native
+from certorail.locations import decode_location, encode_location
 from certorail.policydir import config_dir
+from certorail.sandbox.grants import Access, Exactly, Layer, Narrowing, Pattern, Region, Subtree, says
 
-FORMAT = 1
+FORMAT = 2
 DEFAULT_IDLE = 600.0     # seconds without a lease or a request before the daemon retires
 TICK = 1.0
 SPAWN_DEADLINE = 15.0
@@ -61,70 +70,65 @@ class ViewUnavailable(Exception):
 # ---------------------------------------------------------------------------------------------
 
 
-def _encode_component(c: Component) -> Any:
-    match c:
-        case Named(name=n):
-            return n
-        case AnyName():
-            return {"any": True}
-        case OneOf(names=ns):
-            return {"one_of": sorted(ns)}
-        case Matching(regex=RegexLit(reg=r)):
-            return {"regex": r}
-        case Matching():
-            raise ValueError("a policy location's regex is a single pattern")  # never from a document
+@dataclass(frozen=True)
+class ViewLayer:
+    """A layer as a view holds it: its region, and what it says there -- a grant's access or a
+    restriction's narrowing. Where it came from, and what the placer knew of it, are nothing to
+    the daemon."""
+
+    region: Region
+    says: Access | Narrowing
 
 
-def _decode_component(v: Any) -> Component:
-    if isinstance(v, str):
-        return Named(v)
-    if "any" in v:
-        return AnyName()
-    if "one_of" in v:
-        return OneOf(frozenset(v["one_of"]))
-    return Matching(RegexLit(v["regex"]))
+def _region_document(region: Region) -> dict[str, Any]:
+    match region:
+        case Subtree(path=p):
+            return {"subtree": str(p)}
+        case Exactly(path=p):
+            return {"exactly": str(p)}
+        case Pattern(location=loc, anchor=anchor):
+            return {"pattern": encode_location(loc), "anchor": str(anchor)}
 
 
-def _encode(loc: LocationFact) -> dict[str, Any]:
-    match loc:
-        case StaticPath(path_components=cs, absolute=ab):
-            return {"path": [_encode_component(c) for c in cs], "absolute": ab}
-        case DirSplat(static_prefix=ps, final_component=leaf, absolute=ab):
-            return {
-                "prefix": [_encode_component(c) for c in ps],
-                "leaf": None if leaf is None else _encode_component(leaf),
-                "absolute": ab,
-            }
+def _region(d: dict[str, Any]) -> Region:
+    if "subtree" in d:
+        return Subtree(pathlib.Path(d["subtree"]))
+    if "exactly" in d:
+        return Exactly(pathlib.Path(d["exactly"]))
+    return Pattern(decode_location(d["pattern"]), pathlib.Path(d["anchor"]))
 
 
-def _decode(d: dict[str, Any]) -> LocationFact:
-    if "path" in d:
-        return StaticPath(tuple(_decode_component(c) for c in d["path"]), d["absolute"])
-    leaf = d["leaf"]
-    return DirSplat(
-        tuple(_decode_component(c) for c in d["prefix"]),
-        None if leaf is None else _decode_component(leaf),
-        d["absolute"],
-    )
+def _layer_document(layer: ViewLayer) -> dict[str, Any]:
+    word = {"grant": layer.says.value} if isinstance(layer.says, Access) else {"restrict": layer.says.value}
+    return {"region": _region_document(layer.region), **word}
+
+
+def _layer(d: dict[str, Any]) -> ViewLayer:
+    return ViewLayer(_region(d["region"]), Access(d["grant"]) if "grant" in d else Narrowing(d["restrict"]))
 
 
 @dataclass(frozen=True)
 class ViewSpec:
-    """The root and the filesystem section a view serves. Absolute locations are kept for the
-    record but the view serves the root alone."""
+    """What a view serves: *directory* (a real path, never under a link: the daemon opens it),
+    the layers that decide every name below it, in order -- absolute regions, whatever directory
+    they lie in -- and whether it caches nothing (*strict*, ``world.toml``'s ``view-daemon``:
+    a name replaced from outside the jail is seen at once)."""
 
-    root: str  # the real path
-    read: tuple[LocationFact, ...]
-    write: tuple[LocationFact, ...]
-    no_write: tuple[LocationFact, ...]
+    directory: pathlib.Path
+    layers: tuple[ViewLayer, ...]
+    strict: bool = False
+
+    @classmethod
+    def holding(cls, directory: pathlib.Path, layers: Sequence[Layer[Region]], *, strict: bool = False) -> "ViewSpec":
+        """The view of *directory* that holds *layers* (a ``place.Serve``'s)."""
+        return cls(directory, tuple(ViewLayer(layer.region, says(layer.effect)) for layer in layers), strict)
 
     def document(self) -> str:
         body = {
             "format": FORMAT,
-            "root": self.root,
-            "read": [_encode(loc) for loc in self.read],
-            "write": [_encode(loc) for loc in self.write],
-            "no_write": [_encode(loc) for loc in self.no_write],
+            "directory": str(self.directory),
+            "layers": [_layer_document(layer) for layer in self.layers],
+            "cache": "strict" if self.strict else "cached",
         }
         return json.dumps(body, sort_keys=True, separators=(",", ":"))
 
@@ -137,12 +141,8 @@ class ViewSpec:
         body = json.loads(text)
         if body.get("format") != FORMAT:
             raise ValueError(f"view.json format {body.get('format')!r}, expected {FORMAT}")
-        return cls(
-            body["root"],
-            tuple(_decode(d) for d in body["read"]),
-            tuple(_decode(d) for d in body["write"]),
-            tuple(_decode(d) for d in body["no_write"]),
-        )
+        return cls(pathlib.Path(body["directory"]), tuple(_layer(d) for d in body["layers"]),
+                   body.get("cache", "cached") == "strict")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -164,14 +164,15 @@ def unavailable() -> str | None:
     """Why the view cannot be served here, or None when it can."""
     if sys.platform != "linux":
         return f"the FUSE view is Linux-only ({sys.platform} takes patterns natively)"
-    try:
-        import pyfuse3  # noqa: F401
-    except ImportError:
-        return "pyfuse3 is not installed (the certorail[fuse] extra)"
     if shutil.which("fusermount3") is None:
         return "fusermount3 is not on PATH (install fuse3)"
     if not os.path.exists("/dev/fuse"):
         return "/dev/fuse is absent"
+    if shutil.which("bwrap") is None:
+        return "bubblewrap (bwrap), which jails the view daemon, is not on PATH"
+    daemon = native.locate_view_daemon()
+    if isinstance(daemon, str):
+        return daemon
     return None
 
 
@@ -185,6 +186,8 @@ def liveness(mnt: str) -> str:
             return "stale"
         if e.errno == errno.ENOENT:
             return "absent"
+        if e.errno == errno.EACCES:
+            return "live"  # a refusal is an answer: the daemon is there
         raise
     try:
         return "live" if os.stat(mnt).st_dev != os.stat(os.path.dirname(mnt)).st_dev else "absent"
@@ -242,7 +245,12 @@ def attach(spec: ViewSpec) -> Attachment:
     mnt = keydir / "mnt"
     try:
         keydir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        mnt.mkdir(exist_ok=True)
+        try:
+            mnt.mkdir()
+        except FileExistsError:
+            # not mkdir(exist_ok=True), which stats it: a dead mount the kernel no longer caches
+            # says ENOTCONN there, and recovering it is below
+            pass
     except OSError as e:
         raise ViewUnavailable(f"cannot create {keydir}: {e}")
     lock = os.open(keydir / "lock", os.O_RDWR | os.O_CREAT, 0o600)
@@ -283,43 +291,36 @@ def attach(spec: ViewSpec) -> Attachment:
 
 
 def serve(keydir: pathlib.Path, idle: float) -> int:
-    import pyfuse3
-    import trio
-
-    from certorail.fuseview import Filter, View, raise_fd_limit
-
+    """Supervise the Lean daemon serving ``keydir/view.json`` at ``keydir/mnt``: make the mount,
+    hand the daemon its descriptor in its jail, wait for it to be ready, then each tick ask it for
+    its request counts (activity) and retire it -- unmount, which ends it -- once idle with no
+    lease held. The pid recorded is this process's: signals and ``certorail view stop`` reach the
+    daemon through it."""
     spec = ViewSpec.parse((keydir / "view.json").read_text(encoding="utf-8"))
     mnt = keydir / "mnt"
-    last_activity = time.monotonic()
-
-    class Tracked(View):
-        """The view, with the hot operations recording activity for the idle clock."""
-
-        @override
-        async def lookup(self, parent_inode: pyfuse3.InodeT, name: pyfuse3.FileNameT, ctx: pyfuse3.RequestContext) -> pyfuse3.EntryAttributes:
-            nonlocal last_activity
-            last_activity = time.monotonic()
-            return await super().lookup(parent_inode, name, ctx)
-
-        @override
-        async def readdir(self, fh: pyfuse3.FileHandleT, start_id: int, token: pyfuse3.ReaddirToken) -> None:
-            nonlocal last_activity
-            last_activity = time.monotonic()
-            return await super().readdir(fh, start_id, token)
-
-        @override
-        async def open(self, inode: pyfuse3.InodeT, flags: pyfuse3.FlagT, ctx: pyfuse3.RequestContext) -> pyfuse3.FileInfo:
-            nonlocal last_activity
-            last_activity = time.monotonic()
-            return await super().open(inode, flags, ctx)
-
-    raise_fd_limit()
-    options = set(pyfuse3.default_options)
-    options.add("fsname=certorail-view")
-    view = Tracked(pathlib.Path(spec.root), Filter(spec.read, spec.write, spec.no_write))
-    pyfuse3.init(view, str(mnt), options)
+    binary = native.locate_view_daemon()
+    bwrap = shutil.which("bwrap")
+    if isinstance(binary, str) or bwrap is None:
+        print(f"certorail view {keydir.name}: cannot serve: {binary if isinstance(binary, str) else 'no bwrap'}", flush=True)
+        return 1
+    command = native.view_command(binary, keydir / "view.json", spec.directory, bwrap)
+    fd = native.mount(mnt)
+    try:
+        daemon = subprocess.Popen([*command, "--fd", str(fd), "/view.json"], pass_fds=(fd,),
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr, text=True)
+    except BaseException:
+        lazy_unmount(str(mnt))
+        raise
+    finally:
+        os.close(fd)  # the daemon's now: when it exits, the connection goes with it
+    assert daemon.stdin is not None and daemon.stdout is not None
+    if daemon.stdout.readline().strip() != "ready":
+        lazy_unmount(str(mnt))
+        daemon.wait(timeout=10)
+        print(f"certorail view {keydir.name}: the daemon did not start (exit {daemon.returncode})", flush=True)
+        return 1
     (keydir / "pid").write_text(f"{os.getpid()} {int(time.time())}\n")
-    print(f"certorail view {keydir.name}: serving {spec.root} at {mnt} (pid {os.getpid()})", flush=True)
+    print(f"certorail view {keydir.name}: serving {spec.directory} at {mnt} (pid {os.getpid()}, daemon {daemon.pid})", flush=True)
 
     stop: dict[str, Any] = {"why": None, "lock": None}
 
@@ -328,6 +329,22 @@ def serve(keydir: pathlib.Path, idle: float) -> int:
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
+    last_activity = time.monotonic()
+    last_counts: str | None = None
+
+    def activity() -> bool:
+        """Did the daemon answer any request since last asked? One line in, its counts out."""
+        nonlocal last_counts
+        assert daemon.stdin is not None and daemon.stdout is not None
+        try:
+            daemon.stdin.write("\n")
+            daemon.stdin.flush()
+            counts = daemon.stdout.readline().strip()
+        except (OSError, ValueError):
+            return False
+        changed = last_counts is not None and counts != last_counts
+        last_counts = counts
+        return changed
 
     def retire_if_idle() -> bool:
         nonlocal last_activity
@@ -356,21 +373,25 @@ def serve(keydir: pathlib.Path, idle: float) -> int:
             if lock >= 0:
                 os.close(lock)
 
-    async def main() -> None:
-        async with trio.open_nursery() as nursery:
-            nursery.start_soon(pyfuse3.main)
-            while stop["why"] is None:
-                await trio.sleep(TICK)
-                if retire_if_idle():
-                    stop["why"] = f"idle {idle:g}s with no lease"
-            print(f"certorail view {keydir.name}: stopping ({stop['why']})", flush=True)
-            pyfuse3.terminate()
-
     try:
-        trio.run(main)
+        while stop["why"] is None:
+            time.sleep(TICK)
+            if daemon.poll() is not None:
+                stop["why"] = f"the daemon exited ({daemon.returncode})"
+                break
+            if activity():
+                last_activity = time.monotonic()
+            if retire_if_idle():
+                stop["why"] = f"idle {idle:g}s with no lease"
+        print(f"certorail view {keydir.name}: stopping ({stop['why']})", flush=True)
     finally:
         try:
-            pyfuse3.close(unmount=True)
+            lazy_unmount(str(mnt))  # ends the daemon: the connection goes with the mount
+            try:
+                daemon.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                daemon.kill()
+                daemon.wait()
         finally:
             with open(keydir / "pid", "w"):
                 pass
@@ -407,11 +428,11 @@ def _status(keydir: pathlib.Path) -> str:
     state = liveness(str(keydir / "mnt")) if (keydir / "mnt").exists() else "absent"
     pid = _pid(keydir)
     try:
-        root = json.loads((keydir / "view.json").read_text()).get("root", "?")
+        directory = json.loads((keydir / "view.json").read_text()).get("directory", "?")
     except (OSError, ValueError):
-        root = "?"
+        directory = "?"
     who = f"pid {pid}" if _alive(pid) else "no daemon"
-    return f"{keydir.name}  {state:6}  {who:12}  {root}"
+    return f"{keydir.name}  {state:6}  {who:12}  {directory}"
 
 
 def main(argv: Sequence[str]) -> int:

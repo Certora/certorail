@@ -443,15 +443,15 @@ stdout-has = ["slug ok: alpha"]
 # policy-level behaviour
 
 [[probe]]
-name    = "strict"
+name    = "unholdable"
 program = "probes/hello.py"
-policy  = "strict.toml"
-covers  = "strict: a location the jail cannot express refuses the run before it starts"
+policy  = "unholdable.toml"
+covers  = "a location no jail here can hold refuses the run before it starts"
 check   = "accepted"
 [probe.run]
 exit         = 1
 stdout-lacks = ["ran"]
-stderr-has   = ["strict"]
+stderr-has   = ["cannot be held as configured"]
 
 [[refused]]
 policy = "refused/overlapping-network.toml"

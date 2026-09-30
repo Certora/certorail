@@ -21,9 +21,9 @@ cannot *name* subprocess, and the broker is where exec'd children actually run. 
 child legitimately creates a process -- checks, execs and network requests are all brokered over
 the inherited socket.
 
-``install`` returns a warning string when the jail could not be installed (unknown architecture,
-missing API, a profile Seatbelt rejects), and None on success: the caller decides how loudly to
-degrade.
+``install`` returns why the jail could not be installed (unknown architecture, missing API, a
+profile Seatbelt rejects), and None on success: the bootstrap then refuses the run before the
+program starts.
 
 The second filter here, ``fork_denial_filter``, is for the children the broker spawns
 (``childjail``): bubblewrap installs a caller-supplied BPF program before it execs the tool, so
@@ -162,9 +162,9 @@ def install(profile_fd: int | None = None) -> str | None:
     """Jail this process from the inside. Linux: the seccomp exec denial (bubblewrap around the
     interpreter is the rest). macOS: one ``sandbox_init`` with the profile read from the
     inherited descriptor *profile_fd*, which the host wrote for this run -- the whole jail -- or
-    the fork/exec denial alone when there is none. Returns a warning when nothing could be
-    installed, None on success -- except on Windows, which is handled with the gravity it
-    deserves (WSL and --no-jail both exist)."""
+    the fork/exec denial alone when there is none. Returns why it could not be installed, None
+    on success -- except on Windows, which is handled with the gravity it deserves (WSL and
+    --no-jail both exist)."""
     if sys.platform == "win32":
         print("here's a nickel kid, get yourself a better computer")
         sys.exit(1)

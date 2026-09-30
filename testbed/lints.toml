@@ -1,8 +1,9 @@
 # Legal, and probably not what the author meant: `certorail describe --policy lints.toml --root
 # ROOT` prints each as a `lint (...)` line on stderr. Names, not objects, three ways.
 #
-# The absolute write grant below spells the default testbed root; if the root is mounted
-# elsewhere, change it to match or the shadowed-protection lint has nothing to say.
+# The absolute write grant below spells the default testbed root; run.py respells it as the root
+# it runs against. By hand under another root, change it to match, or the shadowed-protection
+# lint has nothing to say.
 policy-version = 1
 base = false
 

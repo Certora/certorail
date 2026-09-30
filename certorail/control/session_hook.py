@@ -34,8 +34,8 @@ certorail runs Python you write inside an OS jail, after statically checking eve
 subprocess and network operation in it against the policy at the end of this note. Use it
 instead of raw shell for build, test and tool commands. Two commands:
 
-    certorail-run --check -c 'SOURCE'        # analyse only: do this first, it is free
     certorail-run -c 'SOURCE' [-- ARG ...]   # analyse, then run in the jail (or: certorail-run file.py)
+    certorail-run --check -c 'SOURCE'        # analyse only, run nothing
 
 The program's working directory is the sandbox root, {prefix}; relative paths are relative to
 it. A rejection names a line: `violation:` means the program breaks the subset described below
@@ -58,7 +58,7 @@ directory below it without a policy of its own. To get something permitted:
 3. Reload to check the policy: `certorail-run --check -c 'pass'` reports every problem with its
    line. Then re-check your program.
 
-Do **not** disable certorail, run the command outside it, pass `--no-jail`, or reshape the
+Do **not** disable certorail, run the command outside it, or reshape the
 program to slip past the analysis; each of those defeats the review the human asked for. If the
 policy is not yours to change, say what you need and why and stop. The shared vocabularies
 (rulesets) and checkers a policy applies live in {config_dir}; a ruleset's rule cannot be edited

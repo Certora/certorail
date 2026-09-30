@@ -12,6 +12,9 @@ constrains the name a program spells, never the file behind it.
 - ``spelling`` (macOS): a literal name in the policy that the directory stores under another
   spelling folding to the same name (``.Git`` for ``.git``): the names a program reads from a
   listing carry the stored spelling, which the policy's does not match.
+- ``floor-overlap``: a grant reaching into a path this machine's ``world.toml`` marks
+  ``never-write`` or ``never-visible`` (FLOORS.md): the floor carves it out at run time, so an
+  operation there fails mid-run. (A grant lying wholly inside one does not load at all.)
 """
 import os
 import pathlib
@@ -23,13 +26,14 @@ from typing import Literal
 from certorail.analysis import DirSplat, LocationFact, Named, StaticPath, pretty_location
 from certorail.footprints import intersect, items_of
 from certorail.locations import single_path
+from certorail.world import World, floor_findings
 
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from certorail.policy import Policy
 
-type LintKind = Literal["shadowed-protection", "literal-directory", "spelling"]
+type LintKind = Literal["shadowed-protection", "literal-directory", "spelling", "floor-overlap"]
 
 
 @dataclass(frozen=True)
@@ -46,10 +50,10 @@ def _fold(name: str) -> str:
     return unicodedata.normalize("NFC", name).casefold()
 
 
-def lint(policy: "Policy", root: pathlib.Path, *, platform: str = sys.platform) -> list[Lint]:
+def lint(policy: "Policy", root: pathlib.Path, *, platform: str = sys.platform, world: World = World()) -> list[Lint]:
     """Every lint of *policy* governing *root* (the directory as it is now, for the lints that
-    look at it)."""
-    out: list[Lint] = []
+    look at it) on a machine with *world*."""
+    out: list[Lint] = [Lint("floor-overlap", o.grant, o.line()) for o in floor_findings(policy, world, root)[1]]
     real = pathlib.Path(os.path.realpath(root))
     root_tree = DirSplat(tuple(Named(n) for n in real.parts[1:]), None, absolute=True)
     relative_protections = [p for p in policy.no_write if not p.absolute]

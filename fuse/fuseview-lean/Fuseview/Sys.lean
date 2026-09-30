@@ -39,6 +39,20 @@ end O
 
 def AT_REMOVEDIR : UInt32 := 0x200
 
+namespace LOCK
+def SH : UInt32 := 1
+def EX : UInt32 := 2
+def NB : UInt32 := 4
+def UN : UInt32 := 8
+end LOCK
+
+-- a lock's type, as `struct flock` and `struct fuse_file_lock` both carry it
+namespace F
+def RDLCK : UInt32 := 0
+def WRLCK : UInt32 := 1
+def UNLCK : UInt32 := 2
+end F
+
 /-- What stat(2) says, in the fields the view uses. -/
 structure Stat where
   dev : UInt64
@@ -102,6 +116,11 @@ request back, and the daemon allocates one buffer for its life -- else into a fr
 @[extern "fv_reopen"] opaque reopen (fd : Fd) (flags : UInt32) : IO (Except Errno Fd)
 @[extern "fv_close"] opaque close (fd : Fd) : IO Unit
 @[extern "fv_fd_open"] opaque fdOpen (fd : Fd) : IO Bool
+@[extern "fv_wait_readable"] opaque waitReadable (fd : Fd) (ms : UInt32) : IO (Except Errno Bool)
+
+@[extern "fv_flock"] opaque flock (fd : Fd) (op : UInt32) : IO (Except Errno Unit)
+@[extern "fv_ofd_lock"] opaque ofdLock (fd : Fd) (type : UInt32) (start len : UInt64) : IO (Except Errno Unit)
+@[extern "fv_ofd_test"] opaque ofdTest (fd : Fd) (type : UInt32) (start len : UInt64) : IO (Except Errno ByteArray)
 
 @[extern "fv_fstat"] opaque fstatRaw (fd : Fd) : IO (Except Errno ByteArray)
 @[extern "fv_fstatat"] opaque fstatatRaw (dir : Fd) (name : @& ByteArray) : IO (Except Errno ByteArray)

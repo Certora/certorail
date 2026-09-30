@@ -45,6 +45,7 @@ from certorail.lint import lint
 from certorail.policydir import AmbientPolicyError, config_dir, find_policy, munge, policy_dir
 from certorail.policyfile import PolicyFileError, from_data, load_policy_file, rulesets_dir
 from certorail.schema import RulesetDoc, SchemaError, parse_ruleset
+from certorail.world import WorldFileError, floor_findings, load_world
 
 _CHECKER_HEAD = "${checkers}/"
 
@@ -298,7 +299,15 @@ def install_policy(src: pathlib.Path, *, name: str | None = None, replace: bool 
     except PolicyFileError as e:
         raise InstallError(str(e).splitlines())
     root = _declared_root(data, str(src))
-    lints = [finding.line() for finding in lint(policy, pathlib.Path(root))]
+    # this machine's floor: a grant it can never exercise refuses the install, as it would the run
+    try:
+        world = load_world()
+    except WorldFileError as e:
+        raise InstallError(str(e).splitlines())
+    conflicts, _ = floor_findings(policy, world, pathlib.Path(root))
+    if conflicts:
+        raise InstallError([f"{src}: {c.line()}" for c in conflicts])
+    lints = [finding.line() for finding in lint(policy, pathlib.Path(root), world=world)]
     basename = name if name is not None else src.name
     if "/" in basename or not basename.endswith(".toml"):
         raise InstallError([f"--name {basename!r}: a bare *.toml file name"])

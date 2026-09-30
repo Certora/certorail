@@ -6,13 +6,13 @@ One sandbox root and one policy that exercise every mechanism together:
 - the FUSE view on Linux and Seatbelt on macOS, around the tools the program runs;
 - stored-spelling handling in a case-folding directory;
 - hard links and renames through the view;
-- provenance, redirect credentials, checks through the broker, `strict`, the lints, and the
-  policies that must not load.
+- provenance, redirect credentials, checks through the broker, a jail that cannot be held, the
+  lints, and the policies that must not load.
 
 | File | What it is |
 |---|---|
 | `policy.toml` | the policy: every grant commented with what it exercises |
-| `strict.toml` | `strict = true` over a location no jail can express |
+| `unholdable.toml` | a location no jail here can hold, which refuses the run |
 | `lints.toml` | legal but probably unintended: what `certorail describe` flags |
 | `refused/*.toml` | policies that must not load |
 | `probes/*.py` | the programs, one behaviour each, headed by what they show |
@@ -41,10 +41,14 @@ chattr +F /mnt/certorail-testbed/cf
 python3 testbed/build.py              # fills cf/; from now on cf/ itself is never removed
 ```
 
-Without that, `build.py --no-casefold` fills `cf/` anyway. The casefold probe then SKIPs, and its
-control line (a host-view `head` through a folded spelling) fails if you run it by hand. On
-macOS APFS folds by default: build under any directory you own. Then edit the one absolute path
-in `lints.toml` to match the root, and do the same on Linux if you mount elsewhere.
+Without that, `build.py --no-casefold` fills `cf/` anyway. The casefold probe then SKIPs (or
+fails the run, under `run.py --require-casefold`), and its control line (a host-view `head`
+through a folded spelling) fails if you run it by hand. On macOS APFS folds by default: build
+under any directory you own. `run.py` respells the one absolute path in `lints.toml` as the root
+it runs against.
+
+CI runs the whole scenario on both platforms (`.github/workflows/testbed.yml`): on Ubuntu the
+steps above against a loop-mounted image, on macOS under the runner's temporary directory.
 
 ## Running
 

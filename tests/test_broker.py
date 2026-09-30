@@ -12,6 +12,7 @@ import pathlib
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 from certorail import markers
 from tests.brokerpath import build_server, channel, exec_request, request
@@ -364,8 +365,7 @@ class TestBrokerExec(unittest.TestCase):
         # the runtime half speaks over the inherited descriptor the host hands the program
         program_end = channel(self.server.broker)
         self.addCleanup(program_end.close)
-        os.environ["CERTORAIL_BROKER_FD"] = str(program_end.fileno())
-        self.addCleanup(os.environ.pop, "CERTORAIL_BROKER_FD", None)
+        self.enterContext(mock.patch.object(markers, "BROKER_FD", program_end.fileno()))
         result = markers.exec("echo", "hi there", cwd=".")
         self.assertIsInstance(result, markers.ExecResult)
         self.assertEqual(result.returncode, 0)

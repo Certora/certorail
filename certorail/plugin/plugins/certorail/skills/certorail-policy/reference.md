@@ -11,7 +11,6 @@ policy-version = 1
 root = "/srv/work/repo"            # ambient policies only: the sandbox root this file governs
 base = true                        # the default: the installed base ruleset applies (below)
 default-allow = false              # the default: a program the policy does not name is denied (below)
-strict = false                     # the default: a grant the OS jail cannot express warns and runs (below)
 
 [filesystem]
 read  = ["**"]
@@ -67,9 +66,9 @@ itself), which reads POSIX ERE, and the two dialects agree only on a subset: lit
 `[...]` of literals and ranges, `|`, plain groups, greedy `* + ? {n,m}`, and `^`/`$` at the
 pattern's edges (where a full match makes them redundant). A `<regex>` using anything else
 (`\d`, `\w`, `\s`, `(?...)`, lookarounds, backreferences, lazy or possessive quantifiers, an
-anchor in the middle, non-ASCII, a `"`) has no Seatbelt spelling: the location is omitted from
-the jail and the host says so at startup (or refuses to run, under `strict`). Write `[0-9]` where
-you would write `\d`. The translation is generated from Python's own parse of the pattern, so what
+anchor in the middle, non-ASCII, a `"`) has no Seatbelt spelling, and a jail that holds it
+cannot be built: the run is refused before anything runs, naming it. Write `[0-9]` where you
+would write `\d`. The translation is generated from Python's own parse of the pattern, so what
 does translate means the same thing on both sides: `.` and a negated `[^...]` never match a `/`,
 because a component never contains one. Two known exceptions: `.` in ERE also matches a newline,
 and Seatbelt matches without regard to case (see "Names, not objects" under `[filesystem]`).
@@ -122,24 +121,91 @@ stays nothing and `no-write` protections still bind); network is still `[[networ
 run says on stderr that default-allow is on, and `--describe` lists the rule last under
 Programs.
 
-## `strict`
+## What the OS jail holds
 
 The static check is what holds a program to the policy; the OS jail is the backstop behind it,
-and cannot express every location exactly (a `<regex>` outside the shared dialect on macOS, an
-absolute pattern on Linux). By default such a location is omitted from the jail, the host says
-so on stderr, and the run goes ahead with the backstop wider there than the policy. Likewise an
-exec'd tool whose `no-write` protection names a path that does not exist yet, inside a writable
-tree: there is nothing to mount over, so the tool could create it, and the broker says so and
-spawns it. `strict = true` at the top of a root policy (a ruleset has no such key) turns the
-first into a refusal of the run before anything runs, naming the locations, and the second into
-a refusal of that exec.
+and it holds every location exactly or not at all. On Linux, what a bind mount cannot say -- a
+pattern, a path named exactly, a protection, a write grant whose path does not exist yet -- is
+held by name in a FUSE view, which needs the view daemon (`fuseview-lean`), bubblewrap,
+`fusermount3` and `/dev/fuse`. On
+macOS Seatbelt spells every location as a rule. On Linux every jail's mounts are certified before
+anything runs in them, by a checker proved to accept only mounts that hold what the grants say
+(`place-check`). A jail that cannot be held -- a view this machine cannot serve, one that would
+have to be of `/` itself, a `<regex>` Seatbelt cannot spell, mounts the checker does not certify,
+or no checker to ask -- refuses the run before anything runs, with every reason. Nothing is ever
+left out of a jail.
+
+A tool's jail is checked again at each exec: if the filesystem changed under it since the run
+started (a directory became a symbolic link), it is placed again, and an exec whose jail now needs
+a view the run did not start, or is not certified, is refused, naming what changed.
+
+The jail holds names, not objects, and a directory's name is part of every name below it.
+Renaming a directory removes every name below it, and removing a protected name is a write to
+it. So where a protected name -- a `no-write` or `never-visible` path, a read-only grant -- lies
+below a writable directory, each directory on the way to it is **fixed in place**: it cannot be
+renamed, removed or replaced, though what is in it stays as writable as the grants say. A
+program or tool meets this as `EPERM`, from the FUSE view that holds the directory (on Linux a
+protected name inside a writable grant always puts that grant in a view: a bind mount would
+come loose when the name under it changed). `certorail describe` lists the directories a policy's
+protections fix.
+
+## `[system]`: the program itself at run time
+
+The analysis reads `[filesystem]` lexically: every name the program spells lies within the
+grants, on any machine, whatever the names resolve to. By default the program then runs with the
+user's authority and reaches files through those names wherever they lead, symbolic links
+included; only the machine's floor (below) and unix permissions stop it. `[system.exec]` (root
+policy only; a ruleset carrying `[system]` is a load error) can instead hold the program to the
+grants by what its names *resolve* to, in the OS jail: a way for an accepted program to fail
+mid-run (`EACCES`, `ENOENT`), which is the trade for the protection.
+
+```toml
+[system.exec]
+view       = "policy"              # the default is "host"
+mount-read = ["/srv/fixtures/**"]  # under the policy view: seen beyond [filesystem]
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `[system.exec] view` | `"host"` (default) or `"policy"` | what the program sees. `"host"`: the whole filesystem, with the user's authority. `"policy"`: the world a tool gets under `exec.view = "policy"` (read grants read-only, write grants writable, `no-write` read-only on top, the system toolchain) plus the interpreter's own files; a read through a name that resolves outside the grants fails as "No such file" (Linux) or "Operation not permitted" (macOS) |
+| `[system.exec] mount-read`, `mount-write` | lists of locations | under `view = "policy"` only (otherwise a load error): what the program sees beyond `[filesystem]`, as a rule's `exec.mount-*`. The analysis never reads them. An absolute one needs a literal head (Locations) |
+
+`[system.exec]` takes no `env` or `spawn`: the program's network (the broker only) and process
+creation (none) are fixed. Under the policy view the interpreter runs with `-I -S`: no `site`,
+no site-packages. At startup the run names on stderr the layers in force beyond the default, and
+`--describe` lists them under "At run time".
+
+The machine may add a **floor** of its own (`world.toml` in the config directory, the user's, not
+yours to edit): paths nothing writes (`never-write`) and paths whose contents nothing reads
+(`never-visible`), wherever a name leads -- for the program and for every tool and checker it
+runs. A refused operation fails with "Permission denied" (a tool on macOS: "Operation not
+permitted"); a `never-visible` path's name still shows, its contents never. The run names the
+redlines on stderr at startup. A grant a `never-*` path swallows whole is a load error naming the
+path, a rule's `exec.mount-*` included; a grant that reaches into one loads, `--describe` flags it
+(lint `floor-overlap`), and operations there fail at run time. The same file's `stable` list (the
+user's too) says which directories nothing replaces while a jail lives -- by default the home
+directory and the top-level directories; a host-view tool under a redline is refused when no
+stable directory lies above the redline, and the refusal names the list.
+
+A root policy may **lift** a redline for one process: `lift-read` makes the paths readable and
+read-only, `lift-write` writable. `[system.exec] lift-read = [...]` lifts for the program (beside
+the `[filesystem]` grant its names still need), `exec.lift-read` on a rule the root declares lifts
+for that rule's tool, and an `[[edit]]` (below) lifts for a ruleset's. A lift is a location like
+any other, absolute here: no `~`. One that lies in no redline it could lift, or reaches one the
+machine marks `can-override = false`, is a load error; a ruleset lifts nothing. A lift is the
+user's decision about their machine, not a way past a refusal: say which redline stopped what,
+and propose the lift with what it gives away -- a tool that runs code the program wrote hands what
+it reads to the program.
 
 ## `[filesystem]`
 
 `read`, `write`: lists of locations; absent means nothing of that kind is permitted (under
 `default-allow`, below, absent means the whole root, and a written `[]` still means nothing).
 Listing a directory, or probing whether a path exists, is a read of it: a read grant covering the
-directory permits both, and there is no separate `list` key.
+directory permits both, and there is no separate `list` key. A traversal that descends (`os.walk`,
+`rglob`, a `glob` whose pattern has a `/` or `**`) lists every directory below where it starts,
+so it needs a read grant over that subtree (`notes/**`, not `notes`). A write grant also permits
+the directories `mkdir(parents=True)` makes on the way to a path it covers.
 `no-write`: locations **protected** from program writes whatever `write` grants -- a write whose
 path *may* lie at or below one is denied, by an at-or-below alignment of the two locations. A
 `*` component may be anything, `.git` included, so under `repos/**/.git` a
@@ -183,8 +249,10 @@ behind it:
   spellings: `describe` flags the pair (lint `shadowed-protection`). Protect the absolute
   spelling too, or keep absolute write grants out of the root.
 - A symlink inside a granted tree is followed: a read grant on `vendor/**` permits reading
-  through `vendor/link`, wherever it points. The OS jail around the program confines its writes
-  to the root and the absolute write grants; it does not confine reads.
+  through `vendor/link`, wherever it points. The analysis cannot see where a name resolves; the
+  OS jail around the program can, and how far it confines is the root policy's `[system]` table
+  (below): by default writes, to the write grants' literal prefixes, and reads only under
+  `[system.exec] view = "policy"`.
 - **On macOS, Seatbelt matches paths without regard to case.** A tool under `exec.view =
   "policy"` may open `notes/deep/NO.txt` through the grant `notes/**/<[a-z]+\.txt>`, which the
   analysis refuses the program itself. That is no wider than the grant on a case-insensitive
@@ -311,7 +379,7 @@ exec.view  = "policy"                    # sees only what the policy's [filesyst
 | `exec.env` | list of names and tables | the child's environment is exactly this: a string passes that variable through from the host's environment (skipped if the host lacks it), a table `{ NAME = "value", ... }` sets each key to a literal. A variable is mentioned once, either way; values are literal, no `${...}`; `TMPDIR` may not be listed (the host sets it under `write-fs = false` and under `exec.view = "policy"`). Absent: the host's whole environment; `[]`: an empty one |
 | `exec.spawn` | bool, default true | `false`: the child cannot create processes (no hooks, no `-exec`, no helpers, no shells). It can still replace itself with another program, which is not creation |
 | `exec.mount-read`, `exec.mount-write` | lists of locations | under `exec.view = "policy"` only: what this rule's child sees beyond the policy's `[filesystem]` section, mounted read-only or writable (`mount-write` needs `write-fs = true`; either without the policy view is a load error). The analysis never reads them: they widen the tool's world, not the program's, and a call cannot widen them further. `no-write` still applies on top. Absolute in a root policy; in a ruleset headed by a directory parameter the root binds (`credentials = { kind = "directory" }`, `exec.mount-read = ["${credentials}/**"]`). Patterns follow the platform rule below. `--describe` prints them as `also sees:` on the jail line |
-| `exec.view` | `"host"` (default) or `"policy"` | what the child sees of the filesystem. `"host"`: the host's whole filesystem; the tool is trusted as granted. `"policy"`: an empty world holding the system toolchain, the tool itself, a private `TMPDIR`, the exec's cwd as an empty directory, and the applying policy's `[filesystem]` section as mounts: `read` grants read-only, `write` grants writable iff `write-fs = true`, `no-write` protections remounted read-only on top. Nothing else exists: on Linux a path outside the view is "No such file", not "Permission denied". On macOS Seatbelt takes every location, patterns as anchored regexes (a `<regex>` must stay within the subset Python and ERE share, see "Locations"; one that does not is omitted and reported); the entries of `/` stay readable there, since every process reads them at startup, and nothing below them. On Linux a literal file or a literal prefix ending in `**` is a bind mount; when the section holds a pattern (`*`, `<regex>`, a `**/leaf` tail) or a literal directory (which grants its listing alone) the root is served through the **FUSE view** instead, a long-lived per-(root, policy) mount that filters names, listings and writes by the section exactly (the `certorail[fuse]` extra plus `fusermount3`; `certorail view status` / `stop`). Without the extra, patterned locations are omitted from the view and the host says so on stderr at startup; absolute patterned locations outside the root are omitted either way |
+| `exec.view` | `"host"` (default) or `"policy"` | what the child sees of the filesystem. `"host"`: the host's whole filesystem; the tool is trusted as granted. `"policy"`: an empty world holding the system toolchain, the tool itself, a private `TMPDIR`, the exec's cwd, and the applying policy's `[filesystem]` section: `read` grants read-only, `write` grants writable iff `write-fs = true`, `no-write` protections held by name. Nothing else exists: on Linux a path outside the view is "No such file", not "Permission denied". On macOS Seatbelt takes every location as a rule, patterns as anchored regexes (a `<regex>` must stay within the subset Python and ERE share, see "Locations"); the entries of `/` stay readable there, since every process reads them at startup, and nothing below them. On Linux a literal subtree (a prefix ending in `**`) is a bind mount; what a bind cannot say -- a pattern (`*`, `<regex>`, a `**/leaf` tail), a path named exactly (a literal directory grants its listing alone), a protection, a write grant whose path does not exist yet -- is held in a **FUSE view** of the directory it lies in, a long-lived mount that filters names, listings and writes exactly (the view daemon `fuseview-lean`, jailed by bubblewrap, plus `fusermount3`; `certorail view status` / `stop`; `world.toml`'s `view-daemon = "strict"` turns its name cache off). A jail that needs what this machine cannot give refuses the run at startup (see "What the OS jail holds") |
 
 A jailed grant whose sandbox is not installed does not run at all (the program gets a broker
 error), unlike the confined program itself, which on Linux runs with a warning when `bwrap` is missing. So
@@ -554,6 +622,27 @@ A denied shape fails closed like any unlisted form (`git apply` then "matches no
 subcommand"). A `[[deny]]` that takes nothing back, or that names a shape the root grants
 itself, is an error; so is an `override` that overlaps nothing, or one written in a ruleset.
 A ruleset may not deny. Denials are applied before overrides.
+
+**Running a ruleset's tool another way: `[[edit]]`.** An edit amends one applied rule's `exec`
+table, how its tool runs, without restating the rule:
+
+```toml
+[[edit]]
+program          = "cargo build"          # the rule's leading words (or: validation = "<name>")
+from             = "cargo.toml"           # optional: the ruleset, as [[apply]] names it
+exec.view        = "policy"               # a value replaces the rule's
+exec.mount-write = ["/home/me/.cargo/**"] # a list is added to the rule's
+```
+
+`view` and `spawn` replace; `env`, `mount-read`, `mount-write`, `lift-read` and `lift-write` add
+(an `env` list cannot be added to a rule that passes the whole environment: override it). The
+merged rule is checked as if written in place, so the mounts above load because the same edit
+sets the policy view. Nothing else changes: not `argv`, holes or `cwd` (what the program may ask
+of the tool: `override` the rule), not `network` or `write-fs` (the analysis reads those). An edit
+must match exactly one rule an applied ruleset grants; none, several, or one the root declares
+itself (change it in place) is a load error. Edits apply after `[[deny]]` and `override`, root
+only; `--describe` marks an edited rule, and whether the edit widens what its tool reaches,
+narrows it, or both.
 
 **The base ruleset.** `~/.certorail/rulesets/base.toml`, when it exists, is applied to every
 root policy, and to the built-in policy of a root with none, exactly as if the root wrote

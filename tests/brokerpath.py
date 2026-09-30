@@ -49,7 +49,7 @@ def build_server(
 
 def channel(broker: Broker) -> socket.socket:
     """A socketpair served by *broker* on a daemon thread; the returned end is the program's, to
-    be named in ``CERTORAIL_BROKER_FD``. The caller closes it when done."""
+    be named as ``markers.BROKER_FD``. The caller closes it when done."""
     host_end, program_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     threading.Thread(target=broker.serve, args=(host_end,), daemon=True).start()
     return program_end

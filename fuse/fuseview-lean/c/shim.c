@@ -15,11 +15,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -36,6 +38,8 @@ _Static_assert(O_RDONLY == 0 && O_WRONLY == 01 && O_RDWR == 02 && O_CREAT == 010
 _Static_assert(O_TRUNC == 01000 && O_APPEND == 02000 && O_DIRECTORY == 0200000, "open flags");
 _Static_assert(O_NOFOLLOW == 0400000 && O_PATH == 010000000, "open flags");
 _Static_assert(AT_REMOVEDIR == 0x200, "unlinkat flags");
+_Static_assert(LOCK_SH == 1 && LOCK_EX == 2 && LOCK_NB == 4 && LOCK_UN == 8, "flock operations");
+_Static_assert(F_RDLCK == 0 && F_WRLCK == 1 && F_UNLCK == 2, "lock types, as FUSE carries them too");
 
 /* -- results ------------------------------------------------------------------------------- */
 
@@ -164,6 +168,59 @@ LEAN_EXPORT lean_obj_res fv_close(uint32_t fd, lean_obj_arg w) {
 /* Lean: fdOpen (fd : Fd) : IO Bool */
 LEAN_EXPORT lean_obj_res fv_fd_open(uint32_t fd, lean_obj_arg w) {
     return lean_io_result_mk_ok(lean_box(fcntl((int)fd, F_GETFD) >= 0));
+}
+
+/* Lean: waitReadable (fd : Fd) (ms : UInt32) : IO (Except Errno Bool)
+ * Whether *fd* has input within *ms* milliseconds: the loop's tick while a lock waits. */
+LEAN_EXPORT lean_obj_res fv_wait_readable(uint32_t fd, uint32_t ms, lean_obj_arg w) {
+    struct pollfd p = {.fd = (int)fd, .events = POLLIN};
+    int n = poll(&p, 1, (int)ms);
+    if (n < 0) return fail(errno);
+    return ok(lean_box(n > 0));
+}
+
+/* -- locks: held on the backing files, so they are the ones a process outside the view meets -- */
+
+/* Lean: flock (fd : Fd) (op : UInt32) : IO (Except Errno Unit)
+ * flock(2) on *fd*: LOCK_SH, LOCK_EX or LOCK_UN, with LOCK_NB -- the view never waits in a call; a
+ * waiting lock is set aside and tried again (Handle.serve). EWOULDBLOCK is EAGAIN here. */
+LEAN_EXPORT lean_obj_res fv_flock(uint32_t fd, uint32_t op, lean_obj_arg w) {
+    int r;
+    do r = flock((int)fd, (int)op);
+    while (r < 0 && errno == EINTR);
+    return done_or_errno(r);
+}
+
+static struct flock span(uint32_t type, uint64_t start, uint64_t len) {
+    struct flock fl;
+    memset(&fl, 0, sizeof fl);
+    fl.l_type = (short)type;
+    fl.l_whence = SEEK_SET;
+    fl.l_start = (off_t)start;
+    fl.l_len = (off_t)len;
+    return fl;
+}
+
+/* Lean: ofdLock (fd : Fd) (type : UInt32) (start len : UInt64) : IO (Except Errno Unit)
+ * An open-file-description lock on *fd* (F_OFD_SETLK, never waiting): F_RDLCK, F_WRLCK or F_UNLCK
+ * over [start, start + len), len 0 to the end of the file. */
+LEAN_EXPORT lean_obj_res fv_ofd_lock(uint32_t fd, uint32_t type, uint64_t start, uint64_t len, lean_obj_arg w) {
+    struct flock fl = span(type, start, len);
+    int r;
+    do r = fcntl((int)fd, F_OFD_SETLK, &fl);
+    while (r < 0 && errno == EINTR);
+    return done_or_errno(r);
+}
+
+/* Lean: ofdTest (fd : Fd) (type : UInt32) (start len : UInt64) : IO (Except Errno ByteArray)
+ * F_OFD_GETLK: the lock that would conflict, as four little-endian u64s -- its type (F_UNLCK when
+ * there is none), start, length (0: to the end), and holder's pid (0 when unknown: an
+ * open-file-description lock has none, and a process outside this pid namespace is not seen). */
+LEAN_EXPORT lean_obj_res fv_ofd_test(uint32_t fd, uint32_t type, uint64_t start, uint64_t len, lean_obj_arg w) {
+    struct flock fl = span(type, start, len);
+    if (fcntl((int)fd, F_OFD_GETLK, &fl) < 0) return fail(errno);
+    uint64_t out[4] = {(uint64_t)fl.l_type, (uint64_t)fl.l_start, (uint64_t)fl.l_len, fl.l_pid > 0 ? (uint64_t)fl.l_pid : 0};
+    return ok(bytes(out, sizeof out));
 }
 
 /* -- stat ---------------------------------------------------------------------------------- */

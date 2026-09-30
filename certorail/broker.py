@@ -73,14 +73,15 @@ from dataclasses import dataclass
 
 from certorail.analysis import _literal_static, location_le, url_path_location
 from certorail.childjail import JailUnavailable
-from certorail.confinement import Confinement
-from certorail.sandbox import Spawner, unprovisioned
+from certorail.sandbox import Spawner
 from certorail.enforcement import Discharge
 from certorail.integrity import materialize
 from certorail.policy import (
     NetworkRule,
     Policy,
+    Program,
     Refusal,
+    Validation,
     matches_endpoint,
     path_permitted,
     pretty_locations,
@@ -473,23 +474,23 @@ def _spawn_drained(
     client: socket.socket,
     argv: list[str],
     workdir: pathlib.Path,
-    confinement: Confinement,
+    rule: Program | Validation,
     spawner: Spawner,
     stream_to: tuple[int, int] | None = None,
 ) -> tuple[int, bytes, bytes]:
-    """Spawn host-side, under the grant's *confinement* as this run's *spawner* realises it (the
-    OS-enforced reach the grant's media and ``exec`` table allow the child), and drain the output
-    wholesale -- or, with *stream_to* (the host's stdout and stderr descriptors), let the child
-    write straight to them and return empty output. A client hangup kills the child's whole
-    process group (it gets its own, so descendants die with it). A confinement the platform
-    cannot enforce is a broker error before anything runs."""
+    """Spawn host-side, in *rule*'s jail as this run's *spawner* holds it (the OS-enforced reach
+    the grant's media and ``exec`` table allow the child), and drain the output wholesale -- or,
+    with *stream_to* (the host's stdout and stderr descriptors), let the child write straight to
+    them and return empty output. A client hangup kills the child's whole process group (it gets
+    its own, so descendants die with it). A jail that cannot be held is a broker error before
+    anything runs."""
     if stream_to is not None:
         # the host's own buffered output goes first, so the terminal reads in order
         for stream in (sys.stdout, sys.stderr):
             with contextlib.suppress(Exception):
                 stream.flush()
     try:
-        with spawner.spawn(confinement, argv, workdir) as spawn:
+        with spawner.spawn(rule, argv, workdir) as spawn:
             try:
                 proc = subprocess.Popen(
                     spawn.argv,
@@ -538,24 +539,22 @@ def _run_exec(
     discharge: Discharge | None,
     stream: bool,
     stream_to: tuple[int, int] | None,
-    spawner: Spawner,
+    spawner: Spawner | None,
 ) -> dict:
     """One brokered ``certora.exec``: re-check the decidable half of the exec rules
     (``Policy.exec_command`` -- defense in depth; the full rules were enforced statically),
-    let the policy's template compose the argv, spawn the child host-side (under the policy's
-    filesystem view plus the rule's own mounts, when the rule confines it), and return its
-    drained output wholesale -- or stream it to the host's terminal (*stream*) and return the
-    exit code alone."""
+    let the policy's template compose the argv, spawn the child host-side in its rule's jail,
+    and return its drained output wholesale -- or stream it to the host's terminal (*stream*)
+    and return the exit code alone."""
     command = policy.exec_command(program, arguments, keywords, cwd, discharge)
     if isinstance(command, Refusal):
         raise PolicyDenied(command.reason)
-    if root is None:
+    if root is None or spawner is None:
         raise BrokerError("exec: the broker was built without a root")
     if stream and stream_to is None:
         raise BrokerError("stream: the host has no terminal to stream to")
     returncode, out, err = _spawn_drained(
-        client, command.argv, _resolve(root, cwd), policy.confinement(command.rule, root),
-        spawner, stream_to if stream else None,
+        client, command.argv, _resolve(root, cwd), command.rule, spawner, stream_to if stream else None,
     )
     log.info("EXEC %s (cwd=%s) -> %d (%s)",
              " ".join(command.argv), cwd, returncode,
@@ -607,14 +606,13 @@ def _run_check(
     name: str,
     arguments: CheckArguments,
     cwd: str | None,
-    spawner: Spawner,
+    spawner: Spawner | None,
 ) -> dict:
-    """One brokered ``certora.check``: run the declared evaluator host-side -- outside the
-    jail, where whatever it consults (an inventory service, credentials, the org's tooling)
-    actually lives, or under the policy's filesystem view plus its own mounts when its rule
-    confines it -- and return its verdict. Unlike exec's rules, a check's declaration IS its
-    whole runtime contract, so this re-check is complete: name, parameters and cwd are all
-    decidable here."""
+    """One brokered ``certora.check``: run the declared evaluator host-side, in its rule's jail --
+    by default the host's, where whatever it consults (an inventory service, credentials, the
+    org's tooling) actually lives -- and return its verdict. Unlike exec's rules, a check's
+    declaration IS its whole runtime contract, so this re-check is complete: name, parameters
+    and cwd are all decidable here."""
     declared = next((v for v in policy.validations if v.name == name), None)
     if declared is None:
         raise PolicyDenied(f"check: no validation named {name!r}")
@@ -633,7 +631,7 @@ def _run_check(
             f"check {name!r}: expected str arguments {sorted(declared.params)}, "
             f"got {sorted(params)}"
         )
-    if root is None:
+    if root is None or spawner is None:
         raise BrokerError("check: the broker was built without a root")
     if declared.cwd is not None:
         if cwd is None:
@@ -651,7 +649,7 @@ def _run_check(
         # exec the load-time snapshot: the installed checker drifting mid-run changes nothing,
         # because the file in checkers/ is not what runs (integrity.materialize)
         argv[0] = materialize(declared.evaluator)
-    returncode, _, err = _spawn_drained(client, argv, workdir, policy.confinement(declared, root), spawner)
+    returncode, _, err = _spawn_drained(client, argv, workdir, declared, spawner)
     log.info("CHECK %s (cwd=%s) -> %d", name, cwd if cwd is not None else ".", returncode)
     return {
         "returncode": returncode,
@@ -682,9 +680,9 @@ def _send_frame(conn: socket.socket, payload: bytes) -> None:
 
 class Broker:
     """The host-side half for one confined run: the policy, the TLS context, the literal
-    discharger, where a streamed exec writes, and the run's spawner (``certorail.sandbox``: the
-    platform mechanism with the run's FUSE view, when one is attached). ``serve`` speaks the wire
-    protocol on one connected socket until the peer closes it."""
+    discharger, where a streamed exec writes, and the run's spawner (``certorail.sandbox``: its
+    jails, with the views attached for them; None with no root, where nothing is spawned).
+    ``serve`` speaks the wire protocol on one connected socket until the peer closes it."""
 
     def __init__(
         self,
@@ -692,7 +690,7 @@ class Broker:
         discharge: Discharge | None,
         root: pathlib.Path | None,
         stream_to: tuple[int, int] | None,
-        spawner: Spawner,
+        spawner: Spawner | None,
     ):
         self.policy = policy
         self.tls = _tls_context()
@@ -802,13 +800,10 @@ def build_broker(
     rules' ``requires`` atoms (``Policy.discharger``); without it only defined atoms discharge
     and exec is refused. *stream_to* is where a ``stream=True`` exec's child writes (the host's
     own stdout and stderr descriptors, ``terminal_descriptors()``); without it streaming execs
-    are refused. *spawner* is the run's (``sandbox.provision``); without one, children are
-    spawned by ``sandbox.unprovisioned()``, with no FUSE view."""
-    runner = spawner if spawner is not None else unprovisioned()
-    return Broker(
-        policy,
-        None if root is None else policy.discharger(root, runner),
-        None if root is None else pathlib.Path(root),
-        stream_to,
-        runner,
-    )
+    are refused. *spawner* is the run's (``sandbox.prepare``); without one, children are spawned
+    by ``Spawner.unattached``, with no views."""
+    if root is None:
+        return Broker(policy, None, None, stream_to, None)
+    rootpath = pathlib.Path(root)
+    runner = spawner if spawner is not None else Spawner.unattached(policy, rootpath)
+    return Broker(policy, policy.discharger(rootpath, runner), rootpath, stream_to, runner)

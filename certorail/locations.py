@@ -1,10 +1,15 @@
 """The location micro-syntax as the analysis' ``LocationFact``: ``locspec`` parses the spelling,
 this converts. Used by the policy loader and by the ``certora.pathmatch`` guard, so a location a
-program guards for is, component for component, the location a policy grants."""
+program guards for is, component for component, the location a policy grants. And a location as
+JSON (``encode_location``), for the documents handed to another process: a view daemon's
+specification, the floor guard's."""
 import pathlib
+from typing import Any
 
 from certorail import locspec
-from certorail.analysis import ANY_NAME, Component, DirSplat, LocationFact, Matching, Named, OneOf, RegexLit, StaticPath
+from certorail.analysis import (
+    ANY_NAME, AnyName, Component, DirSplat, LocationFact, Matching, Named, OneOf, RegexLit, StaticPath,
+)
 
 
 def _component(c: locspec.Component) -> Component:
@@ -32,6 +37,53 @@ def parse_location(text: str) -> LocationFact:
     """The location a compact spelling names; raises ``ValueError`` for a malformed one. A
     leading "/" anchors the location at the filesystem root instead of the sandbox root."""
     return to_location(locspec.parse(text))
+
+
+def _encode_component(c: Component) -> Any:
+    match c:
+        case Named(name=n):
+            return n
+        case AnyName():
+            return {"any": True}
+        case OneOf(names=ns):
+            return {"one_of": sorted(ns)}
+        case Matching(regex=RegexLit(reg=r)):
+            return {"regex": r}
+        case Matching():
+            raise ValueError("a policy location's regex is a single pattern")  # never from a document
+
+
+def _decode_component(v: Any) -> Component:
+    if isinstance(v, str):
+        return Named(v)
+    if "any" in v:
+        return AnyName()
+    if "one_of" in v:
+        return OneOf(frozenset(v["one_of"]))
+    return Matching(RegexLit(v["regex"]))
+
+
+def encode_location(loc: LocationFact) -> dict[str, Any]:
+    match loc:
+        case StaticPath(path_components=cs, absolute=ab):
+            return {"path": [_encode_component(c) for c in cs], "absolute": ab}
+        case DirSplat(static_prefix=ps, final_component=leaf, absolute=ab):
+            return {
+                "prefix": [_encode_component(c) for c in ps],
+                "leaf": None if leaf is None else _encode_component(leaf),
+                "absolute": ab,
+            }
+
+
+def decode_location(d: dict[str, Any]) -> LocationFact:
+    if "path" in d:
+        return StaticPath(tuple(_decode_component(c) for c in d["path"]), d["absolute"])
+    leaf = d["leaf"]
+    return DirSplat(
+        tuple(_decode_component(c) for c in d["prefix"]),
+        None if leaf is None else _decode_component(leaf),
+        d["absolute"],
+    )
 
 
 def enumerable_prefixes(loc: LocationFact) -> list[tuple[str, ...]]:

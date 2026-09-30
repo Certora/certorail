@@ -13,7 +13,10 @@ open Lean (Json)
 structure Spec where
   /-- the served directory, as the document spells it: where the kernel reports it to be -/
   directory : String
-  layers : Array Layer
+  layers : Array (Says × Region)
+  /-- cache nothing (`"cache": "strict"`): a name replaced from outside the jail is seen at once,
+  and a bind mount over it comes loose at once, at the price of every path walk -/
+  strict : Bool := false
 
 namespace Spec
 
@@ -70,18 +73,22 @@ def says (j : Json) : Except String Says :=
   | none, some "hidden" => .ok (.restrict .hidden)
   | _, _ => .error "a layer that says nothing known"
 
-def layer (j : Json) : Except String Layer := do
+def layer (j : Json) : Except String (Says × Region) := do
   let r ← region (← need "a layer with no region" (field j "region"))
-  return { region := r, says := ← says j }
+  return (← says j, r)
 
 def parse (text : String) : Except String Spec := do
   let body ← Json.parse text
   if (field body "format").bind asInt != some 2 then throw "not a format-2 view specification"
   let directory ← need "no directory" ((field body "directory").bind asStr)
   let layers ← (← need "no list of layers" ((field body "layers").bind asArr)).mapM layer
-  return { directory := directory, layers := layers }
+  let strict ← match (field body "cache").bind asStr with
+    | none | some "cached" => pure false
+    | some "strict" => pure true
+    | some other => throw s!"a cache mode of no known kind: {other}"
+  return { directory := directory, layers := layers, strict := strict }
 
-def filter (s : Spec) : Filter := { directory := splitPath s.directory, layers := s.layers }
+def filter (s : Spec) : Filter := Filter.make (splitPath s.directory) s.layers.toList
 
 end Spec
 end Fuseview

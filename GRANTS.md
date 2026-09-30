@@ -38,6 +38,25 @@ are the same protection. Neither depends on what is on disk today. The asymmetry
 a spelling read either way errs toward refusal, and it is what lets `**/.git` keep writes out
 of `.git/config`.
 
+The analysis checks the names a program spells, the same on every machine, and cannot see where a
+name resolves: `src/link` may point anywhere. By default the program runs with your authority and
+reaches files through the names its policy grants, wherever those names lead; only the redlines in
+this machine's `world.toml` (see the README), checked where each name leads, and unix permissions
+stop it. So an accepted program never fails mid-run on a permission it was granted. The other
+promise is opt-in:
+
+```toml
+[system.exec]
+view = "policy"             # the program reaches only what [filesystem] grants
+```
+
+Under the policy view the kernel holds the program to the policy as written, by what its names
+resolve to: a read or write through a link out of the grants fails mid-run. That is the trade for
+the protection, and why it is opt-in: reads through links are routine (a vendored tree, a shared
+cache). `[system.exec] mount-read` adds what the program should see without being able to name
+it. It is the right setting for a program you would not trust to leave its own interpreter alone.
+`certorail init` asks about it.
+
 Grants are about names, not the files behind them (the README lists what that means). One
 consequence to know on macOS: the OS jail around a tool matches paths without regard to case,
 so a grant that tells names apart by case, like `<[a-z]+\.txt>`, lets a tool open `NO.txt`. On

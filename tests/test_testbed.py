@@ -45,7 +45,7 @@ class TestTestbed(unittest.TestCase):
                 self.assertIn(refused["error"], str(caught.exception))
 
     def test_every_other_policy_loads(self) -> None:
-        for name in ("policy.toml", "strict.toml", "lints.toml"):
+        for name in ("policy.toml", "unholdable.toml", "lints.toml"):
             with self.subTest(policy=name):
                 self.policy(name)
 

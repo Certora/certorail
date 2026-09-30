@@ -16,6 +16,8 @@ policy file, through the installer.
    (``src/**``, ``*.md``, ``/srv/data/**``; empty for none), each checked as it is typed.
 5. Ask whether to allow all programs the policy does not name (``default-allow``: any
    arguments, unjailed, the user's authority). Default no.
+6. Ask whether the certorail process runs under the policy view (``[system.exec] view =
+   "policy"``, FLOORS.md; default no). Written only when the answer is yes.
 
 Before the interview, the machine-level half of a first run (``setup``), idempotent and asked
 step by step: the prerequisites the jails need are reported with the command that installs
@@ -67,6 +69,13 @@ DEFAULT_ALLOW = """\
 # authority, unjailed, and its effects unknown to the analysis. A named program keeps its
 # shapes. Delete the line to fail closed on unnamed programs.
 default-allow = true
+"""
+
+SYSTEM_VIEW = """
+# The certorail process at run time: it reads and writes only what this policy grants,
+# by where each name leads, so a name that resolves elsewhere (a symbolic link) fails mid-run.
+[system.exec]
+view = "policy"
 """
 
 BASE_OPT_OUT = """\
@@ -294,7 +303,12 @@ def interview(*, root: pathlib.Path, ask: Ask, prompt: Prompt, say: Say) -> int:
         grants = {kind: _locations(kind, resolved, prompt, say) for kind in KINDS}
     say("Allow all: a program no rule names runs with any arguments, unjailed, with your authority")
     say("(default-allow). Named programs keep their shapes; a [[deny]] blacklists a first word.")
+    say("[[WARNING]]: Answer \'N\' unless you are aware of the risks associated with default-allow mode")
     allow_all = ask("Allow all programs the policy does not name?", False)
+    say("By default the program reaches files through the names the policy grants, wherever those names")
+    say("lead, and at run time only this machine's floor (world.toml) refuses an access. Under the policy")
+    say("view it reaches only what the policy grants: a name that resolves elsewhere fails mid-run.")
+    view = ask("Run the program itself under the policy view?", False)
 
     def toml_string(entry: str) -> str:
         # a literal string keeps a regex leaf's backslashes as typed; a basic string only when the
@@ -313,6 +327,8 @@ def interview(*, root: pathlib.Path, ask: Ask, prompt: Prompt, say: Say) -> int:
         read=toml_list(grants["read"]),
         write=toml_list(grants["write"]),
     )
+    if view:
+        text += SYSTEM_VIEW
     with tempfile.TemporaryDirectory(prefix="certorail-init-") as tmp:
         draft = pathlib.Path(tmp) / "policy.toml"
         draft.write_text(text, encoding="utf-8")

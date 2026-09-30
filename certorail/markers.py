@@ -232,13 +232,18 @@ def _recv_exact(conn: socket.socket, n: int) -> bytes | None:
     return buf
 
 
+# The broker's socketpair end, by descriptor number, as the host named it in the environment: read
+# once, when the bootstrap imports this module, before it clears the environment. None: no broker.
+BROKER_FD: int | None = int(os.environ["CERTORAIL_BROKER_FD"]) if "CERTORAIL_BROKER_FD" in os.environ else None
+
+
 class _BrokerChannel:
     """The program's one connection to the host's broker: the socketpair end the host handed it
-    at spawn, named by descriptor number in ``CERTORAIL_BROKER_FD``. Requests are sequential (the
-    subset has no threads), so one framed request-reply at a time over one connection. Transport
-    failures surface as OSError for the caller to wrap. A timeout closes the channel -- that is
-    the cancellation the broker acts on -- and every later call fails too: a program that has
-    outlived one of its own requests has no broker any more."""
+    at spawn (``BROKER_FD``). Requests are sequential (the subset has no threads), so one framed
+    request-reply at a time over one connection. Transport failures surface as OSError for the
+    caller to wrap. A timeout closes the channel -- that is the cancellation the broker acts on --
+    and every later call fails too: a program that has outlived one of its own requests has no
+    broker any more."""
 
     def __init__(self) -> None:
         self._sock: socket.socket | None = None
@@ -247,10 +252,11 @@ class _BrokerChannel:
 
     @staticmethod
     def available() -> bool:
-        return "CERTORAIL_BROKER_FD" in os.environ
+        return BROKER_FD is not None
 
     def _socket(self) -> socket.socket:
-        fd = int(os.environ["CERTORAIL_BROKER_FD"])
+        fd = BROKER_FD
+        assert fd is not None, "no broker: available() says so first"
         if self._sock is not None and self._fd != fd:  # a test pointed us elsewhere
             self._sock.close()
             self._sock, self._dead = None, None

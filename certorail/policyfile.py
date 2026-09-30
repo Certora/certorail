@@ -30,14 +30,15 @@ import os
 import pathlib
 import tomllib
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, TypedDict, overload
 
 from certorail import markers
-from certorail.analysis import Exact, RegexLit, StaticPath, alternation, is_prefix
+from certorail.analysis import Exact, LocationFact, RegexLit, StaticPath, alternation, is_prefix
 from certorail.dangerous import EXEC_CWD
 from certorail.docpath import DocPath, Keyed, Path
 from certorail.childjail import View
+from certorail.confinement import Additions, Lifts, SystemJail
 from certorail.ids import BUILTIN_ATOMS, Atom, CheckId, FlagName, FlagsetId, HoleName, ParamName, SourceId
 from certorail.integrity import digest
 from certorail.locations import parse_location
@@ -55,6 +56,7 @@ from certorail.policy import (
     network,
     program,
     pure,
+    reexec,
     region,
     source,
     validation,
@@ -65,6 +67,8 @@ from certorail.schema import (
     AtomDecl,
     ConstraintFields,
     EachHole,
+    EditDecl,
+    EditExecDecl,
     ExecDecl,
     FlagEntry,
     FlagsetDecl,
@@ -73,6 +77,7 @@ from certorail.schema import (
     FlagVocabulary,
     FootprintRegion,
     HoleSpec,
+    Location,
     NetworkRegion,
     ParamKind,
     PolicyDoc,
@@ -505,6 +510,7 @@ class _Document:
     body: PolicyDoc | RulesetDoc
     label: str            # how messages name it: "unix.toml (where=repos,/srv/data)"
     origin: str | None    # provenance on the rules it contributes; None for the root
+    ruleset: str | None = None  # the ruleset file as [[apply]] names it ("unix.toml"); None for the root
 
     @property
     def restricted(self) -> bool:
@@ -586,7 +592,7 @@ def _apply_one(
     shown = ", ".join(f"{k}={_show(v)}" for k, v in sorted(bindings.items()))
     label = f"{entry.ruleset} ({shown})" if shown else entry.ruleset
     instantiated = _Instantiator(ruleset, bindings, label, errors).document(ruleset)
-    out.append(_Document(instantiated, label, label))
+    out.append(_Document(instantiated, label, label, entry.ruleset))
     _apply_all(instantiated, label, (*chain, real), seen, out, errors)
 
 
@@ -713,7 +719,7 @@ def _resolve_checker(piece: str, where: str, path: DocPath, errors: _Errors) -> 
     return str(resolved)
 
 
-def _slot(slot: list[str]) -> list[Any]:
+def _slot(slot: list[str]) -> list[LocationFact]:
     return [parse_location(s) for s in slot]
 
 
@@ -826,6 +832,8 @@ class _Rules:
                     f"a ruleset's validation runs {_CHECKERS}/<name> or one of "
                     f"{', '.join(sorted(RULESET_STOCK_CHECKERS))}, not {v.argv[0]!r}",
                 )
+            if self.doc.restricted and _lifted_in_ruleset(v.exec_):
+                self.errors.add(self.where, path.exec, _RULESET_LIFT)
             argv: list[str | Param] = []
             evaluator: bytes | None = None
             for j, piece in enumerate(v.argv):
@@ -873,6 +881,8 @@ class _Rules:
             path = Path().program(i)
             if p.override and self.doc.restricted:
                 self.errors.add(self.where, path.override, "only the root policy overrides a ruleset's rule")
+            if self.doc.restricted and _lifted_in_ruleset(p.exec_):
+                self.errors.add(self.where, path.exec, _RULESET_LIFT)
             yields = self.source_atom(p.source, path.key("source"))
             if isinstance(p.requires, dict):
                 requires: list[Atom] | Demands = self.demands(p.requires, path.requires)
@@ -919,19 +929,32 @@ class _Exec(TypedDict):
     env: list[str | dict[str, str]] | None
     spawn: bool
     view: View
-    mount_read: list[Any]
-    mount_write: list[Any]
+    mount_read: list[LocationFact]
+    mount_write: list[LocationFact]
+    lift_read: list[LocationFact]
+    lift_write: list[LocationFact]
 
 
 def _exec(decl: ExecDecl | None) -> _Exec:
     """A grant's ``exec`` table as ``program()`` / ``validation()`` keywords; absent, the
     unjailed baseline."""
     if decl is None:
-        return _Exec(env=None, spawn=True, view=View.HOST, mount_read=[], mount_write=[])
+        return _Exec(env=None, spawn=True, view=View.HOST, mount_read=[], mount_write=[], lift_read=[], lift_write=[])
     return _Exec(
         env=decl.env, spawn=decl.spawn, view=View(decl.view),
         mount_read=_slot(decl.mount_read or []), mount_write=_slot(decl.mount_write or []),
+        lift_read=_slot(decl.lift_read or []), lift_write=_slot(decl.lift_write or []),
     )
+
+
+def _lifted_in_ruleset(decl: ExecDecl | None) -> bool:
+    return decl is not None and (decl.lift_read is not None or decl.lift_write is not None)
+
+
+_RULESET_LIFT = (
+    "a ruleset lifts no redline: only the root policy may, on a rule it declares or through "
+    "[[edit]]"
+)
 
 
 def _network(root: PolicyDoc, where: str, declared: _Declared, errors: _Errors) -> list[NetworkRule]:
@@ -975,15 +998,18 @@ def from_data(data: object, where: str = "<policy>") -> Policy:
         raise AssertionError("unreachable")
     documents = _compose(root, where, errors)
     declared = _declare(documents, errors)
-    validations: list[Validation] = []
+    validations: list[_Placed[Validation]] = []
     own: list[Program] = []       # the root's rules
     applied: list[Program] = []   # the rulesets' rules
+    came_from: list[_Placed[Program]] = []  # each ruleset's rule, with the ruleset it came from
     sources: list[Source] = []
     for d in documents:
         rules = _Rules(d, declared, errors)
         rules.declare_flagsets()
-        validations += rules.validations()
-        (applied if d.restricted else own).extend(rules.programs())
+        validations += [_Placed(v, d.ruleset) for v in rules.validations()]
+        programs = rules.programs()
+        (applied if d.restricted else own).extend(programs)
+        came_from += [_Placed(p, d.ruleset) for p in programs if d.restricted]
         sources += rules.sources()
     top = documents[0].body
     assert isinstance(top, PolicyDoc)
@@ -992,6 +1018,9 @@ def from_data(data: object, where: str = "<policy>") -> Policy:
     # in which case errors are pending and nothing below is reported anyway
     if len(own) == len(top.program):
         applied = _override(where, applied, [(p, decl.override) for p, decl in zip(own, top.program)], errors)
+    kept = [_Placed(p, next(c.ruleset for c in came_from if c.rule is p)) for p in applied]
+    rule_set = [*(_Placed(p, None) for p in own), *kept]
+    rule_set, validations = _edit(where, top.edit, rule_set, validations, errors)
     net_rules = _network(top, where, declared, errors)
     errors.raise_if_any()
     no_write = [loc for d in documents for loc in d.body.filesystem.no_write]
@@ -1003,17 +1032,31 @@ def from_data(data: object, where: str = "<policy>") -> Policy:
             return [parse_location("**")] if top.default_allow else []
         return _slot(written) if written else []
 
+    sys_exec = top.system.exec_
+
+    def parsed(texts: list[str] | None) -> tuple[LocationFact, ...]:
+        return tuple(parse_location(t) for t in (texts or []))
+
+    try:
+        system = SystemJail(
+            view=View(sys_exec.view) if sys_exec is not None else View.HOST,
+            additions=Additions(parsed(sys_exec.mount_read), parsed(sys_exec.mount_write)) if sys_exec is not None else Additions(),
+            lifts=Lifts(parsed(sys_exec.lift_read), parsed(sys_exec.lift_write)) if sys_exec is not None else Lifts(),
+        )
+    except ValueError as e:
+        raise PolicyFileError(f"{where}: {e}") from None
+
     try:
         return Policy.allow(
             read=grants(top.filesystem.read),
             write=grants(top.filesystem.write),
             no_write=_slot(no_write) if no_write else [],
-            programs=own + applied, validations=validations, atoms=declared.defined,
+            programs=[r.rule for r in rule_set], validations=[v.rule for v in validations], atoms=declared.defined,
             network=net_rules, sources=sources, regions=declared.regions, reads=declared.reads,
             applied=[d.label for d in documents[1:]],
             default_allow=top.default_allow,
-            strict=top.strict,
             denied=[d.argv[0] for d in top.deny],
+            system=system,
         )
     except ValueError as e:
         raise PolicyFileError(f"{where}: {e}") from None
@@ -1064,6 +1107,102 @@ def _override(
             errors.add(where, path.override, f"{_shape(p.leading_words)!r} overrides nothing: no applied ruleset grants an overlapping shape")
         kept = [q for q in kept if q not in overlapping]
     return kept
+
+
+@dataclass(frozen=True)
+class _Placed[R: Program | Validation]:
+    """A rule, and the ruleset it came from as ``[[apply]]`` names it (None: the root's own)."""
+
+    rule: R
+    ruleset: str | None
+
+
+def _from(ruleset: str, named: str) -> bool:
+    """Does an edit's ``from`` name *ruleset*? As ``[[apply]]`` names it, the ``.toml`` optional."""
+    return named == ruleset or named + ".toml" == ruleset
+
+
+def _env_items(rule: Program | Validation) -> list[str | dict[str, str]]:
+    """A rule's ``exec.env`` as written: the names passed through, then one table of those set."""
+    assert rule.env is not None
+    return [*rule.env.passed, *([dict(rule.env.sets)] if rule.env.sets else [])]
+
+
+def _edited[R: Program | Validation](rule: R, x: EditExecDecl, where: str) -> R:
+    """*rule* with an edit's ``exec`` merged in: a value replaces, a list is added to; the result
+    checked whole, as a table written in place would be. Its provenance says it was edited, and
+    whether the edit widens what the rule's process may reach, narrows it, or both."""
+    if x.env is not None and rule.env is None:
+        raise ValueError(
+            "the rule passes its tool the whole environment, and an edit adds to an env list: there "
+            "is none to add to (override the rule to narrow it)"
+        )
+    view = rule.view if x.view is None else View(x.view)
+    spawn = rule.spawn if x.spawn is None else x.spawn
+    edited = reexec(
+        rule,
+        env=None if rule.env is None else [*_env_items(rule), *(x.env or [])],
+        spawn=spawn,
+        view=view,
+        mount_read=(*rule.mount_read, *_slot(x.mount_read or [])),
+        mount_write=(*rule.mount_write, *_slot(x.mount_write or [])),
+        lift_read=(*rule.lift_read, *_slot(x.lift_read or [])),
+        lift_write=(*rule.lift_write, *_slot(x.lift_write or [])),
+    )
+    widens = (
+        (rule.view is View.POLICY and view is View.HOST) or (spawn and not rule.spawn)
+        or any((x.env, x.mount_read, x.mount_write, x.lift_read, x.lift_write))
+    )
+    narrows = (rule.view is View.HOST and view is View.POLICY) or (rule.spawn and not spawn)
+    how = " and ".join(w for w, on in (("widens", widens), ("narrows", narrows)) if on) or "changes nothing"
+    if isinstance(edited, Program) and isinstance(rule, Program):
+        return replace(edited, origin=f"{rule.origin}, edited by {where} ({how})")
+    return edited
+
+
+def _edit(
+    where: str, edits: Sequence[EditDecl], rules: list[_Placed[Program]], validations: list[_Placed[Validation]],
+    errors: _Errors,
+) -> tuple[list[_Placed[Program]], list[_Placed[Validation]]]:
+    """``[[edit]]`` (REDLINES.md): each amends the ``exec`` table of exactly one rule an applied
+    ruleset grants -- a program rule by its leading words, a validation by its name, narrowed by
+    ``from`` -- after the rulesets, ``[[deny]]`` and ``override``, so against the final rule set.
+    An edit matching none (its rule replaced, taken back, or removed by a pack update), matching
+    several, or matching a rule the root declares itself, is a load error, never a no-op."""
+    programs, checks = list(rules), list(validations)
+    for i, e in enumerate(edits):
+        path = Path().edit(i)
+        pool: list[_Placed[Program]] | list[_Placed[Validation]]
+        if e.program is not None:
+            words = tuple(e.program.split())
+            pool, what = programs, f"program {e.program!r}"
+            matches = [k for k, r in enumerate(programs) if r.rule.leading_words == words]
+        else:
+            pool, what = checks, f"validation {e.validation!r}"
+            matches = [k for k, v in enumerate(checks) if v.rule.name == e.validation]
+        if any(pool[k].ruleset is None for k in matches):
+            errors.add(where, path, f"{what} is declared by this policy: change it in place")
+            continue
+        if e.from_ is not None:
+            matches = [k for k in matches if (r := pool[k].ruleset) is not None and _from(r, e.from_)]
+        if not matches:
+            named = "" if e.from_ is None else f" from {e.from_!r}"
+            errors.add(where, path, f"edit of {what}{named}: no applied ruleset grants it")
+            continue
+        if len(matches) > 1:
+            shown = ", ".join(f"one from {pool[k].ruleset}" for k in matches)
+            errors.add(where, path, f"edit of {what} matches {len(matches)} rules ({shown}): say which with from")
+            continue
+        k = matches[0]
+        target = pool[k]
+        try:
+            if isinstance(target.rule, Program):
+                programs[k] = _Placed(_edited(target.rule, e.exec_, where), target.ruleset)
+            else:
+                checks[k] = _Placed(_edited(target.rule, e.exec_, where), target.ruleset)
+        except ValueError as err:
+            errors.add(where, path.exec, str(err))
+    return programs, checks
 
 
 def load_policy_file(path: pathlib.Path) -> Policy:

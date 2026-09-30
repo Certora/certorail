@@ -10,6 +10,7 @@ import pathlib
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 from certorail import markers
 from tests.brokerpath import build_server, channel
@@ -622,11 +623,10 @@ class TestRuntimeCheck(unittest.TestCase):
         cls.server = build_server(cls.sock, policy, cls.root)
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
         cls.program_end = channel(cls.server.broker)
-        os.environ["CERTORAIL_BROKER_FD"] = str(cls.program_end.fileno())
+        cls.enterClassContext(mock.patch.object(markers, "BROKER_FD", cls.program_end.fileno()))
 
     @classmethod
     def tearDownClass(cls) -> None:
-        os.environ.pop("CERTORAIL_BROKER_FD", None)
         cls.program_end.close()
         cls.server.shutdown()
         cls.server.server_close()

@@ -9,7 +9,8 @@ directly, request by request, over a /dev/fuse descriptor someone else mounted
     fuseview-lean [--entry-ttl S] [--attr-ttl-dirs S] [--attr-ttl-files S] [--keep-cache] --fd N VIEW.JSON
 
 It prints "ready" once the kernel has connected, a JSON line of request counts for each line on
-stdin, and exits when the view is unmounted.
+stdin, and exits when the view is unmounted. A specification with `"cache": "strict"` overrides
+the TTL options: nothing is cached.
 -/
 open Fuseview
 
@@ -78,6 +79,11 @@ def main (argv : List String) : IO UInt32 := do
     let core ← match ← Core.new spec with
       | .ok core => pure core
       | .error message => return ← fail s!"cannot serve: {message}"
+    -- a strict specification caches no name and no directory's attributes: what the host changes
+    -- from outside the jail is seen at the next request
+    let cfg := if spec.strict
+      then { args.cfg with ttls := { args.cfg.ttls with entry := ⟨0, 0⟩, dirs := ⟨0, 0⟩ } }
+      else args.cfg
     Sys.startReporter
     match ← answerInit fd with
     | .error message => fail message
@@ -85,5 +91,5 @@ def main (argv : List String) : IO UInt32 := do
       let out ← IO.getStdout
       out.putStrLn "ready"
       out.flush
-      serve args.cfg fd core .empty
+      serve cfg fd core .empty
       return 0

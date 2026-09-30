@@ -52,8 +52,11 @@ A policy talks about names, not objects. A grant or a protection constrains the 
 spells, not the file that path ends up at. The rule of thumb has four consequences worth
 knowing:
 
-- A symbolic link inside a granted tree is followed. A read through it reaches wherever the link
-  points; the OS jail confines writes to the root and does not confine reads.
+- A symbolic link inside a granted tree is followed. The analysis cannot see where it points; the
+  OS jail around the program can, and by default it holds writes to the write grants, so a
+  write through a link out of them fails mid-run. Reads through links reach wherever they point
+  unless the policy opts into its view (`[system.exec] view = "policy"`, see the
+  [grants guide](GRANTS.md)).
 - A relative `no-write` protection does not cover an absolute spelling of the same file. If the
   policy also grants an absolute write over the root, the protection holds only for relative
   names.
@@ -105,8 +108,36 @@ terminal.
 operation with its proven location, or the reason it was denied; `certorail run prog.py` does the same and
 then runs it. Both take `--policy FILE` to try a draft policy before you install it.
 
-`certorail view status` lists the filesystem views certorail keeps mounted for jailed tools under a
-patterned policy, and `certorail view stop` unmounts them. These are both Linux only, and you will rarely need either.
+`certorail view status` lists the filesystem views certorail keeps mounted for the jails that hold
+what a bind mount cannot (a pattern, an exact path, a protection), and `certorail view stop`
+unmounts them. These are both Linux only, and you will rarely need either.
+
+`world.toml` in the config directory is this machine's floor: the redlines no certorail program may
+cross, whatever any policy grants. It is optional, and it binds the programs, not the tools they run.
+
+```toml
+[system.floor]
+never-write   = ["~/.ssh", "~/.gnupg"]   # nothing writes here
+never-visible = ["~/personal"]           # the contents do not exist for the program
+
+[system.interpreter]
+read = ["/nix/store"]                    # interpreter files certorail does not find by itself
+
+stable = ["home", "tops"]                # the directories nothing replaces while a program runs (the default)
+```
+
+Paths are absolute (`~` is expanded) and resolved once when the file is read. `stable` is your
+judgment about this machine: a tool's redlines are held from the innermost stable directory above
+them, and a run binds a grant plainly only at a stable name. Besides `home` and `tops` (the
+top-level directories) it takes `home-dots` (the dot directories in your home), `root` (the
+sandbox root), `xdg`, absolute paths, or `"nothing"`. A policy grant that
+a `never-*` path swallows whole does not load; one that reaches into it loads, `certorail describe`
+says so, and operations there fail at run time. The program's interpreter checks each operation
+where its path leads at that moment, so a link does not get around the floor, and a `never-*` path
+that does not exist yet is held once something creates it. Otherwise a program runs with your
+authority: it reaches files through the names its policy grants, wherever those names lead. Under
+the policy view the jail holds the floor instead, by name too (on Linux in a filesystem view).
+`[system.interpreter]` matters only to policies that run the program under the policy view.
 
 ## Contributing
 
