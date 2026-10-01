@@ -10,7 +10,7 @@ policy allows — run in an isolated interpreter. Anything unprovable is rejecte
 
 Here is Certorail being used in the development of Certorail:
 
-<img width="888" height="266" alt="Image" src="https://github.com/user-attachments/assets/2b4d72f1-cb33-4f51-a98a-dd0f3b9948ba" />
+<img width="888" height="266" alt="Image" src="https://github.com/user-attachments/assets/e68e9c6c-02ba-4a73-b961-1316f9b98946" />
 
 Here is the program that Claude authored and executed:
 
@@ -36,7 +36,8 @@ for path in ("fuse/fuseview-lean/.lake/build/bin/fuseview-lean", "proofs/place/.
 ```
 
 This is regular old Python, executed by a coding agent without permission prompts, while *statically*
-guaranteed to stay within my security policy.
+guaranteed to stay within my security policy. It parses the ELF headers of the two binaries Claude
+had just built (also through Certorail) and uses that to answer my question about static vs dynamic linking.
 
 ## Getting Started
 
@@ -75,9 +76,9 @@ way to execute code. Claude Code's permission rules can do that; nothing in cert
 enforces it.
 
 Programs run with your authority. A policy grant is trust you extend: a program that is allowed to
-write under a directory, run a command or reach a host does so as you, and the tools it runs do
-whatever those tools do. The analysis proves that the certorail program stays within the grants; it does not
-judge whether the grants were wise. Read the policy as carefully as you would a sudoers file. For
+write under a directory, run a command or reach a host does so as **you**, and the program Certorail
+runs do whatever those programs do. The analysis proves that the Certorail program stays within the grants; it does not
+judge whether the grants were a good idea. Read the policy as carefully as you would a sudoers file. For
 information on how to lockdown programs launched via certorail, see the [grants guide](GRANTS.md).
 
 A policy talks about names, not objects. A grant or a protection constrains the path a program
