@@ -6,6 +6,38 @@ A program written in a restricted subset of Python is analysed, checked against 
 policy, and — only if every filesystem and subprocess operation is *proven* to stay where the
 policy allows — run in an isolated interpreter. Anything unprovable is rejected before it runs.
 
+## Quick Demo:
+
+Here is Certorail being used in the development of Certorail:
+
+<img width="888" height="266" alt="Image" src="https://github.com/user-attachments/assets/2b4d72f1-cb33-4f51-a98a-dd0f3b9948ba" />
+
+Here is the program that Claude authored and executed:
+
+```python
+for path in ("fuse/fuseview-lean/.lake/build/bin/fuseview-lean", "proofs/place/.lake/build/bin/place-check"):
+  data = open(path, "rb").read()
+  assert data[:4] == b"\x7fELF"
+  e_type = int.from_bytes(data[0x10:0x12], "little")
+  phoff = int.from_bytes(data[0x20:0x28], "little")
+  phentsize = int.from_bytes(data[0x36:0x38], "little")
+  phnum = int.from_bytes(data[0x38:0x3a], "little")
+  types = []
+  interp = None
+  for i in range(phnum):
+      h = data[phoff + i * phentsize: phoff + (i + 1) * phentsize]
+      p_type = int.from_bytes(h[0:4], "little")
+      types.append(p_type)
+      if p_type == 3:  # PT_INTERP: the dynamic loader
+          off = int.from_bytes(h[8:16], "little")
+          size = int.from_bytes(h[0x20:0x28], "little")
+          interp = data[off:off + size].rstrip(b"\0").decode()
+  print(path.rsplit("/", 1)[1], "ELF type", e_type, "| PT_INTERP:", interp or "none", "| PT_DYNAMIC:", 2 in types)
+```
+
+This is regular old Python, executed by a coding agent without permission propmts, while *statically*
+guaranteed to stay within my security policy.
+
 ## Getting Started
 
 ### Quickstart
