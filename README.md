@@ -35,7 +35,7 @@ for path in ("fuse/fuseview-lean/.lake/build/bin/fuseview-lean", "proofs/place/.
   print(path.rsplit("/", 1)[1], "ELF type", e_type, "| PT_INTERP:", interp or "none", "| PT_DYNAMIC:", 2 in types)
 ```
 
-This is regular old Python, executed by a coding agent without permission propmts, while *statically*
+This is regular old Python, executed by a coding agent without permission prompts, while *statically*
 guaranteed to stay within my security policy.
 
 ## Getting Started
